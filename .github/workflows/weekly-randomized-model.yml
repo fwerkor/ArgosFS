@@ -503,13 +503,14 @@ jobs:
   qemu-chaos-matrix:
     name: QEMU chaos (${{ matrix.suite }}, ${{ matrix.arch }})
     needs: qemu-image-build
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.job_timeout }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: x86_64
+            runner: ubuntu-24.04
             suite: rootfs-stress
             script: scripts/qemu/rootfs_stress.sh
             qemu_timeout: "4800"
@@ -518,6 +519,7 @@ jobs:
             chaos_workers: ""
             job_timeout: 95
           - arch: arm64
+            runner: ubuntu-24.04-arm
             suite: rootfs-stress
             script: scripts/qemu/rootfs_stress.sh
             qemu_timeout: "5400"
@@ -526,6 +528,7 @@ jobs:
             chaos_workers: ""
             job_timeout: 110
           - arch: x86_64
+            runner: ubuntu-24.04
             suite: block-lifecycle-stress
             script: scripts/qemu/block_lifecycle_stress.sh
             qemu_timeout: "2400"
@@ -534,6 +537,7 @@ jobs:
             chaos_workers: ""
             job_timeout: 55
           - arch: arm64
+            runner: ubuntu-24.04-arm
             suite: block-lifecycle-stress
             script: scripts/qemu/block_lifecycle_stress.sh
             qemu_timeout: "3000"
@@ -542,6 +546,7 @@ jobs:
             chaos_workers: ""
             job_timeout: 65
           - arch: x86_64
+            runner: ubuntu-24.04
             suite: crash-recovery
             script: scripts/qemu/crash_recovery.sh
             qemu_timeout: "2400"
@@ -550,6 +555,7 @@ jobs:
             chaos_workers: ""
             job_timeout: 60
           - arch: arm64
+            runner: ubuntu-24.04-arm
             suite: crash-recovery
             script: scripts/qemu/crash_recovery.sh
             qemu_timeout: "3000"
@@ -558,6 +564,7 @@ jobs:
             chaos_workers: ""
             job_timeout: 75
           - arch: x86_64
+            runner: ubuntu-24.04
             suite: mixed-chaos
             script: scripts/qemu/mixed_chaos.sh
             qemu_timeout: "4800"
@@ -566,6 +573,7 @@ jobs:
             chaos_workers: "10"
             job_timeout: 100
           - arch: arm64
+            runner: ubuntu-24.04-arm
             suite: mixed-chaos
             script: scripts/qemu/mixed_chaos.sh
             qemu_timeout: "5400"
