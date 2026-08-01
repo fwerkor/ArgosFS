@@ -1,3 +1,22 @@
+extern crate self as fuser;
+
+pub use fuser_crate::{
+    AccessFlags, BsdFileFlags, Config, CopyFileRangeFlags, Errno, FileAttr, FileHandle, FileType,
+    Filesystem, FopenFlags, Generation, INodeNo, InitFlags, KernelConfig, LockOwner, MountOption,
+    OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus,
+    ReplyEmpty, ReplyEntry, ReplyLseek, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request,
+    SessionACL, TimeOrNow, WriteFlags,
+};
+
+#[doc(hidden)]
+pub fn mount2<FS: fuser_crate::Filesystem, P: AsRef<std::path::Path>>(
+    filesystem: FS,
+    mountpoint: P,
+    options: &fuser_crate::Config,
+) -> std::io::Result<()> {
+    fuser_crate::mount(filesystem, mountpoint, options)
+}
+
 pub mod cli;
 pub mod control;
 pub mod data;
