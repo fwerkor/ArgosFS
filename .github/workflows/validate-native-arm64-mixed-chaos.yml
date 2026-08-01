@@ -16,7 +16,8 @@ jobs:
   validate-arm64-mixed-chaos:
     name: Native arm64 mixed-chaos validation
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 115
+    # mixed_chaos.sh has two independently bounded QEMU phases.
+    timeout-minutes: 210
     steps:
       - name: Checkout ArgosFS
         uses: actions/checkout@v7
