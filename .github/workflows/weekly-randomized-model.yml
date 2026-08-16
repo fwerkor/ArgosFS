@@ -38,18 +38,12 @@ on:
         description: Maximum generated file size in bytes
         required: false
         default: "131072"
-      qemu_stress_seconds:
-        description: Rootfs stress duration inside each QEMU architecture
-        required: false
-        default: "3600"
-
 permissions:
   contents: read
   issues: write
 
 env:
   CARGO_TERM_COLOR: always
-  ARGOSFS_CAPOS_REF: 3903b2968a692fdc77e05f63eb3a1cfa9a739999
 
 jobs:
   prepare-matrix:
@@ -116,7 +110,7 @@ jobs:
             echo "- Core seeds: ${{ steps.seeds.outputs.seeds }}"
             echo "- FUSE seeds: ${{ steps.seeds.outputs.fuse_seeds }}"
             echo "- FUSE block-fault seeds: ${{ steps.seeds.outputs.fault_seeds }}"
-            echo "- QEMU architectures: x86_64, arm64"
+            echo "- Full CapOS QEMU matrix: x86_64, arm64"
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload seed manifest
@@ -350,278 +344,10 @@ jobs:
             ${{ runner.temp }}/weekly-raw-cli-baseline
           if-no-files-found: ignore
 
-  qemu-image-build:
-    name: Weekly CapOS image (${{ matrix.arch }})
+  full-capos-qemu:
+    name: Full CapOS QEMU matrix
     needs: prepare-matrix
-    runs-on: ubuntu-24.04
-    timeout-minutes: 720
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x86_64
-            capos_target: x86_64
-            make_jobs: "2"
-          - arch: arm64
-            capos_target: armsr_armv8
-            make_jobs: "1"
-    steps:
-      - name: Checkout ArgosFS
-        uses: actions/checkout@v7
-
-      - name: Install system dependencies
-        env:
-          ARGOSFS_CI_QEMU_ARCH: ${{ matrix.arch }}
-        run: scripts/ci/install-deps.sh
-
-      - name: Free runner disk space
-        run: |
-          set -euxo pipefail
-          sudo rm -rf \
-            /usr/share/dotnet \
-            /usr/local/lib/android \
-            /usr/local/share/boost \
-            /usr/local/share/chromium \
-            /opt/ghc \
-            /opt/az \
-            /opt/google-cloud-cli \
-            /opt/hostedtoolcache/CodeQL \
-            /opt/hostedtoolcache/go \
-            /opt/hostedtoolcache/node \
-            /opt/hostedtoolcache/Python \
-            /opt/microsoft \
-            /usr/local/.ghcup || true
-          docker system prune -af --volumes || true
-          sudo apt-get clean
-          df -h
-
-      - name: Select CapOS build storage
-        id: storage
-        shell: bash
-        env:
-          CAPOS_ARCH: ${{ matrix.arch }}
-        run: |
-          set -euo pipefail
-
-          storage_root="$RUNNER_TEMP"
-          runner_device="$(df -Pk "$RUNNER_TEMP" | awk 'NR == 2 { print $1 }')"
-          runner_available="$(df -Pk "$RUNNER_TEMP" | awk 'NR == 2 { print $4 }')"
-
-          if [ -d /mnt ]; then
-            mnt_device="$(df -Pk /mnt | awk 'NR == 2 { print $1 }')"
-            mnt_available="$(df -Pk /mnt | awk 'NR == 2 { print $4 }')"
-            if [ "$mnt_device" != "$runner_device" ] && [ "$mnt_available" -gt "$runner_available" ]; then
-              storage_root=/mnt
-            fi
-          fi
-
-          build_root="$storage_root/argosfs-weekly-capos-$CAPOS_ARCH-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-          sudo rm -rf "$build_root"
-          sudo mkdir -p "$build_root/artifacts" "$build_root/capos-dl"
-          sudo chown -R "$(id -u):$(id -g)" "$build_root"
-
-          echo "artifacts=$build_root/artifacts" >> "$GITHUB_OUTPUT"
-          echo "dl_dir=$build_root/capos-dl" >> "$GITHUB_OUTPUT"
-
-          echo "Selected CapOS build storage: $build_root"
-          df -h "$RUNNER_TEMP" "$storage_root"
-
-      - name: Probe QEMU host prerequisites
-        env:
-          ARGOSFS_QEMU_ARCH: ${{ matrix.arch }}
-        run: |
-          set -euo pipefail
-          source scripts/qemu/lib/common.sh
-          argosfs_qemu_select_arch
-          argosfs_qemu_require_binary
-          "$qemu_bin" --version
-          if [ "$arch" = "arm64" ]; then
-            firmware="$(argosfs_qemu_find_arm64_uefi || true)"
-            test -n "$firmware"
-            echo "AArch64 UEFI firmware: $firmware"
-          fi
-
-      - name: Install Rust toolchain
-        run: scripts/ci/install-rust.sh stable
-
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: weekly-capos-${{ matrix.arch }}
-
-      - name: Cache CapOS downloads
-        uses: actions/cache@v6
-        with:
-          path: ${{ steps.storage.outputs.dl_dir }}
-          key: weekly-capos-dl-${{ matrix.capos_target }}-${{ github.run_id }}
-          restore-keys: |
-            weekly-capos-dl-${{ matrix.capos_target }}-
-            capos-dl-${{ matrix.capos_target }}-
-            capos-dl-
-
-      - name: Build full CapOS ArgosFS image
-        env:
-          ARGOSFS_TEST_ARTIFACTS: ${{ steps.storage.outputs.artifacts }}
-          ARGOSFS_QEMU_ARCH: ${{ matrix.arch }}
-          ARGOSFS_CAPOS_BUILD_TARGET: ${{ matrix.capos_target }}
-          ARGOSFS_CAPOS_MAKE_JOBS: ${{ matrix.make_jobs }}
-          ARGOSFS_CAPOS_IMAGE_MAKE_TARGET: world
-          ARGOSFS_CAPOS_MAKE_V: s
-          ARGOSFS_CAPOS_LOG_STDOUT: periodic
-          ARGOSFS_CI_LOG_INTERVAL_S: "120"
-          ARGOSFS_CI_LOG_TAIL_LINES: "35"
-          ARGOSFS_CAPOS_DL_DIR: ${{ steps.storage.outputs.dl_dir }}
-          ARGOSFS_CAPOS_PRUNE_CARGO_TARGET: "1"
-          ARGOSFS_CI_LIGHT_RUST_PROFILE: "1"
-          CAPOS_REF: ${{ env.ARGOSFS_CAPOS_REF }}
-        run: scripts/qemu/build_capos_image.sh
-
-      - name: Pack QEMU bundle
-        env:
-          ARGOSFS_TEST_ARTIFACTS: ${{ steps.storage.outputs.artifacts }}
-        run: scripts/ci/pack-qemu-bundle.sh
-
-      - name: Upload weekly QEMU bundle
-        uses: actions/upload-artifact@v7
-        with:
-          name: weekly-capos-qemu-bundle-${{ matrix.arch }}
-          path: ${{ steps.storage.outputs.artifacts }}/qemu-bundle
-          if-no-files-found: error
-
-      - name: Upload CapOS build logs
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: weekly-capos-build-${{ matrix.arch }}
-          path: |
-            ${{ steps.storage.outputs.artifacts }}/qemu
-            ${{ steps.storage.outputs.artifacts }}/capos-commit
-            ${{ steps.storage.outputs.artifacts }}/capos-*.log
-            ${{ steps.storage.outputs.artifacts }}/capos-config-*
-          if-no-files-found: ignore
-
-  qemu-chaos-matrix:
-    name: QEMU chaos (${{ matrix.suite }}, ${{ matrix.arch }})
-    needs: qemu-image-build
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: ${{ matrix.job_timeout }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x86_64
-            runner: ubuntu-24.04
-            suite: rootfs-stress
-            script: scripts/qemu/rootfs_stress.sh
-            qemu_timeout: "4800"
-            stress_workers: "10"
-            chaos_files: ""
-            chaos_workers: ""
-            job_timeout: 95
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-            suite: rootfs-stress
-            script: scripts/qemu/rootfs_stress.sh
-            qemu_timeout: "5400"
-            stress_workers: "8"
-            chaos_files: ""
-            chaos_workers: ""
-            job_timeout: 110
-          - arch: x86_64
-            runner: ubuntu-24.04
-            suite: block-lifecycle-stress
-            script: scripts/qemu/block_lifecycle_stress.sh
-            qemu_timeout: "2400"
-            stress_workers: ""
-            chaos_files: ""
-            chaos_workers: ""
-            job_timeout: 55
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-            suite: block-lifecycle-stress
-            script: scripts/qemu/block_lifecycle_stress.sh
-            qemu_timeout: "3000"
-            stress_workers: ""
-            chaos_files: ""
-            chaos_workers: ""
-            job_timeout: 65
-          - arch: x86_64
-            runner: ubuntu-24.04
-            suite: crash-recovery
-            script: scripts/qemu/crash_recovery.sh
-            qemu_timeout: "2400"
-            stress_workers: ""
-            chaos_files: ""
-            chaos_workers: ""
-            job_timeout: 60
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-            suite: crash-recovery
-            script: scripts/qemu/crash_recovery.sh
-            qemu_timeout: "3000"
-            stress_workers: ""
-            chaos_files: ""
-            chaos_workers: ""
-            job_timeout: 75
-          # mixed_chaos.sh runs two sequential QEMU phases. The job timeout must
-          # cover both per-phase timeouts plus runner setup and artifact upload.
-          - arch: x86_64
-            runner: ubuntu-24.04
-            suite: mixed-chaos
-            script: scripts/qemu/mixed_chaos.sh
-            qemu_timeout: "4800"
-            stress_workers: ""
-            chaos_files: "320"
-            chaos_workers: "10"
-            job_timeout: 180
-          - arch: arm64
-            runner: ubuntu-24.04-arm
-            suite: mixed-chaos
-            script: scripts/qemu/mixed_chaos.sh
-            qemu_timeout: "5400"
-            stress_workers: ""
-            chaos_files: "280"
-            chaos_workers: "8"
-            job_timeout: 210
-    steps:
-      - name: Checkout ArgosFS
-        uses: actions/checkout@v7
-
-      - name: Install QEMU test dependencies
-        env:
-          ARGOSFS_CI_QEMU_ARCH: ${{ matrix.arch }}
-        run: scripts/ci/install-deps.sh
-
-      - name: Download QEMU bundle
-        uses: actions/download-artifact@v8
-        with:
-          name: weekly-capos-qemu-bundle-${{ matrix.arch }}
-          path: ${{ runner.temp }}/weekly-capos-qemu-bundle-${{ matrix.arch }}
-
-      - name: Prepare mutable QEMU image
-        env:
-          ARGOSFS_QEMU_BUNDLE_DIR: ${{ runner.temp }}/weekly-capos-qemu-bundle-${{ matrix.arch }}
-          ARGOSFS_QEMU_WORKDIR: ${{ runner.temp }}/weekly-qemu-work-${{ matrix.arch }}-${{ matrix.suite }}
-        run: scripts/ci/prepare-qemu-test-env.sh
-
-      - name: Run high-intensity QEMU chaos suite
-        env:
-          ARGOSFS_TEST_ARTIFACTS: ${{ runner.temp }}/weekly-qemu-${{ matrix.arch }}-${{ matrix.suite }}
-          ARGOSFS_QEMU_MEM: "1536"
-          ARGOSFS_QEMU_TIMEOUT: ${{ matrix.qemu_timeout }}
-          ARGOSFS_QEMU_STRESS_SECONDS: ${{ github.event_name == 'workflow_dispatch' && inputs.qemu_stress_seconds || '3600' }}
-          ARGOSFS_QEMU_STRESS_WORKERS: ${{ matrix.stress_workers }}
-          ARGOSFS_QEMU_CHAOS_FILES: ${{ matrix.chaos_files }}
-          ARGOSFS_QEMU_CHAOS_WORKERS: ${{ matrix.chaos_workers }}
-        run: ${{ matrix.script }}
-
-      - name: Upload QEMU chaos artifacts
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: weekly-qemu-${{ matrix.arch }}-${{ matrix.suite }}
-          path: ${{ runner.temp }}/weekly-qemu-${{ matrix.arch }}-${{ matrix.suite }}
-          if-no-files-found: ignore
+    uses: ./.github/workflows/capos-full-qemu.yml
 
   weekly-required:
     name: Weekly four-matrix gate
@@ -631,8 +357,7 @@ jobs:
       - core-randomized-matrix
       - fuse-posix-matrix
       - fuse-block-fault-matrix
-      - qemu-image-build
-      - qemu-chaos-matrix
+      - full-capos-qemu
     if: always()
     steps:
       - name: Verify all weekly matrices
@@ -684,7 +409,7 @@ jobs:
           - FUSE seeds: $FUSE_SEEDS
           - FUSE block-fault seeds: $FAULT_SEEDS
 
-          The required gate covers the direct core reference model on x86_64 and arm64, mounted FUSE randomized/POSIX compatibility, FUSE plus real device-mapper faults, and full CapOS QEMU chaos on x86_64 and arm64. Download the seed manifest and the failing shard artifacts for exact replay parameters and logs.
+          The required gate covers the direct core reference model on x86_64 and arm64, mounted FUSE randomized/POSIX compatibility, FUSE plus real device-mapper faults, and the full CapOS QEMU matrix on x86_64 and arm64. Download the seed manifest and the failing shard artifacts for exact replay parameters and logs.
           EOF
           )"
           if [ -n "$existing" ]; then
