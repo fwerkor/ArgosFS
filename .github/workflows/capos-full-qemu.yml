@@ -1,24 +1,40 @@
 name: Full CapOS QEMU CI
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  workflow_call:
+    inputs:
+      capos_ref:
+        description: CapOS git ref to build; leave empty to use the pinned ArgosFS CI baseline
+        required: false
+        type: string
+        default: ""
+      make_target:
+        description: CapOS make target for full image build
+        required: false
+        type: string
+        default: world
+      qemu_tests:
+        description: Run QEMU boot/full guest/hotplug/reboot/stress tests after image build
+        required: false
+        type: boolean
+        default: true
   workflow_dispatch:
     inputs:
       capos_ref:
         description: CapOS git ref to build; leave empty to use the pinned ArgosFS CI baseline
         required: false
+        type: string
         default: ""
       make_target:
         description: CapOS make target for full image build
         required: false
+        type: string
         default: world
       qemu_tests:
         description: Run QEMU boot/full guest/hotplug/reboot/stress tests after image build
         required: false
-        default: "true"
+        type: boolean
+        default: true
 permissions:
   contents: read
 
@@ -149,7 +165,7 @@ jobs:
           ARGOSFS_QEMU_ARCH: ${{ matrix.arch }}
           ARGOSFS_CAPOS_BUILD_TARGET: ${{ matrix.capos_target }}
           ARGOSFS_CAPOS_MAKE_JOBS: ${{ matrix.make_jobs }}
-          ARGOSFS_CAPOS_IMAGE_MAKE_TARGET: ${{ github.event_name == 'workflow_dispatch' && inputs.make_target || 'world' }}
+          ARGOSFS_CAPOS_IMAGE_MAKE_TARGET: ${{ inputs.make_target || 'world' }}
           ARGOSFS_CAPOS_MAKE_V: s
           ARGOSFS_CAPOS_LOG_STDOUT: periodic
           ARGOSFS_CI_LOG_INTERVAL_S: "120"
@@ -157,7 +173,7 @@ jobs:
           ARGOSFS_CAPOS_DL_DIR: ${{ steps.storage.outputs.dl_dir }}
           ARGOSFS_CAPOS_PRUNE_CARGO_TARGET: "1"
           ARGOSFS_CI_LIGHT_RUST_PROFILE: "1"
-          CAPOS_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.capos_ref || env.ARGOSFS_CAPOS_REF }}
+          CAPOS_REF: ${{ inputs.capos_ref || env.ARGOSFS_CAPOS_REF }}
         run: scripts/qemu/build_capos_image.sh
 
       - name: Pack QEMU bundle
@@ -174,7 +190,7 @@ jobs:
           {
             echo "### Full CapOS QEMU build (${{ matrix.arch }})"
             echo
-            echo "- CapOS ref: '${{ github.event_name == 'workflow_dispatch' && inputs.capos_ref || env.ARGOSFS_CAPOS_REF }}'"
+            echo "- CapOS ref: '${{ inputs.capos_ref || env.ARGOSFS_CAPOS_REF }}'"
             echo "- CapOS commit: '$(cat "$ARGOSFS_TEST_ARTIFACTS/capos-commit" 2>/dev/null || echo unknown)'"
             echo "- Bundle: capos-qemu-bundle-${{ matrix.arch }}"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -201,7 +217,7 @@ jobs:
   capos-qemu-test:
     name: QEMU ${{ matrix.suite }} (${{ matrix.arch }})
     needs: capos-full-build
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.qemu_tests == 'true' }}
+    if: ${{ inputs.qemu_tests }}
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ matrix.job_timeout }}
     strategy:
