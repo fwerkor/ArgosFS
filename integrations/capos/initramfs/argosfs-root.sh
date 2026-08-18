@@ -420,11 +420,14 @@ prepare_new_root_runtime_dirs() {
 	mkdir -p "$sysroot/tmp" "$sysroot/run"
 	chmod 1777 "$sysroot/tmp" 2>/dev/null || true
 
-	mkdir -p "$sysroot/tmp/lock" "$sysroot/tmp/log" "$sysroot/tmp/run" \
-		"$sysroot/tmp/state" "$sysroot/tmp/ubus" "$sysroot/var/run/ubus"
-	chmod 0755 "$sysroot/tmp/run" "$sysroot/var/run" 2>/dev/null || true
-	chmod 0755 "$sysroot/var/run/ubus" 2>/dev/null || true
-	chown 81:81 "$sysroot/var/run/ubus" 2>/dev/null || true
+	# /var/run is normally an absolute symlink to /tmp/run. Before switch_root,
+	# following /sysroot/var/run would therefore escape into the initramfs /tmp.
+	# Populate the target inside the new root directly; /var/run resolves to it
+	# normally after switch_root.
+	mkdir -p "$sysroot/tmp/lock" "$sysroot/tmp/log" "$sysroot/tmp/run/ubus" \
+		"$sysroot/tmp/state" "$sysroot/tmp/ubus"
+	chmod 0755 "$sysroot/tmp/run" "$sysroot/tmp/run/ubus" 2>/dev/null || true
+	chown 81:81 "$sysroot/tmp/run/ubus" 2>/dev/null || true
 }
 
 mark_argosfs_root_active() {
@@ -534,19 +537,44 @@ main() {
 	args="$(backend_args)"
 	pool_filter="$(pool_args)"
 	log "scan $args pool=${pool:-auto} mode=$mode replay=$replay fsck=$fsck_mode"
+	scan_report="$run_dir/argosfs-scan.json"
 	# shellcheck disable=SC2086
-	"$argosfs_bin" scan $args --json >"$run_dir/argosfs-scan.json"
-	if [ "$replay" != "none" ]; then
+	"$argosfs_bin" scan $args --json >"$scan_report"
+	scan_clean="1"
+	if grep -q '"valid"[[:space:]]*:[[:space:]]*false' "$scan_report" || \
+		grep -q '"clean"[[:space:]]*:[[:space:]]*false' "$scan_report"; then
+		scan_clean="0"
+	fi
+
+	run_replay="0"
+	case "$replay" in
+		none) ;;
+		auto) [ "$scan_clean" = "0" ] && run_replay="1" ;;
+		force) run_replay="1" ;;
+		*) emergency "invalid argosfs.replay policy: $replay" ;;
+	esac
+	if [ "$run_replay" = "1" ]; then
 		# shellcheck disable=SC2086
 		"$argosfs_bin" replay-journal $args $pool_filter >"$run_dir/argosfs-replay.json" || {
 			[ "$mode" = "recovery" ] || emergency "journal replay failed"
 		}
+	else
+		log "journal replay skipped policy=$replay clean=$scan_clean"
 	fi
-	if [ "$fsck_mode" != "skip" ]; then
-		fsck_flags=""
-		[ "$fsck_mode" = "force" ] && fsck_flags="--repair"
+
+	run_fsck="0"
+	fsck_flags=""
+	case "$fsck_mode" in
+		skip) ;;
+		auto) [ "$scan_clean" = "0" ] && run_fsck="1" ;;
+		force) run_fsck="1"; fsck_flags="--repair" ;;
+		*) emergency "invalid argosfs.fsck policy: $fsck_mode" ;;
+	esac
+	if [ "$run_fsck" = "1" ]; then
 		# shellcheck disable=SC2086
 		"$argosfs_bin" fsck $args $pool_filter $fsck_flags >"$run_dir/argosfs-fsck.json" || emergency "fsck failed"
+	else
+		log "fsck skipped policy=$fsck_mode clean=$scan_clean"
 	fi
 	# shellcheck disable=SC2086
 	"$argosfs_bin" preflight-root $args $pool_filter --mode "$mode" >"$run_dir/argosfs-preflight.json"

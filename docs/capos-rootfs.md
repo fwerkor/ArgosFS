@@ -59,8 +59,8 @@ argosfs reshape --backend loop --images disk0.img,disk1.img --k 1 --m 1
 4. runs `argosfs scan`;
 5. validates the requested `argosfs.pool` name or UUID on replay/fsck/preflight
    and mount commands;
-6. replays the journal unless disabled;
-7. runs pre-mount fsck according to policy;
+6. replays the journal according to policy (`auto` only when `scan` reports an unclean pool);
+7. runs pre-mount fsck according to policy (`auto` only for an unclean pool, `force` always repairs);
 8. runs `preflight-root`;
 9. mounts ArgosFS at `/sysroot`;
 10. verifies an init exists;
@@ -79,6 +79,8 @@ Example:
 ```text
 argosfs.images=/boot/disk0.img argosfs.mode=rw argosfs.root=/sysroot argosfs.replay=auto argosfs.fsck=auto
 ```
+
+On a clean pool, the default `auto` policies skip journal replay and full fsck and rely on `preflight-root` before mounting. If `scan` reports the pool unclean, `auto` runs replay and fsck before preflight. Use `argosfs.replay=force` or `argosfs.fsck=force` for explicit maintenance/recovery boots.
 
 For real block devices use `argosfs.devices=/dev/disk/by-id/...`.
 
