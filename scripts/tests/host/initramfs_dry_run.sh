@@ -30,6 +30,17 @@ ARGOSFS_INITRD_SYS_CLASS_BLOCK="$artifacts/sys/class/block" \
 	"$repo/integrations/capos/initramfs/argosfs-root.sh" \
 	--dry-run --images /dev/disk/by-partuuid/5a5e744d-02 --sysroot "$artifacts/sysroot" --argosfs-bin "$argosfs"
 grep -q "resolved /dev/disk/by-partuuid/5a5e744d-02 by partition number 2 to $artifacts/dev/argos-root" "$artifacts/initrd.log"
+grep -q 'journal replay skipped policy=auto clean=1' "$artifacts/initrd.log"
+grep -q 'fsck skipped policy=auto clean=1' "$artifacts/initrd.log"
+test ! -e "$artifacts/run/argosfs-replay.json"
+test ! -e "$artifacts/run/argosfs-fsck.json"
+# Before switch_root, /var/run can be an absolute /tmp/run symlink. The initramfs
+# helper must populate the target below $sysroot directly instead of following it.
+grep -q '\$sysroot/tmp/run/ubus' "$repo/integrations/capos/initramfs/argosfs-root.sh"
+if grep -q '\$sysroot/var/run/ubus' "$repo/integrations/capos/initramfs/argosfs-root.sh"; then
+	echo "initramfs must not follow /sysroot/var/run before switch_root" >&2
+	exit 1
+fi
 rm -f "$artifacts/initrd.log"
 ARGOSFS_INITRD_LOG="$artifacts/initrd.log" \
 ARGOSFS_INITRD_RUN_DIR="$artifacts/run" \
