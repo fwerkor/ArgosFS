@@ -111,6 +111,7 @@ fn xattr_namespace_validation_covers_every_linux_namespace() {
         validate_xattr_write("security.key"),
         Err(ArgosError::PermissionDenied(_))
     ));
+    assert!(validate_xattr_write(SECURITY_CAPABILITY_XATTR).is_ok());
     assert!(matches!(
         validate_xattr_write("system.key"),
         Err(ArgosError::Unsupported(_))
@@ -130,6 +131,7 @@ fn xattr_namespace_validation_covers_every_linux_namespace() {
         acl::ARGOS_POSIX_ACL_DEFAULT_XATTR,
         acl::NFS4_ACL_XATTR,
         BOOT_CRITICAL_XATTR,
+        SECURITY_CAPABILITY_XATTR,
     ] {
         assert!(is_known_system_xattr(known));
         assert!(validate_xattr_write(known).is_ok());
@@ -352,6 +354,21 @@ fn xattr_and_acl_lifecycle_covers_special_names_invalid_values_and_removal() {
         .contains(&"user.key".to_string()));
     fs.removexattr_inode(file, "user.key").unwrap();
     assert!(fs.removexattr_inode(file, "user.key").is_err());
+
+    let capability = 0x0200_0001u32.to_le_bytes();
+    fs.setxattr_inode(file, SECURITY_CAPABILITY_XATTR, &capability)
+        .unwrap();
+    assert_eq!(
+        fs.getxattr_inode(file, SECURITY_CAPABILITY_XATTR).unwrap(),
+        capability
+    );
+    assert!(fs
+        .listxattr_inode(file)
+        .unwrap()
+        .iter()
+        .any(|name| name == SECURITY_CAPABILITY_XATTR));
+    fs.removexattr_inode(file, SECURITY_CAPABILITY_XATTR)
+        .unwrap();
     assert!(fs.setxattr_inode(file, "trusted.key", b"x").is_err());
     assert!(fs.getxattr_inode(file, "system.argosfs.private").is_err());
     assert!(fs.setxattr_inode(9999, "user.key", b"x").is_err());

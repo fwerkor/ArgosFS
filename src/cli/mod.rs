@@ -930,6 +930,15 @@ fn root_mount_options(mut options: Vec<String>) -> Vec<String> {
     if !has_acl {
         options.push("allow_other".to_string());
     }
+    // fuser defaults FUSE mounts to nosuid. A system root must explicitly
+    // opt back into suid semantics so the VFS can honor setuid/setgid bits
+    // and security.capability file capabilities (for example snap-confine).
+    let has_suid_policy = options
+        .iter()
+        .any(|option| option == "suid" || option == "nosuid");
+    if !has_suid_policy {
+        options.push("suid".to_string());
+    }
     options
 }
 

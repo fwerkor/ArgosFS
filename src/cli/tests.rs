@@ -245,14 +245,18 @@ fn backend_open_pool_validation_and_root_options_cover_errors_and_defaults() {
     .unwrap();
     assert_eq!(opened.root(), temp.path());
 
-    assert_eq!(root_mount_options(vec![]), ["allow_other"]);
+    assert_eq!(root_mount_options(vec![]), ["allow_other", "suid"]);
     assert_eq!(
         root_mount_options(vec!["allow_root".to_string()]),
-        ["allow_root"]
+        ["allow_root", "suid"]
     );
     assert_eq!(
         root_mount_options(vec!["allow_other".to_string(), "ro".to_string()]),
-        ["allow_other", "ro"]
+        ["allow_other", "ro", "suid"]
+    );
+    assert_eq!(
+        root_mount_options(vec!["nosuid".to_string()]),
+        ["nosuid", "allow_other"]
     );
 }
 

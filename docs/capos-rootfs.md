@@ -96,6 +96,12 @@ The repository provides CapOS-targeted systemd assets under
 - `argosfs-watchdog.service` periodically reruns readonly root preflight.
 - `argosfs-recovery.target` isolates into emergency recovery mode.
 
+The CapOS root mount explicitly enables `suid` semantics because FUSE mounts are
+`nosuid` by default. This is required for normal system-root behavior, including
+Linux `security.capability` file capabilities such as those used by snap-confine.
+ArgosFS permits runtime writes only to that security xattr; other protected
+`security.*` and `trusted.*` xattrs remain blocked by the filesystem policy.
+
 Rootfs mode is conservative: plain `rw` is rejected when devices are missing;
 use `degraded-ro` for readonly degraded boot or explicit `degraded-rw` when
 operators accept the risk. `recovery` maps to a readonly mount. `preflight-root`
