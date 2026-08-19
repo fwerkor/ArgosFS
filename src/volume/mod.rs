@@ -1503,6 +1503,7 @@ impl ArgosFs {
                         json!({
                             "transactions": dirty_transactions,
                             "previous_txid": previous.txid,
+                            "previous_meta_hash": previous_meta_hash,
                             "txid": meta.txid,
                         }),
                     )?;
