@@ -465,6 +465,14 @@ fn initialize_journal_region(
     backend.write_at(&device_id.to_string(), sb.journal.offset, &header)
 }
 
+pub fn reset_journals(backend: &dyn StorageBackend, superblocks: &[RawSuperblock]) -> Result<()> {
+    for sb in superblocks {
+        initialize_journal_region(backend, &sb.disk_id, sb)?;
+        backend.flush_device(&sb.disk_id)?;
+    }
+    Ok(())
+}
+
 fn append_journal(
     backend: &dyn StorageBackend,
     superblocks: &[RawSuperblock],
@@ -473,7 +481,16 @@ fn append_journal(
     action: &str,
     details: serde_json::Value,
 ) -> Result<()> {
-    let write_checkpoint = previous_metadata.is_none()
+    let delta_base = match previous_metadata {
+        Some(previous)
+            if journal::canonical_metadata_hash(previous)?
+                == metadata.integrity.previous_meta_hash =>
+        {
+            Some(previous)
+        }
+        _ => None,
+    };
+    let write_checkpoint = delta_base.is_none()
         || metadata
             .txid
             .is_multiple_of(journal::checkpoint_interval_txids());
@@ -481,7 +498,7 @@ fn append_journal(
         None
     } else {
         Some(journal::metadata_delta(
-            previous_metadata.expect("checked above"),
+            delta_base.expect("checked above"),
             metadata,
         )?)
     };
@@ -617,6 +634,8 @@ fn load_or_recover(
     if checkpoint_replay && report.replayed {
         journal::inject_crash(FaultPoint::DuringReplay.as_str())?;
         write_metadata_copies(backend, superblocks, &metadata)?;
+        backend.flush_all()?;
+        reset_journals(backend, superblocks)?;
     }
     Ok((metadata, report))
 }
