@@ -1525,6 +1525,8 @@ pub(super) fn decode_symlink_target_bytes(target: &str) -> Vec<u8> {
         .unwrap_or_else(|| target.as_bytes().to_vec())
 }
 
+pub(super) const SECURITY_CAPABILITY_XATTR: &str = "security.capability";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum XattrNamespace {
     User,
@@ -1594,6 +1596,7 @@ pub(super) fn is_known_system_xattr(name: &str) -> bool {
             | acl::ARGOS_POSIX_ACL_DEFAULT_XATTR
             | acl::NFS4_ACL_XATTR
             | BOOT_CRITICAL_XATTR
+            | SECURITY_CAPABILITY_XATTR
     )
 }
 
