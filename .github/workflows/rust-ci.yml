@@ -319,6 +319,25 @@ jobs:
           path: ${{ runner.temp }}/argosfs-capos-${{ matrix.capos_target }}
           if-no-files-found: ignore
 
+  security-validation:
+    name: Security validation
+    uses: ./.github/workflows/security.yml
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+  coverage-validation:
+    name: Coverage validation
+    uses: ./.github/workflows/coverage.yml
+
+  performance-validation:
+    name: Performance validation
+    uses: ./.github/workflows/performance-report.yml
+    with:
+      mode: quick
+      iterations: "3"
+
   required-rust-compat:
     name: Format, lint, test, doc, release build
     runs-on: ubuntu-24.04
@@ -329,6 +348,9 @@ jobs:
       - block-lifecycle-matrix
       - compatibility
       - retained-validation
+      - security-validation
+      - coverage-validation
+      - performance-validation
     if: always()
     steps:
       - name: Verify required Rust CI gates
