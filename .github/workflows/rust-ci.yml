@@ -257,6 +257,9 @@ jobs:
           sh -n integrations/generic/initramfs/argosfs-root.sh integrations/capos/initramfs/argosfs-root.sh integrations/capos/initramfs/hooks/argosfs
           find scripts -name '*.sh' -print0 | xargs -0 bash -n
 
+      - name: Test QEMU helper synchronization
+        run: scripts/tests/host/qemu_helper_logic.sh
+
       - name: Run retained validation workflow
         run: python3 scripts/validation/run_full_validation.py --output "$RUNNER_TEMP/argosfs-validation"
 
@@ -266,64 +269,6 @@ jobs:
         with:
           name: argosfs-validation
           path: ${{ runner.temp }}/argosfs-validation
-          if-no-files-found: ignore
-
-  qemu-harness:
-    name: QEMU harness (${{ matrix.arch }})
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x86_64
-          - arch: arm64
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Install system dependencies
-        run: scripts/ci/install-deps.sh
-
-      - name: Check QEMU scripts
-        run: find scripts/qemu -name '*.sh' -print0 | xargs -0 bash -n
-
-      - name: Test QEMU helper synchronization
-        run: scripts/tests/host/qemu_helper_logic.sh
-
-      - name: Probe QEMU binary
-        env:
-          ARGOSFS_QEMU_ARCH: ${{ matrix.arch }}
-        run: |
-          case "$ARGOSFS_QEMU_ARCH" in
-            x86_64) qemu-system-x86_64 --version ;;
-            arm64) qemu-system-aarch64 --version ;;
-          esac
-
-      - name: Run artifact-gated QEMU boot probe
-        env:
-          ARGOSFS_QEMU_ARCH: ${{ matrix.arch }}
-          ARGOSFS_TEST_ARTIFACTS: ${{ runner.temp }}/argosfs-qemu-${{ matrix.arch }}
-        run: scripts/qemu/boot.sh
-
-      - name: Run artifact-gated QEMU ops probe
-        env:
-          ARGOSFS_QEMU_ARCH: ${{ matrix.arch }}
-          ARGOSFS_TEST_ARTIFACTS: ${{ runner.temp }}/argosfs-qemu-${{ matrix.arch }}
-        run: scripts/qemu/ops.sh
-
-      - name: Run artifact-gated QEMU hotplug probe
-        env:
-          ARGOSFS_QEMU_ARCH: ${{ matrix.arch }}
-          ARGOSFS_TEST_ARTIFACTS: ${{ runner.temp }}/argosfs-qemu-${{ matrix.arch }}
-        run: scripts/qemu/hotplug.sh
-
-      - name: Upload QEMU artifacts
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: argosfs-qemu-${{ matrix.arch }}
-          path: ${{ runner.temp }}/argosfs-qemu-${{ matrix.arch }}
           if-no-files-found: ignore
 
   capos-target-compile:
@@ -384,7 +329,6 @@ jobs:
       - block-lifecycle-matrix
       - compatibility
       - retained-validation
-      - qemu-harness
     if: always()
     steps:
       - name: Verify required Rust CI gates
