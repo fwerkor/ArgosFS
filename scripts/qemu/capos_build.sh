@@ -18,6 +18,11 @@ capos_log_stdout="${ARGOSFS_CAPOS_LOG_STDOUT:-full}"
 capos_target_matrix="${ARGOSFS_CAPOS_TARGET_MATRIX:-x86_64,armsr_armv8}"
 capos_build_target="${ARGOSFS_CAPOS_BUILD_TARGET:-x86_64}"
 capos_dl_dir="${ARGOSFS_CAPOS_DL_DIR:-}"
+argosfs_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$repo/Cargo.toml" | head -n 1)"
+if [ -z "$argosfs_version" ]; then
+	echo "failed to read ArgosFS version from $repo/Cargo.toml" >&2
+	exit 1
+fi
 system_pkg_config_libdir="$(
 	env -u PKG_CONFIG_LIBDIR -u PKG_CONFIG_PATH -u PKG_CONFIG_SYSROOT_DIR \
 		PATH=/usr/local/bin:/usr/bin:/bin \
@@ -155,7 +160,7 @@ cat >"$artifacts/capos/package/utils/argosfs/Makefile" <<'MAKEFILE'
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=argosfs
-PKG_VERSION:=0.1.0
+PKG_VERSION:=@ARGOSFS_VERSION@
 PKG_RELEASE:=1
 
 PKG_SOURCE_PROTO:=git
@@ -263,6 +268,7 @@ endef
 $(eval $(call HostBuild))
 $(eval $(call BuildPackage,argosfs))
 MAKEFILE
+sed -i "s/@ARGOSFS_VERSION@/$argosfs_version/" "$artifacts/capos/package/utils/argosfs/Makefile"
 cat >"$artifacts/capos/package/utils/argosfs/files/05_argosfs_root" <<'SH'
 #!/bin/sh
 
