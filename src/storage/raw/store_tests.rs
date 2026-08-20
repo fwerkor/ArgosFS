@@ -410,3 +410,77 @@ fn clean_state_updates_generation_and_mount_timestamps() {
     assert!(dirty.last_mount_time > 0);
     drop(fs);
 }
+
+#[test]
+fn writable_recovery_checkpoints_and_resets_consumed_journal() {
+    let dir = tempdir().unwrap();
+    let (image, fs) = create_loop_pool(dir.path(), "recovery-journal");
+    fs.write_file("/persistent", b"survives replay compaction", 0o644)
+        .unwrap();
+    let txid = fs.metadata_snapshot().txid;
+    assert!(fs.transaction_report().unwrap().replayed);
+
+    // Model power loss: keep the on-disk journal newer than the metadata
+    // checkpoint instead of letting ArgosFs::drop mark the pool clean.
+    std::mem::forget(fs);
+
+    let recovered = open_pool(BackendKind::LoopBlock, std::slice::from_ref(&image), true).unwrap();
+    assert!(recovered.report.replayed);
+    assert_eq!(recovered.metadata.txid, txid);
+    let compacted = audit(&*recovered.backend, &recovered.superblocks).unwrap();
+    assert_eq!(
+        compacted.raw_journal_members[0].journal_end,
+        RAW_HEADER_SIZE as u64
+    );
+    assert!(!compacted.replayed);
+    assert_eq!(
+        recover_metadata(&*recovered.backend, &recovered.superblocks)
+            .unwrap()
+            .txid,
+        txid
+    );
+}
+
+#[test]
+fn journal_falls_back_to_checkpoint_when_delta_base_hash_is_stale() {
+    let dir = tempdir().unwrap();
+    let (image, fs) = create_loop_pool(dir.path(), "stale-delta-base");
+    fs.mark_clean_unmount().unwrap();
+    drop(fs);
+
+    let opened = open_pool(BackendKind::LoopBlock, std::slice::from_ref(&image), true).unwrap();
+    let persisted = opened.metadata.clone();
+    let persisted_hash = journal::canonical_metadata_hash(&persisted).unwrap();
+    assert_eq!(persisted.integrity.meta_hash, persisted_hash);
+
+    let mut stale_base = persisted.clone();
+    stale_base.disks.values_mut().next().unwrap().used_bytes += 4096;
+    assert_ne!(
+        journal::canonical_metadata_hash(&stale_base).unwrap(),
+        stale_base.integrity.meta_hash
+    );
+
+    let mut next = stale_base.clone();
+    next.txid += 1;
+    next.updated_at = now_f64();
+    journal::prepare_metadata_integrity_with_previous(&mut next, persisted_hash).unwrap();
+    append_transaction_with_previous(
+        &*opened.backend,
+        &opened.superblocks,
+        &next,
+        Some(&stale_base),
+        "stale-base-regression",
+        serde_json::json!({"previous_meta_hash": next.integrity.previous_meta_hash}),
+    )
+    .unwrap();
+
+    let report = audit(&*opened.backend, &opened.superblocks).unwrap();
+    assert_eq!(report.invalid_entries, 0);
+    assert!(report.replayed);
+    let recovered = recover_metadata(&*opened.backend, &opened.superblocks).unwrap();
+    assert_eq!(recovered.txid, next.txid);
+    assert_eq!(
+        recovered.disks.values().next().unwrap().used_bytes,
+        next.disks.values().next().unwrap().used_bytes
+    );
+}

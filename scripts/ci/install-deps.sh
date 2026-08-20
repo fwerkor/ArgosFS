@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-prefer_https_ubuntu_ports() {
+prefer_stable_ubuntu_mirrors() {
 	local source
+	if [[ -f /etc/apt/apt-mirrors.txt ]] && grep -q 'azure\.archive\.ubuntu\.com' /etc/apt/apt-mirrors.txt; then
+		printf '%s\n' 'https://archive.ubuntu.com/ubuntu/' | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
+	fi
 	for source in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
 		[[ -f "$source" ]] || continue
 		sudo sed -i \
-			's|http://ports.ubuntu.com/ubuntu-ports|https://ports.ubuntu.com/ubuntu-ports|g' \
+			-e 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+			-e 's|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' \
+			-e 's|http://ports.ubuntu.com/ubuntu-ports|https://ports.ubuntu.com/ubuntu-ports|g' \
 			"$source"
 	done
 }
@@ -32,7 +37,7 @@ apt_get() {
 	done
 }
 
-prefer_https_ubuntu_ports
+prefer_stable_ubuntu_mirrors
 apt_get update
 apt_get install -y --no-install-recommends \
 	acl \
