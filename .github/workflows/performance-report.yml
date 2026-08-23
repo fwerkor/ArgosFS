@@ -40,7 +40,7 @@ jobs:
   rootfs-performance:
     name: ArgosFS versus ext4
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 180
     env:
       PERF_MODE: ${{ github.event_name == 'schedule' && 'full' || inputs.mode || 'quick' }}
       PERF_ITERATIONS: ${{ github.event_name == 'schedule' && '5' || inputs.iterations || '3' }}
