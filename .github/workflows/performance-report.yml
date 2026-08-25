@@ -40,7 +40,7 @@ jobs:
   rootfs-performance:
     name: ArgosFS versus ext4
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 60
     env:
       PERF_MODE: ${{ github.event_name == 'schedule' && 'full' || inputs.mode || 'quick' }}
       PERF_ITERATIONS: ${{ github.event_name == 'schedule' && '5' || inputs.iterations || '3' }}
@@ -88,11 +88,20 @@ jobs:
       - name: Run repeated rootfs benchmarks
         run: |
           mkdir -p "$PERF_OUTPUT"
-          python3 scripts/experiments/run_rootfs_perf.py \
-            --mode "$PERF_MODE" \
-            --iterations "$PERF_ITERATIONS" \
-            --require-all \
-            --output "$PERF_OUTPUT/rootfs-perf.jsonl"
+          set +e
+          timeout --signal=TERM --kill-after=30s 30m \
+            python3 scripts/experiments/run_rootfs_perf.py \
+              --mode "$PERF_MODE" \
+              --iterations "$PERF_ITERATIONS" \
+              --require-all \
+              --output "$PERF_OUTPUT/rootfs-perf.jsonl"
+          status=$?
+          set -e
+          if [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then
+            echo "::error::Rootfs performance benchmark exceeded the 30-minute limit"
+            exit 1
+          fi
+          exit "$status"
 
       - name: Render ext4 comparison report
         if: always()

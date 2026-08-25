@@ -82,6 +82,7 @@ use namespace::*;
 #[derive(Clone, Debug)]
 struct DeferredCommitState {
     durable_metadata: Option<Metadata>,
+    raw_uncommitted_metadata_dirty: bool,
     dirty_transactions: u64,
     dirty_since: Option<Instant>,
     pending_reclaims: Vec<FileBlock>,
@@ -90,8 +91,13 @@ struct DeferredCommitState {
 
 impl DeferredCommitState {
     fn new(meta: &Metadata) -> Self {
+        Self::new_with_raw_dirty(meta, false)
+    }
+
+    fn new_with_raw_dirty(meta: &Metadata, raw_uncommitted_metadata_dirty: bool) -> Self {
         Self {
             durable_metadata: (meta.backend != BackendKind::Host).then(|| meta.clone()),
+            raw_uncommitted_metadata_dirty,
             dirty_transactions: 0,
             dirty_since: None,
             pending_reclaims: Vec::new(),
@@ -504,12 +510,18 @@ impl ArgosFs {
             .and_then(|path| path.parent())
             .map(Path::to_path_buf)
             .unwrap_or_else(std::env::temp_dir);
+        let raw_uncommitted_metadata_dirty = meta.backend != BackendKind::Host
+            && (meta.integrity.meta_hash.is_empty()
+                || journal::canonical_metadata_hash(&meta)? != meta.integrity.meta_hash);
         Ok(Self {
             root: Arc::new(root),
             backend,
             backend_writable,
             raw_superblocks: Arc::new(superblocks),
-            deferred_commit: Arc::new(Mutex::new(DeferredCommitState::new(&meta))),
+            deferred_commit: Arc::new(Mutex::new(DeferredCommitState::new_with_raw_dirty(
+                &meta,
+                raw_uncommitted_metadata_dirty,
+            ))),
             meta: Arc::new(RwLock::new(meta)),
             dirty_host_shards: Arc::new(Mutex::new(BTreeSet::new())),
             inode_locks: Arc::new(Mutex::new(BTreeMap::new())),
@@ -547,9 +559,14 @@ impl ArgosFs {
     }
 
     pub fn sync_deferred_if_dirty(&self) -> Result<bool> {
-        if !self.backend_writable || self.deferred_commit.lock().dirty_transactions == 0 {
+        if !self.backend_writable {
             return Ok(false);
         }
+        let state = self.deferred_commit.lock();
+        if state.dirty_transactions == 0 && !state.raw_uncommitted_metadata_dirty {
+            return Ok(false);
+        }
+        drop(state);
         self.sync()?;
         Ok(true)
     }
@@ -562,6 +579,12 @@ impl ArgosFs {
                 self.commit_deferred_locked(&mut meta, bulk_import_enabled())?;
                 return Ok(());
             }
+            let raw_uncommitted_metadata_dirty =
+                self.deferred_commit.lock().raw_uncommitted_metadata_dirty;
+            if raw_uncommitted_metadata_dirty {
+                let previous_meta_hash = meta.integrity.meta_hash.clone();
+                journal::prepare_metadata_integrity_with_previous(&mut meta, previous_meta_hash)?;
+            }
             let superblocks = self.active_superblocks_locked(&meta)?;
             if self.open_backend_covers_superblocks(&superblocks) {
                 raw_store::write_metadata_copies(&*self.backend, &superblocks, &meta)?;
@@ -571,6 +594,9 @@ impl ArgosFs {
                 raw_store::write_metadata_copies(&backend, &superblocks, &meta)?;
                 backend.flush_all()?;
             }
+            let mut state = self.deferred_commit.lock();
+            state.durable_metadata = Some(meta.clone());
+            state.raw_uncommitted_metadata_dirty = false;
             return Ok(());
         }
 
@@ -1463,9 +1489,13 @@ impl ArgosFs {
     fn commit_deferred_locked(&self, meta: &mut Metadata, checkpoint: bool) -> Result<bool> {
         self.ensure_block_backend_writable_locked(meta)?;
         let mut state = self.deferred_commit.lock();
-        if state.dirty_transactions == 0 && state.pending_reclaims.is_empty() {
+        if state.dirty_transactions == 0
+            && state.pending_reclaims.is_empty()
+            && !state.raw_uncommitted_metadata_dirty
+        {
             return Ok(false);
         }
+        let checkpoint = checkpoint || state.raw_uncommitted_metadata_dirty;
 
         let previous = state
             .durable_metadata
@@ -1494,7 +1524,7 @@ impl ArgosFs {
                 if checkpoint {
                     raw_store::write_metadata_copies(backend, &superblocks, meta)?;
                 } else {
-                    raw_store::append_transaction_with_previous(
+                    raw_store::append_transaction_with_trusted_integrity(
                         backend,
                         &superblocks,
                         meta,
@@ -1521,6 +1551,7 @@ impl ArgosFs {
         match result {
             Ok(()) => {
                 state.durable_metadata = Some(meta.clone());
+                state.raw_uncommitted_metadata_dirty = false;
                 state.dirty_transactions = 0;
                 state.dirty_since = None;
                 state.pending_reclaims.clear();
@@ -1532,6 +1563,7 @@ impl ArgosFs {
                     && Self::transaction_error_is_committed(&err) =>
             {
                 state.durable_metadata = Some(meta.clone());
+                state.raw_uncommitted_metadata_dirty = false;
                 state.dirty_transactions = 0;
                 state.dirty_since = None;
                 state.pending_reclaims.clear();
@@ -1571,7 +1603,13 @@ impl ArgosFs {
             self.note_deferred_transaction_locked(meta)?;
             return Ok(());
         }
-        let previous_meta_hash = if meta.integrity.meta_hash.is_empty() {
+        let raw_uncommitted_metadata_dirty = meta.backend != BackendKind::Host
+            && self.deferred_commit.lock().raw_uncommitted_metadata_dirty;
+        let previous_meta_hash = if raw_uncommitted_metadata_dirty {
+            // Read-side telemetry can change the live metadata without a transaction.
+            // The stored integrity hash still identifies the last journal-durable state.
+            meta.integrity.meta_hash.clone()
+        } else if meta.integrity.meta_hash.is_empty() {
             journal::canonical_metadata_hash(meta)?
         } else {
             meta.integrity.meta_hash.clone()
@@ -1585,18 +1623,16 @@ impl ArgosFs {
                 return Ok(());
             }
             let superblocks = self.active_superblocks_locked(meta)?;
-            let replay_previous = match previous_metadata {
-                Some(previous)
-                    if journal::canonical_metadata_hash(previous)? == previous_meta_hash =>
-                {
-                    Some(previous)
-                }
-                _ => None,
+            let replay_previous = if raw_uncommitted_metadata_dirty {
+                None
+            } else {
+                previous_metadata
+                    .filter(|previous| previous.integrity.meta_hash == previous_meta_hash)
             };
             let details = json!({"txid": meta.txid, "previous_meta_hash": previous_meta_hash, "details": details});
             let result = if self.open_backend_covers_superblocks(&superblocks) {
                 match replay_previous {
-                    Some(previous) => raw_store::append_transaction_with_previous(
+                    Some(previous) => raw_store::append_transaction_with_trusted_integrity(
                         &*self.backend,
                         &superblocks,
                         meta,
@@ -1615,7 +1651,7 @@ impl ArgosFs {
             } else {
                 let backend = self.active_block_backend_locked(meta, true)?;
                 match replay_previous {
-                    Some(previous) => raw_store::append_transaction_with_previous(
+                    Some(previous) => raw_store::append_transaction_with_trusted_integrity(
                         &backend,
                         &superblocks,
                         meta,
@@ -1629,6 +1665,9 @@ impl ArgosFs {
                 }
             };
             if let Err(commit_err) = result {
+                if Self::transaction_error_is_committed(&commit_err) {
+                    self.deferred_commit.lock().raw_uncommitted_metadata_dirty = false;
+                }
                 let should_restore = !Self::transaction_error_is_committed(&commit_err)
                     && (previous_metadata.is_none()
                         || matches!(commit_err, ArgosError::Conflict(_)));
@@ -1642,6 +1681,7 @@ impl ArgosFs {
                 }
                 return Err(commit_err);
             }
+            self.deferred_commit.lock().raw_uncommitted_metadata_dirty = false;
             return Ok(());
         }
         let result = journal::append_transaction_checked(
@@ -1680,6 +1720,11 @@ impl ArgosFs {
         };
         *meta = recovered;
         recompute_disk_usage_from_metadata(meta);
+        let mut state = self.deferred_commit.lock();
+        state.durable_metadata = Some(meta.clone());
+        // Recovery may normalize/recompute fields after validating the persisted hash.
+        // Re-establish a full durable checkpoint before trusting a delta base again.
+        state.raw_uncommitted_metadata_dirty = true;
         Ok(())
     }
 

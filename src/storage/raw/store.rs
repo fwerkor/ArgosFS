@@ -272,6 +272,26 @@ pub fn append_transaction_with_previous(
     Ok(())
 }
 
+pub(crate) fn append_transaction_with_trusted_integrity(
+    backend: &dyn StorageBackend,
+    superblocks: &[RawSuperblock],
+    metadata: &Metadata,
+    previous_metadata: Option<&Metadata>,
+    action: &str,
+    details: serde_json::Value,
+) -> Result<()> {
+    append_journal_trusted(
+        backend,
+        superblocks,
+        metadata,
+        previous_metadata,
+        action,
+        details,
+    )?;
+    journal::inject_crash(FaultPoint::AfterJournalCommitBeforeMetadataCommit.as_str())?;
+    Ok(())
+}
+
 pub fn write_metadata_copies(
     backend: &dyn StorageBackend,
     superblocks: &[RawSuperblock],
@@ -481,10 +501,51 @@ fn append_journal(
     action: &str,
     details: serde_json::Value,
 ) -> Result<()> {
+    append_journal_with_previous_validation(
+        backend,
+        superblocks,
+        metadata,
+        previous_metadata,
+        action,
+        details,
+        false,
+    )
+}
+
+fn append_journal_trusted(
+    backend: &dyn StorageBackend,
+    superblocks: &[RawSuperblock],
+    metadata: &Metadata,
+    previous_metadata: Option<&Metadata>,
+    action: &str,
+    details: serde_json::Value,
+) -> Result<()> {
+    append_journal_with_previous_validation(
+        backend,
+        superblocks,
+        metadata,
+        previous_metadata,
+        action,
+        details,
+        true,
+    )
+}
+
+fn append_journal_with_previous_validation(
+    backend: &dyn StorageBackend,
+    superblocks: &[RawSuperblock],
+    metadata: &Metadata,
+    previous_metadata: Option<&Metadata>,
+    action: &str,
+    details: serde_json::Value,
+    trust_integrity: bool,
+) -> Result<()> {
     let delta_base = match previous_metadata {
         Some(previous)
-            if journal::canonical_metadata_hash(previous)?
-                == metadata.integrity.previous_meta_hash =>
+            if previous.integrity.meta_hash == metadata.integrity.previous_meta_hash
+                && (trust_integrity
+                    || journal::canonical_metadata_hash(previous)?
+                        == metadata.integrity.previous_meta_hash) =>
         {
             Some(previous)
         }
@@ -502,6 +563,11 @@ fn append_journal(
             metadata,
         )?)
     };
+    let meta_hash = if trust_integrity && !metadata.integrity.meta_hash.is_empty() {
+        metadata.integrity.meta_hash.clone()
+    } else {
+        journal::canonical_metadata_hash(metadata)?
+    };
     let mut record = RawJournalRecord {
         version: RAW_STORE_VERSION,
         time: now_f64(),
@@ -510,7 +576,7 @@ fn append_journal(
         generation: metadata.integrity.generation,
         action: action.to_string(),
         details,
-        meta_hash: journal::canonical_metadata_hash(metadata)?,
+        meta_hash,
         metadata: if metadata_delta.is_some() {
             None
         } else {
