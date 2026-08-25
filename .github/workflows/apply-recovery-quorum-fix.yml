@@ -23,48 +23,19 @@ jobs:
       - name: Apply recovery quorum fix and regression test
         run: |
           python3 - <<'PY'
+          import base64
           from pathlib import Path
 
+          decode = lambda value: base64.b64decode(value).decode()
           store = Path("src/storage/raw/store.rs")
           text = store.read_text()
-          old = '''    let mut supported =
-        BTreeMap::<(u64, u64, String), (Metadata, std::collections::BTreeSet<String>)>::new();
-    for (disk_id, metadata, _) in candidates {
-        let Some(metadata) = metadata else {
-            continue;
-        };
-        let hash = metadata_hash_for_replay(metadata)?;
-        supported
-            .entry((metadata.txid, metadata.integrity.generation, hash))
-'''
-          new = '''    let mut supported = BTreeMap::<
-        (u64, u64, String, String),
-        (Metadata, std::collections::BTreeSet<String>),
-    >::new();
-    for (disk_id, metadata, _) in candidates {
-        let Some(metadata) = metadata else {
-            continue;
-        };
-        // A read can update in-memory statistics without resealing integrity.meta_hash.
-        // Quorum selection must therefore agree on both the declared replay hash and
-        // the actual canonical metadata contents before a snapshot is trusted.
-        let replay_hash = metadata_hash_for_replay(metadata)?;
-        let canonical_hash = journal::canonical_metadata_hash(metadata)?;
-        supported
-            .entry((
-                metadata.txid,
-                metadata.integrity.generation,
-                replay_hash,
-                canonical_hash,
-            ))
-'''
+          old = decode("ICAgIGxldCBtdXQgc3VwcG9ydGVkID0KICAgICAgICBCVHJlZU1hcDo6PCh1NjQsIHU2NCwgU3RyaW5nKSwgKE1ldGFkYXRhLCBzdGQ6OmNvbGxlY3Rpb25zOjpCVHJlZVNldDxTdHJpbmc+KT46Om5ldygpOwogICAgZm9yIChkaXNrX2lkLCBtZXRhZGF0YSwgXykgaW4gY2FuZGlkYXRlcyB7CiAgICAgICAgbGV0IFNvbWUobWV0YWRhdGEpID0gbWV0YWRhdGEgZWxzZSB7CiAgICAgICAgICAgIGNvbnRpbnVlOwogICAgICAgIH07CiAgICAgICAgbGV0IGhhc2ggPSBtZXRhZGF0YV9oYXNoX2Zvcl9yZXBsYXkobWV0YWRhdGEpPzsKICAgICAgICBzdXBwb3J0ZWQKICAgICAgICAgICAgLmVudHJ5KChtZXRhZGF0YS50eGlkLCBtZXRhZGF0YS5pbnRlZ3JpdHkuZ2VuZXJhdGlvbiwgaGFzaCkpCg==")
+          new = decode("ICAgIGxldCBtdXQgc3VwcG9ydGVkID0gQlRyZWVNYXA6OjwKICAgICAgICAodTY0LCB1NjQsIFN0cmluZywgU3RyaW5nKSwKICAgICAgICAoTWV0YWRhdGEsIHN0ZDo6Y29sbGVjdGlvbnM6OkJUcmVlU2V0PFN0cmluZz4pLAogICAgPjo6bmV3KCk7CiAgICBmb3IgKGRpc2tfaWQsIG1ldGFkYXRhLCBfKSBpbiBjYW5kaWRhdGVzIHsKICAgICAgICBsZXQgU29tZShtZXRhZGF0YSkgPSBtZXRhZGF0YSBlbHNlIHsKICAgICAgICAgICAgY29udGludWU7CiAgICAgICAgfTsKICAgICAgICAvLyBBIHJlYWQgY2FuIHVwZGF0ZSBpbi1tZW1vcnkgc3RhdGlzdGljcyB3aXRob3V0IHJlc2VhbGluZyBpbnRlZ3JpdHkubWV0YV9oYXNoLgogICAgICAgIC8vIFF1b3J1bSBzZWxlY3Rpb24gbXVzdCB0aGVyZWZvcmUgYWdyZWUgb24gYm90aCB0aGUgZGVjbGFyZWQgcmVwbGF5IGhhc2ggYW5kCiAgICAgICAgLy8gdGhlIGFjdHVhbCBjYW5vbmljYWwgbWV0YWRhdGEgY29udGVudHMgYmVmb3JlIGEgc25hcHNob3QgaXMgdHJ1c3RlZC4KICAgICAgICBsZXQgcmVwbGF5X2hhc2ggPSBtZXRhZGF0YV9oYXNoX2Zvcl9yZXBsYXkobWV0YWRhdGEpPzsKICAgICAgICBsZXQgY2Fub25pY2FsX2hhc2ggPSBqb3VybmFsOjpjYW5vbmljYWxfbWV0YWRhdGFfaGFzaChtZXRhZGF0YSk/OwogICAgICAgIHN1cHBvcnRlZAogICAgICAgICAgICAuZW50cnkoKAogICAgICAgICAgICAgICAgbWV0YWRhdGEudHhpZCwKICAgICAgICAgICAgICAgIG1ldGFkYXRhLmludGVncml0eS5nZW5lcmF0aW9uLAogICAgICAgICAgICAgICAgcmVwbGF5X2hhc2gsCiAgICAgICAgICAgICAgICBjYW5vbmljYWxfaGFzaCwKICAgICAgICAgICAgKSkK")
           if text.count(old) != 1:
               raise SystemExit(f"store.rs quorum target count={text.count(old)}")
           text = text.replace(old, new, 1)
-          old_max = '''        .max_by_key(|((txid, generation, _), _)| (*txid, *generation))
-'''
-          new_max = '''        .max_by_key(|((txid, generation, _, _), _)| (*txid, *generation))
-'''
+          old_max = decode("ICAgICAgICAubWF4X2J5X2tleSh8KCh0eGlkLCBnZW5lcmF0aW9uLCBfKSwgXyl8ICgqdHhpZCwgKmdlbmVyYXRpb24pKQo=")
+          new_max = decode("ICAgICAgICAubWF4X2J5X2tleSh8KCh0eGlkLCBnZW5lcmF0aW9uLCBfLCBfKSwgXyl8ICgqdHhpZCwgKmdlbmVyYXRpb24pKQo=")
           if text.count(old_max) != 1:
               raise SystemExit(f"store.rs max-key target count={text.count(old_max)}")
           store.write_text(text.replace(old_max, new_max, 1))
@@ -74,64 +45,8 @@ jobs:
           name = "raw_recovery_requires_quorum_on_actual_checkpoint_contents"
           if name in body:
               raise SystemExit("recovery quorum regression already present")
-          body += r'''
-
-#[test]
-fn raw_recovery_requires_quorum_on_actual_checkpoint_contents() {
-    let tmp = TempDir::new().unwrap();
-    let images = loop_images(&tmp, 3);
-    let fs = ArgosFs::create_loop(
-        &images,
-        config(2, 1),
-        32 * 1024 * 1024,
-        "checkpoint-content-quorum",
-        false,
-    )
-    .unwrap();
-    fs.write_file("/value", b"payload", 0o644).unwrap();
-    fs.sync().unwrap();
-
-    let ino = fs.resolve_path("/value", true).unwrap();
-    let durable_access_count = fs.metadata_snapshot().inodes[&ino].access_count;
-    assert_eq!(fs.read_file("/value", false).unwrap(), b"payload");
-    let mutated = fs.metadata_snapshot();
-    assert!(mutated.inodes[&ino].access_count > durable_access_count);
-
-    let disk_id = "disk-0000".to_string();
-    let backend = FileBlockBackend::open_with_ids(
-        BackendKind::LoopBlock,
-        vec![(disk_id, images[0].clone())],
-        true,
-    )
-    .unwrap();
-    let superblock = argosfs::raw_store::inspect_device(
-        BackendKind::LoopBlock,
-        images[0].clone(),
-    )
-    .unwrap()
-    .0;
-    argosfs::raw_store::write_metadata_copies(
-        &backend,
-        std::slice::from_ref(&superblock),
-        &mutated,
-    )
-    .unwrap();
-    backend.flush_all().unwrap();
-
-    // Keep the one-member read-mutated checkpoint unclean. The other two members
-    // still contain the pre-read checkpoint with the same declared integrity hash.
-    std::mem::forget(fs);
-
-    let reopened = ArgosFs::open_loop(&images, false).unwrap();
-    let reopened_ino = reopened.resolve_path("/value", true).unwrap();
-    assert_eq!(
-        reopened.metadata_snapshot().inodes[&reopened_ino].access_count,
-        durable_access_count
-    );
-    assert_eq!(reopened.read_file("/value", false).unwrap(), b"payload");
-}
-'''
-          test.write_text(body)
+          regression = decode("CiNbdGVzdF0KZm4gcmF3X3JlY292ZXJ5X3JlcXVpcmVzX3F1b3J1bV9vbl9hY3R1YWxfY2hlY2twb2ludF9jb250ZW50cygpIHsKICAgIGxldCB0bXAgPSBUZW1wRGlyOjpuZXcoKS51bndyYXAoKTsKICAgIGxldCBpbWFnZXMgPSBsb29wX2ltYWdlcygmdG1wLCAzKTsKICAgIGxldCBmcyA9IEFyZ29zRnM6OmNyZWF0ZV9sb29wKAogICAgICAgICZpbWFnZXMsCiAgICAgICAgY29uZmlnKDIsIDEpLAogICAgICAgIDMyICogMTAyNCAqIDEwMjQsCiAgICAgICAgImNoZWNrcG9pbnQtY29udGVudC1xdW9ydW0iLAogICAgICAgIGZhbHNlLAogICAgKQogICAgLnVud3JhcCgpOwogICAgZnMud3JpdGVfZmlsZSgiL3ZhbHVlIiwgYiJwYXlsb2FkIiwgMG82NDQpLnVud3JhcCgpOwogICAgZnMuc3luYygpLnVud3JhcCgpOwoKICAgIGxldCBpbm8gPSBmcy5yZXNvbHZlX3BhdGgoIi92YWx1ZSIsIHRydWUpLnVud3JhcCgpOwogICAgbGV0IGR1cmFibGVfYWNjZXNzX2NvdW50ID0gZnMubWV0YWRhdGFfc25hcHNob3QoKS5pbm9kZXNbJmlub10uYWNjZXNzX2NvdW50OwogICAgYXNzZXJ0X2VxIShmcy5yZWFkX2ZpbGUoIi92YWx1ZSIsIGZhbHNlKS51bndyYXAoKSwgYiJwYXlsb2FkIik7CiAgICBsZXQgbXV0YXRlZCA9IGZzLm1ldGFkYXRhX3NuYXBzaG90KCk7CiAgICBhc3NlcnQhKG11dGF0ZWQuaW5vZGVzWyZpbm9dLmFjY2Vzc19jb3VudCA+IGR1cmFibGVfYWNjZXNzX2NvdW50KTsKCiAgICBsZXQgZGlza19pZCA9ICJkaXNrLTAwMDAiLnRvX3N0cmluZygpOwogICAgbGV0IGJhY2tlbmQgPSBGaWxlQmxvY2tCYWNrZW5kOjpvcGVuX3dpdGhfaWRzKAogICAgICAgIEJhY2tlbmRLaW5kOjpMb29wQmxvY2ssCiAgICAgICAgdmVjIVsoZGlza19pZCwgaW1hZ2VzWzBdLmNsb25lKCkpXSwKICAgICAgICB0cnVlLAogICAgKQogICAgLnVud3JhcCgpOwogICAgbGV0IHN1cGVyYmxvY2sgPSBhcmdvc2ZzOjpyYXdfc3RvcmU6Omluc3BlY3RfZGV2aWNlKAogICAgICAgIEJhY2tlbmRLaW5kOjpMb29wQmxvY2ssCiAgICAgICAgaW1hZ2VzWzBdLmNsb25lKCksCiAgICApCiAgICAudW53cmFwKCkKICAgIC4wOwogICAgYXJnb3Nmczo6cmF3X3N0b3JlOjp3cml0ZV9tZXRhZGF0YV9jb3BpZXMoCiAgICAgICAgJmJhY2tlbmQsCiAgICAgICAgc3RkOjpzbGljZTo6ZnJvbV9yZWYoJnN1cGVyYmxvY2spLAogICAgICAgICZtdXRhdGVkLAogICAgKQogICAgLnVud3JhcCgpOwogICAgYmFja2VuZC5mbHVzaF9hbGwoKS51bndyYXAoKTsKCiAgICAvLyBLZWVwIHRoZSBvbmUtbWVtYmVyIHJlYWQtbXV0YXRlZCBjaGVja3BvaW50IHVuY2xlYW4uIFRoZSBvdGhlciB0d28gbWVtYmVycwogICAgLy8gc3RpbGwgY29udGFpbiB0aGUgcHJlLXJlYWQgY2hlY2twb2ludCB3aXRoIHRoZSBzYW1lIGRlY2xhcmVkIGludGVncml0eSBoYXNoLgogICAgc3RkOjptZW06OmZvcmdldChmcyk7CgogICAgbGV0IHJlb3BlbmVkID0gQXJnb3NGczo6b3Blbl9sb29wKCZpbWFnZXMsIGZhbHNlKS51bndyYXAoKTsKICAgIGxldCByZW9wZW5lZF9pbm8gPSByZW9wZW5lZC5yZXNvbHZlX3BhdGgoIi92YWx1ZSIsIHRydWUpLnVud3JhcCgpOwogICAgYXNzZXJ0X2VxISgKICAgICAgICByZW9wZW5lZC5tZXRhZGF0YV9zbmFwc2hvdCgpLmlub2Rlc1smcmVvcGVuZWRfaW5vXS5hY2Nlc3NfY291bnQsCiAgICAgICAgZHVyYWJsZV9hY2Nlc3NfY291bnQKICAgICk7CiAgICBhc3NlcnRfZXEhKHJlb3BlbmVkLnJlYWRfZmlsZSgiL3ZhbHVlIiwgZmFsc2UpLnVud3JhcCgpLCBiInBheWxvYWQiKTsKfQo=")
+          test.write_text(body + regression)
           PY
           git diff --check
 
