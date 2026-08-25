@@ -91,11 +91,13 @@ struct DeferredCommitState {
 
 impl DeferredCommitState {
     fn new(meta: &Metadata) -> Self {
+        Self::new_with_raw_dirty(meta, false)
+    }
+
+    fn new_with_raw_dirty(meta: &Metadata, raw_uncommitted_metadata_dirty: bool) -> Self {
         Self {
             durable_metadata: (meta.backend != BackendKind::Host).then(|| meta.clone()),
-            // Opening or creating a raw pool may normalize/recompute in-memory metadata.
-            // Force one checkpoint before trusting declared integrity hashes as delta bases.
-            raw_uncommitted_metadata_dirty: meta.backend != BackendKind::Host,
+            raw_uncommitted_metadata_dirty,
             dirty_transactions: 0,
             dirty_since: None,
             pending_reclaims: Vec::new(),
@@ -508,12 +510,18 @@ impl ArgosFs {
             .and_then(|path| path.parent())
             .map(Path::to_path_buf)
             .unwrap_or_else(std::env::temp_dir);
+        let raw_uncommitted_metadata_dirty = meta.backend != BackendKind::Host
+            && (meta.integrity.meta_hash.is_empty()
+                || journal::canonical_metadata_hash(&meta)? != meta.integrity.meta_hash);
         Ok(Self {
             root: Arc::new(root),
             backend,
             backend_writable,
             raw_superblocks: Arc::new(superblocks),
-            deferred_commit: Arc::new(Mutex::new(DeferredCommitState::new(&meta))),
+            deferred_commit: Arc::new(Mutex::new(DeferredCommitState::new_with_raw_dirty(
+                &meta,
+                raw_uncommitted_metadata_dirty,
+            ))),
             meta: Arc::new(RwLock::new(meta)),
             dirty_host_shards: Arc::new(Mutex::new(BTreeSet::new())),
             inode_locks: Arc::new(Mutex::new(BTreeMap::new())),
