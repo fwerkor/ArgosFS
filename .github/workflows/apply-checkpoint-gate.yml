@@ -1,0 +1,57 @@
+name: Apply raw checkpoint gate fix
+
+on:
+  push:
+    branches:
+      - fix/raw-journal-perf-regression
+    paths:
+      - .github/workflows/apply-checkpoint-gate.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-slim
+    steps:
+      - name: Checkout source branch
+        uses: actions/checkout@v7
+        with:
+          ref: fix/raw-journal-perf-regression
+          fetch-depth: 0
+
+      - name: Preserve full-checkpoint signal
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/volume/mod.rs")
+          text = path.read_text()
+          old = '''            let replay_previous = durable_previous
+              .as_ref()
+              .filter(|previous| previous.integrity.meta_hash == previous_meta_hash);
+          '''
+          new = '''            let replay_previous = if previous_metadata.is_some() {
+              durable_previous
+                  .as_ref()
+                  .filter(|previous| previous.integrity.meta_hash == previous_meta_hash)
+          } else {
+              None
+          };
+          '''
+          if new in text:
+              raise SystemExit("checkpoint gate already applied")
+          if text.count(old) != 1:
+              raise SystemExit(f"expected one checkpoint-gate target, found {text.count(old)}")
+          path.write_text(text.replace(old, new, 1))
+          PY
+          git diff --check
+
+      - name: Commit source fix
+        run: |
+          git config user.name "Cao Yuhang"
+          git config user.email "caoyuhang@fwerkor.com"
+          git add src/volume/mod.rs
+          git diff --cached --check
+          git commit -m "fix: preserve raw full-checkpoint commits"
+          git push origin HEAD:fix/raw-journal-perf-regression
