@@ -1,0 +1,32 @@
+name: Materialize final raw journal fix
+
+on:
+  push:
+    branches:
+      - fix/raw-journal-perf-regression
+    paths:
+      - .github/workflows/materialize-final-raw-journal-fix-windows.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: windows-2025
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: fix/raw-journal-perf-regression
+          fetch-depth: 0
+      - run: python .github/apply_final_raw_journal_fix.py
+      - run: git diff --check
+      - run: |
+          git config user.name "Cao Yuhang"
+          git config user.email "caoyuhang@fwerkor.com"
+          git add src/volume/mod.rs src/volume/namespace.rs
+          git diff --cached --check
+          git commit -m "fix: verify raw journal delta bases per mount"
+          git push origin HEAD:fix/raw-journal-perf-regression
