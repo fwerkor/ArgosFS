@@ -1,0 +1,145 @@
+name: Apply raw recovery quorum fix
+
+on:
+  push:
+    branches:
+      - fix/raw-journal-perf-regression
+    paths:
+      - .github/workflows/apply-recovery-quorum-fix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-slim
+    steps:
+      - name: Checkout source branch
+        uses: actions/checkout@v7
+        with:
+          ref: fix/raw-journal-perf-regression
+          fetch-depth: 0
+
+      - name: Apply recovery quorum fix and regression test
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          store = Path("src/storage/raw/store.rs")
+          text = store.read_text()
+          old = '''    let mut supported =
+        BTreeMap::<(u64, u64, String), (Metadata, std::collections::BTreeSet<String>)>::new();
+    for (disk_id, metadata, _) in candidates {
+        let Some(metadata) = metadata else {
+            continue;
+        };
+        let hash = metadata_hash_for_replay(metadata)?;
+        supported
+            .entry((metadata.txid, metadata.integrity.generation, hash))
+'''
+          new = '''    let mut supported = BTreeMap::<
+        (u64, u64, String, String),
+        (Metadata, std::collections::BTreeSet<String>),
+    >::new();
+    for (disk_id, metadata, _) in candidates {
+        let Some(metadata) = metadata else {
+            continue;
+        };
+        // A read can update in-memory statistics without resealing integrity.meta_hash.
+        // Quorum selection must therefore agree on both the declared replay hash and
+        // the actual canonical metadata contents before a snapshot is trusted.
+        let replay_hash = metadata_hash_for_replay(metadata)?;
+        let canonical_hash = journal::canonical_metadata_hash(metadata)?;
+        supported
+            .entry((
+                metadata.txid,
+                metadata.integrity.generation,
+                replay_hash,
+                canonical_hash,
+            ))
+'''
+          if text.count(old) != 1:
+              raise SystemExit(f"store.rs quorum target count={text.count(old)}")
+          text = text.replace(old, new, 1)
+          old_max = '''        .max_by_key(|((txid, generation, _), _)| (*txid, *generation))
+'''
+          new_max = '''        .max_by_key(|((txid, generation, _, _), _)| (*txid, *generation))
+'''
+          if text.count(old_max) != 1:
+              raise SystemExit(f"store.rs max-key target count={text.count(old_max)}")
+          store.write_text(text.replace(old_max, new_max, 1))
+
+          test = Path("tests/integration/block_backend.rs")
+          body = test.read_text()
+          name = "raw_recovery_requires_quorum_on_actual_checkpoint_contents"
+          if name in body:
+              raise SystemExit("recovery quorum regression already present")
+          body += r'''
+
+#[test]
+fn raw_recovery_requires_quorum_on_actual_checkpoint_contents() {
+    let tmp = TempDir::new().unwrap();
+    let images = loop_images(&tmp, 3);
+    let fs = ArgosFs::create_loop(
+        &images,
+        config(2, 1),
+        32 * 1024 * 1024,
+        "checkpoint-content-quorum",
+        false,
+    )
+    .unwrap();
+    fs.write_file("/value", b"payload", 0o644).unwrap();
+    fs.sync().unwrap();
+
+    let ino = fs.resolve_path("/value", true).unwrap();
+    let durable_access_count = fs.metadata_snapshot().inodes[&ino].access_count;
+    assert_eq!(fs.read_file("/value", false).unwrap(), b"payload");
+    let mutated = fs.metadata_snapshot();
+    assert!(mutated.inodes[&ino].access_count > durable_access_count);
+
+    let disk_id = "disk-0000".to_string();
+    let backend = FileBlockBackend::open_with_ids(
+        BackendKind::LoopBlock,
+        vec![(disk_id, images[0].clone())],
+        true,
+    )
+    .unwrap();
+    let superblock = argosfs::raw_store::inspect_device(
+        BackendKind::LoopBlock,
+        images[0].clone(),
+    )
+    .unwrap()
+    .0;
+    argosfs::raw_store::write_metadata_copies(
+        &backend,
+        std::slice::from_ref(&superblock),
+        &mutated,
+    )
+    .unwrap();
+    backend.flush_all().unwrap();
+
+    // Keep the one-member read-mutated checkpoint unclean. The other two members
+    // still contain the pre-read checkpoint with the same declared integrity hash.
+    std::mem::forget(fs);
+
+    let reopened = ArgosFs::open_loop(&images, false).unwrap();
+    let reopened_ino = reopened.resolve_path("/value", true).unwrap();
+    assert_eq!(
+        reopened.metadata_snapshot().inodes[&reopened_ino].access_count,
+        durable_access_count
+    );
+    assert_eq!(reopened.read_file("/value", false).unwrap(), b"payload");
+}
+'''
+          test.write_text(body)
+          PY
+          git diff --check
+
+      - name: Commit source fix
+        run: |
+          git config user.name "Cao Yuhang"
+          git config user.email "caoyuhang@fwerkor.com"
+          git add src/storage/raw/store.rs tests/integration/block_backend.rs
+          git diff --cached --check
+          git commit -m "fix: require quorum on canonical raw metadata"
+          git push origin HEAD:fix/raw-journal-perf-regression
