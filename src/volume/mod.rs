@@ -575,10 +575,7 @@ impl ArgosFs {
                 self.deferred_commit.lock().raw_uncommitted_metadata_dirty;
             if raw_uncommitted_metadata_dirty {
                 let previous_meta_hash = meta.integrity.meta_hash.clone();
-                journal::prepare_metadata_integrity_with_previous(
-                    &mut meta,
-                    previous_meta_hash,
-                )?;
+                journal::prepare_metadata_integrity_with_previous(&mut meta, previous_meta_hash)?;
             }
             let superblocks = self.active_superblocks_locked(&meta)?;
             if self.open_backend_covers_superblocks(&superblocks) {
