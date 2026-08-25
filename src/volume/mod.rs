@@ -1571,7 +1571,18 @@ impl ArgosFs {
             self.note_deferred_transaction_locked(meta)?;
             return Ok(());
         }
-        let previous_meta_hash = if meta.integrity.meta_hash.is_empty() {
+        let durable_previous = if meta.backend != BackendKind::Host {
+            self.deferred_commit.lock().durable_metadata.clone()
+        } else {
+            None
+        };
+        let previous_meta_hash = if let Some(previous) = durable_previous.as_ref() {
+            if previous.integrity.meta_hash.is_empty() {
+                journal::canonical_metadata_hash(previous)?
+            } else {
+                previous.integrity.meta_hash.clone()
+            }
+        } else if meta.integrity.meta_hash.is_empty() {
             journal::canonical_metadata_hash(meta)?
         } else {
             meta.integrity.meta_hash.clone()
@@ -1585,12 +1596,9 @@ impl ArgosFs {
                 return Ok(());
             }
             let superblocks = self.active_superblocks_locked(meta)?;
-            let replay_previous = match previous_metadata {
-                Some(previous) if previous.integrity.meta_hash == previous_meta_hash => {
-                    Some(previous)
-                }
-                _ => None,
-            };
+            let replay_previous = durable_previous
+                .as_ref()
+                .filter(|previous| previous.integrity.meta_hash == previous_meta_hash);
             let details = json!({"txid": meta.txid, "previous_meta_hash": previous_meta_hash, "details": details});
             let result = if self.open_backend_covers_superblocks(&superblocks) {
                 match replay_previous {
@@ -1627,6 +1635,9 @@ impl ArgosFs {
                 }
             };
             if let Err(commit_err) = result {
+                if Self::transaction_error_is_committed(&commit_err) {
+                    self.deferred_commit.lock().durable_metadata = Some(meta.clone());
+                }
                 let should_restore = !Self::transaction_error_is_committed(&commit_err)
                     && (previous_metadata.is_none()
                         || matches!(commit_err, ArgosError::Conflict(_)));
@@ -1640,6 +1651,7 @@ impl ArgosFs {
                 }
                 return Err(commit_err);
             }
+            self.deferred_commit.lock().durable_metadata = Some(meta.clone());
             return Ok(());
         }
         let result = journal::append_transaction_checked(
@@ -1678,6 +1690,7 @@ impl ArgosFs {
         };
         *meta = recovered;
         recompute_disk_usage_from_metadata(meta);
+        self.deferred_commit.lock().durable_metadata = Some(meta.clone());
         Ok(())
     }
 
