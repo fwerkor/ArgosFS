@@ -1,4 +1,5 @@
 from pathlib import Path
+import subprocess
 
 
 def replace_once(text: str, old: str, new: str, label: str) -> str:
@@ -202,8 +203,6 @@ text = replace_once(
     "recovery state",
 )
 
-# Deferred group commits still need their full durable snapshot, but a successful
-# group commit also makes any read-side live metadata mutation durable.
 text = replace_once(
     text,
     '''            Ok(()) => {
@@ -308,3 +307,16 @@ fn raw_sync_after_read_refreshes_integrity_and_dirty_state() {
 '''
 
 test.write_text(t)
+
+# Stage all generated source changes here so older queued workflow definitions
+# cannot accidentally omit namespace.rs from the commit.
+subprocess.run(
+    [
+        "git",
+        "add",
+        "src/volume/mod.rs",
+        "src/volume/namespace.rs",
+        "tests/raw_journal_durable_base_regression.rs",
+    ],
+    check=True,
+)
