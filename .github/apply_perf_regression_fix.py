@@ -187,34 +187,3 @@ sub_once(
                 _ => None,
             };""",
 )
-
-workflow_path = ".github/workflows/performance-report.yml"
-sub_once(workflow_path, r"(?m)^    timeout-minutes: 180$", "    timeout-minutes: 35")
-sub_once(
-    workflow_path,
-    r"          python3 scripts/experiments/run_rootfs_perf\.py \\\n"
-    r"            --mode \"\$PERF_MODE\" \\\n"
-    r"            --iterations \"\$PERF_ITERATIONS\" \\\n"
-    r"            --require-all \\\n"
-    r"            --output \"\$PERF_OUTPUT/rootfs-perf\.jsonl\"",
-    """          set +e
-          timeout --signal=TERM --kill-after=30s 30m \\
-            python3 scripts/experiments/run_rootfs_perf.py \\
-              --mode \"$PERF_MODE\" \\
-              --iterations \"$PERF_ITERATIONS\" \\
-              --require-all \\
-              --output \"$PERF_OUTPUT/rootfs-perf.jsonl\"
-          status=$?
-          set -e
-          if [ \"$status\" -eq 124 ] || [ \"$status\" -eq 137 ]; then
-            echo \"::error::Rootfs performance benchmark exceeded the 30-minute limit\"
-            exit 1
-          fi
-          exit \"$status\"""",
-)
-
-for path in [
-    ".github/apply_perf_regression_fix.py",
-    ".github/workflows/apply-perf-regression-fix.yml",
-]:
-    Path(path).unlink(missing_ok=True)
