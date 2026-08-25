@@ -1,4 +1,4 @@
-name: Apply raw sync durability fix
+name: Apply raw journal dirty-state fix
 
 on:
   push:
@@ -27,14 +27,14 @@ jobs:
       - name: Validate patch shape
         run: git diff --check
 
-      - name: Commit source and regression test
+      - name: Commit source and regression tests
         run: |
           git config user.name "Cao Yuhang"
           git config user.email "caoyuhang@fwerkor.com"
-          git add src/volume/mod.rs tests/raw_journal_durable_base_regression.rs
+          git add src/volume/mod.rs src/volume/namespace.rs tests/raw_journal_durable_base_regression.rs
           git diff --cached --check
           if git diff --cached --quiet; then
             exit 0
           fi
-          git commit -m "fix: refresh raw durable metadata on sync"
+          git commit -m "fix: avoid raw journal full-tree hot-path work"
           git push origin HEAD:fix/raw-journal-perf-regression
