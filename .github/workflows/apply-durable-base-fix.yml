@@ -1,0 +1,37 @@
+name: Apply durable journal base fix
+
+on:
+  push:
+    branches:
+      - fix/raw-journal-perf-regression
+    paths:
+      - .github/apply_durable_base_fix.py
+      - .github/workflows/apply-durable-base-fix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: macos-15
+    steps:
+      - name: Checkout source branch
+        uses: actions/checkout@v7
+        with:
+          ref: fix/raw-journal-perf-regression
+          fetch-depth: 0
+
+      - name: Apply focused source changes
+        run: python3 .github/apply_durable_base_fix.py
+
+      - name: Validate patch shape
+        run: git diff --check
+
+      - name: Commit resulting source and regression test
+        run: |
+          git config user.name "Cao Yuhang"
+          git config user.email "caoyuhang@fwerkor.com"
+          git add src/volume/mod.rs tests/raw_journal_durable_base_regression.rs
+          git diff --cached --check
+          git commit -m "fix: base raw deltas on durable metadata"
+          git push origin HEAD:fix/raw-journal-perf-regression
