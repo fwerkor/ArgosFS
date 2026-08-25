@@ -202,7 +202,6 @@ text = replace_once(
 ''',
     "recovery state",
 )
-
 text = replace_once(
     text,
     '''            Ok(()) => {
@@ -229,7 +228,6 @@ text = replace_once(
 ''',
     "deferred committed-error state",
 )
-
 mod.write_text(text)
 
 namespace = Path("src/volume/namespace.rs")
@@ -255,6 +253,39 @@ new_read = '''        } else {
 '''
 ns = replace_once(ns, old_read, new_read, "read-side dirty marker")
 namespace.write_text(ns)
+
+store = Path("src/storage/raw/store.rs")
+s = store.read_text()
+old_record = '''    let mut record = RawJournalRecord {
+        version: RAW_STORE_VERSION,
+        time: now_f64(),
+        volume_uuid: metadata.uuid.clone(),
+        txid: metadata.txid,
+        generation: metadata.integrity.generation,
+        action: action.to_string(),
+        details,
+        meta_hash: journal::canonical_metadata_hash(metadata)?,
+'''
+new_record = '''    let meta_hash = if trust_previous_integrity
+        && metadata.integrity.generation == metadata.txid
+        && !metadata.integrity.meta_hash.is_empty()
+    {
+        metadata.integrity.meta_hash.clone()
+    } else {
+        journal::canonical_metadata_hash(metadata)?
+    };
+    let mut record = RawJournalRecord {
+        version: RAW_STORE_VERSION,
+        time: now_f64(),
+        volume_uuid: metadata.uuid.clone(),
+        txid: metadata.txid,
+        generation: metadata.integrity.generation,
+        action: action.to_string(),
+        details,
+        meta_hash,
+'''
+s = replace_once(s, old_record, new_record, "trusted current hash")
+store.write_text(s)
 
 test = Path("tests/raw_journal_durable_base_regression.rs")
 t = test.read_text()
@@ -305,15 +336,13 @@ fn raw_sync_after_read_refreshes_integrity_and_dirty_state() {
     assert_eq!(reopened.metadata_snapshot().txid, committed_txid);
 }
 '''
-
 test.write_text(t)
 
-# Stage all generated source changes here so older queued workflow definitions
-# cannot accidentally omit namespace.rs from the commit.
 subprocess.run(
     [
         "git",
         "add",
+        "src/storage/raw/store.rs",
         "src/volume/mod.rs",
         "src/volume/namespace.rs",
         "tests/raw_journal_durable_base_regression.rs",
