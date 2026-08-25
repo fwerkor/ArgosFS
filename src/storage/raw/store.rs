@@ -272,6 +272,26 @@ pub fn append_transaction_with_previous(
     Ok(())
 }
 
+pub(crate) fn append_transaction_with_trusted_previous(
+    backend: &dyn StorageBackend,
+    superblocks: &[RawSuperblock],
+    metadata: &Metadata,
+    previous_metadata: Option<&Metadata>,
+    action: &str,
+    details: serde_json::Value,
+) -> Result<()> {
+    append_journal_trusted(
+        backend,
+        superblocks,
+        metadata,
+        previous_metadata,
+        action,
+        details,
+    )?;
+    journal::inject_crash(FaultPoint::AfterJournalCommitBeforeMetadataCommit.as_str())?;
+    Ok(())
+}
+
 pub fn write_metadata_copies(
     backend: &dyn StorageBackend,
     superblocks: &[RawSuperblock],
@@ -481,10 +501,51 @@ fn append_journal(
     action: &str,
     details: serde_json::Value,
 ) -> Result<()> {
+    append_journal_with_previous_validation(
+        backend,
+        superblocks,
+        metadata,
+        previous_metadata,
+        action,
+        details,
+        false,
+    )
+}
+
+fn append_journal_trusted(
+    backend: &dyn StorageBackend,
+    superblocks: &[RawSuperblock],
+    metadata: &Metadata,
+    previous_metadata: Option<&Metadata>,
+    action: &str,
+    details: serde_json::Value,
+) -> Result<()> {
+    append_journal_with_previous_validation(
+        backend,
+        superblocks,
+        metadata,
+        previous_metadata,
+        action,
+        details,
+        true,
+    )
+}
+
+fn append_journal_with_previous_validation(
+    backend: &dyn StorageBackend,
+    superblocks: &[RawSuperblock],
+    metadata: &Metadata,
+    previous_metadata: Option<&Metadata>,
+    action: &str,
+    details: serde_json::Value,
+    trust_previous_integrity: bool,
+) -> Result<()> {
     let delta_base = match previous_metadata {
         Some(previous)
-            if journal::canonical_metadata_hash(previous)?
-                == metadata.integrity.previous_meta_hash =>
+            if previous.integrity.meta_hash == metadata.integrity.previous_meta_hash
+                && (trust_previous_integrity
+                    || journal::canonical_metadata_hash(previous)?
+                        == metadata.integrity.previous_meta_hash) =>
         {
             Some(previous)
         }
