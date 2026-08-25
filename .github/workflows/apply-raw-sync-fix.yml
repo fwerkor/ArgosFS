@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   apply:
-    runs-on: ubuntu-slim
+    runs-on: macos-15
     steps:
       - name: Checkout source branch
         uses: actions/checkout@v7
