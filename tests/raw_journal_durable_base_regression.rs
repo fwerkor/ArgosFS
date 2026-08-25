@@ -55,7 +55,6 @@ fn raw_journal_replays_write_after_read_side_metadata_mutation() {
     assert_eq!(reopened.metadata_snapshot().txid, committed_txid);
 }
 
-
 #[test]
 fn raw_sync_after_read_refreshes_integrity_and_dirty_state() {
     let tmp = TempDir::new().unwrap();

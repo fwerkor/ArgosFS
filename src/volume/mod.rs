@@ -1516,7 +1516,7 @@ impl ArgosFs {
                 if checkpoint {
                     raw_store::write_metadata_copies(backend, &superblocks, meta)?;
                 } else {
-                    raw_store::append_transaction_with_trusted_previous(
+                    raw_store::append_transaction_with_trusted_integrity(
                         backend,
                         &superblocks,
                         meta,
@@ -1624,7 +1624,7 @@ impl ArgosFs {
             let details = json!({"txid": meta.txid, "previous_meta_hash": previous_meta_hash, "details": details});
             let result = if self.open_backend_covers_superblocks(&superblocks) {
                 match replay_previous {
-                    Some(previous) => raw_store::append_transaction_with_trusted_previous(
+                    Some(previous) => raw_store::append_transaction_with_trusted_integrity(
                         &*self.backend,
                         &superblocks,
                         meta,
@@ -1643,7 +1643,7 @@ impl ArgosFs {
             } else {
                 let backend = self.active_block_backend_locked(meta, true)?;
                 match replay_previous {
-                    Some(previous) => raw_store::append_transaction_with_trusted_previous(
+                    Some(previous) => raw_store::append_transaction_with_trusted_integrity(
                         &backend,
                         &superblocks,
                         meta,

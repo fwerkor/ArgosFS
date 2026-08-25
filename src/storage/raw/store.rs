@@ -272,7 +272,7 @@ pub fn append_transaction_with_previous(
     Ok(())
 }
 
-pub(crate) fn append_transaction_with_trusted_previous(
+pub(crate) fn append_transaction_with_trusted_integrity(
     backend: &dyn StorageBackend,
     superblocks: &[RawSuperblock],
     metadata: &Metadata,
@@ -538,12 +538,12 @@ fn append_journal_with_previous_validation(
     previous_metadata: Option<&Metadata>,
     action: &str,
     details: serde_json::Value,
-    trust_previous_integrity: bool,
+    trust_integrity: bool,
 ) -> Result<()> {
     let delta_base = match previous_metadata {
         Some(previous)
             if previous.integrity.meta_hash == metadata.integrity.previous_meta_hash
-                && (trust_previous_integrity
+                && (trust_integrity
                     || journal::canonical_metadata_hash(previous)?
                         == metadata.integrity.previous_meta_hash) =>
         {
@@ -563,6 +563,11 @@ fn append_journal_with_previous_validation(
             metadata,
         )?)
     };
+    let meta_hash = if trust_integrity && !metadata.integrity.meta_hash.is_empty() {
+        metadata.integrity.meta_hash.clone()
+    } else {
+        journal::canonical_metadata_hash(metadata)?
+    };
     let mut record = RawJournalRecord {
         version: RAW_STORE_VERSION,
         time: now_f64(),
@@ -571,7 +576,7 @@ fn append_journal_with_previous_validation(
         generation: metadata.integrity.generation,
         action: action.to_string(),
         details,
-        meta_hash: journal::canonical_metadata_hash(metadata)?,
+        meta_hash,
         metadata: if metadata_delta.is_some() {
             None
         } else {
