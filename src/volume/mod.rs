@@ -1596,9 +1596,13 @@ impl ArgosFs {
                 return Ok(());
             }
             let superblocks = self.active_superblocks_locked(meta)?;
-            let replay_previous = durable_previous
-                .as_ref()
-                .filter(|previous| previous.integrity.meta_hash == previous_meta_hash);
+            let replay_previous = if previous_metadata.is_some() {
+                durable_previous
+                    .as_ref()
+                    .filter(|previous| previous.integrity.meta_hash == previous_meta_hash)
+            } else {
+                None
+            };
             let details = json!({"txid": meta.txid, "previous_meta_hash": previous_meta_hash, "details": details});
             let result = if self.open_backend_covers_superblocks(&superblocks) {
                 match replay_previous {
