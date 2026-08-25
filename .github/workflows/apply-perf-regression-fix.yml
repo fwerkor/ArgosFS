@@ -1,0 +1,42 @@
+name: Apply journal performance regression fix
+
+on:
+  push:
+    branches:
+      - fix/raw-journal-perf-regression
+    paths:
+      - .github/apply_perf_regression_fix.py
+      - .github/workflows/apply-perf-regression-fix.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Apply focused source changes
+        run: python3 .github/apply_perf_regression_fix.py
+
+      - name: Format Rust changes
+        run: cargo fmt --all
+
+      - name: Validate stale-base safety regression
+        run: cargo test journal_falls_back_to_checkpoint_when_delta_base_hash_is_stale -- --exact
+
+      - name: Validate raw storage tests
+        run: cargo test storage::raw::store_tests
+
+      - name: Commit resulting fix
+        run: |
+          git config user.name "Cao Yuhang"
+          git config user.email "caoyuhang@fwerkor.com"
+          git add -A
+          git diff --cached --check
+          git commit -m "fix: avoid redundant raw journal base hashing"
+          git push origin HEAD:fix/raw-journal-perf-regression
