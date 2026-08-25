@@ -51,8 +51,8 @@ jobs:
 
       - name: Install benchmark dependencies
         run: |
-          if [ -f /etc/apt/apt-mirrors.txt ] && grep -q 'azure\.archive\.ubuntu\.com' /etc/apt-mirrors.txt; then
-            printf '%s\n' 'https://archive.ubuntu.com/ubuntu/' | sudo tee /etc/apt-mirrors.txt >/dev/null
+          if [ -f /etc/apt/apt-mirrors.txt ] && grep -q 'azure\.archive\.ubuntu\.com' /etc/apt/apt-mirrors.txt; then
+            printf '%s\n' 'https://archive.ubuntu.com/ubuntu/' | sudo tee /etc/apt/apt-mirrors.txt >/dev/null
           fi
           sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=3 -o Acquire::https::Timeout=15 update
           sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=3 -o Acquire::https::Timeout=15 install -y --no-install-recommends \
