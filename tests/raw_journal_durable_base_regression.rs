@@ -30,10 +30,13 @@ fn raw_journal_replays_write_after_read_side_metadata_mutation() {
     )
     .unwrap();
 
-    fs.write_file("/seed", b"seed payload", 0o644).unwrap();
+    let seed_payload = vec![0x5a; 2048];
+    fs.write_file("/seed", &seed_payload, 0o644).unwrap();
     let seed = fs.resolve_path("/seed", true).unwrap();
-    let before = fs.metadata_snapshot().inodes[&seed].access_count;
-    assert_eq!(fs.read_file("/seed", false).unwrap(), b"seed payload");
+    let before_snapshot = fs.metadata_snapshot();
+    assert!(!before_snapshot.inodes[&seed].blocks.is_empty());
+    let before = before_snapshot.inodes[&seed].access_count;
+    assert_eq!(fs.read_file("/seed", false).unwrap(), seed_payload);
     assert!(fs.metadata_snapshot().inodes[&seed].access_count > before);
 
     fs.write_file("/after-read", b"must survive replay", 0o644)
@@ -67,8 +70,11 @@ fn raw_sync_after_read_refreshes_integrity_and_dirty_state() {
     )
     .unwrap();
 
-    fs.write_file("/seed", b"seed payload", 0o644).unwrap();
-    assert_eq!(fs.read_file("/seed", false).unwrap(), b"seed payload");
+    let seed_payload = vec![0x5a; 2048];
+    fs.write_file("/seed", &seed_payload, 0o644).unwrap();
+    let seed = fs.resolve_path("/seed", true).unwrap();
+    assert!(!fs.metadata_snapshot().inodes[&seed].blocks.is_empty());
+    assert_eq!(fs.read_file("/seed", false).unwrap(), seed_payload);
     fs.sync().unwrap();
 
     let synced = fs.metadata_snapshot();

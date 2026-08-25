@@ -93,7 +93,9 @@ impl DeferredCommitState {
     fn new(meta: &Metadata) -> Self {
         Self {
             durable_metadata: (meta.backend != BackendKind::Host).then(|| meta.clone()),
-            raw_uncommitted_metadata_dirty: false,
+            // Opening or creating a raw pool may normalize/recompute in-memory metadata.
+            // Force one checkpoint before trusting declared integrity hashes as delta bases.
+            raw_uncommitted_metadata_dirty: meta.backend != BackendKind::Host,
             dirty_transactions: 0,
             dirty_since: None,
             pending_reclaims: Vec::new(),
@@ -549,9 +551,14 @@ impl ArgosFs {
     }
 
     pub fn sync_deferred_if_dirty(&self) -> Result<bool> {
-        if !self.backend_writable || self.deferred_commit.lock().dirty_transactions == 0 {
+        if !self.backend_writable {
             return Ok(false);
         }
+        let state = self.deferred_commit.lock();
+        if state.dirty_transactions == 0 && !state.raw_uncommitted_metadata_dirty {
+            return Ok(false);
+        }
+        drop(state);
         self.sync()?;
         Ok(true)
     }
@@ -1477,9 +1484,13 @@ impl ArgosFs {
     fn commit_deferred_locked(&self, meta: &mut Metadata, checkpoint: bool) -> Result<bool> {
         self.ensure_block_backend_writable_locked(meta)?;
         let mut state = self.deferred_commit.lock();
-        if state.dirty_transactions == 0 && state.pending_reclaims.is_empty() {
+        if state.dirty_transactions == 0
+            && state.pending_reclaims.is_empty()
+            && !state.raw_uncommitted_metadata_dirty
+        {
             return Ok(false);
         }
+        let checkpoint = checkpoint || state.raw_uncommitted_metadata_dirty;
 
         let previous = state
             .durable_metadata
@@ -1706,7 +1717,9 @@ impl ArgosFs {
         recompute_disk_usage_from_metadata(meta);
         let mut state = self.deferred_commit.lock();
         state.durable_metadata = Some(meta.clone());
-        state.raw_uncommitted_metadata_dirty = false;
+        // Recovery may normalize/recompute fields after validating the persisted hash.
+        // Re-establish a full durable checkpoint before trusting a delta base again.
+        state.raw_uncommitted_metadata_dirty = true;
         Ok(())
     }
 

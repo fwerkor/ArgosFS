@@ -403,11 +403,16 @@ impl ArgosFs {
                     }
                 }
             }
-        } else if let Some(live) = meta.inodes.get_mut(&ino) {
-            live.access_count = live.access_count.saturating_add(1);
-            live.read_bytes = live.read_bytes.saturating_add(data.len() as u64);
-            live.last_accessed_at = now_f64();
-            live.workload_score = live.workload_score * 0.98 + 1.0;
+        } else {
+            if meta.backend != BackendKind::Host {
+                self.deferred_commit.lock().raw_uncommitted_metadata_dirty = true;
+            }
+            if let Some(live) = meta.inodes.get_mut(&ino) {
+                live.access_count = live.access_count.saturating_add(1);
+                live.read_bytes = live.read_bytes.saturating_add(data.len() as u64);
+                live.last_accessed_at = now_f64();
+                live.workload_score = live.workload_score * 0.98 + 1.0;
+            }
         }
         Ok((data, damaged, repaired))
     }
