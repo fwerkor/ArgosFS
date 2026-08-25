@@ -13,10 +13,7 @@ permissions:
 
 jobs:
   apply:
-    runs-on: windows-2025
-    defaults:
-      run:
-        shell: bash
+    runs-on: ubuntu-slim
     steps:
       - name: Checkout source branch
         uses: actions/checkout@v7
@@ -25,7 +22,7 @@ jobs:
           fetch-depth: 0
 
       - name: Apply focused source changes
-        run: python .github/apply_durable_base_fix.py
+        run: python3 .github/apply_durable_base_fix.py
 
       - name: Validate patch shape
         run: git diff --check
