@@ -23,27 +23,29 @@ jobs:
       - name: Preserve full-checkpoint signal
         run: |
           python3 - <<'PY'
+          import re
           from pathlib import Path
 
           path = Path("src/volume/mod.rs")
           text = path.read_text()
-          old = '''            let replay_previous = durable_previous
-              .as_ref()
-              .filter(|previous| previous.integrity.meta_hash == previous_meta_hash);
-          '''
-          new = '''            let replay_previous = if previous_metadata.is_some() {
-              durable_previous
-                  .as_ref()
-                  .filter(|previous| previous.integrity.meta_hash == previous_meta_hash)
-          } else {
-              None
-          };
-          '''
-          if new in text:
-              raise SystemExit("checkpoint gate already applied")
-          if text.count(old) != 1:
-              raise SystemExit(f"expected one checkpoint-gate target, found {text.count(old)}")
-          path.write_text(text.replace(old, new, 1))
+          pattern = re.compile(
+              r"(?m)^            let replay_previous = durable_previous\n"
+              r"\s+\.as_ref\(\)\n"
+              r"\s+\.filter\(\|previous\| previous\.integrity\.meta_hash == previous_meta_hash\);\n"
+          )
+          replacement = (
+              "            let replay_previous = if previous_metadata.is_some() {\n"
+              "                durable_previous\n"
+              "                    .as_ref()\n"
+              "                    .filter(|previous| previous.integrity.meta_hash == previous_meta_hash)\n"
+              "            } else {\n"
+              "                None\n"
+              "            };\n"
+          )
+          text, count = pattern.subn(replacement, text, count=1)
+          if count != 1:
+              raise SystemExit(f"expected one checkpoint-gate target, found {count}")
+          path.write_text(text)
           PY
           git diff --check
 
