@@ -245,10 +245,8 @@ run_phase2() {
   argosfs_qemu_add_hotplug_ports 5 recover
   qemu_args+=(-monitor "unix:$monitor,server,nowait")
   : >"$monitor_log"
-  set +e
-  # QEMU output is intentionally polled while this pipeline appends to the log.
-  # shellcheck disable=SC2094
-  (
+  # shellcheck disable=SC2317 # Invoked indirectly by argosfs_qemu_run_with_feeder.
+  mixed_phase2_feeder() {
     set -e
     argosfs_qemu_wait_console_prompt "$log2" 1 "$console_timeout_s" "$reject" "mixed-chaos phase2 console prompt"
     argosfs_qemu_stream_script "$commands2" 1 /tmp/argosfs-qemu-mixed-phase2.sh "$log2"
@@ -259,13 +257,10 @@ run_phase2() {
     qemu_device_add recover 2 "${disks[3]}"
     qemu_device_add recover 3 "${disks[4]}"
     qemu_device_add recover 4 "${disks[5]}"
-  ) | timeout "$timeout_s" "$qemu_bin" "${qemu_args[@]}" >"$log2" 2>&1
-  pipeline_status=("${PIPESTATUS[@]}")
-  feeder_status="${pipeline_status[0]}"
-  status="${pipeline_status[1]}"
-  set -e
-  [ "$feeder_status" -eq 0 ] || return "$feeder_status"
-  return "$status"
+  }
+  argosfs_qemu_run_with_feeder "$log2" "$timeout_s" mixed_phase2_feeder "$qemu_bin" "${qemu_args[@]}"
+  [ "$ARGOSFS_QEMU_FEEDER_STATUS" -eq 0 ] || return "$ARGOSFS_QEMU_FEEDER_STATUS"
+  return "$ARGOSFS_QEMU_STATUS"
 }
 
 if ! run_phase1_until_kill_marker; then
