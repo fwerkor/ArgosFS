@@ -111,6 +111,51 @@ argosfs_qemu_wait_process_gone() {
 	return 1
 }
 
+argosfs_qemu_run_with_feeder() {
+	local log="$1"
+	local timeout_s="$2"
+	local feeder="$3"
+	shift 3
+
+	local run_dir stdin_fifo qemu_pid feeder_pid feeder_status qemu_status
+	run_dir="$(mktemp -d "${TMPDIR:-/tmp}/argosfs-qemu-run.XXXXXX")"
+	stdin_fifo="$run_dir/stdin"
+	mkfifo "$stdin_fifo"
+
+	# Run QEMU independently from the feeder so a feeder-side timeout can stop
+	# the emulator immediately instead of leaving it alive until timeout(1).
+	timeout "$timeout_s" "$@" <"$stdin_fifo" >"$log" 2>&1 &
+	qemu_pid=$!
+	(
+		exec >"$stdin_fifo"
+		"$feeder"
+	) &
+	feeder_pid=$!
+
+	if wait "$feeder_pid"; then
+		feeder_status=0
+	else
+		feeder_status=$?
+	fi
+
+	if [ "$feeder_status" -ne 0 ] && kill -0 "$qemu_pid" 2>/dev/null; then
+		argosfs_qemu_kill_tree "$qemu_pid"
+	fi
+
+	if wait "$qemu_pid" 2>/dev/null; then
+		qemu_status=0
+	else
+		qemu_status=$?
+	fi
+	argosfs_qemu_wait_process_gone "$qemu_pid" 5 || true
+	rm -rf "$run_dir"
+
+	# shellcheck disable=SC2034 # Output variables are consumed by caller scripts.
+	ARGOSFS_QEMU_FEEDER_STATUS="$feeder_status"
+	# shellcheck disable=SC2034 # Output variables are consumed by caller scripts.
+	ARGOSFS_QEMU_STATUS="$qemu_status"
+}
+
 argosfs_qemu_add_hotplug_ports() {
 	local count="$1"
 	local prefix="$2"

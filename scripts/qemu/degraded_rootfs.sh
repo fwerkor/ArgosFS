@@ -75,6 +75,7 @@ argosfs_qemu_add_hotplug_ports 3 deg
 qemu_args+=(-monitor "unix:$monitor,server,nowait")
 : >"$monitor_log"
 
+# shellcheck disable=SC2317 # Invoked by the indirectly-called QEMU feeder.
 qemu_device_add() {
   local idx="$1" path="$2"
   local bus_arg rom_arg
@@ -87,10 +88,8 @@ qemu_device_add() {
     "device_add virtio-blk-pci,drive=deg$idx,id=degdisk$idx${bus_arg}${rom_arg}" "$monitor_log" || return
 }
 
-set +e
-# QEMU output is intentionally polled while this pipeline appends to the log.
-# shellcheck disable=SC2094
-(
+# shellcheck disable=SC2317 # Invoked indirectly by argosfs_qemu_run_with_feeder.
+qemu_feeder() {
   set -e
   argosfs_qemu_wait_console_prompt "$log" 1 "$console_timeout_s" "$reject" "degraded-rootfs console prompt"
   argosfs_qemu_stream_script "$commands" 1 /tmp/argosfs-qemu-degraded-rootfs.sh "$log"
@@ -101,11 +100,11 @@ set +e
     qemu_device_add "$idx" "$disk"
     idx=$((idx + 1))
   done
-) | timeout "$timeout_s" "$qemu_bin" "${qemu_args[@]}" >"$log" 2>&1
-pipeline_status=("${PIPESTATUS[@]}")
-feeder_status="${pipeline_status[0]}"
-status="${pipeline_status[1]}"
-set -e
+}
+
+argosfs_qemu_run_with_feeder "$log" "$timeout_s" qemu_feeder "$qemu_bin" "${qemu_args[@]}"
+feeder_status="$ARGOSFS_QEMU_FEEDER_STATUS"
+status="$ARGOSFS_QEMU_STATUS"
 
 if [ "$feeder_status" -ne 0 ]; then
   echo "QEMU degraded rootfs feeder failed; status=$feeder_status" >&2

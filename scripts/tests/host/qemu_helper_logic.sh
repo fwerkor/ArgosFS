@@ -39,4 +39,31 @@ argosfs_qemu_log_has_marker "$log" ARGOSFS_EVENT_DONE
 argosfs_qemu_log_has_root_mount "$log"
 argosfs_qemu_log_has_marker_prefix "$log" ARGOSFS_STRESS_WORKER_1_DONE
 
+feeder_ok() {
+	printf 'hello from feeder\n'
+}
+
+feeder_fail() {
+	return 23
+}
+
+success_log="$tmp/qemu-helper-success.log"
+# shellcheck disable=SC2016 # The inner shell must expand $line, not this test shell.
+argosfs_qemu_run_with_feeder "$success_log" 10 feeder_ok \
+	bash -c 'IFS= read -r line; [ "$line" = "hello from feeder" ]'
+[ "$ARGOSFS_QEMU_FEEDER_STATUS" -eq 0 ]
+[ "$ARGOSFS_QEMU_STATUS" -eq 0 ]
+
+failure_log="$tmp/qemu-helper-failure.log"
+start_seconds="$SECONDS"
+argosfs_qemu_run_with_feeder "$failure_log" 30 feeder_fail \
+	bash -c 'while :; do sleep 1; done'
+elapsed=$((SECONDS - start_seconds))
+[ "$ARGOSFS_QEMU_FEEDER_STATUS" -eq 23 ]
+[ "$ARGOSFS_QEMU_STATUS" -ne 0 ]
+if [ "$elapsed" -ge 5 ]; then
+	echo "QEMU helper did not terminate emulator promptly after feeder failure: ${elapsed}s" >&2
+	exit 1
+fi
+
 printf 'QEMU helper marker tests passed\n'

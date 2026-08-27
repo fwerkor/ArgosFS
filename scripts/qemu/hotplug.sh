@@ -60,10 +60,8 @@ argosfs_qemu_add_hotplug_ports 1 hot
 qemu_args+=(-monitor "unix:$monitor,server,nowait")
 : >"$monitor_log"
 
-set +e
-# QEMU output is intentionally polled while this pipeline appends to the log.
-# shellcheck disable=SC2094
-(
+# shellcheck disable=SC2317 # Invoked indirectly by argosfs_qemu_run_with_feeder.
+qemu_feeder() {
 	set -e
 	argosfs_qemu_wait_console_prompt "$log" 1 "$console_timeout_s" "$reject" "hotplug console prompt"
 	argosfs_qemu_stream_script "$commands" 1 /tmp/argosfs-qemu-hotplug.sh "$log"
@@ -83,11 +81,11 @@ set +e
 	# therefore disappear before this optional backend cleanup reaches QEMU; the
 	# guest markers below remain the authoritative validation of the operation.
 	argosfs_qemu_monitor_command "$monitor" "drive_del hot0" "$monitor_log" "Device '[^']+' not found" || true
-) | timeout "$timeout_s" "$qemu_bin" "${qemu_args[@]}" >"$log" 2>&1
-pipeline_status=("${PIPESTATUS[@]}")
-feeder_status="${pipeline_status[0]}"
-status="${pipeline_status[1]}"
-set -e
+}
+
+argosfs_qemu_run_with_feeder "$log" "$timeout_s" qemu_feeder "$qemu_bin" "${qemu_args[@]}"
+feeder_status="$ARGOSFS_QEMU_FEEDER_STATUS"
+status="$ARGOSFS_QEMU_STATUS"
 
 if [ "$feeder_status" -ne 0 ]; then
 	echo "QEMU hotplug feeder failed; status=$feeder_status" >&2
