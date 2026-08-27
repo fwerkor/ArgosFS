@@ -66,4 +66,16 @@ if [ "$elapsed" -ge 5 ]; then
 	exit 1
 fi
 
+hard_timeout_log="$tmp/qemu-helper-hard-timeout.log"
+start_seconds="$SECONDS"
+ARGOSFS_QEMU_KILL_AFTER=1 argosfs_qemu_run_with_feeder "$hard_timeout_log" 1 feeder_ok \
+	bash -c 'IFS= read -r _; trap "" TERM; while :; do sleep 1; done'
+elapsed=$((SECONDS - start_seconds))
+[ "$ARGOSFS_QEMU_FEEDER_STATUS" -eq 0 ]
+[ "$ARGOSFS_QEMU_STATUS" -ne 0 ]
+if [ "$elapsed" -ge 5 ]; then
+	echo "QEMU helper hard timeout did not kill a TERM-resistant emulator promptly: ${elapsed}s" >&2
+	exit 1
+fi
+
 printf 'QEMU helper marker tests passed\n'

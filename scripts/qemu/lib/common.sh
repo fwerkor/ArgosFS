@@ -124,7 +124,7 @@ argosfs_qemu_run_with_feeder() {
 
 	# Run QEMU independently from the feeder so a feeder-side timeout can stop
 	# the emulator immediately instead of leaving it alive until timeout(1).
-	timeout "$timeout_s" "$@" <"$stdin_fifo" >"$log" 2>&1 &
+	timeout --kill-after="${ARGOSFS_QEMU_KILL_AFTER:-10}" "$timeout_s" "$@" <"$stdin_fifo" >"$log" 2>&1 &
 	qemu_pid=$!
 	(
 		exec >"$stdin_fifo"

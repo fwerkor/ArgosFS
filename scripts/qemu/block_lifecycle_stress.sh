@@ -48,22 +48,48 @@ while [ "$i" -lt 160 ]; do
   i=$((i + 1))
 done
 devs=/dev/vdb,/dev/vdc,/dev/vdd
+echo "ARGOSFS_BLOCK_LIFECYCLE_PHASE mkfs begin"
 argosfs mkfs --backend raw --devices "$devs" --k 2 --m 1 --chunk-size 65536 --compression zstd --force >/tmp/argosfs-lifecycle-mkfs.json
+echo "ARGOSFS_BLOCK_LIFECYCLE_PHASE mkfs done"
+echo "ARGOSFS_BLOCK_LIFECYCLE_PHASE import-tree begin"
 argosfs import-tree --backend raw --devices "$devs" "$src" /
+echo "ARGOSFS_BLOCK_LIFECYCLE_PHASE import-tree done"
+echo "ARGOSFS_BLOCK_LIFECYCLE_PHASE fsck-initial begin"
 argosfs fsck --backend raw --devices "$devs" --repair --remove-orphans >/tmp/argosfs-lifecycle-fsck-initial.json
+echo "ARGOSFS_BLOCK_LIFECYCLE_PHASE fsck-initial done"
 all="$devs"
+echo "ARGOSFS_BLOCK_LIFECYCLE_PHASE add-device begin"
 argosfs add-device --backend raw --devices "$all" --device /dev/vde --force >/tmp/argosfs-lifecycle-add.json
+echo "ARGOSFS_BLOCK_LIFECYCLE_PHASE add-device done"
 all="$all,/dev/vde"
+echo "ARGOSFS_BLOCK_LIFECYCLE_PHASE list-devices-after-add begin"
 argosfs list-devices --backend raw --devices "$all" >/tmp/argosfs-lifecycle-devices-after-add.json
+echo "ARGOSFS_BLOCK_LIFECYCLE_PHASE list-devices-after-add done"
+echo "ARGOSFS_BLOCK_LIFECYCLE_PHASE reshape begin"
 argosfs reshape --backend raw --devices "$all" --k 2 --m 1 --max-files 96 >/tmp/argosfs-lifecycle-reshape.json
+echo "ARGOSFS_BLOCK_LIFECYCLE_PHASE reshape done"
+echo "ARGOSFS_BLOCK_LIFECYCLE_PHASE scrub-after-reshape begin"
 argosfs scrub --backend raw --devices "$all" >/tmp/argosfs-lifecycle-scrub-after-reshape.json
+echo "ARGOSFS_BLOCK_LIFECYCLE_PHASE scrub-after-reshape done"
+echo "ARGOSFS_BLOCK_LIFECYCLE_PHASE drain-device begin"
 argosfs drain-device --backend raw --devices "$all" --device disk-0000 >/tmp/argosfs-lifecycle-drain.json
+echo "ARGOSFS_BLOCK_LIFECYCLE_PHASE drain-device done"
+echo "ARGOSFS_BLOCK_LIFECYCLE_PHASE remove-device begin"
 argosfs remove-device --backend raw --devices "$all" --device disk-0000 >/tmp/argosfs-lifecycle-remove.json
+echo "ARGOSFS_BLOCK_LIFECYCLE_PHASE remove-device done"
+echo "ARGOSFS_BLOCK_LIFECYCLE_PHASE replace-device begin"
 argosfs replace-device --backend raw --devices "$all" --old disk-0001 --new /dev/vdf --force >/tmp/argosfs-lifecycle-replace.json
+echo "ARGOSFS_BLOCK_LIFECYCLE_PHASE replace-device done"
 all="$all,/dev/vdf"
+echo "ARGOSFS_BLOCK_LIFECYCLE_PHASE fsck-final begin"
 argosfs fsck --backend raw --devices "$all" --repair --remove-orphans >/tmp/argosfs-lifecycle-fsck-final.json
+echo "ARGOSFS_BLOCK_LIFECYCLE_PHASE fsck-final done"
+echo "ARGOSFS_BLOCK_LIFECYCLE_PHASE scrub-final begin"
 argosfs scrub --backend raw --devices "$all" >/tmp/argosfs-lifecycle-scrub-final.json
+echo "ARGOSFS_BLOCK_LIFECYCLE_PHASE scrub-final done"
+echo "ARGOSFS_BLOCK_LIFECYCLE_PHASE export-tree begin"
 argosfs export-tree --backend raw --devices "$all" "$out"
+echo "ARGOSFS_BLOCK_LIFECYCLE_PHASE export-tree done"
 if cmp "$src/data/meta-37.txt" "$out/data/meta-37.txt" &&
    cmp "$src/data/blob-111.bin" "$out/data/blob-111.bin"; then
   echo ARGOSFS_BLOCK_LIFECYCLE_CONTENT_OK
@@ -107,18 +133,26 @@ qemu_feeder() {
   done
 }
 
+report_lifecycle_phases() {
+  echo "Observed block lifecycle phases:" >&2
+  awk '{ gsub(/\r/, ""); if (index($0, "ARGOSFS_BLOCK_LIFECYCLE_PHASE ") == 1) print }' "$log" \
+    | tail -n 40 >&2 || true
+}
+
 argosfs_qemu_run_with_feeder "$log" "$timeout_s" qemu_feeder "$qemu_bin" "${qemu_args[@]}"
 feeder_status="$ARGOSFS_QEMU_FEEDER_STATUS"
 status="$ARGOSFS_QEMU_STATUS"
 
 if [ "$feeder_status" -ne 0 ]; then
   echo "QEMU block lifecycle feeder failed; status=$feeder_status" >&2
+  report_lifecycle_phases
   tail -n 500 "$log" >&2 || true
   exit 1
 fi
 
 if grep -Eiq "$reject" "$log"; then
   echo "QEMU block lifecycle stress failed; qemu status=$status; rejected pattern: $reject" >&2
+  report_lifecycle_phases
   tail -n 500 "$log" >&2 || true
   exit 1
 fi
@@ -133,5 +167,6 @@ if [ "${#missing[@]}" -eq 0 ]; then
 fi
 
 echo "QEMU block lifecycle stress failed; qemu status=$status; missing markers: ${missing[*]}" >&2
+report_lifecycle_phases
 tail -n 500 "$log" >&2 || true
 exit 1

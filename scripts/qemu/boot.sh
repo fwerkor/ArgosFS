@@ -17,7 +17,7 @@ timeout_s="${ARGOSFS_QEMU_TIMEOUT:-120}"
 argosfs_qemu_build_args
 
 status=0
-timeout "$timeout_s" "$qemu_bin" "${qemu_args[@]}" >"$log" 2>&1 || status=$?
+timeout --kill-after="${ARGOSFS_QEMU_KILL_AFTER:-10}" "$timeout_s" "$qemu_bin" "${qemu_args[@]}" >"$log" 2>&1 || status=$?
 if grep -Eiq "$reject" "$log"; then
 	echo "QEMU boot smoke failed; qemu status=$status; rejected pattern: $reject" >&2
 	tail -n 200 "$log" >&2 || true
