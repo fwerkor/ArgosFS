@@ -81,7 +81,7 @@ mkfifo "$stdin_fifo"
 : >"$log"
 
 set +e
-timeout "$timeout_s" "$qemu_bin" "${qemu_args[@]}" <"$stdin_fifo" >"$log" 2>&1 &
+timeout --kill-after="${ARGOSFS_QEMU_KILL_AFTER:-10}" "$timeout_s" "$qemu_bin" "${qemu_args[@]}" <"$stdin_fifo" >"$log" 2>&1 &
 qemu_pid=$!
 exec 3>"$stdin_fifo"
 

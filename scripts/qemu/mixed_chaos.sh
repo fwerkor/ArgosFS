@@ -216,7 +216,7 @@ run_phase1_until_kill_marker() {
       done
       echo 0 >"$feeder_status_file"
     ) || echo "$?" >"$feeder_status_file"
-  } | timeout "$timeout_s" "$qemu_bin" "${qemu_args[@]}" >"$log1" 2>&1 &
+  } | timeout --kill-after="${ARGOSFS_QEMU_KILL_AFTER:-10}" "$timeout_s" "$qemu_bin" "${qemu_args[@]}" >"$log1" 2>&1 &
   qemu_pid=$!
   deadline=$((SECONDS + timeout_s))
   result=1
