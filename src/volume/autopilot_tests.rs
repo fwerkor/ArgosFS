@@ -70,7 +70,7 @@ fn autopilot_defaults_are_conservative_and_versioned() {
     assert_eq!(config.rebalance_files_per_run, 32);
     assert_eq!(config.max_drains_per_run, 1);
     assert_eq!(config.foreground_latency_target_ms, 75.0);
-    assert_eq!(autopilot_state_version(), 2);
+    assert_eq!(autopilot_state_version(), 3);
 }
 
 #[test]
@@ -84,6 +84,36 @@ fn due_calculation_handles_disabled_new_due_and_recent_actions() {
 #[test]
 fn risk_memory_requires_two_healthy_observations_to_clear_streaks() {
     let mut state = AutopilotState::default();
+    let mut risky_disk = disk("disk-a", DiskStatus::Online, 0, 100, 0.7, true, 0);
+    risky_disk.health.last_smart_refresh_at = 10.0;
+    let mut risky = report(vec![risky_disk]);
+    update_autopilot_risk_memory(&mut state, &risky, 10.0);
+    update_autopilot_risk_memory(&mut state, &risky, 15.0);
+    assert_eq!(state.disks["disk-a"].risk_streak, 1);
+    risky.disks[0].health.last_smart_refresh_at = 20.0;
+    update_autopilot_risk_memory(&mut state, &risky, 20.0);
+    let disk_state = state.disks.get("disk-a").unwrap();
+    assert_eq!(disk_state.risk_streak, 2);
+    assert_eq!(disk_state.healthy_streak, 0);
+    assert!(disk_state.last_predicted_failure);
+
+    state.disks.get_mut("disk-a").unwrap().next_action_after = 100.0;
+    let mut healthy_disk = disk("disk-a", DiskStatus::Online, 0, 100, 0.0, false, 0);
+    healthy_disk.health.last_smart_refresh_at = 30.0;
+    let mut healthy = report(vec![healthy_disk]);
+    update_autopilot_risk_memory(&mut state, &healthy, 30.0);
+    assert_eq!(state.disks["disk-a"].risk_streak, 2);
+    update_autopilot_risk_memory(&mut state, &healthy, 35.0);
+    assert_eq!(state.disks["disk-a"].risk_streak, 2);
+    healthy.disks[0].health.last_smart_refresh_at = 40.0;
+    update_autopilot_risk_memory(&mut state, &healthy, 40.0);
+    assert_eq!(state.disks["disk-a"].risk_streak, 0);
+    assert_eq!(state.disks["disk-a"].next_action_after, 40.0);
+}
+
+#[test]
+fn risk_memory_counts_legacy_untimestamped_health_once() {
+    let mut state = AutopilotState::default();
     let risky = report(vec![disk(
         "disk-a",
         DiskStatus::Online,
@@ -93,28 +123,12 @@ fn risk_memory_requires_two_healthy_observations_to_clear_streaks() {
         true,
         0,
     )]);
+
     update_autopilot_risk_memory(&mut state, &risky, 10.0);
     update_autopilot_risk_memory(&mut state, &risky, 20.0);
-    let disk_state = state.disks.get("disk-a").unwrap();
-    assert_eq!(disk_state.risk_streak, 2);
-    assert_eq!(disk_state.healthy_streak, 0);
-    assert!(disk_state.last_predicted_failure);
 
-    state.disks.get_mut("disk-a").unwrap().next_action_after = 100.0;
-    let healthy = report(vec![disk(
-        "disk-a",
-        DiskStatus::Online,
-        0,
-        100,
-        0.0,
-        false,
-        0,
-    )]);
-    update_autopilot_risk_memory(&mut state, &healthy, 30.0);
-    assert_eq!(state.disks["disk-a"].risk_streak, 2);
-    update_autopilot_risk_memory(&mut state, &healthy, 40.0);
-    assert_eq!(state.disks["disk-a"].risk_streak, 0);
-    assert_eq!(state.disks["disk-a"].next_action_after, 40.0);
+    assert_eq!(state.disks["disk-a"].risk_streak, 1);
+    assert!(state.disks["disk-a"].has_health_observation);
 }
 
 #[test]

@@ -85,6 +85,10 @@ struct AutopilotDiskState {
     #[serde(default)]
     last_predicted_failure: bool,
     #[serde(default)]
+    last_health_observation_at: f64,
+    #[serde(default)]
+    has_health_observation: bool,
+    #[serde(default)]
     last_drain_attempt_at: f64,
     #[serde(default)]
     next_action_after: f64,
@@ -109,7 +113,7 @@ struct AutopilotActionStats {
 }
 
 fn autopilot_state_version() -> u32 {
-    2
+    3
 }
 
 impl ArgosFs {
@@ -585,6 +589,20 @@ fn autopilot_due(last_at: f64, interval_sec: u64, now: f64) -> bool {
 fn update_autopilot_risk_memory(state: &mut AutopilotState, report: &HealthReport, now: f64) {
     for disk in &report.disks {
         let disk_state = state.disks.entry(disk.id.clone()).or_default();
+        let observation_at = disk
+            .health
+            .last_smart_refresh_at
+            .max(disk.health.smart_evidence_updated_at);
+        let fresh_observation = if observation_at > 0.0 {
+            observation_at > disk_state.last_health_observation_at
+        } else {
+            !disk_state.has_health_observation
+        };
+
+        if !fresh_observation {
+            continue;
+        }
+
         if disk.predicted_failure {
             disk_state.risk_streak = disk_state.risk_streak.saturating_add(1);
             disk_state.healthy_streak = 0;
@@ -597,6 +615,8 @@ fn update_autopilot_risk_memory(state: &mut AutopilotState, report: &HealthRepor
         }
         disk_state.last_risk_score = disk.risk_score;
         disk_state.last_predicted_failure = disk.predicted_failure;
+        disk_state.last_health_observation_at = observation_at;
+        disk_state.has_health_observation = true;
     }
 }
 
