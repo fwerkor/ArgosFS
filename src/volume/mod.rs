@@ -8,7 +8,9 @@ use crate::compression::{compress, decompress};
 use crate::crypto;
 use crate::erasure::RsCodec;
 use crate::error::{ArgosError, Result};
-use crate::health::{classify_inode, probe_disk_path, refresh_smart, risk_report};
+use crate::health::{
+    classify_inode, probe_disk_path, refresh_smart, risk_report, update_smart_evidence,
+};
 pub use crate::inode_ops::{DirEntry, NodeAttr, RenamePolicy};
 use crate::journal;
 use crate::raw_format::{self, RawSuperblock};

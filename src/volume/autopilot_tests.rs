@@ -135,7 +135,8 @@ fn drain_decision_prioritizes_cooldown_critical_and_confirmation() {
         AutopilotDrainDecision::Drain
     );
 
-    let io_risky = disk("disk-a", DiskStatus::Online, 0, 100, 0.1, true, 40);
+    let mut io_risky = disk("disk-a", DiskStatus::Online, 0, 100, 0.1, true, 40);
+    io_risky.health.smart_status_failed = true;
     assert_eq!(
         autopilot_drain_decision(&io_risky, &state, 10.0, &config),
         AutopilotDrainDecision::Drain

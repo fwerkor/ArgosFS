@@ -357,6 +357,18 @@ pub struct HealthCounters {
     pub smart_fields_observed: Vec<String>,
     #[serde(default)]
     pub smart_fields_missing: Vec<String>,
+    #[serde(default)]
+    pub smart_status_failed: bool,
+    #[serde(default)]
+    pub smart_evidence_score: f64,
+    #[serde(default)]
+    pub smart_evidence_updated_at: f64,
+    #[serde(default)]
+    pub recent_reallocated_delta: u64,
+    #[serde(default)]
+    pub recent_crc_delta: u64,
+    #[serde(default)]
+    pub recent_io_error_delta: u64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

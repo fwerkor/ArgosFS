@@ -259,13 +259,25 @@ impl ArgosFs {
         )
     }
 
-    pub fn set_disk_health(&self, disk_id: &str, values: HealthCounters) -> Result<()> {
+    pub fn set_disk_health(&self, disk_id: &str, mut values: HealthCounters) -> Result<()> {
         let mut meta = self.meta.write();
         self.ensure_block_backend_writable_locked(&meta)?;
         let disk = meta
             .disks
             .get_mut(disk_id)
             .ok_or_else(|| ArgosError::NotFound(disk_id.to_string()))?;
+        let previous = disk.health.clone();
+        let explicit_smart_reset = values.reallocated_sectors == 0
+            && values.pending_sectors == 0
+            && values.crc_errors == 0
+            && values.io_errors == 0
+            && !values.smart_status_failed
+            && values.last_smart_refresh_at <= 0.0
+            && values.smart_evidence_score <= 0.0
+            && values.smart_evidence_updated_at <= 0.0;
+        if !explicit_smart_reset {
+            update_smart_evidence(&previous, &mut values, now_f64(), false);
+        }
         if values.latency_ms > 0.0 {
             disk.read_latency_ewma_ms = values.latency_ms;
             disk.write_latency_ewma_ms = values.latency_ms;

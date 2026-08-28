@@ -609,7 +609,7 @@ fn autopilot_drain_decision(
     if now < state.next_action_after {
         return AutopilotDrainDecision::Cooldown;
     }
-    let critical = disk.risk_score >= config.critical_risk_score || disk.health.io_errors >= 40;
+    let critical = disk.risk_score >= config.critical_risk_score || disk.health.smart_status_failed;
     let confirmed = state.risk_streak >= config.risk_confirmations;
     if critical || confirmed {
         AutopilotDrainDecision::Drain
