@@ -14,12 +14,53 @@ use std::time::Instant;
 
 const SMART_EVIDENCE_HALF_LIFE_SEC: f64 = 24.0 * 60.0 * 60.0;
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SmartCounterObservations {
+    pub reallocated_sectors: bool,
+    pub crc_errors: bool,
+    pub io_errors: bool,
+}
+
+impl SmartCounterObservations {
+    pub(crate) const fn all() -> Self {
+        Self {
+            reallocated_sectors: true,
+            crc_errors: true,
+            io_errors: true,
+        }
+    }
+
+    fn any(self) -> bool {
+        self.reallocated_sectors || self.crc_errors || self.io_errors
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn update_smart_evidence(
     previous: &HealthCounters,
     current: &mut HealthCounters,
     now: f64,
     establish_baseline: bool,
 ) {
+    update_smart_evidence_for_observations(
+        previous,
+        current,
+        now,
+        establish_baseline,
+        SmartCounterObservations::all(),
+    );
+}
+
+pub(crate) fn update_smart_evidence_for_observations(
+    previous: &HealthCounters,
+    current: &mut HealthCounters,
+    now: f64,
+    establish_baseline: bool,
+    observations: SmartCounterObservations,
+) {
+    if !observations.any() {
+        return;
+    }
     let initialized =
         previous.last_smart_refresh_at > 0.0 || previous.smart_evidence_updated_at > 0.0;
     let elapsed = if previous.smart_evidence_updated_at > 0.0 {
@@ -33,23 +74,68 @@ pub(crate) fn update_smart_evidence(
         previous.smart_evidence_score
     };
 
-    current.recent_reallocated_delta = 0;
-    current.recent_crc_delta = 0;
-    current.recent_io_error_delta = 0;
+    current.recent_reallocated_delta = previous.recent_reallocated_delta;
+    current.recent_reallocated_delta_at = previous.recent_reallocated_delta_at;
+    current.recent_crc_delta = previous.recent_crc_delta;
+    current.recent_crc_delta_at = previous.recent_crc_delta_at;
+    current.recent_io_error_delta = previous.recent_io_error_delta;
+    current.recent_io_error_delta_at = previous.recent_io_error_delta_at;
 
-    if !(establish_baseline && !initialized) {
-        current.recent_reallocated_delta = current
-            .reallocated_sectors
-            .saturating_sub(previous.reallocated_sectors);
-        current.recent_crc_delta = current.crc_errors.saturating_sub(previous.crc_errors);
-        current.recent_io_error_delta = current.io_errors.saturating_sub(previous.io_errors);
-
-        evidence += (current.recent_reallocated_delta as f64 / 400.0).min(0.25);
-        evidence += (current.recent_crc_delta as f64 / 500.0).min(0.12);
-        evidence += (current.recent_io_error_delta as f64 / 100.0).min(0.25);
+    if establish_baseline && !initialized {
+        if observations.reallocated_sectors {
+            current.recent_reallocated_delta = 0;
+            current.recent_reallocated_delta_at = 0.0;
+        }
+        if observations.crc_errors {
+            current.recent_crc_delta = 0;
+            current.recent_crc_delta_at = 0.0;
+        }
+        if observations.io_errors {
+            current.recent_io_error_delta = 0;
+            current.recent_io_error_delta_at = 0.0;
+        }
+    } else {
+        if observations.reallocated_sectors {
+            current.recent_reallocated_delta = current
+                .reallocated_sectors
+                .saturating_sub(previous.reallocated_sectors);
+            current.recent_reallocated_delta_at = if current.recent_reallocated_delta > 0 {
+                now
+            } else {
+                0.0
+            };
+            evidence += (current.recent_reallocated_delta as f64 / 400.0).min(0.25);
+        }
+        if observations.crc_errors {
+            current.recent_crc_delta = current.crc_errors.saturating_sub(previous.crc_errors);
+            current.recent_crc_delta_at = if current.recent_crc_delta > 0 {
+                now
+            } else {
+                0.0
+            };
+            evidence += (current.recent_crc_delta as f64 / 500.0).min(0.12);
+        }
+        if observations.io_errors {
+            current.recent_io_error_delta = current.io_errors.saturating_sub(previous.io_errors);
+            current.recent_io_error_delta_at = if current.recent_io_error_delta > 0 {
+                now
+            } else {
+                0.0
+            };
+            evidence += (current.recent_io_error_delta as f64 / 100.0).min(0.25);
+        }
     }
     current.smart_evidence_score = evidence.clamp(0.0, 1.0);
     current.smart_evidence_updated_at = now;
+}
+
+fn recent_delta_is_fresh(observed_at: f64, now: f64) -> bool {
+    observed_at > 0.0 && (now - observed_at).max(0.0) <= SMART_EVIDENCE_HALF_LIFE_SEC
+}
+
+pub(crate) fn recent_io_error_spike(health: &HealthCounters, now: f64) -> bool {
+    health.recent_io_error_delta >= 40
+        && recent_delta_is_fresh(health.recent_io_error_delta_at, now)
 }
 
 pub fn risk_report(disk: &Disk, _disk_path: &Path) -> HealthDiskReport {
@@ -69,7 +155,9 @@ pub fn risk_report(disk: &Disk, _disk_path: &Path) -> HealthDiskReport {
         }
         DiskStatus::Online | DiskStatus::Removed => {}
     }
-    if disk.health.recent_reallocated_delta > 0 {
+    if disk.health.recent_reallocated_delta > 0
+        && recent_delta_is_fresh(disk.health.recent_reallocated_delta_at, now)
+    {
         reasons.push("reallocated-sectors-increasing".to_string());
     } else if disk.health.reallocated_sectors > 0 {
         reasons.push("reallocated-sectors-history".to_string());
@@ -78,12 +166,16 @@ pub fn risk_report(disk: &Disk, _disk_path: &Path) -> HealthDiskReport {
         score += (disk.health.pending_sectors as f64 / 100.0).min(0.25);
         reasons.push("pending-sectors".to_string());
     }
-    if disk.health.recent_crc_delta > 0 {
+    if disk.health.recent_crc_delta > 0
+        && recent_delta_is_fresh(disk.health.recent_crc_delta_at, now)
+    {
         reasons.push("crc-errors-increasing".to_string());
     } else if disk.health.crc_errors > 0 {
         reasons.push("crc-errors-history".to_string());
     }
-    if disk.health.recent_io_error_delta > 0 {
+    if disk.health.recent_io_error_delta > 0
+        && recent_delta_is_fresh(disk.health.recent_io_error_delta_at, now)
+    {
         reasons.push("io-errors-increasing".to_string());
     } else if disk.health.io_errors > 0 {
         reasons.push("io-errors-history".to_string());
@@ -127,7 +219,7 @@ pub fn risk_report(disk: &Disk, _disk_path: &Path) -> HealthDiskReport {
     let score = score.min(1.0);
     let predicted_failure = score >= 0.65
         || disk.health.pending_sectors >= 8
-        || disk.health.recent_io_error_delta >= 40
+        || recent_io_error_spike(&disk.health, now)
         || disk.health.smart_status_failed
         || disk.status == DiskStatus::Failed;
     HealthDiskReport {
@@ -392,7 +484,17 @@ fn parse_smartctl_json(disk: &Disk, output: &[u8]) -> Result<HealthCounters> {
         "crc_errors",
     ];
     let now = now_f64();
-    update_smart_evidence(&previous, &mut health, now, true);
+    update_smart_evidence_for_observations(
+        &previous,
+        &mut health,
+        now,
+        true,
+        SmartCounterObservations {
+            reallocated_sectors: reallocated.is_some(),
+            crc_errors: crc.is_some(),
+            io_errors: io_errors.is_some(),
+        },
+    );
     health.last_smart_refresh_at = now;
     health.smart_device_type = device_type.to_string();
     health.smart_fields_observed = observed.iter().map(|field| (*field).to_string()).collect();

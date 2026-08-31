@@ -401,6 +401,51 @@ fn validation_hash_helpers_and_metadata_order_cover_legacy_and_mismatch_paths() 
 }
 
 #[test]
+fn default_trend_health_fields_do_not_change_legacy_metadata_hashes() {
+    let (_dir, fs) = volume();
+    let mut meta = fs.metadata_snapshot();
+    for disk in meta.disks.values_mut() {
+        disk.health.smart_status_failed = false;
+        disk.health.smart_evidence_score = 0.0;
+        disk.health.smart_evidence_updated_at = 0.0;
+        disk.health.recent_reallocated_delta = 0;
+        disk.health.recent_reallocated_delta_at = 0.0;
+        disk.health.recent_crc_delta = 0;
+        disk.health.recent_crc_delta_at = 0.0;
+        disk.health.recent_io_error_delta = 0;
+        disk.health.recent_io_error_delta_at = 0.0;
+    }
+
+    let value = serde_json::to_value(&meta).unwrap();
+    for disk in value["disks"].as_object().unwrap().values() {
+        let health = disk["health"].as_object().unwrap();
+        for field in [
+            "smart_status_failed",
+            "smart_evidence_score",
+            "smart_evidence_updated_at",
+            "recent_reallocated_delta",
+            "recent_reallocated_delta_at",
+            "recent_crc_delta",
+            "recent_crc_delta_at",
+            "recent_io_error_delta",
+            "recent_io_error_delta_at",
+        ] {
+            assert!(
+                !health.contains_key(field),
+                "legacy hash field leaked: {field}"
+            );
+        }
+    }
+
+    let hash = canonical_metadata_hash(&meta).unwrap();
+    meta.integrity.meta_hash = hash.clone();
+    let bytes = serde_json::to_vec_pretty(&meta).unwrap();
+    let computed = canonical_metadata_hash_bytes(&bytes).unwrap();
+    assert_eq!(computed, hash);
+    validate_metadata(&mut meta, &computed).unwrap();
+}
+
+#[test]
 fn compaction_handles_missing_disabled_no_checkpoint_and_valid_checkpoint_chains() {
     let empty = tempdir().unwrap();
     compact_journal(empty.path()).unwrap();

@@ -603,7 +603,26 @@ fn update_autopilot_risk_memory(state: &mut AutopilotState, report: &HealthRepor
             continue;
         }
 
-        if disk.predicted_failure {
+        let explicit_health_reset = disk.health.last_smart_refresh_at <= 0.0
+            && disk.health.smart_evidence_updated_at > 0.0
+            && disk.health.smart_evidence_score <= 0.0
+            && disk.health.reallocated_sectors == 0
+            && disk.health.pending_sectors == 0
+            && disk.health.crc_errors == 0
+            && disk.health.io_errors == 0
+            && disk.health.recent_reallocated_delta == 0
+            && disk.health.recent_reallocated_delta_at <= 0.0
+            && disk.health.recent_crc_delta == 0
+            && disk.health.recent_crc_delta_at <= 0.0
+            && disk.health.recent_io_error_delta == 0
+            && disk.health.recent_io_error_delta_at <= 0.0
+            && !disk.health.smart_status_failed;
+
+        if explicit_health_reset && !disk.predicted_failure {
+            disk_state.risk_streak = 0;
+            disk_state.healthy_streak = 2;
+            disk_state.next_action_after = disk_state.next_action_after.min(now);
+        } else if disk.predicted_failure {
             disk_state.risk_streak = disk_state.risk_streak.saturating_add(1);
             disk_state.healthy_streak = 0;
         } else {
@@ -629,7 +648,9 @@ fn autopilot_drain_decision(
     if now < state.next_action_after {
         return AutopilotDrainDecision::Cooldown;
     }
-    let critical = disk.risk_score >= config.critical_risk_score || disk.health.smart_status_failed;
+    let critical = disk.risk_score >= config.critical_risk_score
+        || disk.health.smart_status_failed
+        || recent_io_error_spike(&disk.health, now);
     let confirmed = state.risk_streak >= config.risk_confirmations;
     if critical || confirmed {
         AutopilotDrainDecision::Drain

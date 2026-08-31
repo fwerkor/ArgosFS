@@ -70,6 +70,7 @@ fn inode(kind: NodeKind, size: u64) -> Inode {
 #[test]
 fn risk_report_combines_status_smart_and_capacity_signals() {
     let mut disk = disk();
+    let now = now_f64();
     disk.status = DiskStatus::Failed;
     disk.used_bytes = 950;
     disk.health = HealthCounters {
@@ -82,10 +83,13 @@ fn risk_report_combines_status_smart_and_capacity_signals() {
         temperature_c: 70.0,
         smart_status_failed: true,
         smart_evidence_score: 1.0,
-        smart_evidence_updated_at: now_f64(),
+        smart_evidence_updated_at: now,
         recent_reallocated_delta: 500,
+        recent_reallocated_delta_at: now,
         recent_crc_delta: 600,
+        recent_crc_delta_at: now,
         recent_io_error_delta: 50,
+        recent_io_error_delta_at: now,
         ..HealthCounters::default()
     };
 
@@ -353,12 +357,54 @@ fn cumulative_counter_growth_adds_decaying_evidence() {
 fn stale_recent_evidence_decays_in_risk_reports() {
     let mut disk = disk();
     let now = now_f64();
+    disk.health.io_errors = 40;
+    disk.health.recent_io_error_delta = 40;
     disk.health.smart_evidence_score = 0.8;
     disk.health.smart_evidence_updated_at = now - 48.0 * 60.0 * 60.0;
-    disk.health.last_smart_refresh_at = now;
+    disk.health.recent_io_error_delta_at = disk.health.smart_evidence_updated_at;
+    disk.health.last_smart_refresh_at = disk.health.smart_evidence_updated_at;
     let report = risk_report(&disk, Path::new("/unused"));
     assert!((report.risk_score - 0.2).abs() < 0.02);
     assert!(!report.predicted_failure);
+    assert!(report
+        .reasons
+        .iter()
+        .any(|reason| reason == "io-errors-history"));
+    assert!(!report
+        .reasons
+        .iter()
+        .any(|reason| reason == "io-errors-increasing"));
+}
+
+#[test]
+fn unrelated_smart_observation_does_not_refresh_old_io_spike() {
+    let now = now_f64();
+    let old = now - 48.0 * 60.0 * 60.0;
+    let previous = HealthCounters {
+        reallocated_sectors: 10,
+        io_errors: 40,
+        smart_evidence_score: 0.25,
+        smart_evidence_updated_at: old,
+        recent_io_error_delta: 40,
+        recent_io_error_delta_at: old,
+        ..HealthCounters::default()
+    };
+    let mut current = previous.clone();
+    current.reallocated_sectors = 11;
+    update_smart_evidence_for_observations(
+        &previous,
+        &mut current,
+        now,
+        false,
+        SmartCounterObservations {
+            reallocated_sectors: true,
+            ..SmartCounterObservations::default()
+        },
+    );
+
+    assert_eq!(current.recent_io_error_delta, 40);
+    assert_eq!(current.recent_io_error_delta_at, old);
+    assert!(!recent_io_error_spike(&current, now));
 }
 
 #[test]

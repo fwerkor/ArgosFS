@@ -9,7 +9,8 @@ use crate::crypto;
 use crate::erasure::RsCodec;
 use crate::error::{ArgosError, Result};
 use crate::health::{
-    classify_inode, probe_disk_path, refresh_smart, risk_report, update_smart_evidence,
+    classify_inode, probe_disk_path, recent_io_error_spike, refresh_smart, risk_report,
+    update_smart_evidence_for_observations, SmartCounterObservations,
 };
 pub use crate::inode_ops::{DirEntry, NodeAttr, RenamePolicy};
 use crate::journal;

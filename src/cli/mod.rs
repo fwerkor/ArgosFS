@@ -536,6 +536,7 @@ pub fn run() -> Result<()> {
             latency_ms,
             wear_percent,
             temperature_c,
+            smart_status_failed,
         } => {
             let fs = ArgosFs::open(root)?;
             let meta = fs.metadata_snapshot();
@@ -544,6 +545,11 @@ pub fn run() -> Result<()> {
                 .get(&disk_id)
                 .map(|disk| disk.health.clone())
                 .with_context(|| format!("unknown disk {disk_id}"))?;
+            let observations = crate::health::SmartCounterObservations {
+                reallocated_sectors: reallocated_sectors.is_some(),
+                crc_errors: crc_errors.is_some(),
+                io_errors: io_errors.is_some(),
+            };
             if let Some(value) = reallocated_sectors {
                 health.reallocated_sectors = value;
             }
@@ -565,7 +571,10 @@ pub fn run() -> Result<()> {
             if let Some(value) = temperature_c {
                 health.temperature_c = value;
             }
-            fs.set_disk_health(&disk_id, health)?;
+            if let Some(value) = smart_status_failed {
+                health.smart_status_failed = value;
+            }
+            fs.set_disk_health_overrides(&disk_id, health, observations)?;
         }
         Command::Health { root } => {
             let report = ArgosFs::open(root)?.health_report();

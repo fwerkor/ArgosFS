@@ -17,6 +17,18 @@ fn default_deferred_commit_max_transactions() -> u64 {
     DEFAULT_DEFERRED_COMMIT_MAX_TRANSACTIONS
 }
 
+fn bool_is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn f64_is_zero(value: &f64) -> bool {
+    *value == 0.0
+}
+
+fn u64_is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FaultPoint {
@@ -357,18 +369,24 @@ pub struct HealthCounters {
     pub smart_fields_observed: Vec<String>,
     #[serde(default)]
     pub smart_fields_missing: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "bool_is_false")]
     pub smart_status_failed: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "f64_is_zero")]
     pub smart_evidence_score: f64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "f64_is_zero")]
     pub smart_evidence_updated_at: f64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "u64_is_zero")]
     pub recent_reallocated_delta: u64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "f64_is_zero")]
+    pub recent_reallocated_delta_at: f64,
+    #[serde(default, skip_serializing_if = "u64_is_zero")]
     pub recent_crc_delta: u64,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "f64_is_zero")]
+    pub recent_crc_delta_at: f64,
+    #[serde(default, skip_serializing_if = "u64_is_zero")]
     pub recent_io_error_delta: u64,
+    #[serde(default, skip_serializing_if = "f64_is_zero")]
+    pub recent_io_error_delta_at: f64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

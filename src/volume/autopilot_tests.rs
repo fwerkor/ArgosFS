@@ -132,6 +132,22 @@ fn risk_memory_counts_legacy_untimestamped_health_once() {
 }
 
 #[test]
+fn explicit_health_reset_clears_prior_risk_memory_immediately() {
+    let mut state = AutopilotState::default();
+    let mut risky_disk = disk("disk-a", DiskStatus::Online, 0, 100, 0.7, true, 0);
+    risky_disk.health.last_smart_refresh_at = 10.0;
+    update_autopilot_risk_memory(&mut state, &report(vec![risky_disk]), 10.0);
+    assert_eq!(state.disks["disk-a"].risk_streak, 1);
+
+    let mut reset_disk = disk("disk-a", DiskStatus::Online, 0, 100, 0.0, false, 0);
+    reset_disk.health.smart_evidence_updated_at = 20.0;
+    update_autopilot_risk_memory(&mut state, &report(vec![reset_disk]), 20.0);
+
+    assert_eq!(state.disks["disk-a"].risk_streak, 0);
+    assert_eq!(state.disks["disk-a"].healthy_streak, 2);
+}
+
+#[test]
 fn drain_decision_prioritizes_cooldown_critical_and_confirmation() {
     let config = AutopilotConfig::default();
     let risky = disk("disk-a", DiskStatus::Online, 0, 100, 0.9, true, 0);
@@ -150,9 +166,18 @@ fn drain_decision_prioritizes_cooldown_critical_and_confirmation() {
     );
 
     let mut io_risky = disk("disk-a", DiskStatus::Online, 0, 100, 0.1, true, 40);
-    io_risky.health.smart_status_failed = true;
+    io_risky.health.recent_io_error_delta = 40;
+    io_risky.health.recent_io_error_delta_at = 10.0;
+    io_risky.health.smart_evidence_updated_at = 10.0;
     assert_eq!(
         autopilot_drain_decision(&io_risky, &state, 10.0, &config),
+        AutopilotDrainDecision::Drain
+    );
+
+    let mut smart_failed = disk("disk-a", DiskStatus::Online, 0, 100, 0.1, true, 0);
+    smart_failed.health.smart_status_failed = true;
+    assert_eq!(
+        autopilot_drain_decision(&smart_failed, &state, 10.0, &config),
         AutopilotDrainDecision::Drain
     );
 
