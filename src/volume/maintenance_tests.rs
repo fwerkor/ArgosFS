@@ -140,6 +140,63 @@ fn health_probe_and_smart_refresh_cover_observation_and_all_failed_paths() {
 }
 
 #[test]
+fn explicit_health_replacement_can_clear_recent_smart_evidence() {
+    let (_dir, fs) = host_volume(1);
+    let disk_id = fs.metadata_snapshot().disks.keys().next().unwrap().clone();
+    fs.set_disk_health(
+        &disk_id,
+        HealthCounters {
+            pending_sectors: 8,
+            ..HealthCounters::default()
+        },
+    )
+    .unwrap();
+    fs.set_disk_health(&disk_id, HealthCounters::default())
+        .unwrap();
+    let cleared = fs.metadata_snapshot().disks[&disk_id].health.clone();
+    assert_eq!(cleared.pending_sectors, 0);
+    assert_eq!(cleared.smart_evidence_score, 0.0);
+    assert!(cleared.smart_evidence_updated_at > 0.0);
+}
+
+#[test]
+fn partial_health_override_preserves_unobserved_recent_deltas() {
+    let (_dir, fs) = host_volume(1);
+    let disk_id = fs.metadata_snapshot().disks.keys().next().unwrap().clone();
+    fs.set_disk_health(
+        &disk_id,
+        HealthCounters {
+            io_errors: 40,
+            smart_status_failed: true,
+            ..HealthCounters::default()
+        },
+    )
+    .unwrap();
+    let before = fs.metadata_snapshot().disks[&disk_id].health.clone();
+    assert_eq!(before.recent_io_error_delta, 40);
+
+    let mut override_values = before.clone();
+    override_values.latency_ms = 10.0;
+    override_values.smart_status_failed = false;
+    fs.set_disk_health_overrides(
+        &disk_id,
+        override_values,
+        SmartCounterObservations::default(),
+    )
+    .unwrap();
+
+    let after = fs.metadata_snapshot().disks[&disk_id].health.clone();
+    assert_eq!(after.recent_io_error_delta, before.recent_io_error_delta);
+    assert_eq!(after.smart_evidence_score, before.smart_evidence_score);
+    assert_eq!(
+        after.smart_evidence_updated_at,
+        before.smart_evidence_updated_at
+    );
+    assert_eq!(after.latency_ms, 10.0);
+    assert!(!after.smart_status_failed);
+}
+
+#[test]
 fn drain_remove_rebalance_and_zero_budget_paths_cover_capacity_rules() {
     let (dir, fs) = host_volume(1);
     let original = fs.metadata_snapshot().disks.keys().next().unwrap().clone();

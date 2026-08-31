@@ -114,6 +114,26 @@ fn json_flag_is_global() {
 }
 
 #[test]
+fn set_health_accepts_explicit_smart_status_override() {
+    let cli = Cli::try_parse_from([
+        "argosfs",
+        "set-health",
+        "/tmp/volume",
+        "disk-0001",
+        "--smart-status-failed",
+        "false",
+    ])
+    .unwrap();
+    match cli.command {
+        Command::SetHealth {
+            smart_status_failed,
+            ..
+        } => assert_eq!(smart_status_failed, Some(false)),
+        _ => panic!("set-health parsed as the wrong command"),
+    }
+}
+
+#[test]
 fn backend_path_and_tree_argument_helpers_cover_all_syntaxes() {
     assert!(require_paths(Vec::new(), "missing").is_err());
     assert_eq!(

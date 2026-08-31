@@ -70,6 +70,7 @@ fn inode(kind: NodeKind, size: u64) -> Inode {
 #[test]
 fn risk_report_combines_status_smart_and_capacity_signals() {
     let mut disk = disk();
+    let now = now_f64();
     disk.status = DiskStatus::Failed;
     disk.used_bytes = 950;
     disk.health = HealthCounters {
@@ -80,6 +81,15 @@ fn risk_report_combines_status_smart_and_capacity_signals() {
         latency_ms: 600.0,
         wear_percent: 95.0,
         temperature_c: 70.0,
+        smart_status_failed: true,
+        smart_evidence_score: 1.0,
+        smart_evidence_updated_at: now,
+        recent_reallocated_delta: 500,
+        recent_reallocated_delta_at: now,
+        recent_crc_delta: 600,
+        recent_crc_delta_at: now,
+        recent_io_error_delta: 50,
+        recent_io_error_delta_at: now,
         ..HealthCounters::default()
     };
 
@@ -90,10 +100,12 @@ fn risk_report_combines_status_smart_and_capacity_signals() {
     assert_eq!(report.available_bytes, 50);
     for reason in [
         "failed",
-        "reallocated-sectors",
+        "reallocated-sectors-increasing",
         "pending-sectors",
-        "crc-errors",
-        "io-errors",
+        "crc-errors-increasing",
+        "io-errors-increasing",
+        "recent-smart-change",
+        "smart-status-failed",
         "high-latency",
         "wear",
         "temperature",
@@ -188,7 +200,9 @@ fn smart_json_parser_handles_nvme_and_failed_health() {
     .unwrap();
     assert_eq!(health.temperature_c, 43.0);
     assert_eq!(health.wear_percent, 87.0);
-    assert_eq!(health.io_errors, 100);
+    assert_eq!(health.io_errors, 12);
+    assert!(health.smart_status_failed);
+    assert_eq!(health.smart_evidence_score, 0.0);
     assert_eq!(health.smart_device_type, "nvme");
     assert!(health
         .smart_fields_observed
@@ -197,6 +211,12 @@ fn smart_json_parser_handles_nvme_and_failed_health() {
         .smart_fields_missing
         .contains(&"crc_errors".to_string()));
     assert!(health.last_smart_refresh_at > 0.0);
+
+    let mut failed_disk = disk();
+    failed_disk.health = health;
+    let report = risk_report(&failed_disk, Path::new("/unused"));
+    assert_eq!(report.risk_score, 1.0);
+    assert!(report.predicted_failure);
 }
 
 #[test]
@@ -229,6 +249,162 @@ fn smart_json_parser_handles_ata_attributes_and_sparse_reports() {
     assert!(sparse.smart_fields_observed.is_empty());
     assert_eq!(sparse.smart_fields_missing.len(), 6);
     assert!(parse_smartctl_json(&disk, b"not-json").is_err());
+}
+
+#[test]
+fn smart_counter_history_is_baselined_and_only_growth_adds_evidence() {
+    let mut disk = disk();
+    let first = parse_smartctl_json(
+        &disk,
+        br#"{
+            "smart_status":{"passed":true},
+            "ata_smart_attributes":{"table":[
+                {"name":"Reallocated_Sector_Ct","raw":{"value":120}},
+                {"name":"Current_Pending_Sector","raw":{"value":0}},
+                {"name":"UDMA_CRC_Error_Count","raw":{"value":400}}
+            ]}
+        }"#,
+    )
+    .unwrap();
+    assert_eq!(first.smart_evidence_score, 0.0);
+    assert_eq!(first.recent_reallocated_delta, 0);
+    assert_eq!(first.recent_crc_delta, 0);
+
+    disk.health = first;
+    let stable = parse_smartctl_json(
+        &disk,
+        br#"{
+            "smart_status":{"passed":true},
+            "ata_smart_attributes":{"table":[
+                {"name":"Reallocated_Sector_Ct","raw":{"value":120}},
+                {"name":"Current_Pending_Sector","raw":{"value":0}},
+                {"name":"UDMA_CRC_Error_Count","raw":{"value":400}}
+            ]}
+        }"#,
+    )
+    .unwrap();
+    assert_eq!(stable.smart_evidence_score, 0.0);
+    disk.health = stable;
+    let report = risk_report(&disk, Path::new("/unused"));
+    assert!(!report.predicted_failure);
+    assert_eq!(report.risk_score, 0.0);
+    assert!(report
+        .reasons
+        .iter()
+        .any(|reason| reason == "reallocated-sectors-history"));
+    assert!(report
+        .reasons
+        .iter()
+        .any(|reason| reason == "crc-errors-history"));
+}
+
+#[test]
+fn current_pending_sectors_remain_actionable_without_cumulative_history() {
+    let mut previous = HealthCounters {
+        last_smart_refresh_at: now_f64() - 60.0,
+        smart_evidence_updated_at: now_f64() - 60.0,
+        ..HealthCounters::default()
+    };
+    let mut current = previous.clone();
+    current.pending_sectors = 8;
+    let now = now_f64();
+    update_smart_evidence(&previous, &mut current, now, true);
+    assert_eq!(current.smart_evidence_score, 0.0);
+
+    let mut disk = disk();
+    current.last_smart_refresh_at = now;
+    disk.health = current;
+    let report = risk_report(&disk, Path::new("/unused"));
+    assert!(report.predicted_failure);
+    assert!(report.risk_score < 0.65);
+
+    previous = disk.health.clone();
+    let mut recovered = previous.clone();
+    recovered.pending_sectors = 0;
+    update_smart_evidence(&previous, &mut recovered, now + 60.0, true);
+    assert_eq!(recovered.smart_evidence_score, 0.0);
+}
+
+#[test]
+fn cumulative_counter_growth_adds_decaying_evidence() {
+    let now = now_f64();
+    let previous = HealthCounters {
+        reallocated_sectors: 100,
+        crc_errors: 200,
+        io_errors: 10,
+        last_smart_refresh_at: now - 60.0,
+        smart_evidence_updated_at: now - 60.0,
+        ..HealthCounters::default()
+    };
+    let mut current = previous.clone();
+    current.reallocated_sectors = 500;
+    current.crc_errors = 700;
+    current.io_errors = 50;
+    update_smart_evidence(&previous, &mut current, now, true);
+
+    assert_eq!(current.recent_reallocated_delta, 400);
+    assert_eq!(current.recent_crc_delta, 500);
+    assert_eq!(current.recent_io_error_delta, 40);
+    assert!((current.smart_evidence_score - 0.62).abs() < 0.01);
+
+    let mut disk = disk();
+    current.last_smart_refresh_at = now;
+    disk.health = current;
+    assert!(risk_report(&disk, Path::new("/unused")).predicted_failure);
+}
+
+#[test]
+fn stale_recent_evidence_decays_in_risk_reports() {
+    let mut disk = disk();
+    let now = now_f64();
+    disk.health.io_errors = 40;
+    disk.health.recent_io_error_delta = 40;
+    disk.health.smart_evidence_score = 0.8;
+    disk.health.smart_evidence_updated_at = now - 48.0 * 60.0 * 60.0;
+    disk.health.recent_io_error_delta_at = disk.health.smart_evidence_updated_at;
+    disk.health.last_smart_refresh_at = disk.health.smart_evidence_updated_at;
+    let report = risk_report(&disk, Path::new("/unused"));
+    assert!((report.risk_score - 0.2).abs() < 0.02);
+    assert!(!report.predicted_failure);
+    assert!(report
+        .reasons
+        .iter()
+        .any(|reason| reason == "io-errors-history"));
+    assert!(!report
+        .reasons
+        .iter()
+        .any(|reason| reason == "io-errors-increasing"));
+}
+
+#[test]
+fn unrelated_smart_observation_does_not_refresh_old_io_spike() {
+    let now = now_f64();
+    let old = now - 48.0 * 60.0 * 60.0;
+    let previous = HealthCounters {
+        reallocated_sectors: 10,
+        io_errors: 40,
+        smart_evidence_score: 0.25,
+        smart_evidence_updated_at: old,
+        recent_io_error_delta: 40,
+        recent_io_error_delta_at: old,
+        ..HealthCounters::default()
+    };
+    let mut current = previous.clone();
+    current.reallocated_sectors = 11;
+    update_smart_evidence_for_observations(
+        &previous,
+        &mut current,
+        now,
+        false,
+        SmartCounterObservations {
+            reallocated_sectors: true,
+            ..SmartCounterObservations::default()
+        },
+    );
+
+    assert_eq!(current.recent_io_error_delta, 40);
+    assert_eq!(current.recent_io_error_delta_at, old);
+    assert!(!recent_io_error_spike(&current, now));
 }
 
 #[test]

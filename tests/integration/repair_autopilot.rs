@@ -164,6 +164,9 @@ fn autopilot_confirms_risk_before_draining_and_keeps_data_available() {
         DiskStatus::Online
     );
 
+    let health = fs.metadata_snapshot().disks["disk-0001"].health.clone();
+    fs.set_disk_health("disk-0001", health).unwrap();
+
     let second = fs.autopilot_once_with_config(autopilot).unwrap();
     assert!(second["actions"].as_array().unwrap().iter().any(|action| {
         action["action"] == "drain-predicted-failure" && action["disk_id"] == "disk-0001"

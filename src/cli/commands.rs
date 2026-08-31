@@ -485,6 +485,9 @@ pub(super) enum Command {
         wear_percent: Option<f64>,
         #[arg(long)]
         temperature_c: Option<f64>,
+        /// Override the SMART overall-health failure flag (true or false).
+        #[arg(long)]
+        smart_status_failed: Option<bool>,
     },
     #[command(about = "Show volume and disk health")]
     Health {
