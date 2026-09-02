@@ -258,7 +258,9 @@ jobs:
           find scripts -name '*.sh' -print0 | xargs -0 bash -n
 
       - name: Test QEMU helper synchronization
-        run: scripts/tests/host/qemu_helper_logic.sh
+        run: |
+          scripts/tests/host/qemu_helper_logic.sh
+          scripts/tests/host/qemu_phase1_retry_logic.sh
 
       - name: Run retained validation workflow
         run: python3 scripts/validation/run_full_validation.py --output "$RUNNER_TEMP/argosfs-validation"
