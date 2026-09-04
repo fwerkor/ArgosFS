@@ -14,6 +14,8 @@ log1="$artifacts/qemu-crash-recovery-phase1-$arch.log"
 log2="$artifacts/qemu-crash-recovery-phase2-$arch.log"
 commands1="$artifacts/qemu-crash-recovery-phase1.commands"
 commands2="$artifacts/qemu-crash-recovery-phase2.commands"
+feeder_status_file="$artifacts/crash-phase1-feeder.status"
+console_ready_file="$artifacts/crash-phase1-console-ready"
 reject="${ARGOSFS_QEMU_REJECT:-Kernel panic|Bad file descriptor|argosfs-initrd: emergency|Oops:|BUG:|segfault}"
 timeout_s="${ARGOSFS_QEMU_TIMEOUT:-1800}"
 console_timeout_s="${ARGOSFS_QEMU_CRASH_CONSOLE_TIMEOUT:-600}"
@@ -103,25 +105,40 @@ run_phase1_until_kill_marker() {
   qemu_args+=(-monitor "unix:$monitor,server,nowait")
   : >"$monitor_log"
   : >"$log1"
-  feeder_status_file="$artifacts/crash-phase1-feeder.status"
-  rm -f "$feeder_status_file"
+  rm -f "$feeder_status_file" "$console_ready_file"
+  local restore_errexit=0
+  case $- in
+    *e*) restore_errexit=1 ;;
+  esac
   set +e
   # QEMU output is intentionally polled while this pipeline appends to the log.
   # shellcheck disable=SC2094
   {
     (
-      set -e
-      argosfs_qemu_wait_console_prompt "$log1" 1 "$console_timeout_s" "$reject" "crash-recovery phase1 console prompt"
-      argosfs_qemu_stream_script "$commands1" 1 /tmp/argosfs-qemu-crash-phase1.sh "$log1"
-      argosfs_qemu_wait_log_marker "$log1" ARGOSFS_WAIT_CRASH_HOTPLUG 300
-      argosfs_qemu_wait_monitor "$monitor" 60
-      idx=0
-      for disk in "${disks[@]}"; do
-        qemu_device_add "$idx" "$disk"
-        idx=$((idx + 1))
-      done
-      echo 0 >"$feeder_status_file"
-    ) || echo "$?" >"$feeder_status_file"
+      feeder_status=0
+      argosfs_qemu_wait_console_prompt "$log1" 1 "$console_timeout_s" "$reject" "crash-recovery phase1 console prompt" || feeder_status=$?
+      if [ "$feeder_status" -eq 0 ]; then
+        : >"$console_ready_file"
+        argosfs_qemu_stream_script "$commands1" 1 /tmp/argosfs-qemu-crash-phase1.sh "$log1" || feeder_status=$?
+      fi
+      if [ "$feeder_status" -eq 0 ]; then
+        argosfs_qemu_wait_log_marker "$log1" ARGOSFS_WAIT_CRASH_HOTPLUG 300 || feeder_status=$?
+      fi
+      if [ "$feeder_status" -eq 0 ]; then
+        argosfs_qemu_wait_monitor "$monitor" 60 || feeder_status=$?
+      fi
+      if [ "$feeder_status" -eq 0 ]; then
+        idx=0
+        for disk in "${disks[@]}"; do
+          if ! qemu_device_add "$idx" "$disk"; then
+            feeder_status=1
+            break
+          fi
+          idx=$((idx + 1))
+        done
+      fi
+      printf '%s\n' "$feeder_status" >"$feeder_status_file"
+    )
   } | timeout --kill-after="${ARGOSFS_QEMU_KILL_AFTER:-10}" "$timeout_s" "$qemu_bin" "${qemu_args[@]}" >"$log1" 2>&1 &
   qemu_pid=$!
   deadline=$((SECONDS + timeout_s))
@@ -138,7 +155,9 @@ run_phase1_until_kill_marker() {
   fi
   wait "$qemu_pid" >/dev/null 2>&1 || true
   argosfs_qemu_wait_process_gone "$qemu_pid" 30 || true
-  set -e
+  if [ "$restore_errexit" -eq 1 ]; then
+    set -e
+  fi
   return "$wait_status"
 }
 
@@ -155,11 +174,41 @@ run_phase2() {
   return "$ARGOSFS_QEMU_STATUS"
 }
 
-if ! run_phase1_until_kill_marker; then
-  echo "QEMU crash recovery phase1 failed before host kill" >&2
-  tail -n 500 "$log1" >&2 || true
-  exit 1
+# Retry only the pre-script arm64 phase1 console startup. Retrying after the
+# guest workload begins could hide a real storage failure or repeat mutations.
+phase1_attempts=1
+if [ "$arch" = "arm64" ]; then
+  phase1_attempts="${ARGOSFS_QEMU_PHASE1_CONSOLE_ATTEMPTS:-2}"
 fi
+case "$phase1_attempts" in
+  ''|*[!0-9]*|0)
+    echo "ARGOSFS_QEMU_PHASE1_CONSOLE_ATTEMPTS must be a positive integer" >&2
+    exit 2
+    ;;
+esac
+
+phase1_attempt=1
+while true; do
+  set +e
+  run_phase1_until_kill_marker
+  phase1_status=$?
+  set -e
+  if [ "$phase1_status" -eq 0 ]; then
+    break
+  fi
+
+  feeder_status=""
+  [ -s "$feeder_status_file" ] && feeder_status="$(cat "$feeder_status_file")"
+  if [ "$phase1_attempt" -ge "$phase1_attempts" ] || [ -e "$console_ready_file" ] || [ "$feeder_status" != "1" ]; then
+    echo "QEMU crash recovery phase1 failed before host kill" >&2
+    tail -n 500 "$log1" >&2 || true
+    exit 1
+  fi
+
+  cp "$log1" "${log1%.log}-console-attempt-$phase1_attempt.log"
+  echo "QEMU crash recovery arm64 console did not become ready; retrying phase1 ($phase1_attempt/$phase1_attempts)" >&2
+  phase1_attempt=$((phase1_attempt + 1))
+done
 if ! argosfs_qemu_log_has_marker "$log1" ARGOSFS_RAW_CRASH_INJECTED_OK || ! argosfs_qemu_log_has_marker "$log1" ARGOSFS_RAW_JOURNAL_REPLAY_OK; then
   echo "QEMU crash recovery phase1 missed raw journal markers" >&2
   tail -n 500 "$log1" >&2 || true

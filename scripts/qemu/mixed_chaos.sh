@@ -14,6 +14,8 @@ log1="$artifacts/qemu-mixed-chaos-phase1-$arch.log"
 log2="$artifacts/qemu-mixed-chaos-phase2-$arch.log"
 commands1="$artifacts/qemu-mixed-chaos-phase1.commands"
 commands2="$artifacts/qemu-mixed-chaos-phase2.commands"
+feeder_status_file="$artifacts/mixed-phase1-feeder.status"
+console_ready_file="$artifacts/mixed-phase1-console-ready"
 reject="${ARGOSFS_QEMU_REJECT:-Kernel panic|Bad file descriptor|argosfs-initrd: emergency|Oops:|BUG:|segfault}"
 timeout_s="${ARGOSFS_QEMU_TIMEOUT:-3000}"
 console_timeout_s="${ARGOSFS_QEMU_CHAOS_CONSOLE_TIMEOUT:-600}"
@@ -197,25 +199,40 @@ run_phase1_until_kill_marker() {
   qemu_args+=(-monitor "unix:$monitor,server,nowait")
   : >"$monitor_log"
   : >"$log1"
-  feeder_status_file="$artifacts/mixed-phase1-feeder.status"
-  rm -f "$feeder_status_file"
+  rm -f "$feeder_status_file" "$console_ready_file"
+  local restore_errexit=0
+  case $- in
+    *e*) restore_errexit=1 ;;
+  esac
   set +e
   # QEMU output is intentionally polled while this pipeline appends to the log.
   # shellcheck disable=SC2094
   {
     (
-      set -e
-      argosfs_qemu_wait_console_prompt "$log1" 1 "$console_timeout_s" "$reject" "mixed-chaos phase1 console prompt"
-      argosfs_qemu_stream_script "$commands1" 1 /tmp/argosfs-qemu-mixed-phase1.sh "$log1"
-      argosfs_qemu_wait_log_marker "$log1" ARGOSFS_WAIT_CHAOS_HOTPLUG 300
-      argosfs_qemu_wait_monitor "$monitor" 60
-      idx=0
-      for disk in "${disks[@]}"; do
-        qemu_device_add chaos "$idx" "$disk"
-        idx=$((idx + 1))
-      done
-      echo 0 >"$feeder_status_file"
-    ) || echo "$?" >"$feeder_status_file"
+      feeder_status=0
+      argosfs_qemu_wait_console_prompt "$log1" 1 "$console_timeout_s" "$reject" "mixed-chaos phase1 console prompt" || feeder_status=$?
+      if [ "$feeder_status" -eq 0 ]; then
+        : >"$console_ready_file"
+        argosfs_qemu_stream_script "$commands1" 1 /tmp/argosfs-qemu-mixed-phase1.sh "$log1" || feeder_status=$?
+      fi
+      if [ "$feeder_status" -eq 0 ]; then
+        argosfs_qemu_wait_log_marker "$log1" ARGOSFS_WAIT_CHAOS_HOTPLUG 300 || feeder_status=$?
+      fi
+      if [ "$feeder_status" -eq 0 ]; then
+        argosfs_qemu_wait_monitor "$monitor" 60 || feeder_status=$?
+      fi
+      if [ "$feeder_status" -eq 0 ]; then
+        idx=0
+        for disk in "${disks[@]}"; do
+          if ! qemu_device_add chaos "$idx" "$disk"; then
+            feeder_status=1
+            break
+          fi
+          idx=$((idx + 1))
+        done
+      fi
+      printf '%s\n' "$feeder_status" >"$feeder_status_file"
+    )
   } | timeout --kill-after="${ARGOSFS_QEMU_KILL_AFTER:-10}" "$timeout_s" "$qemu_bin" "${qemu_args[@]}" >"$log1" 2>&1 &
   qemu_pid=$!
   deadline=$((SECONDS + timeout_s))
@@ -235,7 +252,9 @@ run_phase1_until_kill_marker() {
   if kill -0 "$qemu_pid" 2>/dev/null; then argosfs_qemu_kill_tree "$qemu_pid"; fi
   wait "$qemu_pid" >/dev/null 2>&1 || true
   argosfs_qemu_wait_process_gone "$qemu_pid" 30 || true
-  set -e
+  if [ "$restore_errexit" -eq 1 ]; then
+    set -e
+  fi
   return "$result"
 }
 
@@ -263,11 +282,41 @@ run_phase2() {
   return "$ARGOSFS_QEMU_STATUS"
 }
 
-if ! run_phase1_until_kill_marker; then
-  echo "QEMU mixed chaos phase1 failed before hard kill" >&2
-  tail -n 600 "$log1" >&2 || true
-  exit 1
+# Retry only the pre-script arm64 phase1 console startup. Retrying after the
+# guest workload begins could hide a real storage failure or repeat mutations.
+phase1_attempts=1
+if [ "$arch" = "arm64" ]; then
+  phase1_attempts="${ARGOSFS_QEMU_PHASE1_CONSOLE_ATTEMPTS:-2}"
 fi
+case "$phase1_attempts" in
+  ''|*[!0-9]*|0)
+    echo "ARGOSFS_QEMU_PHASE1_CONSOLE_ATTEMPTS must be a positive integer" >&2
+    exit 2
+    ;;
+esac
+
+phase1_attempt=1
+while true; do
+  set +e
+  run_phase1_until_kill_marker
+  phase1_status=$?
+  set -e
+  if [ "$phase1_status" -eq 0 ]; then
+    break
+  fi
+
+  feeder_status=""
+  [ -s "$feeder_status_file" ] && feeder_status="$(cat "$feeder_status_file")"
+  if [ "$phase1_attempt" -ge "$phase1_attempts" ] || [ -e "$console_ready_file" ] || [ "$feeder_status" != "1" ]; then
+    echo "QEMU mixed chaos phase1 failed before hard kill" >&2
+    tail -n 600 "$log1" >&2 || true
+    exit 1
+  fi
+
+  cp "$log1" "${log1%.log}-console-attempt-$phase1_attempt.log"
+  echo "QEMU mixed chaos arm64 console did not become ready; retrying phase1 ($phase1_attempt/$phase1_attempts)" >&2
+  phase1_attempt=$((phase1_attempt + 1))
+done
 for marker in ARGOSFS_CHAOS_BASELINE_OK ARGOSFS_CHAOS_WORKLOAD_STARTED ARGOSFS_CHAOS_DEVICE_LOSS_OBSERVED ARGOSFS_CHAOS_DEGRADED_READ_OK ARGOSFS_CHAOS_WORKLOAD_STOPPED ARGOSFS_CHAOS_REPLACEMENT_REPAIR_OK ARGOSFS_CHAOS_READY_FOR_HARD_KILL; do
   if ! argosfs_qemu_log_has_marker "$log1" "$marker"; then
     echo "QEMU mixed chaos phase1 missed marker: $marker" >&2
