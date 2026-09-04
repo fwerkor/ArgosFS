@@ -16,6 +16,17 @@ cat >/dev/null
 QEMU
 chmod +x "$tmp/qemu-no-console"
 
+cat >"$tmp/qemu-img" <<'QEMU_IMG'
+#!/usr/bin/env bash
+set -euo pipefail
+[ "$#" -eq 5 ]
+[ "$1" = create ]
+[ "$2" = -f ]
+[ "$3" = raw ]
+: >"$4"
+QEMU_IMG
+chmod +x "$tmp/qemu-img"
+
 run_no_console_case() {
   local script="$1"
   local name="${script%.sh}"
@@ -26,7 +37,8 @@ run_no_console_case() {
   mkdir -p "$artifacts"
   start=$SECONDS
   set +e
-  ARGOSFS_QEMU_ARCH=arm64 \
+  PATH="$tmp:$PATH" \
+    ARGOSFS_QEMU_ARCH=arm64 \
     ARGOSFS_QEMU_BIN="$tmp/qemu-no-console" \
     ARGOSFS_QEMU_KERNEL="$kernel" \
     ARGOSFS_QEMU_ROOTFS="$rootfs" \
@@ -77,7 +89,8 @@ run_retry_boundary_case() {
 
   mkdir -p "$artifacts"
   set +e
-  FAKE_QEMU_COUNT="$count_file" \
+  PATH="$tmp:$PATH" \
+    FAKE_QEMU_COUNT="$count_file" \
     ARGOSFS_QEMU_ARCH=arm64 \
     ARGOSFS_QEMU_BIN="$tmp/qemu-second-console" \
     ARGOSFS_QEMU_KERNEL="$kernel" \
