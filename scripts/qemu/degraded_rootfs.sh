@@ -91,7 +91,7 @@ qemu_device_add() {
 # shellcheck disable=SC2317 # Invoked indirectly by argosfs_qemu_run_with_feeder.
 qemu_feeder() {
   set -e
-  argosfs_qemu_wait_console_prompt "$log" 1 "$console_timeout_s" "$reject" "degraded-rootfs console prompt"
+  argosfs_qemu_wait_console_ready "$log" 1 "$console_timeout_s" "$reject" "degraded-rootfs console prompt" 1
   argosfs_qemu_stream_script "$commands" 1 /tmp/argosfs-qemu-degraded-rootfs.sh "$log"
   argosfs_qemu_wait_log_marker "$log" ARGOSFS_WAIT_DEGRADED_HOTPLUG 300
   argosfs_qemu_wait_monitor "$monitor" 60
