@@ -99,7 +99,7 @@ argosfs_qemu_build_args
 # shellcheck disable=SC2317 # Invoked indirectly by argosfs_qemu_run_with_feeder.
 qemu_feeder() {
 	set -e
-	argosfs_qemu_wait_console_prompt "$log" 1 "$console_timeout_s" "$reject" "full-guest console prompt"
+	argosfs_qemu_wait_console_ready "$log" 1 "$console_timeout_s" "$reject" "full-guest console prompt" 1
 	argosfs_qemu_stream_script "$commands" 1 /tmp/argosfs-qemu-full-guest.sh "$log"
 }
 

@@ -210,7 +210,7 @@ run_phase1_until_kill_marker() {
   {
     (
       feeder_status=0
-      argosfs_qemu_wait_console_prompt "$log1" 1 "$console_timeout_s" "$reject" "mixed-chaos phase1 console prompt" || feeder_status=$?
+      argosfs_qemu_wait_console_ready "$log1" 1 "$console_timeout_s" "$reject" "mixed-chaos phase1 console prompt" 1 || feeder_status=$?
       if [ "$feeder_status" -eq 0 ]; then
         : >"$console_ready_file"
         argosfs_qemu_stream_script "$commands1" 1 /tmp/argosfs-qemu-mixed-phase1.sh "$log1" || feeder_status=$?
@@ -267,7 +267,7 @@ run_phase2() {
   # shellcheck disable=SC2317 # Invoked indirectly by argosfs_qemu_run_with_feeder.
   mixed_phase2_feeder() {
     set -e
-    argosfs_qemu_wait_console_prompt "$log2" 1 "$console_timeout_s" "$reject" "mixed-chaos phase2 console prompt"
+    argosfs_qemu_wait_console_ready "$log2" 1 "$console_timeout_s" "$reject" "mixed-chaos phase2 console prompt" 1
     argosfs_qemu_stream_script "$commands2" 1 /tmp/argosfs-qemu-mixed-phase2.sh "$log2"
     argosfs_qemu_wait_log_marker "$log2" ARGOSFS_WAIT_CHAOS_REATTACH 300
     argosfs_qemu_wait_monitor "$monitor" 60

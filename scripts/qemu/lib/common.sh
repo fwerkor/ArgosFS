@@ -310,23 +310,42 @@ argosfs_qemu_stream_script() {
 	printf "if command -v stty >/dev/null 2>&1; then stty echo; fi; sh '%s'; status=\$?; echo ARGOSFS_QEMU_SCRIPT_EXIT_%s status=\$status; if [ \"\$status\" -ne 0 ]; then poweroff -f || reboot -f || halt -f; fi\r" \
 		"$remote" "$marker_id" >&"$fd"
 }
-argosfs_qemu_wait_console_prompt() {
+argosfs_qemu_wait_console_ready() {
 	local log="$1"
 	local min_count="${2:-1}"
 	local timeout_s="${3:-120}"
 	local reject="${4:-}"
-	local label="${5:-QEMU console prompt}"
+	local label="${5:-QEMU console}"
+	local fd="${6:-}"
 	local deadline=$((SECONDS + timeout_s))
-	local count
+	local wake_interval="${ARGOSFS_QEMU_CONSOLE_WAKE_INTERVAL:-5}"
+	local next_wake="$SECONDS"
+	local prompt_count login_count shell_count ready_count
 
 	while [ "$SECONDS" -lt "$deadline" ]; do
 		if [ -n "$reject" ] && grep -Eiq "$reject" "$log" 2>/dev/null; then
 			echo "QEMU rejected while waiting for $label: $reject" >&2
 			return 2
 		fi
-		count="$(grep -Fc 'Please press Enter to activate this console.' "$log" 2>/dev/null || true)"
-		if [ "$count" -ge "$min_count" ]; then
+		prompt_count="$(grep -Fc 'Please press Enter to activate this console.' "$log" 2>/dev/null || true)"
+		login_count="$(grep -Ec "root login on 'tty[^']+'" "$log" 2>/dev/null || true)"
+		shell_count="$(grep -Fc 'built-in shell (ash)' "$log" 2>/dev/null || true)"
+		ready_count="$prompt_count"
+		[ "$login_count" -le "$ready_count" ] || ready_count="$login_count"
+		[ "$shell_count" -le "$ready_count" ] || ready_count="$shell_count"
+		if [ "$ready_count" -ge "$min_count" ]; then
 			return 0
+		fi
+
+		# OpenWrt normally prints an activation prompt once procd starts the
+		# console getty. Under arm64 TCG that prompt can be lost even though the
+		# guest is otherwise healthy. Nudge the serial line after userspace has
+		# reached procd init; the subsequent shell-marker handshake remains the
+		# authoritative proof that commands can actually execute.
+		if [ "${arch:-}" = "arm64" ] && [ -n "$fd" ] && [ "$SECONDS" -ge "$next_wake" ] && \
+			grep -Fq 'procd: - init -' "$log" 2>/dev/null; then
+			printf '\r' >&"$fd"
+			next_wake=$((SECONDS + wake_interval))
 		fi
 		sleep 1
 	done

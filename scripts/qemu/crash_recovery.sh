@@ -116,7 +116,7 @@ run_phase1_until_kill_marker() {
   {
     (
       feeder_status=0
-      argosfs_qemu_wait_console_prompt "$log1" 1 "$console_timeout_s" "$reject" "crash-recovery phase1 console prompt" || feeder_status=$?
+      argosfs_qemu_wait_console_ready "$log1" 1 "$console_timeout_s" "$reject" "crash-recovery phase1 console prompt" 1 || feeder_status=$?
       if [ "$feeder_status" -eq 0 ]; then
         : >"$console_ready_file"
         argosfs_qemu_stream_script "$commands1" 1 /tmp/argosfs-qemu-crash-phase1.sh "$log1" || feeder_status=$?
@@ -166,7 +166,7 @@ run_phase2() {
   # shellcheck disable=SC2317 # Invoked indirectly by argosfs_qemu_run_with_feeder.
   crash_phase2_feeder() {
     set -e
-    argosfs_qemu_wait_console_prompt "$log2" 1 "$console_timeout_s" "$reject" "crash-recovery phase2 console prompt"
+    argosfs_qemu_wait_console_ready "$log2" 1 "$console_timeout_s" "$reject" "crash-recovery phase2 console prompt" 1
     argosfs_qemu_stream_script "$commands2" 1 /tmp/argosfs-qemu-crash-phase2.sh "$log2"
   }
   argosfs_qemu_run_with_feeder "$log2" "$timeout_s" crash_phase2_feeder "$qemu_bin" "${qemu_args[@]}"

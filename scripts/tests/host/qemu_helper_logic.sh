@@ -78,4 +78,26 @@ if [ "$elapsed" -ge 5 ]; then
 	exit 1
 fi
 
+console_log="$tmp/qemu-console.log"
+console_input="$tmp/qemu-console.input"
+printf '%s\n' '[   72.391219] procd: - init -' >"$console_log"
+exec 9>"$console_input"
+(
+	sleep 2
+	printf '%s\n' "login[1322]: root login on 'ttyAMA0'" >>"$console_log"
+) &
+console_writer_pid=$!
+arch=arm64 ARGOSFS_QEMU_CONSOLE_WAKE_INTERVAL=1 \
+	argosfs_qemu_wait_console_ready "$console_log" 1 5 "" "arm64 console readiness" 9
+wait "$console_writer_pid"
+exec 9>&-
+if [ ! -s "$console_input" ]; then
+	echo "QEMU console readiness helper did not nudge arm64 serial input" >&2
+	exit 1
+fi
+
+prompt_log="$tmp/qemu-console-prompt.log"
+printf '%s\n' 'Please press Enter to activate this console.' >"$prompt_log"
+argosfs_qemu_wait_console_ready "$prompt_log" 1 2 "" "prompt readiness"
+
 printf 'QEMU helper marker tests passed\n'
