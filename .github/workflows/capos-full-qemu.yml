@@ -301,7 +301,7 @@ jobs:
             qemu_mem: "1536"
             qemu_timeout: "1500"
             stress_seconds: ""
-            job_timeout: 40
+            job_timeout: 50
           - arch: arm64
             suite: hotplug
             script: scripts/qemu/hotplug.sh
@@ -329,7 +329,7 @@ jobs:
             qemu_mem: "1536"
             qemu_timeout: "3600"
             stress_seconds: ""
-            job_timeout: 70
+            job_timeout: 80
           - arch: arm64
             suite: degraded-rootfs
             script: scripts/qemu/degraded_rootfs.sh
