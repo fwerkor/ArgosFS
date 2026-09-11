@@ -16,6 +16,7 @@ reject="${ARGOSFS_QEMU_REJECT:-Kernel panic|Bad file descriptor|argosfs-initrd: 
 timeout_s="${ARGOSFS_QEMU_TIMEOUT:-360}"
 console_timeout_s="${ARGOSFS_QEMU_FULL_CONSOLE_TIMEOUT:-600}"
 done_marker="ARGOSFS_QEMU_FULL_GUEST_DONE"
+console_ready_file="$artifacts/full-guest-console-ready"
 
 cat >"$commands" <<'CMDS'
 set -eu
@@ -100,12 +101,38 @@ argosfs_qemu_build_args
 qemu_feeder() {
 	set -e
 	argosfs_qemu_wait_console_ready "$log" 1 "$console_timeout_s" "$reject" "full-guest console prompt" 1
+	: >"$console_ready_file"
 	argosfs_qemu_stream_script "$commands" 1 /tmp/argosfs-qemu-full-guest.sh "$log"
 }
 
-argosfs_qemu_run_with_feeder "$log" "$timeout_s" qemu_feeder "$qemu_bin" "${qemu_args[@]}"
-feeder_status="$ARGOSFS_QEMU_FEEDER_STATUS"
-status="$ARGOSFS_QEMU_STATUS"
+# Retry only the arm64 console startup. Once the console is ready, later
+# feeder failures can reflect the guest workload and must remain fatal.
+console_attempts=1
+if [ "$arch" = "arm64" ]; then
+	console_attempts="${ARGOSFS_QEMU_PRE_SCRIPT_CONSOLE_ATTEMPTS:-2}"
+fi
+case "$console_attempts" in
+	''|*[!0-9]*|0)
+		echo "ARGOSFS_QEMU_PRE_SCRIPT_CONSOLE_ATTEMPTS must be a positive integer" >&2
+		exit 2
+		;;
+esac
+
+attempt=1
+while true; do
+	rm -f "$console_ready_file"
+	argosfs_qemu_run_with_feeder "$log" "$timeout_s" qemu_feeder "$qemu_bin" "${qemu_args[@]}"
+	feeder_status="$ARGOSFS_QEMU_FEEDER_STATUS"
+	status="$ARGOSFS_QEMU_STATUS"
+	if [ "$feeder_status" -eq 0 ] || [ "$attempt" -ge "$console_attempts" ] || \
+		[ -e "$console_ready_file" ] || [ "$feeder_status" -ne 1 ]; then
+		break
+	fi
+
+	cp "$log" "${log%.log}-console-attempt-$attempt.log"
+	echo "QEMU full guest arm64 console did not become ready; retrying pre-script startup ($attempt/$console_attempts)" >&2
+	attempt=$((attempt + 1))
+done
 
 if [ "$feeder_status" -ne 0 ]; then
 	echo "QEMU full guest feeder failed; status=$feeder_status" >&2

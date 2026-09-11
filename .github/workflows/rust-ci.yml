@@ -261,6 +261,7 @@ jobs:
         run: |
           scripts/tests/host/qemu_helper_logic.sh
           scripts/tests/host/qemu_phase1_retry_logic.sh
+          scripts/tests/host/qemu_pre_script_retry_logic.sh
 
       - name: Run retained validation workflow
         run: python3 scripts/validation/run_full_validation.py --output "$RUNNER_TEMP/argosfs-validation"
