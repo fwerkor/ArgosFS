@@ -217,7 +217,17 @@ pub(super) enum Command {
         /// Codec-specific compression level.
         #[arg(long, default_value_t = 3)]
         compression_level: i32,
-        /// Batch journal flushes; intended for block-backed group commit.
+        /// Use per-transaction data and journal durability instead of the block-backend default bounded group commit.
+        #[arg(
+            long,
+            conflicts_with_all = [
+                "defer_journal_flush",
+                "defer_metadata_commit",
+                "defer_data_flush"
+            ]
+        )]
+        strict_durability: bool,
+        /// Batch journal flushes. Retained for explicit/legacy policy selection.
         #[arg(long)]
         defer_journal_flush: bool,
         /// Enable bounded metadata group commit on loop/raw pools.

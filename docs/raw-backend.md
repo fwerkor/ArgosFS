@@ -56,9 +56,8 @@ when checkpoint copies are stale. Rw open marks member superblocks dirty. A
 clean unmount writes fresh metadata checkpoint copies before marking the member
 superblocks clean.
 
-By default, data and journal writes are flushed at each metadata transaction.
-Volumes created with `--defer-metadata-commit` instead use bounded group commit:
-ordinary updates are accumulated in memory and persisted as one journal
+New loop/raw volumes created by the CLI use bounded group commit by default.
+Ordinary buffered updates are accumulated in memory and persisted as one journal
 transaction after either of these limits is reached:
 
 - `--deferred-commit-interval-ms` (default `5000` milliseconds); or
@@ -70,20 +69,20 @@ filesystem is also bounded by the transaction limit. `fsync`, `fdatasync`,
 `O_SYNC`, `O_DSYNC`, explicit `ArgosFs::sync()`, and clean unmount bypass the
 timer and synchronously commit the current group.
 
-`--defer-journal-flush` avoids a separate device flush for every journal append.
-With group commit, the complete group is appended and then flushed once across
-the active members. `--defer-data-flush` is accepted only together with
-`--defer-metadata-commit`; it batches shard flushes but still enforces the
-ordering barrier that all referenced data becomes durable before the group
-journal record is committed.
+The default policy batches journal and data flushes together with metadata group
+commit. `--defer-journal-flush`, `--defer-metadata-commit`, and
+`--defer-data-flush` remain available for explicit legacy policy selection. Use
+`--strict-durability` when per-transaction data and journal durability is
+required. Existing volumes keep the policy stored in their metadata; opening an
+older volume does not silently change its durability behavior.
 
 Raw extents replaced or deleted inside an uncommitted group remain reserved.
 ArgosFS releases them only at the same durability boundary that commits the new
 metadata, preventing a later write from overwriting data still referenced by
 the last durable checkpoint. A crash can therefore lose at most the configured
 group window, while recovery continues to use checksum-valid, quorum-supported
-metadata and journal records. The strict default remains per-transaction data
-and journal durability for volumes that do not opt into deferred commit.
+metadata and journal records. Strict mode remains available as an explicit
+compatibility and diagnostic mode.
 
 ## Data Extents
 

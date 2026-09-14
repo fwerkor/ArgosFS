@@ -53,6 +53,25 @@ struct Cli {
     command: Command,
 }
 
+fn mkfs_commit_policy(
+    backend: BackendKind,
+    strict_durability: bool,
+    defer_journal_flush: bool,
+    defer_metadata_commit: bool,
+    defer_data_flush: bool,
+) -> (bool, bool, bool) {
+    if strict_durability {
+        return (false, false, false);
+    }
+    if defer_journal_flush || defer_metadata_commit || defer_data_flush {
+        return (defer_journal_flush, defer_metadata_commit, defer_data_flush);
+    }
+    match backend {
+        BackendKind::LoopBlock | BackendKind::RawBlock => (true, true, true),
+        BackendKind::Host => (false, false, false),
+    }
+}
+
 pub fn run() -> Result<()> {
     let Cli { command, json } = Cli::parse();
     match command {
@@ -67,6 +86,7 @@ pub fn run() -> Result<()> {
             chunk_size,
             compression,
             compression_level,
+            strict_durability,
             defer_journal_flush,
             defer_metadata_commit,
             defer_data_flush,
@@ -76,6 +96,13 @@ pub fn run() -> Result<()> {
         } => {
             let storage = storage.resolve(BackendKind::Host)?;
             validate_root_backend(root.as_deref(), storage.backend)?;
+            let (defer_journal_flush, defer_metadata_commit, defer_data_flush) = mkfs_commit_policy(
+                storage.backend,
+                strict_durability,
+                defer_journal_flush,
+                defer_metadata_commit,
+                defer_data_flush,
+            );
             let config = VolumeConfig {
                 k,
                 m,
