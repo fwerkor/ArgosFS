@@ -1,24 +1,217 @@
 <!doctype html>
 <html lang="en">
   <head>
-    <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Research | ArgosFS</title>
-    <meta name="description" content="ArgosFS research agenda, safety-constrained self-driving storage model, experiment families, and artifact evaluation workflow.">
-    <link rel="icon" href="favicon.svg" type="image/svg+xml"><link rel="stylesheet" href="styles.css">
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f5f4ef" />
+    <title>Research — ArgosFS</title>
+    <meta
+      name="description"
+      content="Explore ArgosFS experiment families and reproduce storage recovery, placement, and autopilot runs with raw records and manifests."
+    />
+    <meta property="og:title" content="Research — ArgosFS" />
+    <meta
+      property="og:description"
+      content="Explore ArgosFS experiment families and reproduce storage recovery, placement, and autopilot runs with raw records and manifests."
+    />
+    <meta property="og:type" content="website" />
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="styles.css" />
+    <script src="app.js" defer></script>
   </head>
   <body data-page="research">
-    <header class="site-header"><a class="brand" href="index.html"><span class="brand-mark"></span><span>ArgosFS</span></a><button class="nav-toggle" type="button" aria-label="Open navigation" aria-expanded="false">Menu</button><nav class="site-nav" aria-label="Primary navigation"><a href="index.html" data-nav="home">Home</a><a href="technology.html" data-nav="technology">Technology</a><a href="research.html" data-nav="research">Research</a><a href="compatibility.html" data-nav="compatibility">Compatibility</a><a href="start.html" data-nav="start">Start</a><a class="github-link" href="https://github.com/fwerkor/argosfs">GitHub</a></nav></header>
-    <main>
-      <section class="page-hero research-hero"><canvas class="mesh-canvas" data-scene="page" aria-hidden="true"></canvas><div><p class="eyebrow">Research agenda</p><h1>Safety-constrained self-driving storage.</h1><p>ArgosFS treats storage autonomy as a measurable control problem: observations, plans, rejected actions, mutations, and verification results all become inspectable data.</p></div></section>
-      <section class="section timeline"><div class="timeline-item"><span>Observe</span><p>Collect SMART fields, parser coverage, latency EWMAs, capacity provenance, boot-critical classification, workload heat, and stale-measurement markers.</p></div><div class="timeline-item"><span>Diagnose</span><p>Use risk memory and repeated evidence to distinguish unhealthy disks from missing or stale telemetry, avoiding one-sample overreaction.</p></div><div class="timeline-item"><span>Plan</span><p>Emit dry-run records containing the selected action, rejected alternatives, safety checks, expected utility, cooldowns, and capacity constraints.</p></div><div class="timeline-item"><span>Verify</span><p>Finish mutations with journal validation, fsck checks, shard verification, and adaptive mode downgrade when a post-action invariant fails.</p></div></section>
-      <section class="section detail-split"><div><p class="eyebrow">Research questions</p><h2>What ArgosFS is trying to make testable.</h2><p>The project targets the gap between static local filesystems and policy-rich distributed storage: a single-machine root filesystem can still make autonomous placement and repair decisions, but only under strict boot and recovery constraints.</p></div><div class="detail-grid"><div class="detail-panel"><span>RQ1</span><h3>Can local storage become policy-driven?</h3><p>Evaluate whether capacity, health, tier, and workload signals can guide placement without hiding the decision process.</p></div><div class="detail-panel"><span>RQ2</span><h3>Can automation remain safe for rootfs?</h3><p>Study whether the controller can improve layout while preserving mountability, repairability, and emergency-mode behavior.</p></div><div class="detail-panel"><span>RQ3</span><h3>Can experiments be reproducible?</h3><p>Emit raw JSONL/CSV, manifests, command logs, and summaries so each figure or table can be regenerated from artifacts.</p></div><div class="detail-panel"><span>RQ4</span><h3>Can heterogeneous disks be first-class?</h3><p>Test SSD/HDD mixes, uneven capacities, tier changes, disk drain, add-disk, and degraded operation rather than assuming uniform devices.</p></div></div></section>
-      <section class="section split-feature"><div><p class="eyebrow">Artifact evaluation</p><h2>One command to produce reviewable artifacts.</h2><p>The experiment framework writes raw event streams, processed summaries, compatibility records, manifests, and command logs. The goal is to make review less dependent on screenshots or undocumented manual runs.</p></div><pre><code>scripts/experiments/run_all.sh --quick --output target/argosfs-artifacts/runs/ae-quick
-python3 scripts/experiments/summarize_results.py \
-  target/argosfs-artifacts/runs/ae-quick/raw \
-  target/argosfs-artifacts/runs/ae-quick</code></pre></section>
-      <section class="section dark-band"><div class="section-heading compact-heading"><p class="eyebrow">Experiment families</p><h2>From smoke tests to paper figures.</h2><p>ArgosFS separates correctness-oriented tests from research-oriented measurements so quick CI checks and artifact evaluation can share infrastructure without pretending they have the same cost.</p></div><div class="feature-grid feature-grid-4"><article><span>Recovery</span><h3>Failure matrix</h3><p>Clean writes, interrupted metadata commits, degraded reads, shard reconstruction, rename recovery, and orphan cleanup are exercised as explicit scenarios.</p></article><article><span>Placement</span><h3>Workload shifts</h3><p>Hot/cold phase changes measure whether placement converges and how much background interference the controller introduces.</p></article><article><span>Boot</span><h3>QEMU rootfs matrix</h3><p>Root filesystem boot, degraded boot, interrupted boot, and emergency-mode outcomes are recorded as first-class research artifacts.</p></article><article><span>Baseline</span><h3>Manual and autopilot modes</h3><p>ArgosFS manual policy, autopilot policy, and documented comparisons against familiar Linux storage stacks can be evaluated side by side.</p></article><article><span>Metadata</span><h3>Scalability probes</h3><p>Metadata size, journal behavior, snapshot costs, and import/export performance are tracked under growing file and directory populations.</p></article><article><span>Compatibility</span><h3>POSIX-facing suites</h3><p>Mounted smoke tests, pjdfstest-oriented checks, and skipped-record handling give compatibility results that are reproducible even when external suites are absent.</p></article><article><span>Health</span><h3>Telemetry robustness</h3><p>SMART parsing, stale refreshes, missing fields, latency signals, and risk memory can be studied separately from the data-path implementation.</p></article><article><span>Artifacts</span><h3>Manifested runs</h3><p>Each run can include commit, kernel, mode, seed, command output, generated files, and processed summary tables.</p></article></div></section>
-      <section class="section detail-split"><div><p class="eyebrow">Publication angle</p><h2>The central claim is not “another filesystem”.</h2><p>The research contribution is the combination of rootfs-capable local storage, heterogeneous disk control, and safety-constrained autonomy.</p></div><div class="detail-panel"><span>Contribution map</span><h3>What a paper can emphasize</h3><ul><li>A boot-first self-driving storage controller where mountability dominates optimization.</li><li>An explainable maintenance planner with rejected-action records and safety gates.</li><li>A heterogeneous placement model that treats disk capacity, tier, health, and failure domain as inputs.</li><li>A reproducible artifact pipeline that links raw events to summarized research claims.</li></ul></div></section>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class="site-header">
+      <div class="header-inner wrap">
+        <a class="brand" href="index.html" aria-label="ArgosFS home"
+          ><img src="favicon.svg" width="32" height="32" alt="" />Argos<span
+            >FS</span
+          ></a
+        >
+        <button
+          class="nav-toggle"
+          type="button"
+          aria-expanded="false"
+          aria-controls="primary-nav"
+          hidden
+        >
+          Menu <span aria-hidden="true">+</span>
+        </button>
+        <nav id="primary-nav" class="site-nav" aria-label="Main navigation">
+          <a href="index.html">Overview</a>
+          <a href="technology.html">Technology</a>
+          <a href="research.html" aria-current="page">Research</a>
+          <a href="compatibility.html">Compatibility</a>
+          <a href="start.html">Get started</a>
+          <a class="nav-github" href="https://github.com/fwerkor/ArgosFS"
+            >GitHub <span aria-hidden="true">↗</span></a
+          >
+        </nav>
+      </div>
+    </header>
+    <main id="main" tabindex="-1">
+      <section class="page-intro wrap">
+        <p class="eyebrow">Research &amp; reproducibility</p>
+        <h1>Follow the evidence.<br />Reproduce the run.</h1>
+        <p class="lede">
+          ArgosFS provides a testbed for placement, recovery, and storage
+          automation. Experiment scripts retain raw records and summaries so
+          behavior can be inspected.
+        </p>
+      </section>
+      <section class="section wrap section-first">
+        <div class="section-heading">
+          <p class="eyebrow">Questions to investigate</p>
+          <h2>What should a storage<br />controller earn your trust on?</h2>
+        </div>
+        <div class="feature-grid">
+          <article class="feature">
+            <span class="item-number">Recovery</span>
+            <h3>Does data survive faults?</h3>
+            <p>
+              Exercise interrupted operations, degraded reads, reconstruction,
+              and consistency checks. Separate a successful recovery from an
+              untested failure mode.
+            </p>
+          </article>
+          <article class="feature">
+            <span class="item-number">Placement</span>
+            <h3>Does it adapt usefully?</h3>
+            <p>
+              Study workload shifts and uneven disks. Measure placement behavior
+              and maintenance cost alongside foreground I/O.
+            </p>
+          </article>
+          <article class="feature">
+            <span class="item-number">Control</span>
+            <h3>Can decisions be explained?</h3>
+            <p>
+              Compare manual and autopilot policies. Inspect selected actions,
+              rejection reasons, and verification outcomes instead of relying on
+              a single final score.
+            </p>
+          </article>
+        </div>
+      </section>
+      <section class="control-band">
+        <div class="wrap split-section">
+          <div>
+            <p class="eyebrow">Artifact workflow</p>
+            <h2>Commands.<br />Records.<br />Results.</h2>
+            <p>
+              The experiment runner builds the release binary, runs its
+              experiment families, and summarizes the output. Start with the
+              quick mode.
+            </p>
+            <a
+              class="text-link"
+              href="https://github.com/fwerkor/ArgosFS/blob/main/docs/artifact-evaluation.md"
+              >Read the artifact guide <span aria-hidden="true">↗</span></a
+            >
+          </div>
+          <div>
+            <div class="code-block">
+              <div class="code-toolbar">
+                <span>Repository root</span
+                ><button class="copy-button" type="button" hidden>Copy</button>
+              </div>
+              <pre><code>scripts/experiments/run_all.sh --quick \
+  --output target/argosfs-artifacts/runs/local-quick</code></pre>
+            </div>
+            <p class="code-note">
+              “Quick” still builds Rust and may require extra tools or
+              privileges for individual suites. Inspect failed and skipped
+              records before interpreting summaries.
+            </p>
+            <div class="artifact-map">
+              <div>
+                <strong>raw/</strong
+                ><span>JSONL and CSV experiment records</span>
+              </div>
+              <div>
+                <strong>processed/ · tables/</strong
+                ><span>Summaries derived from the raw output</span>
+              </div>
+              <div>
+                <strong>logs/ · manifest.json</strong
+                ><span>Build output, commit, kernel, and seed</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+      <section class="section wrap">
+        <div class="section-heading">
+          <p class="eyebrow">Experiment entry points</p>
+          <h2>Pick a question. Inspect its script.</h2>
+          <p>
+            These are available experiment families, not published performance
+            results. Hardware, mode, revision, and skipped checks are part of
+            any comparison.
+          </p>
+        </div>
+        <div class="resource-grid">
+          <a
+            class="text-link"
+            href="https://github.com/fwerkor/ArgosFS/blob/main/scripts/experiments/run_failure_matrix.py"
+            >Failure and recovery matrix <span aria-hidden="true">↗</span></a
+          >
+          <a
+            class="text-link"
+            href="https://github.com/fwerkor/ArgosFS/blob/main/scripts/experiments/run_autopilot_matrix.py"
+            >Autopilot policy matrix <span aria-hidden="true">↗</span></a
+          >
+          <a
+            class="text-link"
+            href="https://github.com/fwerkor/ArgosFS/blob/main/scripts/experiments/run_workload_shift.py"
+            >Workload shifts <span aria-hidden="true">↗</span></a
+          >
+          <a
+            class="text-link"
+            href="https://github.com/fwerkor/ArgosFS/blob/main/scripts/experiments/run_metadata_scalability.py"
+            >Metadata scalability <span aria-hidden="true">↗</span></a
+          >
+          <a
+            class="text-link"
+            href="https://github.com/fwerkor/ArgosFS/blob/main/scripts/experiments/run_qemu_rootfs_matrix.sh"
+            >QEMU rootfs experiments <span aria-hidden="true">↗</span></a
+          >
+          <a
+            class="text-link"
+            href="https://github.com/fwerkor/ArgosFS/blob/main/docs/performance-report.md"
+            >Performance report methodology <span aria-hidden="true">↗</span></a
+          >
+        </div>
+      </section>
+      <section class="start-cta wrap">
+        <div>
+          <p class="eyebrow">Contribute</p>
+          <h2>Make the next result<br />easier to reproduce.</h2>
+          <p>
+            Report the revision, environment, command, and relevant logs with an
+            issue.
+          </p>
+        </div>
+        <a
+          class="button primary"
+          href="https://github.com/fwerkor/ArgosFS/issues"
+          >Open an issue <span aria-hidden="true">↗</span></a
+        >
+      </section>
     </main>
-    <footer class="site-footer"><span>ArgosFS</span><a href="https://github.com/fwerkor/argosfs">GitHub</a><a href="compatibility.html">Compatibility</a></footer><script src="app.js"></script>
+    <footer class="site-footer wrap">
+      <div>
+        <a class="brand" href="index.html">Argos<span>FS</span></a>
+        <p>Storage, with a plan.</p>
+      </div>
+      <div class="footer-links">
+        <a href="https://github.com/fwerkor/ArgosFS">Source code ↗</a
+        ><a href="https://github.com/fwerkor/ArgosFS/issues">Issues ↗</a
+        ><a href="https://github.com/fwerkor/ArgosFS/blob/main/LICENSE"
+          >Apache-2.0 ↗</a
+        >
+      </div>
+      <p class="footer-note">Built in Rust. Open to inspection.</p>
+    </footer>
   </body>
 </html>
