@@ -76,6 +76,56 @@ fn clap_rejects_images_and_devices_together() {
 }
 
 #[test]
+fn mkfs_commit_policy_defaults_block_backends_to_bounded_group_commit() {
+    assert_eq!(
+        mkfs_commit_policy(BackendKind::LoopBlock, false, false, false, false),
+        (true, true, true)
+    );
+    assert_eq!(
+        mkfs_commit_policy(BackendKind::RawBlock, false, false, false, false),
+        (true, true, true)
+    );
+    assert_eq!(
+        mkfs_commit_policy(BackendKind::Host, false, false, false, false),
+        (false, false, false)
+    );
+}
+
+#[test]
+fn mkfs_commit_policy_preserves_explicit_legacy_and_strict_modes() {
+    assert_eq!(
+        mkfs_commit_policy(BackendKind::LoopBlock, false, true, false, false),
+        (true, false, false)
+    );
+    assert_eq!(
+        mkfs_commit_policy(BackendKind::LoopBlock, false, true, true, true),
+        (true, true, true)
+    );
+    assert_eq!(
+        mkfs_commit_policy(BackendKind::LoopBlock, true, false, false, false),
+        (false, false, false)
+    );
+}
+
+#[test]
+fn clap_rejects_strict_durability_with_deferred_flags() {
+    let error = match Cli::try_parse_from([
+        "argosfs",
+        "mkfs",
+        "--backend",
+        "loop",
+        "--images",
+        "disk.img",
+        "--strict-durability",
+        "--defer-journal-flush",
+    ]) {
+        Ok(_) => panic!("conflicting durability flags were accepted"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+}
+
+#[test]
 fn version_flag_is_available() {
     let error = match Cli::try_parse_from(["argosfs", "--version"]) {
         Ok(_) => panic!("--version unexpectedly parsed as a normal command"),

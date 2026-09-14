@@ -18,6 +18,7 @@ METRICS = (
     ("small_stat_files_s", "Small stat", "files/s"),
 )
 SCENARIO_ORDER = (
+    "argosfs-loop-fuse-default",
     "argosfs-loop-fuse-strict",
     "argosfs-loop-fuse-deferred",
     "argosfs-loop-fuse-batched",
@@ -25,6 +26,7 @@ SCENARIO_ORDER = (
     "host-directory",
 )
 SCENARIO_LABELS = {
+    "argosfs-loop-fuse-default": "ArgosFS default (bounded group commit)",
     "argosfs-loop-fuse-strict": "ArgosFS strict",
     "argosfs-loop-fuse-deferred": "ArgosFS deferred journal",
     "argosfs-loop-fuse-batched": "ArgosFS batched metadata/data",

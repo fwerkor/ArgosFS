@@ -23,7 +23,6 @@ CapOS root tree with build-time batching enabled by default:
 
 ```bash
 argosfs mkfs --backend loop --images disk0.img --k 1 --m 0 \
-  --defer-journal-flush --defer-metadata-commit --defer-data-flush \
   --deferred-commit-interval-ms 5000 \
   --deferred-commit-max-transactions 128
 argosfs import-tree --backend loop --images disk0.img ROOT /

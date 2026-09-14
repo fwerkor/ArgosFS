@@ -176,6 +176,21 @@ def run_host_directory(
     emit(out, metrics)
 
 
+def run_argosfs_loop_default(
+    out: Path, mode: str, work: Path, file_mib: int, small_files: int
+) -> None:
+    run_argosfs_loop_variant(
+        out,
+        mode,
+        work,
+        file_mib,
+        small_files,
+        defer_flush=False,
+        batch_metadata=False,
+        default_policy=True,
+    )
+
+
 def run_argosfs_loop(
     out: Path, mode: str, work: Path, file_mib: int, small_files: int
 ) -> None:
@@ -209,8 +224,11 @@ def run_argosfs_loop_variant(
     *,
     defer_flush: bool,
     batch_metadata: bool,
+    default_policy: bool = False,
 ) -> None:
-    if batch_metadata:
+    if default_policy:
+        scenario = "argosfs-loop-fuse-default"
+    elif batch_metadata:
         scenario = "argosfs-loop-fuse-batched"
     else:
         scenario = (
@@ -224,7 +242,11 @@ def run_argosfs_loop_variant(
             skip(out, mode, scenario, f"{required} unavailable")
             return
     bin_path = binary()
-    suffix = "batched" if batch_metadata else ("deferred" if defer_flush else "strict")
+    suffix = (
+        "default"
+        if default_policy
+        else ("batched" if batch_metadata else ("deferred" if defer_flush else "strict"))
+    )
     image = work / f"argosfs-loop-{suffix}.img"
     mountpoint = work / f"argosfs-mnt-{suffix}"
     remove_path(image)
@@ -250,6 +272,8 @@ def run_argosfs_loop_variant(
         "none",
         "--force",
     ]
+    if not default_policy and not defer_flush and not batch_metadata:
+        mkfs_cmd.append("--strict-durability")
     if defer_flush:
         mkfs_cmd.append("--defer-journal-flush")
     if batch_metadata:
@@ -306,12 +330,16 @@ def run_argosfs_loop_variant(
                 "reason": (
                     "ArgosFS loop backend mounted through FUSE mount-root"
                     + (
-                        " with batched metadata commit and deferred data flush"
-                        if batch_metadata
+                        " with the default bounded group-commit policy"
+                        if default_policy
                         else (
-                            " with deferred journal flush"
-                            if defer_flush
-                            else " with strict journal flush"
+                            " with batched metadata commit and deferred data flush"
+                            if batch_metadata
+                            else (
+                                " with deferred journal flush"
+                                if defer_flush
+                                else " with strict per-transaction durability"
+                            )
                         )
                     )
                 ),
@@ -419,7 +447,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--scenarios",
-        default="host-directory,argosfs-loop-strict,argosfs-loop-deferred,argosfs-loop-batched,ext4-loop",
+        default="host-directory,argosfs-loop-default,ext4-loop",
         help="comma-separated scenarios to run",
     )
     args = parser.parse_args()
@@ -453,6 +481,7 @@ def main() -> int:
 
     scenario_map: dict[str, Callable[[Path, str, Path, int, int], None]] = {
         "host-directory": run_host_directory,
+        "argosfs-loop-default": run_argosfs_loop_default,
         "argosfs-loop-strict": run_argosfs_loop,
         "argosfs-loop-deferred": run_argosfs_loop_deferred,
         "argosfs-loop-batched": run_argosfs_loop_batched,
@@ -465,6 +494,7 @@ def main() -> int:
     if unknown:
         parser.error(f"unknown scenario(s): {','.join(unknown)}")
     result_scenarios = {
+        "argosfs-loop-default": "argosfs-loop-fuse-default",
         "argosfs-loop-strict": "argosfs-loop-fuse-strict",
         "argosfs-loop-deferred": "argosfs-loop-fuse-deferred",
         "argosfs-loop-batched": "argosfs-loop-fuse-batched",
