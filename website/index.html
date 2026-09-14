@@ -1,172 +1,308 @@
 <!doctype html>
 <html lang="en">
   <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>ArgosFS | Self-driving Linux storage</title>
-    <meta name="description" content="ArgosFS is a Rust, FUSE-based, self-driving filesystem for heterogeneous local disks, erasure-coded redundancy, rootfs experiments, health automation, and auditable storage research.">
-    <link rel="icon" href="favicon.svg" type="image/svg+xml">
-    <link rel="stylesheet" href="styles.css">
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f5f4ef" />
+    <title>ArgosFS — Storage, with a plan.</title>
+    <meta
+      name="description"
+      content="A Rust filesystem for mixed local disks, with erasure-coded redundancy, health-aware placement, and inspectable maintenance."
+    />
+    <meta property="og:title" content="ArgosFS — Storage, with a plan." />
+    <meta
+      property="og:description"
+      content="A Rust filesystem for mixed local disks, with erasure-coded redundancy, health-aware placement, and inspectable maintenance."
+    />
+    <meta property="og:type" content="website" />
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="styles.css" />
+    <script src="app.js" defer></script>
   </head>
   <body data-page="home">
+    <a class="skip-link" href="#main">Skip to content</a>
     <header class="site-header">
-      <a class="brand" href="index.html" aria-label="ArgosFS home">
-        <span class="brand-mark"></span>
-        <span>ArgosFS</span>
-      </a>
-      <button class="nav-toggle" type="button" aria-label="Open navigation" aria-expanded="false">Menu</button>
-      <nav class="site-nav" aria-label="Primary navigation">
-        <a href="index.html" data-nav="home">Home</a>
-        <a href="technology.html" data-nav="technology">Technology</a>
-        <a href="research.html" data-nav="research">Research</a>
-        <a href="compatibility.html" data-nav="compatibility">Compatibility</a>
-        <a href="start.html" data-nav="start">Start</a>
-        <a class="github-link" href="https://github.com/fwerkor/argosfs">GitHub</a>
-      </nav>
+      <div class="header-inner wrap">
+        <a class="brand" href="index.html" aria-label="ArgosFS home"
+          ><img src="favicon.svg" width="32" height="32" alt="" />Argos<span
+            >FS</span
+          ></a
+        >
+        <button
+          class="nav-toggle"
+          type="button"
+          aria-expanded="false"
+          aria-controls="primary-nav"
+          hidden
+        >
+          Menu <span aria-hidden="true">+</span>
+        </button>
+        <nav id="primary-nav" class="site-nav" aria-label="Main navigation">
+          <a href="index.html" aria-current="page">Overview</a>
+          <a href="technology.html">Technology</a>
+          <a href="research.html">Research</a>
+          <a href="compatibility.html">Compatibility</a>
+          <a href="start.html">Get started</a>
+          <a class="nav-github" href="https://github.com/fwerkor/ArgosFS"
+            >GitHub <span aria-hidden="true">↗</span></a
+          >
+        </nav>
+      </div>
     </header>
-
-    <main>
-      <section class="hero hero-home">
-        <canvas class="mesh-canvas" data-scene="hero" aria-hidden="true"></canvas>
-        <div class="hero-content">
-          <p class="eyebrow">Self-driving local storage for Linux</p>
-          <h1>Self-driving storage for Linux.</h1>
-          <p class="hero-lede">ArgosFS is a Rust FUSE filesystem for heterogeneous local disks, erasure-coded redundancy, rootfs experiments, and auditable health automation.</p>
-          <div class="hero-actions">
-            <a class="button primary" href="start.html">Build a test volume</a>
-            <a class="button" href="technology.html">Read the architecture</a>
-            <a class="button ghost" href="https://github.com/fwerkor/argosfs">GitHub</a>
+    <main id="main" tabindex="-1">
+      <section class="hero wrap">
+        <div class="hero-copy">
+          <p class="eyebrow">
+            <span class="signal" aria-hidden="true"></span> A filesystem for
+            heterogeneous disks
+          </p>
+          <h1>Different disks.<br />One resilient<br /><em>filesystem.</em></h1>
+          <p class="lede">
+            Bring mixed local storage together with erasure coding, health-aware
+            placement, and maintenance you can inspect.
+          </p>
+          <div class="actions">
+            <a class="button primary" href="start.html"
+              >Get started <span aria-hidden="true">↗</span></a
+            ><a class="button secondary" href="technology.html"
+              >Explore the architecture <span aria-hidden="true">→</span></a
+            >
+          </div>
+          <p class="hero-caption">
+            Open-source Rust · Linux / FUSE · Apache-2.0
+          </p>
+        </div>
+        <figure class="storage-figure">
+          <div class="figure-topline">
+            <span>THE STORAGE MODEL</span
+            ><span class="figure-tag">4 + 2 layout</span>
+          </div>
+          <div class="volume-name">
+            <span class="volume-icon" aria-hidden="true">/</span>
+            <div>
+              <strong>One filesystem</strong
+              ><span>Your files, distributed across disks</span>
+            </div>
+          </div>
+          <div class="encoding-line">
+            <span>Reed–Solomon encoding</span><span aria-hidden="true">↓</span>
+          </div>
+          <div
+            class="disk-grid"
+            aria-label="Illustrative stripe with four data and two parity shards"
+          >
+            <button
+              class="disk"
+              type="button"
+              aria-pressed="false"
+              aria-label="Simulate failure of disk 1"
+              disabled
+            >
+              <span class="disk-id">DISK 01</span><span class="shard">D1</span
+              ><span class="disk-state">Online</span></button
+            ><button
+              class="disk"
+              type="button"
+              aria-pressed="false"
+              aria-label="Simulate failure of disk 2"
+              disabled
+            >
+              <span class="disk-id">DISK 02</span><span class="shard">D2</span
+              ><span class="disk-state">Online</span></button
+            ><button
+              class="disk"
+              type="button"
+              aria-pressed="false"
+              aria-label="Simulate failure of disk 3"
+              disabled
+            >
+              <span class="disk-id">DISK 03</span><span class="shard">D3</span
+              ><span class="disk-state">Online</span></button
+            ><button
+              class="disk"
+              type="button"
+              aria-pressed="false"
+              aria-label="Simulate failure of disk 4"
+              disabled
+            >
+              <span class="disk-id">DISK 04</span><span class="shard">D4</span
+              ><span class="disk-state">Online</span></button
+            ><button
+              class="disk parity"
+              type="button"
+              aria-pressed="false"
+              aria-label="Simulate failure of disk 5"
+              disabled
+            >
+              <span class="disk-id">DISK 05</span><span class="shard">P1</span
+              ><span class="disk-state">Online</span></button
+            ><button
+              class="disk parity"
+              type="button"
+              aria-pressed="false"
+              aria-label="Simulate failure of disk 6"
+              disabled
+            >
+              <span class="disk-id">DISK 06</span><span class="shard">P2</span
+              ><span class="disk-state">Online</span>
+            </button>
+          </div>
+          <div class="shard-legend">
+            <span><i></i> 4 data shards</span
+            ><span><i class="parity-key"></i> 2 parity shards</span>
+          </div>
+          <div class="recovery-state" data-state="healthy">
+            <span class="status-dot" aria-hidden="true"></span>
+            <div role="status" aria-live="polite" aria-atomic="true">
+              <strong id="recovery-title">All six shards available</strong
+              ><span id="recovery-detail"
+                >Any four are enough to recover this stripe.</span
+              >
+            </div>
+            <button id="reset-disks" type="button" hidden>Reset</button>
+          </div>
+          <figcaption>
+            Illustrative stripe, not live telemetry.
+            <span id="diagram-hint"
+              >A 4+2 layout can recover up to two missing shards.</span
+            >
+          </figcaption>
+        </figure>
+      </section>
+      <div class="spec-strip wrap" aria-label="Project fundamentals">
+        <div>
+          <strong>Linux / FUSE</strong><span>Familiar file operations</span>
+        </div>
+        <div><strong>k + m</strong><span>Configurable redundancy</span></div>
+        <div>
+          <strong>Host · Loop · Raw</strong><span>Three storage backends</span>
+        </div>
+        <div>
+          <strong>Plan → Verify</strong><span>Inspectable maintenance</span>
+        </div>
+      </div>
+      <section class="section wrap" id="features">
+        <div class="section-heading">
+          <p class="eyebrow">01 / Built around your disks</p>
+          <h2>Storage is rarely uniform.<br />Your filesystem can adapt.</h2>
+          <p>
+            Different capacities. Different media. Different health. ArgosFS
+            uses those differences when placing and maintaining data.
+          </p>
+        </div>
+        <div class="feature-grid">
+          <article class="feature">
+            <span class="item-number">01</span>
+            <h3>Make room for mixed media.</h3>
+            <p>
+              Weighted rendezvous placement accounts for capacity, storage tier,
+              latency, and health. Disks do not have to be identical to belong
+              to the same volume.
+            </p>
+          </article>
+          <article class="feature">
+            <span class="item-number">02</span>
+            <h3>Recover from missing shards.</h3>
+            <p>
+              Reed–Solomon coding distributes data and parity across disks.
+              Reads verify checksums and reconstruct missing or corrupt shards
+              when enough survive.
+            </p>
+          </article>
+          <article class="feature">
+            <span class="item-number">03</span>
+            <h3>Understand the next move.</h3>
+            <p>
+              Inspect health signals and dry-run plans before maintenance. The
+              autopilot uses confirmation gates, cooldowns, and work budgets to
+              bound its actions.
+            </p>
+          </article>
+        </div>
+      </section>
+      <section class="control-band">
+        <div class="wrap control-grid">
+          <div>
+            <p class="eyebrow">02 / Automation with visibility</p>
+            <h2>See the plan.<br />Then decide.</h2>
+            <p>
+              Health reports and planner explanations expose what the controller
+              sees and why an action is selected or rejected.
+            </p>
+            <a class="text-link" href="technology.html#autopilot"
+              >Inside the control loop <span aria-hidden="true">→</span></a
+            >
+          </div>
+          <div>
+            <div class="code-block">
+              <div class="code-toolbar">
+                <span>Inspect a host volume</span
+                ><button class="copy-button" type="button" hidden>Copy</button>
+              </div>
+              <pre><code>argosfs health ROOT --json
+argosfs autopilot ROOT --dry-run --explain --json</code></pre>
+            </div>
+            <p class="code-note">
+              Replace ROOT with your volume directory. The dry-run command does
+              not execute maintenance.
+            </p>
+            <ol class="control-steps">
+              <li><span>01</span> Observe</li>
+              <li><span>02</span> Plan</li>
+              <li><span>03</span> Act within budgets</li>
+              <li><span>04</span> Verify</li>
+            </ol>
           </div>
         </div>
-        <aside class="hero-terminal" aria-label="Quick commands">
-          <div class="terminal-bar"><span></span><span></span><span></span></div>
-          <pre><code>cargo build --release
-argosfs mkfs /var/lib/argosfs/root --disks 6 --k 4 --m 2 --compression zstd
-argosfs mount /var/lib/argosfs/root /mnt/argos-root --foreground
-argosfs autopilot /var/lib/argosfs/root --dry-run --explain --json</code></pre>
-        </aside>
       </section>
-
-      <section class="metrics-strip" aria-label="Project capabilities">
-        <div><strong>FUSE</strong><span>real mounted Linux filesystem frontend</span></div>
-        <div><strong>4+2</strong><span>configurable Reed-Solomon data + parity</span></div>
-        <div><strong>SMART</strong><span>disk-health signals for automation</span></div>
-        <div><strong>rootfs</strong><span>initramfs and systemd integration assets</span></div>
-      </section>
-
-      <section class="section">
-        <div class="section-heading compact-heading">
-          <p class="eyebrow">Implemented features</p>
-          <h2>A complete experimental filesystem surface.</h2>
-          <p>ArgosFS exposes normal filesystem behavior while keeping the redundancy, placement, health, and recovery decisions inspectable from the CLI and retained artifacts.</p>
-        </div>
-        <div class="feature-grid feature-grid-4">
-          <article>
-            <span>01</span>
-            <h3>Rootfs-capable FUSE frontend</h3>
-            <p>Implements lookup, getattr, setattr, create, read, write, rename, xattrs, readdir, fsync, statfs, symlinks, hardlinks, devices, FIFOs, and sockets.</p>
-          </article>
-          <article>
-            <span>02</span>
-            <h3>Erasure-coded storage</h3>
-            <p>Configurable <code class="inline-code">k+m</code> Reed-Solomon stripes distribute data and parity shards across disk failure domains, with reconstruction on degraded reads.</p>
-          </article>
-          <article>
-            <span>03</span>
-            <h3>Heterogeneous disk placement</h3>
-            <p>Weighted, tier-aware rendezvous hashing uses capacity, tier, latency, NUMA locality, and health pressure instead of assuming identical disks.</p>
-          </article>
-          <article>
-            <span>04</span>
-            <h3>Compression and encryption</h3>
-            <p>Per-stripe compression supports zstd, lz4, or none. Authenticated encryption uses Argon2id-derived keys and XChaCha20-Poly1305.</p>
-          </article>
-          <article>
-            <span>05</span>
-            <h3>Health autopilot</h3>
-            <p>SMART refresh, latency EWMAs, capacity pressure, risk memory, cooldown gates, and dry-run explanations drive conservative maintenance plans.</p>
-          </article>
-          <article>
-            <span>06</span>
-            <h3>Repair and self-heal</h3>
-            <p>Scrub, fsck repair, orphan cleanup, read reconstruction, deferred self-heal, disk drain, add-disk, and weighted rebalance are available from the CLI.</p>
-          </article>
-          <article>
-            <span>07</span>
-            <h3>Durable metadata</h3>
-            <p>Copy-on-write JSON metadata, primary and secondary copies, hash-checked journal snapshots, replay, mismatch detection, and named snapshots make recovery auditable.</p>
-          </article>
-          <article>
-            <span>08</span>
-            <h3>Advanced I/O and observability</h3>
-            <p>Buffered I/O, direct-I/O fallback, io_uring fallback, mmap-backed read staging, RAM + L2 cache, and a Prometheus exporter expose the data path.</p>
-          </article>
-        </div>
-      </section>
-
-      <section class="section dark-band">
-        <div class="section-heading compact-heading">
-          <p class="eyebrow">Technical principle</p>
-          <h2>Safety-constrained storage automation.</h2>
-          <p>ArgosFS does not let automation freely mutate the volume. Every action is proposed, bounded, checked against recoverability constraints, executed in small budgets, and verified before the next step.</p>
-        </div>
-        <div class="principle-grid">
-          <article>
-            <span>Observe</span>
-            <h3>Collect disk and workload state</h3>
-            <p>Probe media class, capacity, backing devices, SMART fields, latency, throughput, cache behavior, and file heat.</p>
-          </article>
-          <article>
-            <span>Score</span>
-            <h3>Rank safe actions</h3>
-            <p>Compare observe, scrub, drain, self-heal, and rebalance candidates with explicit rejection reasons when a safety guard fails.</p>
-          </article>
-          <article>
-            <span>Mutate</span>
-            <h3>Rewrite only within budgets</h3>
-            <p>Move shards incrementally, preserve redundancy targets, respect capacity reservations, and throttle background work.</p>
-          </article>
-          <article>
-            <span>Verify</span>
-            <h3>Prove the volume still mounts</h3>
-            <p>Run journal validation, fsck checks, shard hash verification, and downgrade automation when post-action validation fails.</p>
-          </article>
-        </div>
-      </section>
-
-      <section class="section split-feature">
+      <section class="section wrap split-section">
         <div>
-          <p class="eyebrow">Data path</p>
-          <h2>From POSIX operation to recoverable shards.</h2>
-          <p>Writes enter through FUSE, pass permission and ACL checks, are chunked into stripes, optionally compressed and encrypted, encoded into data/parity shards, placed across weighted disks, and committed through a copy-on-write metadata transaction.</p>
-          <a class="text-link" href="technology.html">Open the technical walkthrough</a>
+          <p class="eyebrow">03 / From a local lab to rootfs experiments</p>
+          <h2>Start small.<br />Inspect everything.</h2>
         </div>
-        <div class="pipeline-card" aria-label="ArgosFS data path">
-          <div><strong>01</strong><span>FUSE request</span></div>
-          <div><strong>02</strong><span>ACL + inode checks</span></div>
-          <div><strong>03</strong><span>Compression / encryption</span></div>
-          <div><strong>04</strong><span>Reed-Solomon encoding</span></div>
-          <div><strong>05</strong><span>Tier-aware placement</span></div>
-          <div><strong>06</strong><span>COW metadata commit</span></div>
+        <div class="body-copy">
+          <p>
+            Build a directory-backed test volume, mount it through FUSE, and use
+            normal Linux tools. Explore loop images, raw pools, or initramfs
+            integration when you need to go deeper.
+          </p>
+          <p>
+            ArgosFS is under active development. Rootfs and raw-device use
+            require environment-specific validation; performance and
+            compatibility should be assessed on your workload.
+          </p>
+          <div class="inline-links">
+            <a class="text-link" href="compatibility.html"
+              >Compatibility &amp; limits →</a
+            ><a class="text-link" href="research.html"
+              >Reproduce experiments →</a
+            >
+          </div>
         </div>
       </section>
-
-      <section class="section callout">
+      <section class="start-cta wrap">
         <div>
-          <p class="eyebrow">Source available</p>
-          <h2>Read the code, run the tests, inspect every planner decision.</h2>
+          <p class="eyebrow">Try it locally</p>
+          <h2>Your first volume<br />starts here.</h2>
         </div>
-        <a class="button primary" href="https://github.com/fwerkor/argosfs">Open GitHub Repository</a>
+        <a class="button primary" href="start.html"
+          >Build a test volume <span aria-hidden="true">↗</span></a
+        >
       </section>
     </main>
-
-    <footer class="site-footer">
-      <span>ArgosFS</span>
-      <a href="https://github.com/fwerkor/argosfs">GitHub</a>
-      <a href="research.html">Research</a>
-      <a href="technology.html">Technology</a>
-      <a href="compatibility.html">Compatibility</a>
+    <footer class="site-footer wrap">
+      <div>
+        <a class="brand" href="index.html">Argos<span>FS</span></a>
+        <p>Storage, with a plan.</p>
+      </div>
+      <div class="footer-links">
+        <a href="https://github.com/fwerkor/ArgosFS">Source code ↗</a
+        ><a href="https://github.com/fwerkor/ArgosFS/issues">Issues ↗</a
+        ><a href="https://github.com/fwerkor/ArgosFS/blob/main/LICENSE"
+          >Apache-2.0 ↗</a
+        >
+      </div>
+      <p class="footer-note">Built in Rust. Open to inspection.</p>
     </footer>
-    <script src="app.js"></script>
   </body>
 </html>
