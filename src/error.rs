@@ -56,6 +56,12 @@ pub enum ArgosError {
     MissingDevice(String),
     #[error("degraded pool: {0}")]
     DegradedPool(String),
+    #[error("{operation} quorum unavailable: need {need}, have {have}")]
+    QuorumUnavailable {
+        operation: String,
+        need: usize,
+        have: usize,
+    },
     #[error("unsafe mount: {0}")]
     UnsafeMount(String),
     #[error("journal replay required: {0}")]
@@ -88,6 +94,7 @@ impl ArgosError {
             ArgosError::IncompatibleFormat(_) => libc::EINVAL,
             ArgosError::MissingDevice(_) => libc::ENODEV,
             ArgosError::DegradedPool(_) => libc::EIO,
+            ArgosError::QuorumUnavailable { .. } => libc::EROFS,
             ArgosError::UnsafeMount(_) => libc::EROFS,
             ArgosError::JournalReplayRequired(_) => libc::EAGAIN,
             ArgosError::ReadonlyRequired(_) => libc::EROFS,

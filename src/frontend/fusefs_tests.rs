@@ -510,6 +510,37 @@ fn empty_writeback_flushes_are_noops() {
 }
 
 #[test]
+fn best_effort_writeback_does_not_poison_unrelated_inodes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let volume = ArgosFs::create(
+        tmp.path(),
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            ..VolumeConfig::default()
+        },
+        1,
+        false,
+    )
+    .unwrap();
+    let healthy = volume.create_file_path("/healthy", 0o644).unwrap();
+    let root = volume.resolve_path("/", true).unwrap();
+    let fuse = ArgosFuse::new(volume.clone());
+
+    assert!(fuse.queue_writeback(root, 0, b"cannot-write-a-directory"));
+    assert!(fuse.queue_writeback(healthy, 0, b"still-readable"));
+    fuse.flush_all_writeback_best_effort();
+
+    assert_eq!(
+        volume.read_file("/healthy", true).unwrap(),
+        b"still-readable"
+    );
+    let writeback = fuse.writeback.lock();
+    assert!(writeback.dirty.contains_key(&root));
+    assert!(!writeback.dirty.contains_key(&healthy));
+}
+
+#[test]
 fn mount_option_normalization_covers_known_and_custom_values() {
     let cases = [
         ("auto_unmount", MountOption::AutoUnmount),

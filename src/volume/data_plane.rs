@@ -964,11 +964,15 @@ impl ArgosFs {
         meta: &Metadata,
         request: PlacementRequest<'_>,
     ) -> Result<Vec<String>> {
+        let quarantined = self.quarantined_devices.lock().clone();
         if request.count == 1 {
             let mut only = None;
             let mut eligible = 0usize;
             for (disk_id, disk) in &meta.disks {
-                if request.exclude_disks.contains(disk_id) || disk.status != DiskStatus::Online {
+                if request.exclude_disks.contains(disk_id)
+                    || quarantined.contains(disk_id)
+                    || disk.status != DiskStatus::Online
+                {
                     continue;
                 }
                 if meta.backend == BackendKind::Host {
@@ -1000,7 +1004,10 @@ impl ArgosFs {
                 .flatten()
         };
         for (disk_id, disk) in &meta.disks {
-            if request.exclude_disks.contains(disk_id) || disk.status != DiskStatus::Online {
+            if request.exclude_disks.contains(disk_id)
+                || quarantined.contains(disk_id)
+                || disk.status != DiskStatus::Online
+            {
                 continue;
             }
             if meta.backend == BackendKind::Host {
@@ -1350,13 +1357,22 @@ impl ArgosFs {
         offset: u64,
         buf: &mut [u8],
     ) -> Result<()> {
-        match self.backend.read_at(&disk_id.to_string(), offset, buf) {
+        if self.is_device_quarantined(disk_id) {
+            return Err(ArgosError::MissingDevice(disk_id.to_string()));
+        }
+        let result = match self.backend.read_at(&disk_id.to_string(), offset, buf) {
             Err(ArgosError::MissingDevice(_)) if meta.backend != BackendKind::Host => {
                 let backend = self.single_device_backend_locked(meta, disk_id, false)?;
                 backend.read_at(&disk_id.to_string(), offset, buf)
             }
             other => other,
+        };
+        if let Err(err) = &result {
+            if Self::device_error_should_quarantine(err) && meta.backend != BackendKind::Host {
+                self.quarantine_device(disk_id);
+            }
         }
+        result
     }
 
     pub(super) fn backend_write_at_locked(
@@ -1366,23 +1382,41 @@ impl ArgosFs {
         offset: u64,
         data: &[u8],
     ) -> Result<()> {
-        match self.backend.write_at(&disk_id.to_string(), offset, data) {
+        if self.is_device_quarantined(disk_id) {
+            return Err(ArgosError::MissingDevice(disk_id.to_string()));
+        }
+        let result = match self.backend.write_at(&disk_id.to_string(), offset, data) {
             Err(ArgosError::MissingDevice(_)) if meta.backend != BackendKind::Host => {
                 let backend = self.single_device_backend_locked(meta, disk_id, true)?;
                 backend.write_at(&disk_id.to_string(), offset, data)
             }
             other => other,
+        };
+        if let Err(err) = &result {
+            if Self::device_error_should_quarantine(err) && meta.backend != BackendKind::Host {
+                self.quarantine_device(disk_id);
+            }
         }
+        result
     }
 
     pub(super) fn backend_flush_locked(&self, meta: &Metadata, disk_id: &str) -> Result<()> {
-        match self.backend.flush_device(&disk_id.to_string()) {
+        if self.is_device_quarantined(disk_id) {
+            return Err(ArgosError::MissingDevice(disk_id.to_string()));
+        }
+        let result = match self.backend.flush_device(&disk_id.to_string()) {
             Err(ArgosError::MissingDevice(_)) if meta.backend != BackendKind::Host => {
                 let backend = self.single_device_backend_locked(meta, disk_id, true)?;
                 backend.flush_device(&disk_id.to_string())
             }
             other => other,
+        };
+        if let Err(err) = &result {
+            if Self::device_error_should_quarantine(err) && meta.backend != BackendKind::Host {
+                self.quarantine_device(disk_id);
+            }
         }
+        result
     }
 
     pub(super) fn single_device_backend_locked(

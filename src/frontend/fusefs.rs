@@ -347,6 +347,27 @@ impl ArgosFuse {
             self.flush_inode_writeback(ino)?;
         }
     }
+
+    fn flush_all_writeback_best_effort(&self) {
+        let inodes = {
+            let writeback = self.writeback.lock();
+            writeback
+                .dirty
+                .keys()
+                .chain(writeback.reap_after_flush.iter())
+                .copied()
+                .collect::<BTreeSet<_>>()
+        };
+        for ino in inodes {
+            let _ = self.flush_inode_writeback(ino);
+        }
+    }
+
+    fn discard_inode_writeback(&self, ino: InodeId) {
+        let mut writeback = self.writeback.lock();
+        writeback.dirty.remove(&ino);
+        writeback.reap_after_flush.remove(&ino);
+    }
 }
 
 impl Drop for ArgosFuse {
@@ -451,10 +472,7 @@ impl Filesystem for ArgosFuse {
     }
 
     fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        if let Err(err) = self.flush_all_writeback() {
-            reply.error(errno(&err));
-            return;
-        }
+        self.flush_all_writeback_best_effort();
         match self
             .require_access(req, parent, libc::X_OK)
             .and_then(|()| self.volume.lookup(parent.0, name))
@@ -653,23 +671,21 @@ impl Filesystem for ArgosFuse {
     }
 
     fn unlink(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        if let Err(err) = self.flush_all_writeback() {
-            reply.error(errno(&err));
-            return;
-        }
-        let handles = self.handles.lock();
-        let result = self
-            .require_access(req, parent, libc::W_OK | libc::X_OK)
-            .and_then(|()| self.volume.lookup(parent.0, name))
-            .and_then(|attr| {
-                if handles.refs(attr.ino) > 0 {
-                    self.volume
-                        .unlink_at_as_preserving_open(parent.0, name, req.uid())
-                } else {
-                    self.volume.unlink_at_as(parent.0, name, req.uid())
-                }
-            });
-        drop(handles);
+        let result = (|| -> Result<()> {
+            self.require_access(req, parent, libc::W_OK | libc::X_OK)?;
+            let attr = self.volume.lookup(parent.0, name)?;
+            let preserve_open = self.handles.lock().refs(attr.ino) > 0;
+            if !preserve_open && self.flush_inode_writeback(attr.ino).is_err() {
+                self.discard_inode_writeback(attr.ino);
+            }
+            self.flush_all_writeback()?;
+            if preserve_open {
+                self.volume
+                    .unlink_at_as_preserving_open(parent.0, name, req.uid())
+            } else {
+                self.volume.unlink_at_as(parent.0, name, req.uid())
+            }
+        })();
         match result {
             Ok(()) => reply.ok(),
             Err(err) => reply.error(errno(&err)),
@@ -1042,10 +1058,7 @@ impl Filesystem for ArgosFuse {
     }
 
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
-        if let Err(err) = self.flush_all_writeback() {
-            reply.error(errno(&err));
-            return;
-        }
+        self.flush_all_writeback_best_effort();
         let meta = self.volume.metadata_snapshot();
         let block = (meta.config.chunk_size as u64).max(4096);
         let (usable, free) = statfs_bytes(&meta, self.volume.root());
@@ -1302,10 +1315,7 @@ impl Filesystem for ArgosFuse {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        if let Err(err) = self.flush_all_writeback() {
-            reply.error(errno(&err));
-            return;
-        }
+        self.flush_all_writeback_best_effort();
         match self
             .require_access(req, ino, libc::R_OK)
             .and_then(|()| self.volume.readdir(ino.0))
@@ -1336,10 +1346,7 @@ impl Filesystem for ArgosFuse {
         offset: u64,
         mut reply: ReplyDirectoryPlus,
     ) {
-        if let Err(err) = self.flush_all_writeback() {
-            reply.error(errno(&err));
-            return;
-        }
+        self.flush_all_writeback_best_effort();
         match self
             .require_access(req, ino, libc::R_OK | libc::X_OK)
             .and_then(|()| self.volume.readdir(ino.0))

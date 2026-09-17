@@ -11,7 +11,7 @@ use crate::types::{
 };
 use crate::util::{now_f64, sha256_hex};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -34,6 +34,18 @@ pub struct RawOpen {
     pub metadata: Metadata,
     pub report: TransactionReport,
     pub superblocks: Vec<RawSuperblock>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct QuorumWriteReport {
+    pub failed_devices: BTreeMap<String, String>,
+}
+
+impl QuorumWriteReport {
+    fn record_failure(&mut self, disk_id: &str, err: &ArgosError) {
+        self.failed_devices
+            .insert(disk_id.to_string(), err.to_string());
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -272,24 +284,46 @@ pub fn append_transaction_with_previous(
     Ok(())
 }
 
-pub(crate) fn append_transaction_with_trusted_integrity(
+pub(crate) fn append_transaction_quorum(
     backend: &dyn StorageBackend,
     superblocks: &[RawSuperblock],
     metadata: &Metadata,
     previous_metadata: Option<&Metadata>,
     action: &str,
     details: serde_json::Value,
-) -> Result<()> {
-    append_journal_trusted(
+) -> Result<QuorumWriteReport> {
+    let report = append_journal_quorum(
         backend,
         superblocks,
         metadata,
         previous_metadata,
         action,
         details,
+        false,
     )?;
     journal::inject_crash(FaultPoint::AfterJournalCommitBeforeMetadataCommit.as_str())?;
-    Ok(())
+    Ok(report)
+}
+
+pub(crate) fn append_transaction_with_trusted_integrity_quorum(
+    backend: &dyn StorageBackend,
+    superblocks: &[RawSuperblock],
+    metadata: &Metadata,
+    previous_metadata: Option<&Metadata>,
+    action: &str,
+    details: serde_json::Value,
+) -> Result<QuorumWriteReport> {
+    let report = append_journal_quorum(
+        backend,
+        superblocks,
+        metadata,
+        previous_metadata,
+        action,
+        details,
+        true,
+    )?;
+    journal::inject_crash(FaultPoint::AfterJournalCommitBeforeMetadataCommit.as_str())?;
+    Ok(report)
 }
 
 pub fn write_metadata_copies(
@@ -300,23 +334,54 @@ pub fn write_metadata_copies(
     let bytes = serde_json::to_vec_pretty(metadata)?;
     let hash = sha256_hex(&bytes);
     for sb in superblocks {
-        let slot_len = sb.metadata.length / 2;
-        let slot = (metadata.txid % 2) * slot_len;
-        let offset = sb.metadata.offset + slot;
-        write_metadata_slot(backend, sb, offset, slot_len, metadata, &bytes, &hash)?;
-        let mirror_slot = ((metadata.txid + 1) % 2) * slot_len;
-        let mirror_offset = sb.metadata.offset + mirror_slot;
-        write_metadata_slot(
-            backend,
-            sb,
-            mirror_offset,
-            slot_len,
-            metadata,
-            &bytes,
-            &hash,
-        )?;
+        write_metadata_member(backend, sb, metadata, &bytes, &hash)?;
     }
     Ok(())
+}
+
+pub(crate) fn write_metadata_copies_quorum(
+    backend: &dyn StorageBackend,
+    superblocks: &[RawSuperblock],
+    metadata: &Metadata,
+) -> Result<QuorumWriteReport> {
+    let need = metadata_quorum_requirement(metadata);
+    if superblocks.len() < need {
+        return Err(quorum_unavailable(
+            "metadata checkpoint",
+            need,
+            superblocks.len(),
+        ));
+    }
+    let bytes = serde_json::to_vec_pretty(metadata)?;
+    let hash = sha256_hex(&bytes);
+    let mut report = QuorumWriteReport::default();
+    let mut durable = 0usize;
+    for sb in superblocks {
+        match write_metadata_member(backend, sb, metadata, &bytes, &hash) {
+            Ok(()) => durable += 1,
+            Err(err) => report.record_failure(&sb.disk_id, &err),
+        }
+    }
+    if durable < need {
+        return Err(quorum_unavailable("metadata checkpoint", need, durable));
+    }
+    Ok(report)
+}
+
+fn write_metadata_member(
+    backend: &dyn StorageBackend,
+    sb: &RawSuperblock,
+    metadata: &Metadata,
+    bytes: &[u8],
+    hash: &str,
+) -> Result<()> {
+    let slot_len = sb.metadata.length / 2;
+    let slot = (metadata.txid % 2) * slot_len;
+    let offset = sb.metadata.offset + slot;
+    write_metadata_slot(backend, sb, offset, slot_len, metadata, bytes, hash)?;
+    let mirror_slot = ((metadata.txid + 1) % 2) * slot_len;
+    let mirror_offset = sb.metadata.offset + mirror_slot;
+    write_metadata_slot(backend, sb, mirror_offset, slot_len, metadata, bytes, hash)
 }
 
 fn write_metadata_slot(
@@ -512,34 +577,13 @@ fn append_journal(
     )
 }
 
-fn append_journal_trusted(
-    backend: &dyn StorageBackend,
-    superblocks: &[RawSuperblock],
-    metadata: &Metadata,
-    previous_metadata: Option<&Metadata>,
-    action: &str,
-    details: serde_json::Value,
-) -> Result<()> {
-    append_journal_with_previous_validation(
-        backend,
-        superblocks,
-        metadata,
-        previous_metadata,
-        action,
-        details,
-        true,
-    )
-}
-
-fn append_journal_with_previous_validation(
-    backend: &dyn StorageBackend,
-    superblocks: &[RawSuperblock],
+fn build_journal_entry(
     metadata: &Metadata,
     previous_metadata: Option<&Metadata>,
     action: &str,
     details: serde_json::Value,
     trust_integrity: bool,
-) -> Result<()> {
+) -> Result<Vec<u8>> {
     let delta_base = match previous_metadata {
         Some(previous)
             if previous.integrity.meta_hash == metadata.integrity.previous_meta_hash
@@ -596,22 +640,67 @@ fn append_journal_with_previous_validation(
         .map_err(|err| ArgosError::Invalid(format!("raw journal hash encode failed: {err}")))?;
     entry.extend_from_slice(&record_hash_bytes);
     entry.extend_from_slice(&record_bytes);
+    Ok(entry)
+}
 
+fn journal_append_position(
+    backend: &dyn StorageBackend,
+    sb: &RawSuperblock,
+    entry_len: usize,
+) -> Result<(Vec<u8>, u64, u64, bool)> {
+    let mut header = vec![0u8; RAW_HEADER_SIZE];
+    backend.read_at(&sb.disk_id, sb.journal.offset, &mut header)?;
+    if &header[..16] != JOURNAL_MAGIC {
+        initialize_journal_region(backend, &sb.disk_id, sb)?;
+        backend.read_at(&sb.disk_id, sb.journal.offset, &mut header)?;
+    }
+    let write_offset = get_u64(&header, 24)?;
+    let end = write_offset.checked_add(entry_len as u64);
+    let rollover =
+        write_offset < RAW_HEADER_SIZE as u64 || end.is_none_or(|end| end > sb.journal.length);
+    Ok((header, write_offset, end.unwrap_or_default(), rollover))
+}
+
+fn append_journal_member(
+    backend: &dyn StorageBackend,
+    sb: &RawSuperblock,
+    mut header: Vec<u8>,
+    write_offset: u64,
+    end: u64,
+    entry: &[u8],
+    flush: bool,
+) -> Result<()> {
+    backend.write_at(&sb.disk_id, sb.journal.offset + write_offset, entry)?;
+    put_u64(&mut header, 24, end);
+    backend.write_at(&sb.disk_id, sb.journal.offset, &header)?;
+    if flush {
+        backend.flush_device(&sb.disk_id)?;
+    }
+    Ok(())
+}
+
+fn append_journal_with_previous_validation(
+    backend: &dyn StorageBackend,
+    superblocks: &[RawSuperblock],
+    metadata: &Metadata,
+    previous_metadata: Option<&Metadata>,
+    action: &str,
+    details: serde_json::Value,
+    trust_integrity: bool,
+) -> Result<()> {
+    let entry = build_journal_entry(
+        metadata,
+        previous_metadata,
+        action,
+        details,
+        trust_integrity,
+    )?;
     let mut append_positions = Vec::with_capacity(superblocks.len());
     let mut rollover = false;
     for sb in superblocks {
-        let mut header = vec![0u8; RAW_HEADER_SIZE];
-        backend.read_at(&sb.disk_id, sb.journal.offset, &mut header)?;
-        if &header[..16] != JOURNAL_MAGIC {
-            initialize_journal_region(backend, &sb.disk_id, sb)?;
-            backend.read_at(&sb.disk_id, sb.journal.offset, &mut header)?;
-        }
-        let write_offset = get_u64(&header, 24)?;
-        let end = write_offset.checked_add(entry.len() as u64);
-        if write_offset < RAW_HEADER_SIZE as u64 || end.is_none_or(|end| end > sb.journal.length) {
-            rollover = true;
-        }
-        append_positions.push((header, write_offset, end.unwrap_or_default()));
+        let position = journal_append_position(backend, sb, entry.len())?;
+        rollover |= position.3;
+        append_positions.push(position);
     }
     if rollover {
         for sb in superblocks {
@@ -622,16 +711,19 @@ fn append_journal_with_previous_validation(
 
     let mut rollback_headers: Vec<(String, u64, Vec<u8>)> = Vec::new();
     let result = (|| -> Result<()> {
-        for (index, (sb, (mut header, write_offset, end))) in
+        for (index, (sb, (header, write_offset, end, _))) in
             superblocks.iter().zip(append_positions).enumerate()
         {
             rollback_headers.push((sb.disk_id.clone(), sb.journal.offset, header.clone()));
-            backend.write_at(&sb.disk_id, sb.journal.offset + write_offset, &entry)?;
-            put_u64(&mut header, 24, end);
-            backend.write_at(&sb.disk_id, sb.journal.offset, &header)?;
-            if !metadata.config.defer_journal_flush {
-                backend.flush_device(&sb.disk_id)?;
-            }
+            append_journal_member(
+                backend,
+                sb,
+                header,
+                write_offset,
+                end,
+                &entry,
+                !metadata.config.defer_journal_flush,
+            )?;
             if index + 1 < superblocks.len() {
                 journal::inject_crash(FaultPoint::AfterPartialJournalFanout.as_str())?;
             }
@@ -648,6 +740,110 @@ fn append_journal_with_previous_validation(
         }
     }
     result
+}
+
+fn append_journal_quorum(
+    backend: &dyn StorageBackend,
+    superblocks: &[RawSuperblock],
+    metadata: &Metadata,
+    previous_metadata: Option<&Metadata>,
+    action: &str,
+    details: serde_json::Value,
+    trust_integrity: bool,
+) -> Result<QuorumWriteReport> {
+    let need = metadata_quorum_requirement(metadata);
+    if superblocks.len() < need {
+        return Err(quorum_unavailable(
+            "metadata journal",
+            need,
+            superblocks.len(),
+        ));
+    }
+    let entry = build_journal_entry(
+        metadata,
+        previous_metadata,
+        action,
+        details,
+        trust_integrity,
+    )?;
+    let mut report = QuorumWriteReport::default();
+    let mut positions = Vec::with_capacity(superblocks.len());
+    let mut rollover = false;
+    for sb in superblocks {
+        match journal_append_position(backend, sb, entry.len()) {
+            Ok(position) => {
+                rollover |= position.3;
+                positions.push((sb, position));
+            }
+            Err(err) => report.record_failure(&sb.disk_id, &err),
+        }
+    }
+    if positions.len() < need {
+        return Err(quorum_unavailable(
+            "metadata journal",
+            need,
+            positions.len(),
+        ));
+    }
+
+    if rollover {
+        let mut durable = 0usize;
+        for (sb, _) in positions {
+            match checkpoint_and_reset_journal(backend, sb, metadata) {
+                Ok(()) => durable += 1,
+                Err(err) => report.record_failure(&sb.disk_id, &err),
+            }
+        }
+        if durable < need {
+            return Err(quorum_unavailable(
+                "metadata journal rollover",
+                need,
+                durable,
+            ));
+        }
+        return Ok(report);
+    }
+
+    let position_count = positions.len();
+    let mut appended = BTreeSet::new();
+    for (index, (sb, (header, write_offset, end, _))) in positions.into_iter().enumerate() {
+        match append_journal_member(
+            backend,
+            sb,
+            header,
+            write_offset,
+            end,
+            &entry,
+            !metadata.config.defer_journal_flush,
+        ) {
+            Ok(()) => {
+                appended.insert(sb.disk_id.clone());
+                if index + 1 < position_count {
+                    journal::inject_crash(FaultPoint::AfterPartialJournalFanout.as_str())?;
+                }
+            }
+            Err(err) => report.record_failure(&sb.disk_id, &err),
+        }
+    }
+
+    let durable = if metadata.config.defer_journal_flush {
+        let mut durable = BTreeSet::new();
+        for disk_id in appended {
+            match backend.flush_device(&disk_id) {
+                Ok(()) => {
+                    durable.insert(disk_id);
+                }
+                Err(err) => report.record_failure(&disk_id, &err),
+            }
+        }
+        durable
+    } else {
+        appended
+    };
+    if durable.len() < need {
+        return Err(quorum_unavailable("metadata journal", need, durable.len()));
+    }
+    Ok(report)
 }
 
 fn checkpoint_and_reset_journal(
@@ -729,7 +925,7 @@ fn select_quorum_metadata_candidate(
         .map(|(_, (metadata, _))| metadata))
 }
 
-fn metadata_quorum_requirement(metadata: &Metadata) -> usize {
+pub(crate) fn metadata_quorum_requirement(metadata: &Metadata) -> usize {
     metadata
         .disks
         .values()
@@ -738,6 +934,14 @@ fn metadata_quorum_requirement(metadata: &Metadata) -> usize {
         .max(1)
         / 2
         + 1
+}
+
+fn quorum_unavailable(operation: &str, need: usize, have: usize) -> ArgosError {
+    ArgosError::QuorumUnavailable {
+        operation: operation.to_string(),
+        need,
+        have,
+    }
 }
 
 fn read_metadata_candidates(

@@ -127,7 +127,36 @@ fn deferred_state_and_interval_distinguish_host_writable_and_readonly_block_back
     assert!(readonly
         .ensure_block_backend_writable_locked(&meta)
         .is_err());
-    assert!(readonly.active_block_backend_locked(&meta, false).is_ok());
+    let superblocks = readonly.metadata_superblocks_locked(&meta).unwrap();
+    assert!(readonly
+        .metadata_block_backend_locked(&meta, &superblocks, false)
+        .is_ok());
+}
+
+#[test]
+fn quorum_loss_write_fence_stops_mutations_and_background_retries() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = dir.path().join("write-fence.img");
+    let fs = ArgosFs::create_loop(
+        std::slice::from_ref(&image),
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            defer_metadata_commit: true,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "write-fence",
+        false,
+    )
+    .unwrap();
+    *fs.write_fence.lock() = Some("metadata quorum unavailable".to_string());
+
+    assert!(matches!(
+        fs.write_file("/rejected", b"data", 0o600),
+        Err(ArgosError::ReadonlyRequired(_))
+    ));
+    assert!(!fs.sync_deferred_if_dirty().unwrap());
 }
 
 #[test]
@@ -307,14 +336,16 @@ fn transaction_error_classification_covers_committed_and_uncommitted_points() {
 }
 
 #[test]
-fn active_backend_helpers_cover_host_empty_and_loop_status_filtering() {
+fn metadata_backend_helpers_cover_host_empty_and_removed_member_filtering() {
     let (_dir, host) = host_volume();
     let host_meta = host.meta.read();
     assert!(host
-        .active_superblocks_locked(&host_meta)
+        .metadata_superblocks_locked(&host_meta)
         .unwrap()
         .is_empty());
-    assert!(host.active_block_backend_locked(&host_meta, false).is_err());
+    assert!(host
+        .metadata_block_backend_locked(&host_meta, &[], false)
+        .is_err());
     assert!(host.open_backend_covers_superblocks(&[]));
     drop(host_meta);
 
@@ -334,13 +365,17 @@ fn active_backend_helpers_cover_host_empty_and_loop_status_filtering() {
     .unwrap();
     let mut meta = loop_fs.meta.write();
     assert!(loop_fs.open_backend_covers_superblocks(&loop_fs.raw_superblocks));
-    assert_eq!(loop_fs.active_superblocks_locked(&meta).unwrap().len(), 2);
+    assert_eq!(loop_fs.metadata_superblocks_locked(&meta).unwrap().len(), 2);
     let first = meta.disks.keys().next().unwrap().clone();
     meta.disks.get_mut(&first).unwrap().status = DiskStatus::Removed;
-    assert_eq!(loop_fs.active_superblocks_locked(&meta).unwrap().len(), 1);
+    assert_eq!(loop_fs.metadata_superblocks_locked(&meta).unwrap().len(), 1);
     assert_eq!(
         loop_fs
-            .active_block_backend_locked(&meta, false)
+            .metadata_block_backend_locked(
+                &meta,
+                &loop_fs.metadata_superblocks_locked(&meta).unwrap(),
+                false,
+            )
             .unwrap()
             .list_devices()
             .unwrap()

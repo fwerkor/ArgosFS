@@ -2,9 +2,75 @@ use super::*;
 use crate::raw_format::MIN_DEVICE_BYTES;
 use crate::types::{Disk, MetadataIntegrity, VolumeConfig};
 use crate::volume::ArgosFs;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 use tempfile::tempdir;
+
+struct FailingBackend {
+    inner: FileBlockBackend,
+    failed: BTreeSet<String>,
+}
+
+impl FailingBackend {
+    fn eio() -> ArgosError {
+        ArgosError::Io(std::io::Error::from_raw_os_error(libc::EIO))
+    }
+
+    fn fails(&self, device_id: &str) -> bool {
+        self.failed.contains(device_id)
+    }
+}
+
+impl StorageBackend for FailingBackend {
+    fn backend_kind(&self) -> BackendKind {
+        self.inner.backend_kind()
+    }
+
+    fn list_devices(&self) -> Result<Vec<crate::backend::BackendDeviceInfo>> {
+        self.inner.list_devices()
+    }
+
+    fn read_at(&self, device_id: &String, offset: u64, buf: &mut [u8]) -> Result<()> {
+        if self.fails(device_id) {
+            return Err(Self::eio());
+        }
+        self.inner.read_at(device_id, offset, buf)
+    }
+
+    fn write_at(&self, device_id: &String, offset: u64, data: &[u8]) -> Result<()> {
+        if self.fails(device_id) {
+            return Err(Self::eio());
+        }
+        self.inner.write_at(device_id, offset, data)
+    }
+
+    fn flush_device(&self, device_id: &String) -> Result<()> {
+        if self.fails(device_id) {
+            return Err(Self::eio());
+        }
+        self.inner.flush_device(device_id)
+    }
+
+    fn flush_all(&self) -> Result<()> {
+        for device in self.inner.list_devices()? {
+            self.flush_device(&device.device_id)?;
+        }
+        Ok(())
+    }
+
+    fn capacity(&self, device_id: &String) -> Result<u64> {
+        self.inner.capacity(device_id)
+    }
+
+    fn device_status(&self, device_id: &String) -> Result<DiskStatus> {
+        self.inner.device_status(device_id)
+    }
+
+    fn capabilities(&self) -> crate::backend::BackendCapabilities {
+        self.inner.capabilities()
+    }
+}
 
 fn metadata() -> Metadata {
     let dir = tempdir().unwrap();
@@ -47,6 +113,70 @@ fn create_loop_pool(dir: &Path, name: &str) -> (PathBuf, ArgosFs) {
     )
     .unwrap();
     (image, fs)
+}
+
+fn quorum_fixture() -> (
+    tempfile::TempDir,
+    Vec<PathBuf>,
+    Metadata,
+    Vec<RawSuperblock>,
+) {
+    let dir = tempdir().unwrap();
+    let images = (0..3)
+        .map(|index| dir.path().join(format!("quorum-{index}.img")))
+        .collect::<Vec<_>>();
+    let fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            ..VolumeConfig::default()
+        },
+        MIN_DEVICE_BYTES,
+        "quorum-test",
+        false,
+    )
+    .unwrap();
+    fs.write_file("/base", b"durable-base", 0o600).unwrap();
+    fs.sync().unwrap();
+    let metadata = fs.metadata_snapshot();
+    drop(fs);
+    let superblocks = images
+        .iter()
+        .map(|path| {
+            inspect_device(BackendKind::LoopBlock, path.clone())
+                .unwrap()
+                .0
+        })
+        .collect();
+    (dir, images, metadata, superblocks)
+}
+
+fn block_backend_for(images: &[PathBuf]) -> FileBlockBackend {
+    FileBlockBackend::open_with_ids(
+        BackendKind::LoopBlock,
+        images
+            .iter()
+            .enumerate()
+            .map(|(index, path)| (format!("disk-{index:04}"), path.clone()))
+            .collect(),
+        true,
+    )
+    .unwrap()
+}
+
+fn next_metadata(previous: &Metadata, pool_name: &str) -> Metadata {
+    let mut next = previous.clone();
+    next.raw_pool.pool_name = pool_name.to_string();
+    next.txid += 1;
+    next.updated_at = crate::util::now_f64();
+    journal::prepare_metadata_integrity_with_previous(
+        &mut next,
+        previous.integrity.meta_hash.clone(),
+    )
+    .unwrap();
+    next
 }
 
 #[test]
@@ -131,6 +261,67 @@ fn raw_journal_quorum_ignores_unreadable_and_invalid_members() {
         &[member(false, 0, 2, "same"), member(true, 1, 2, "same")],
         2
     ));
+}
+
+#[test]
+fn quorum_journal_commit_survives_one_member_eio() {
+    let (_dir, images, previous, superblocks) = quorum_fixture();
+    let next = next_metadata(&previous, "committed-with-one-eio");
+    let backend = FailingBackend {
+        inner: block_backend_for(&images),
+        failed: BTreeSet::from(["disk-0002".to_string()]),
+    };
+
+    let report = append_transaction_with_trusted_integrity_quorum(
+        &backend,
+        &superblocks,
+        &next,
+        Some(&previous),
+        "quorum-eio-test",
+        serde_json::json!({}),
+    )
+    .unwrap();
+    assert!(report.failed_devices.contains_key("disk-0002"));
+    drop(backend);
+
+    let reopened = ArgosFs::open_loop(&images, false).unwrap();
+    let recovered = reopened.metadata_snapshot();
+    assert_eq!(recovered.txid, next.txid);
+    assert_eq!(recovered.raw_pool.pool_name, "committed-with-one-eio");
+}
+
+#[test]
+fn quorum_journal_commit_rejects_loss_of_majority() {
+    let (_dir, images, previous, superblocks) = quorum_fixture();
+    let next = next_metadata(&previous, "must-not-commit");
+    let backend = FailingBackend {
+        inner: block_backend_for(&images),
+        failed: BTreeSet::from(["disk-0001".to_string(), "disk-0002".to_string()]),
+    };
+
+    let err = append_transaction_with_trusted_integrity_quorum(
+        &backend,
+        &superblocks,
+        &next,
+        Some(&previous),
+        "quorum-loss-test",
+        serde_json::json!({}),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        ArgosError::QuorumUnavailable {
+            need: 2,
+            have: 1,
+            ..
+        }
+    ));
+    drop(backend);
+
+    let reopened = ArgosFs::open_loop(&images, false).unwrap();
+    let recovered = reopened.metadata_snapshot();
+    assert_eq!(recovered.txid, previous.txid);
+    assert_eq!(recovered.raw_pool.pool_name, previous.raw_pool.pool_name);
 }
 
 #[test]
