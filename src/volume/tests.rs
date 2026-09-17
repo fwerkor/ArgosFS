@@ -336,6 +336,54 @@ fn transaction_error_classification_covers_committed_and_uncommitted_points() {
 }
 
 #[test]
+fn raw_journal_events_refresh_stale_read_telemetry_integrity() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = dir.path().join("event-integrity.img");
+    let fs = ArgosFs::create_loop(
+        std::slice::from_ref(&image),
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            compression: Compression::None,
+            defer_journal_flush: true,
+            defer_metadata_commit: true,
+            defer_data_flush: true,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "event-integrity",
+        false,
+    )
+    .unwrap();
+    fs.write_file("/value", b"telemetry", 0o600).unwrap();
+    fs.sync().unwrap();
+
+    let durable = fs.metadata_snapshot();
+    assert_eq!(
+        journal::canonical_metadata_hash(&durable).unwrap(),
+        durable.integrity.meta_hash
+    );
+    assert_eq!(fs.read_file("/value", true).unwrap(), b"telemetry");
+    let dirty = fs.metadata_snapshot();
+    assert_ne!(
+        journal::canonical_metadata_hash(&dirty).unwrap(),
+        dirty.integrity.meta_hash
+    );
+    assert!(fs.deferred_commit.lock().raw_uncommitted_metadata_dirty);
+
+    {
+        let meta = fs.meta.read();
+        fs.journal_locked(&meta, "self-heal-deferred", json!({"reason": "test-event"}))
+            .unwrap();
+    }
+
+    let report = fs.transaction_report().unwrap();
+    assert_eq!(report.invalid_entries, 0, "{:#?}", report.errors);
+    assert_eq!(report.raw_journal_quorum, Some(true));
+    assert!(fs.deferred_commit.lock().raw_uncommitted_metadata_dirty);
+}
+
+#[test]
 fn metadata_backend_helpers_cover_host_empty_and_removed_member_filtering() {
     let (_dir, host) = host_volume();
     let host_meta = host.meta.read();

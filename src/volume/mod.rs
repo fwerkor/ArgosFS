@@ -1818,22 +1818,38 @@ impl ArgosFs {
     ) -> Result<()> {
         self.ensure_block_backend_writable_locked(meta)?;
         if meta.backend != BackendKind::Host {
-            let superblocks = self.metadata_superblocks_locked(meta)?;
+            // Read-side telemetry is allowed to mutate live metadata without a
+            // transaction, so its integrity fields can still describe the last
+            // durable state. Audit/event records must never persist that stale
+            // integrity tuple as an embedded recovery snapshot.
+            let canonical_hash = journal::canonical_metadata_hash(meta)?;
+            let journal_meta = if meta.integrity.meta_hash == canonical_hash {
+                meta.clone()
+            } else {
+                let mut snapshot = meta.clone();
+                journal::prepare_metadata_integrity_with_previous(
+                    &mut snapshot,
+                    meta.integrity.meta_hash.clone(),
+                )?;
+                snapshot
+            };
+            let superblocks = self.metadata_superblocks_locked(&journal_meta)?;
             let result = if self.open_backend_covers_superblocks(&superblocks) {
                 raw_store::append_transaction_quorum(
                     &*self.backend,
                     &superblocks,
-                    meta,
+                    &journal_meta,
                     None,
                     action,
                     details,
                 )
             } else {
-                let backend = self.metadata_block_backend_locked(meta, &superblocks, true)?;
+                let backend =
+                    self.metadata_block_backend_locked(&journal_meta, &superblocks, true)?;
                 raw_store::append_transaction_quorum(
                     &backend,
                     &superblocks,
-                    meta,
+                    &journal_meta,
                     None,
                     action,
                     details,
