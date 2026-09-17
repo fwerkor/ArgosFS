@@ -142,20 +142,24 @@ fn raw_statfs_uses_allocator_regions_and_free_extents() {
         false,
     )
     .unwrap();
-    let before = statfs_bytes(&volume.metadata_snapshot(), volume.root());
+    let before = statfs_bytes(&volume.metadata_snapshot(), volume.root(), &BTreeSet::new());
     volume
         .write_file("/payload", &vec![7u8; 64 * 1024], 0o644)
         .unwrap();
-    let after = statfs_bytes(&volume.metadata_snapshot(), volume.root());
+    let after = statfs_bytes(&volume.metadata_snapshot(), volume.root(), &BTreeSet::new());
     assert!(before.0 > 0);
     assert!(before.0 < 3 * 32 * 1024 * 1024);
     assert!(after.1 < before.1);
     assert!(after.1 <= after.0);
 
     volume.mark_disk("disk-0000", DiskStatus::Degraded).unwrap();
-    let degraded = statfs_bytes(&volume.metadata_snapshot(), volume.root());
+    let degraded = statfs_bytes(&volume.metadata_snapshot(), volume.root(), &BTreeSet::new());
     assert_eq!(degraded.0, after.0);
     assert_eq!(degraded.1, 0);
+
+    let quarantined = BTreeSet::from(["disk-0000".to_string()]);
+    let unavailable = statfs_bytes(&volume.metadata_snapshot(), volume.root(), &quarantined);
+    assert_eq!(unavailable, (0, 0));
 }
 
 #[test]
@@ -173,10 +177,10 @@ fn host_statfs_subtracts_logical_usage_after_erasure_scaling() {
         false,
     )
     .unwrap();
-    let before = statfs_bytes(&volume.metadata_snapshot(), volume.root());
+    let before = statfs_bytes(&volume.metadata_snapshot(), volume.root(), &BTreeSet::new());
     let payload = vec![7u8; 64 * 1024];
     volume.write_file("/payload", &payload, 0o644).unwrap();
-    let after = statfs_bytes(&volume.metadata_snapshot(), volume.root());
+    let after = statfs_bytes(&volume.metadata_snapshot(), volume.root(), &BTreeSet::new());
 
     assert_eq!(before.1.saturating_sub(after.1), payload.len() as u64);
 }
@@ -538,6 +542,104 @@ fn best_effort_writeback_does_not_poison_unrelated_inodes() {
     let writeback = fuse.writeback.lock();
     assert!(writeback.dirty.contains_key(&root));
     assert!(!writeback.dirty.contains_key(&healthy));
+}
+
+#[test]
+fn unlink_ignores_unrelated_failed_writeback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let volume = ArgosFs::create(
+        tmp.path(),
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            ..VolumeConfig::default()
+        },
+        1,
+        false,
+    )
+    .unwrap();
+    let target = volume.create_file_path("/target", 0o644).unwrap();
+    let root = volume.resolve_path("/", true).unwrap();
+    let fuse = ArgosFuse::new(volume.clone());
+    assert!(fuse.queue_writeback(root, 0, b"cannot-write-a-directory"));
+
+    fuse.unlink_after_access(root, OsStr::new("target"), unsafe { libc::geteuid() })
+        .unwrap();
+
+    assert!(matches!(
+        volume.lookup(root, OsStr::new("target")),
+        Err(ArgosError::NotFound(_))
+    ));
+    assert!(matches!(
+        volume.attr_inode(target),
+        Err(ArgosError::NotFound(_))
+    ));
+    assert!(fuse.writeback.lock().dirty.contains_key(&root));
+}
+
+#[test]
+fn rejected_unlink_retains_failed_target_writeback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let volume = ArgosFs::create(
+        tmp.path(),
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            ..VolumeConfig::default()
+        },
+        1,
+        false,
+    )
+    .unwrap();
+    let dir = volume.mkdir("/dir", 0o755).unwrap();
+    let root = volume.resolve_path("/", true).unwrap();
+    let fuse = ArgosFuse::new(volume.clone());
+    assert!(fuse.queue_writeback(dir, 0, b"invalid-directory-writeback"));
+
+    assert!(fuse
+        .unlink_after_access(root, OsStr::new("dir"), unsafe { libc::geteuid() })
+        .is_err());
+
+    assert!(volume.lookup(root, OsStr::new("dir")).is_ok());
+    assert!(fuse.writeback.lock().dirty.contains_key(&dir));
+}
+
+#[test]
+fn unlink_preserves_inode_while_open_handle_exists() {
+    let tmp = tempfile::tempdir().unwrap();
+    let volume = ArgosFs::create(
+        tmp.path(),
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            ..VolumeConfig::default()
+        },
+        1,
+        false,
+    )
+    .unwrap();
+    let ino = volume.create_file_path("/open", 0o644).unwrap();
+    let root = volume.resolve_path("/", true).unwrap();
+    let fuse = ArgosFuse::new(volume.clone());
+    let handle = fuse.handles.lock().open(OpenFileHandle {
+        ino,
+        flags: libc::O_RDONLY,
+    });
+
+    fuse.unlink_after_access(root, OsStr::new("open"), unsafe { libc::geteuid() })
+        .unwrap();
+
+    assert!(matches!(
+        volume.lookup(root, OsStr::new("open")),
+        Err(ArgosError::NotFound(_))
+    ));
+    assert!(volume.attr_inode(ino).is_ok());
+    assert!(fuse.handles.lock().close(handle).unwrap().1);
+    volume.reap_unlinked_inode(ino).unwrap();
+    assert!(matches!(
+        volume.attr_inode(ino),
+        Err(ArgosError::NotFound(_))
+    ));
 }
 
 #[test]

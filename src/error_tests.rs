@@ -46,6 +46,15 @@ fn every_error_variant_has_the_expected_errno() {
         (ArgosError::IncompatibleFormat("x".into()), libc::EINVAL),
         (ArgosError::MissingDevice("x".into()), libc::ENODEV),
         (ArgosError::DegradedPool("x".into()), libc::EIO),
+        (
+            ArgosError::QuorumUnavailable {
+                operation: "metadata".into(),
+                need: 2,
+                have: 1,
+            },
+            libc::EROFS,
+        ),
+        (ArgosError::CommittedDurabilityLoss("x".into()), libc::EIO),
         (ArgosError::UnsafeMount("x".into()), libc::EROFS),
         (ArgosError::JournalReplayRequired("x".into()), libc::EAGAIN),
         (ArgosError::ReadonlyRequired("x".into()), libc::EROFS),

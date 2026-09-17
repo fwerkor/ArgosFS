@@ -62,6 +62,8 @@ pub enum ArgosError {
         need: usize,
         have: usize,
     },
+    #[error("committed transaction lost data durability: {0}")]
+    CommittedDurabilityLoss(String),
     #[error("unsafe mount: {0}")]
     UnsafeMount(String),
     #[error("journal replay required: {0}")]
@@ -95,6 +97,7 @@ impl ArgosError {
             ArgosError::MissingDevice(_) => libc::ENODEV,
             ArgosError::DegradedPool(_) => libc::EIO,
             ArgosError::QuorumUnavailable { .. } => libc::EROFS,
+            ArgosError::CommittedDurabilityLoss(_) => libc::EIO,
             ArgosError::UnsafeMount(_) => libc::EROFS,
             ArgosError::JournalReplayRequired(_) => libc::EAGAIN,
             ArgosError::ReadonlyRequired(_) => libc::EROFS,

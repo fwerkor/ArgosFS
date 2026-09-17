@@ -588,12 +588,27 @@ impl ArgosFs {
         self.quarantined_devices.lock().insert(disk_id.to_string());
     }
 
-    fn apply_quorum_write_report(&self, report: raw_store::QuorumWriteReport) {
-        if report.failed_devices.is_empty() {
-            return;
+    fn apply_quorum_write_report(
+        &self,
+        meta: &Metadata,
+        report: raw_store::QuorumWriteReport,
+    ) -> Result<()> {
+        if !report.failed_devices.is_empty() {
+            let mut quarantined = self.quarantined_devices.lock();
+            quarantined.extend(report.failed_devices.into_keys());
         }
-        let mut quarantined = self.quarantined_devices.lock();
-        quarantined.extend(report.failed_devices.into_keys());
+        let unavailable = self.quarantined_devices.lock().clone();
+        match self.validate_data_durability_locked(meta, &unavailable) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.fence_on_quorum_loss(&err);
+                Err(ArgosError::CommittedDurabilityLoss(err.to_string()))
+            }
+        }
+    }
+
+    pub(crate) fn runtime_unavailable_devices(&self) -> BTreeSet<String> {
+        self.quarantined_devices.lock().clone()
     }
 
     fn fence_on_quorum_loss(&self, err: &ArgosError) {
@@ -630,16 +645,17 @@ impl ArgosFs {
                 let backend = self.metadata_block_backend_locked(&meta, &superblocks, true)?;
                 raw_store::write_metadata_copies_quorum(&backend, &superblocks, &meta)
             };
-            match result {
-                Ok(report) => self.apply_quorum_write_report(report),
+            let durability = match result {
+                Ok(report) => self.apply_quorum_write_report(&meta, report),
                 Err(err) => {
                     self.fence_on_quorum_loss(&err);
                     return Err(err);
                 }
-            }
+            };
             let mut state = self.deferred_commit.lock();
             state.durable_metadata = Some(meta.clone());
             state.raw_uncommitted_metadata_dirty = false;
+            durability?;
             return Ok(());
         }
 
@@ -675,7 +691,7 @@ impl ArgosFs {
         let mark_clean = |backend: &dyn StorageBackend| -> Result<()> {
             if meta.config.defer_metadata_commit {
                 let report = raw_store::write_metadata_copies_quorum(backend, &superblocks, &meta)?;
-                self.apply_quorum_write_report(report);
+                self.apply_quorum_write_report(&meta, report)?;
             }
             raw_store::write_superblock_clean_state(backend, &superblocks, true)
         };
@@ -1500,19 +1516,20 @@ impl ArgosFs {
     }
 
     fn transaction_error_is_committed(err: &ArgosError) -> bool {
-        matches!(
-            err,
-            ArgosError::InjectedCrash(point)
-                if matches!(
-                    point.as_str(),
-                    "after-journal"
-                        | "after-primary-metadata"
-                        | "after-secondary-metadata"
-                        | "after-compatible-metadata"
-                        | "after-journal-commit-before-metadata-commit"
-                        | "after-metadata-commit-before-superblock-update"
-                )
-        )
+        matches!(err, ArgosError::CommittedDurabilityLoss(_))
+            || matches!(
+                err,
+                ArgosError::InjectedCrash(point)
+                    if matches!(
+                        point.as_str(),
+                        "after-journal"
+                            | "after-primary-metadata"
+                            | "after-secondary-metadata"
+                            | "after-compatible-metadata"
+                            | "after-journal-commit-before-metadata-commit"
+                            | "after-metadata-commit-before-superblock-update"
+                    )
+            )
     }
 
     fn flush_deferred_data_locked(
@@ -1535,6 +1552,14 @@ impl ArgosFs {
             .lock()
             .extend(unavailable.iter().cloned());
 
+        self.validate_data_durability_locked(meta, &unavailable)
+    }
+
+    fn validate_data_durability_locked(
+        &self,
+        meta: &Metadata,
+        unavailable: &BTreeSet<String>,
+    ) -> Result<()> {
         for block in meta.inodes.values().flat_map(|inode| inode.blocks.iter()) {
             let layout = layout_by_id(meta, block_layout_id(block))?;
             let missing = block
@@ -1604,6 +1629,8 @@ impl ArgosFs {
             }
             journal::prepare_metadata_integrity_with_previous(meta, previous_meta_hash.clone())?;
             let superblocks = self.metadata_superblocks_locked(meta)?;
+            let unavailable = self.quarantined_devices.lock().clone();
+            self.validate_data_durability_locked(meta, &unavailable)?;
             let commit = |backend: &dyn StorageBackend| -> Result<raw_store::QuorumWriteReport> {
                 if dirty_transactions > 0 && (meta.config.defer_data_flush || bulk_import_enabled())
                 {
@@ -1638,14 +1665,22 @@ impl ArgosFs {
 
         match result {
             Ok(report) => {
-                self.apply_quorum_write_report(report);
+                let durability = self.apply_quorum_write_report(meta, report);
                 state.durable_metadata = Some(meta.clone());
                 state.raw_uncommitted_metadata_dirty = false;
                 state.dirty_transactions = 0;
                 state.dirty_since = None;
                 state.pending_reclaims.clear();
-                state.last_error = None;
-                Ok(true)
+                match durability {
+                    Ok(()) => {
+                        state.last_error = None;
+                        Ok(true)
+                    }
+                    Err(err) => {
+                        state.last_error = Some(err.to_string());
+                        Err(err)
+                    }
+                }
             }
             Err(err) if Self::transaction_error_is_committed(&err) => {
                 state.durable_metadata = Some(meta.clone());
@@ -1710,6 +1745,8 @@ impl ArgosFs {
                 return Ok(());
             }
             let superblocks = self.metadata_superblocks_locked(meta)?;
+            let unavailable = self.quarantined_devices.lock().clone();
+            self.validate_data_durability_locked(meta, &unavailable)?;
             let replay_previous = if raw_uncommitted_metadata_dirty {
                 None
             } else {
@@ -1742,7 +1779,19 @@ impl ArgosFs {
                 commit(&backend)
             };
             match result {
-                Ok(report) => self.apply_quorum_write_report(report),
+                Ok(report) => {
+                    if let Err(err) = self.apply_quorum_write_report(meta, report) {
+                        // The metadata quorum has already committed this transaction.
+                        // Keep the live metadata at that durable state, but fail the
+                        // mutation and fence further writes because referenced data is
+                        // no longer reconstructable from runtime-available members.
+                        let mut state = self.deferred_commit.lock();
+                        state.durable_metadata = Some(meta.clone());
+                        state.raw_uncommitted_metadata_dirty = false;
+                        state.last_error = Some(err.to_string());
+                        return Err(err);
+                    }
+                }
                 Err(commit_err) => {
                     self.fence_on_quorum_loss(&commit_err);
                     if Self::transaction_error_is_committed(&commit_err) {
@@ -1857,7 +1906,7 @@ impl ArgosFs {
             };
             return match result {
                 Ok(report) => {
-                    self.apply_quorum_write_report(report);
+                    self.apply_quorum_write_report(&journal_meta, report)?;
                     Ok(())
                 }
                 Err(err) => {
@@ -1911,12 +1960,15 @@ impl ArgosFs {
             // Metadata membership is independent of data-placement status. An
             // administratively Offline/Failed member that is still physically
             // reachable may still carry the membership-changing transaction.
-            // Truly absent members are simply omitted; quorum accounting below
-            // still uses the metadata electorate and will reject unsafe commits.
-            if let Ok((superblock, _)) = raw_store::inspect_device(meta.backend, disk.path.clone())
-            {
-                seen.insert(superblock.disk_id.clone());
-                superblocks.push(superblock);
+            // If a dynamically added member cannot be inspected, quarantine it
+            // rather than silently omitting it: deferred data may already reference
+            // shards placed there, and durability validation must count it missing.
+            match raw_store::inspect_device(meta.backend, disk.path.clone()) {
+                Ok((superblock, _)) => {
+                    seen.insert(superblock.disk_id.clone());
+                    superblocks.push(superblock);
+                }
+                Err(_) => self.quarantine_device(disk_id),
             }
         }
         Ok(superblocks)

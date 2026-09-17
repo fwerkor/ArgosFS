@@ -326,6 +326,9 @@ fn transaction_error_classification_covers_committed_and_uncommitted_points() {
             &ArgosError::InjectedCrash(point.to_string())
         ));
     }
+    assert!(ArgosFs::transaction_error_is_committed(
+        &ArgosError::CommittedDurabilityLoss("data quorum lost".to_string())
+    ));
     for error in [
         ArgosError::InjectedCrash("before-journal".to_string()),
         ArgosError::Invalid("x".to_string()),
@@ -381,6 +384,92 @@ fn raw_journal_events_refresh_stale_read_telemetry_integrity() {
     assert_eq!(report.invalid_entries, 0, "{:#?}", report.errors);
     assert_eq!(report.raw_journal_quorum, Some(true));
     assert!(fs.deferred_commit.lock().raw_uncommitted_metadata_dirty);
+}
+
+#[test]
+fn quorum_report_fences_when_failed_member_owns_required_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|index| dir.path().join(format!("fanout-{index}.img")))
+        .collect::<Vec<_>>();
+    let fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            compression: Compression::None,
+            chunk_size: 4096,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "fanout-durability",
+        false,
+    )
+    .unwrap();
+    fs.write_file("/payload", &vec![7u8; 64 * 1024], 0o600)
+        .unwrap();
+    fs.sync().unwrap();
+
+    let meta = fs.metadata_snapshot();
+    let failed_disk = meta
+        .inodes
+        .values()
+        .find(|inode| inode.kind == NodeKind::File)
+        .and_then(|inode| inode.blocks.first())
+        .and_then(|block| block.shards.first())
+        .map(|shard| shard.disk_id.clone())
+        .unwrap();
+    let mut report = raw_store::QuorumWriteReport::default();
+    report
+        .failed_devices
+        .insert(failed_disk.clone(), "simulated metadata EIO".to_string());
+
+    let err = fs.apply_quorum_write_report(&meta, report).unwrap_err();
+    assert!(matches!(err, ArgosError::CommittedDurabilityLoss(_)));
+    assert!(fs.is_device_quarantined(&failed_disk));
+    assert!(fs.write_fence.lock().is_some());
+}
+
+#[test]
+fn failed_inspection_of_new_block_member_blocks_deferred_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base.img");
+    let fs = ArgosFs::create_loop(
+        std::slice::from_ref(&base),
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            chunk_size: 4096,
+            compression: Compression::None,
+            defer_journal_flush: true,
+            defer_metadata_commit: true,
+            defer_data_flush: true,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "dynamic-member",
+        false,
+    )
+    .unwrap();
+    let added_path = dir.path().join("added.img");
+    let disk_id = fs
+        .add_block_device(added_path.clone(), 32 * 1024 * 1024, false)
+        .unwrap();
+    fs.sync().unwrap();
+    assert!(!fs.raw_superblocks.iter().any(|sb| sb.disk_id == disk_id));
+
+    // Force new data onto the dynamically added member, then make its path
+    // disappear before the bounded group commit tries to inspect/flush it.
+    fs.mark_disk("disk-0000", DiskStatus::Offline).unwrap();
+    fs.sync().unwrap();
+    fs.write_file("/new-data", &vec![3u8; 64 * 1024], 0o600)
+        .unwrap();
+    std::fs::remove_file(&added_path).unwrap();
+
+    let err = fs.sync().unwrap_err();
+    assert!(matches!(err, ArgosError::QuorumUnavailable { .. }));
+    assert!(fs.is_device_quarantined(&disk_id));
+    assert!(fs.write_fence.lock().is_some());
 }
 
 #[test]
