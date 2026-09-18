@@ -545,7 +545,7 @@ fn best_effort_writeback_does_not_poison_unrelated_inodes() {
 }
 
 #[test]
-fn lookup_propagates_target_writeback_failure_but_ignores_unrelated_dirty_inode() {
+fn lookup_retries_target_writeback_without_blocking_namespace_resolution() {
     let tmp = tempfile::tempdir().unwrap();
     let volume = ArgosFs::create(
         tmp.path(),
@@ -572,9 +572,12 @@ fn lookup_propagates_target_writeback_failure_but_ignores_unrelated_dirty_inode(
     );
     assert!(fuse.writeback.lock().dirty.contains_key(&bad_dir));
 
-    assert!(fuse
-        .lookup_after_access(root, OsStr::new("bad-dir"))
-        .is_err());
+    assert_eq!(
+        fuse.lookup_after_access(root, OsStr::new("bad-dir"))
+            .unwrap()
+            .ino,
+        bad_dir
+    );
     assert!(fuse.writeback.lock().dirty.contains_key(&bad_dir));
 }
 

@@ -371,7 +371,10 @@ impl ArgosFuse {
 
     fn lookup_after_access(&self, parent: InodeId, name: &OsStr) -> Result<NodeAttr> {
         let attr = self.volume.lookup(parent, name)?;
-        self.flush_inode_writeback(attr.ino)?;
+        // Lookup is path resolution, not a durability boundary. Retry the target
+        // writeback so successful flushes refresh attributes, but do not make a
+        // failed dirty inode impossible to resolve for unlink/rename cleanup.
+        let _ = self.flush_inode_writeback(attr.ino);
         self.volume.lookup(parent, name)
     }
 
