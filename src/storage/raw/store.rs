@@ -53,14 +53,7 @@ impl QuorumWriteReport {
 }
 
 fn member_failure_makes_data_unavailable(err: &ArgosError) -> bool {
-    match err {
-        ArgosError::MissingDevice(_) => true,
-        ArgosError::Io(io_err) => matches!(
-            io_err.raw_os_error(),
-            Some(libc::EIO | libc::ENODEV | libc::ENXIO | libc::EREMOTEIO)
-        ),
-        _ => false,
-    }
+    err.is_fatal_device_error()
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1182,7 +1175,17 @@ fn read_latest_journal_metadata(
                 break;
             }
             let mut bytes = vec![0u8; len];
-            backend.read_at(&sb.disk_id, sb.journal.offset + cursor + 36, &mut bytes)?;
+            if let Err(err) =
+                backend.read_at(&sb.disk_id, sb.journal.offset + cursor + 36, &mut bytes)
+            {
+                member.error = Some(err.to_string());
+                report.invalid_entries += 1;
+                report.errors.push(format!(
+                    "raw journal payload at {}:{} could not be read: {err}",
+                    sb.disk_id, cursor
+                ));
+                break;
+            }
             if hex::encode(&entry_header[4..36]) != sha256_hex(&bytes) {
                 report.invalid_entries += 1;
                 break;

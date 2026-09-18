@@ -71,3 +71,16 @@ fn every_error_variant_has_the_expected_errno() {
         libc::EIO
     );
 }
+
+#[test]
+fn fatal_device_error_classification_excludes_capacity_and_transient_io() {
+    for errno in [libc::EIO, libc::ENODEV, libc::ENXIO, libc::EREMOTEIO] {
+        assert!(ArgosError::Io(std::io::Error::from_raw_os_error(errno)).is_fatal_device_error());
+    }
+    assert!(ArgosError::MissingDevice("disk-0001".to_string()).is_fatal_device_error());
+
+    for errno in [libc::ENOSPC, libc::EDQUOT, libc::EAGAIN, libc::EINTR] {
+        assert!(!ArgosError::Io(std::io::Error::from_raw_os_error(errno)).is_fatal_device_error());
+    }
+    assert!(!ArgosError::Io(std::io::Error::other("no errno")).is_fatal_device_error());
+}

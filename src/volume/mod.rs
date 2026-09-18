@@ -621,7 +621,7 @@ impl ArgosFs {
     }
 
     fn device_error_should_quarantine(err: &ArgosError) -> bool {
-        matches!(err, ArgosError::Io(_) | ArgosError::MissingDevice(_))
+        err.is_fatal_device_error()
     }
 
     pub fn sync(&self) -> Result<()> {

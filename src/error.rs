@@ -73,6 +73,17 @@ pub enum ArgosError {
 }
 
 impl ArgosError {
+    pub(crate) fn is_fatal_device_error(&self) -> bool {
+        match self {
+            ArgosError::MissingDevice(_) => true,
+            ArgosError::Io(err) => matches!(
+                err.raw_os_error(),
+                Some(libc::EIO | libc::ENODEV | libc::ENXIO | libc::EREMOTEIO)
+            ),
+            _ => false,
+        }
+    }
+
     pub fn errno(&self) -> i32 {
         match self {
             ArgosError::NotFound(_) => libc::ENOENT,

@@ -12,6 +12,54 @@ struct FailingBackend {
     failed: BTreeSet<String>,
 }
 
+struct JournalPayloadFailBackend {
+    inner: FileBlockBackend,
+    failed_device: String,
+    fail_from: u64,
+    fail_to: u64,
+}
+
+impl StorageBackend for JournalPayloadFailBackend {
+    fn backend_kind(&self) -> BackendKind {
+        self.inner.backend_kind()
+    }
+
+    fn list_devices(&self) -> Result<Vec<crate::backend::BackendDeviceInfo>> {
+        self.inner.list_devices()
+    }
+
+    fn read_at(&self, device_id: &String, offset: u64, buf: &mut [u8]) -> Result<()> {
+        if device_id == &self.failed_device && offset >= self.fail_from && offset < self.fail_to {
+            return Err(ArgosError::Io(std::io::Error::from_raw_os_error(libc::EIO)));
+        }
+        self.inner.read_at(device_id, offset, buf)
+    }
+
+    fn write_at(&self, device_id: &String, offset: u64, data: &[u8]) -> Result<()> {
+        self.inner.write_at(device_id, offset, data)
+    }
+
+    fn flush_device(&self, device_id: &String) -> Result<()> {
+        self.inner.flush_device(device_id)
+    }
+
+    fn flush_all(&self) -> Result<()> {
+        self.inner.flush_all()
+    }
+
+    fn capacity(&self, device_id: &String) -> Result<u64> {
+        self.inner.capacity(device_id)
+    }
+
+    fn device_status(&self, device_id: &String) -> Result<DiskStatus> {
+        self.inner.device_status(device_id)
+    }
+
+    fn capabilities(&self) -> crate::backend::BackendCapabilities {
+        self.inner.capabilities()
+    }
+}
+
 impl FailingBackend {
     fn eio() -> ArgosError {
         ArgosError::Io(std::io::Error::from_raw_os_error(libc::EIO))
@@ -288,6 +336,51 @@ fn quorum_journal_commit_survives_one_member_eio() {
     let recovered = reopened.metadata_snapshot();
     assert_eq!(recovered.txid, next.txid);
     assert_eq!(recovered.raw_pool.pool_name, "committed-with-one-eio");
+}
+
+#[test]
+fn journal_recovery_ignores_one_member_payload_eio_when_quorum_is_readable() {
+    let (_dir, images, previous, superblocks) = quorum_fixture();
+    let next = next_metadata(&previous, "recover-with-payload-eio");
+    let backend = block_backend_for(&images);
+    append_transaction_with_trusted_integrity_quorum(
+        &backend,
+        &superblocks,
+        &next,
+        Some(&previous),
+        "payload-eio-recovery",
+        serde_json::json!({}),
+    )
+    .unwrap();
+    drop(backend);
+
+    let failed = &superblocks[2];
+    let backend = JournalPayloadFailBackend {
+        inner: block_backend_for(&images),
+        failed_device: failed.disk_id.clone(),
+        fail_from: failed.journal.offset + RAW_HEADER_SIZE as u64 + 36,
+        fail_to: failed.journal.offset + failed.journal.length,
+    };
+    let mut report = TransactionReport::default();
+    let recovered =
+        read_latest_journal_metadata(&backend, &superblocks, &mut report, Some(&previous))
+            .unwrap()
+            .unwrap();
+
+    assert_eq!(recovered.txid, next.txid);
+    assert_eq!(recovered.raw_pool.pool_name, "recover-with-payload-eio");
+    let failed_member = report
+        .raw_journal_members
+        .iter()
+        .find(|member| member.disk_id == failed.disk_id)
+        .unwrap();
+    assert!(failed_member
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("I/O error"));
+    assert!(failed_member.invalid_entries > 0);
+    assert_eq!(report.raw_journal_quorum, Some(true));
 }
 
 #[test]
