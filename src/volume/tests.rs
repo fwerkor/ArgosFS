@@ -423,10 +423,104 @@ fn quorum_report_fences_when_failed_member_owns_required_data() {
     report
         .failed_devices
         .insert(failed_disk.clone(), "simulated metadata EIO".to_string());
+    report.unavailable_devices.insert(failed_disk.clone());
 
     let err = fs.apply_quorum_write_report(&meta, report).unwrap_err();
     assert!(matches!(err, ArgosError::CommittedDurabilityLoss(_)));
     assert!(fs.is_device_quarantined(&failed_disk));
+    assert!(fs.write_fence.lock().is_some());
+}
+
+#[test]
+fn durability_validation_counts_offline_and_quarantined_shards_together() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|index| dir.path().join(format!("admin-unavailable-{index}.img")))
+        .collect::<Vec<_>>();
+    let fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            compression: Compression::None,
+            chunk_size: 4096,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "admin-unavailable",
+        false,
+    )
+    .unwrap();
+    fs.write_file("/payload", &vec![5u8; 64 * 1024], 0o600)
+        .unwrap();
+    fs.sync().unwrap();
+
+    let meta = fs.metadata_snapshot();
+    let block = meta
+        .inodes
+        .values()
+        .find(|inode| inode.kind == NodeKind::File)
+        .and_then(|inode| inode.blocks.first())
+        .unwrap();
+    let offline = block.shards[0].disk_id.clone();
+    let quarantined = block.shards[1].disk_id.clone();
+
+    let mut degraded = meta.clone();
+    degraded.disks.get_mut(&offline).unwrap().status = DiskStatus::Offline;
+    let unavailable = BTreeSet::from([quarantined]);
+    assert!(matches!(
+        fs.validate_data_durability_locked(&degraded, &unavailable),
+        Err(ArgosError::QuorumUnavailable { .. })
+    ));
+}
+
+#[test]
+fn immediate_precommit_durability_rejection_rolls_back_namespace_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|index| dir.path().join(format!("rollback-{index}.img")))
+        .collect::<Vec<_>>();
+    let fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            compression: Compression::None,
+            chunk_size: 4096,
+            defer_metadata_commit: false,
+            defer_journal_flush: false,
+            defer_data_flush: false,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "rollback-precommit",
+        false,
+    )
+    .unwrap();
+    fs.write_file("/payload", &vec![9u8; 64 * 1024], 0o600)
+        .unwrap();
+    fs.sync().unwrap();
+
+    let snapshot = fs.metadata_snapshot();
+    let block = snapshot
+        .inodes
+        .values()
+        .find(|inode| inode.kind == NodeKind::File)
+        .and_then(|inode| inode.blocks.first())
+        .unwrap();
+    let offline = block.shards[0].disk_id.clone();
+    let quarantined = block.shards[1].disk_id.clone();
+    fs.mark_disk(&offline, DiskStatus::Offline).unwrap();
+    fs.quarantine_device(&quarantined);
+
+    assert!(matches!(
+        fs.mkdir("/rejected", 0o755),
+        Err(ArgosError::QuorumUnavailable { .. })
+    ));
+    assert!(matches!(
+        fs.resolve_path("/rejected", true),
+        Err(ArgosError::NotFound(_))
+    ));
     assert!(fs.write_fence.lock().is_some());
 }
 

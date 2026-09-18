@@ -291,6 +291,28 @@ fn quorum_journal_commit_survives_one_member_eio() {
 }
 
 #[test]
+fn quorum_report_distinguishes_metadata_failure_from_device_unavailability() {
+    let mut report = QuorumWriteReport::default();
+    report.record_failure(
+        "metadata-full",
+        &ArgosError::DiskFull {
+            disk_id: "metadata-full".to_string(),
+            required: 2,
+            available: 1,
+        },
+    );
+    report.record_failure(
+        "eio",
+        &ArgosError::Io(std::io::Error::from_raw_os_error(libc::EIO)),
+    );
+
+    assert!(report.failed_devices.contains_key("metadata-full"));
+    assert!(!report.unavailable_devices.contains("metadata-full"));
+    assert!(report.failed_devices.contains_key("eio"));
+    assert!(report.unavailable_devices.contains("eio"));
+}
+
+#[test]
 fn quorum_journal_commit_rejects_loss_of_majority() {
     let (_dir, images, previous, superblocks) = quorum_fixture();
     let next = next_metadata(&previous, "must-not-commit");

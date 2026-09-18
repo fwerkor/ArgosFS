@@ -545,6 +545,40 @@ fn best_effort_writeback_does_not_poison_unrelated_inodes() {
 }
 
 #[test]
+fn lookup_propagates_target_writeback_failure_but_ignores_unrelated_dirty_inode() {
+    let tmp = tempfile::tempdir().unwrap();
+    let volume = ArgosFs::create(
+        tmp.path(),
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            ..VolumeConfig::default()
+        },
+        1,
+        false,
+    )
+    .unwrap();
+    let target = volume.create_file_path("/target", 0o644).unwrap();
+    let bad_dir = volume.mkdir("/bad-dir", 0o755).unwrap();
+    let root = volume.resolve_path("/", true).unwrap();
+    let fuse = ArgosFuse::new(volume.clone());
+
+    assert!(fuse.queue_writeback(bad_dir, 0, b"cannot-write-a-directory"));
+    assert_eq!(
+        fuse.lookup_after_access(root, OsStr::new("target"))
+            .unwrap()
+            .ino,
+        target
+    );
+    assert!(fuse.writeback.lock().dirty.contains_key(&bad_dir));
+
+    assert!(fuse
+        .lookup_after_access(root, OsStr::new("bad-dir"))
+        .is_err());
+    assert!(fuse.writeback.lock().dirty.contains_key(&bad_dir));
+}
+
+#[test]
 fn unlink_ignores_unrelated_failed_writeback() {
     let tmp = tempfile::tempdir().unwrap();
     let volume = ArgosFs::create(

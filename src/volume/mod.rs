@@ -593,9 +593,9 @@ impl ArgosFs {
         meta: &Metadata,
         report: raw_store::QuorumWriteReport,
     ) -> Result<()> {
-        if !report.failed_devices.is_empty() {
+        if !report.unavailable_devices.is_empty() {
             let mut quarantined = self.quarantined_devices.lock();
-            quarantined.extend(report.failed_devices.into_keys());
+            quarantined.extend(report.unavailable_devices);
         }
         let unavailable = self.quarantined_devices.lock().clone();
         match self.validate_data_durability_locked(meta, &unavailable) {
@@ -1565,7 +1565,15 @@ impl ArgosFs {
             let missing = block
                 .shards
                 .iter()
-                .filter(|shard| unavailable.contains(&shard.disk_id))
+                .filter(|shard| {
+                    unavailable.contains(&shard.disk_id)
+                        || meta.disks.get(&shard.disk_id).is_none_or(|disk| {
+                            matches!(
+                                disk.status,
+                                DiskStatus::Failed | DiskStatus::Offline | DiskStatus::Removed
+                            )
+                        })
+                })
                 .count();
             if missing > layout.m {
                 let have = block.shards.len().saturating_sub(missing);
@@ -1746,7 +1754,20 @@ impl ArgosFs {
             }
             let superblocks = self.metadata_superblocks_locked(meta)?;
             let unavailable = self.quarantined_devices.lock().clone();
-            self.validate_data_durability_locked(meta, &unavailable)?;
+            if let Err(precommit_err) = self.validate_data_durability_locked(meta, &unavailable) {
+                self.fence_on_quorum_loss(&precommit_err);
+                if let Some(previous) = previous_metadata {
+                    *meta = previous.clone();
+                    recompute_disk_usage_from_metadata(meta);
+                } else if let Err(recovery_err) =
+                    self.restore_raw_metadata_locked(meta, &superblocks)
+                {
+                    return Err(ArgosError::CorruptedMetadata(format!(
+                        "raw transaction rejected before commit ({precommit_err}) and metadata rollback failed ({recovery_err})"
+                    )));
+                }
+                return Err(precommit_err);
+            }
             let replay_previous = if raw_uncommitted_metadata_dirty {
                 None
             } else {

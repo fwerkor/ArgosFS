@@ -369,6 +369,12 @@ impl ArgosFuse {
         writeback.reap_after_flush.remove(&ino);
     }
 
+    fn lookup_after_access(&self, parent: InodeId, name: &OsStr) -> Result<NodeAttr> {
+        let attr = self.volume.lookup(parent, name)?;
+        self.flush_inode_writeback(attr.ino)?;
+        self.volume.lookup(parent, name)
+    }
+
     fn unlink_after_access(&self, parent: InodeId, name: &OsStr, uid: u32) -> Result<()> {
         // Keep the open-handle decision atomic with the namespace mutation. A
         // concurrent open/release must not turn a preserving unlink into a normal
@@ -494,10 +500,9 @@ impl Filesystem for ArgosFuse {
     }
 
     fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        self.flush_all_writeback_best_effort();
         match self
             .require_access(req, parent, libc::X_OK)
-            .and_then(|()| self.volume.lookup(parent.0, name))
+            .and_then(|()| self.lookup_after_access(parent.0, name))
         {
             Ok(attr) => reply.entry(&TTL, &to_file_attr(&attr), Generation(0)),
             Err(err) => reply.error(errno(&err)),

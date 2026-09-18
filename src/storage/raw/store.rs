@@ -39,12 +39,27 @@ pub struct RawOpen {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct QuorumWriteReport {
     pub failed_devices: BTreeMap<String, String>,
+    pub unavailable_devices: BTreeSet<String>,
 }
 
 impl QuorumWriteReport {
     fn record_failure(&mut self, disk_id: &str, err: &ArgosError) {
         self.failed_devices
             .insert(disk_id.to_string(), err.to_string());
+        if member_failure_makes_data_unavailable(err) {
+            self.unavailable_devices.insert(disk_id.to_string());
+        }
+    }
+}
+
+fn member_failure_makes_data_unavailable(err: &ArgosError) -> bool {
+    match err {
+        ArgosError::MissingDevice(_) => true,
+        ArgosError::Io(io_err) => matches!(
+            io_err.raw_os_error(),
+            Some(libc::EIO | libc::ENODEV | libc::ENXIO | libc::EREMOTEIO)
+        ),
+        _ => false,
     }
 }
 
