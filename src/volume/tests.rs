@@ -329,13 +329,49 @@ fn transaction_error_classification_covers_committed_and_uncommitted_points() {
     assert!(ArgosFs::transaction_error_is_committed(
         &ArgosError::CommittedDurabilityLoss("data quorum lost".to_string())
     ));
+    assert!(ArgosFs::transaction_error_is_committed(
+        &ArgosError::IndeterminateCommit("flush outcome unknown".to_string())
+    ));
     for error in [
         ArgosError::InjectedCrash("before-journal".to_string()),
         ArgosError::Invalid("x".to_string()),
         ArgosError::Conflict("x".to_string()),
+        ArgosError::RetryableQuorumUnavailable {
+            operation: "metadata".to_string(),
+            need: 2,
+            have: 1,
+        },
     ] {
         assert!(!ArgosFs::transaction_error_is_committed(&error));
     }
+}
+
+#[test]
+fn retryable_quorum_shortfall_does_not_write_fence_mount() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fs = ArgosFs::create(
+        tmp.path(),
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            ..VolumeConfig::default()
+        },
+        1,
+        false,
+    )
+    .unwrap();
+    let retryable = ArgosError::RetryableQuorumUnavailable {
+        operation: "metadata".to_string(),
+        need: 2,
+        have: 1,
+    };
+    fs.fence_on_quorum_loss(&retryable);
+    assert!(fs.write_fence.lock().is_none());
+
+    fs.fence_on_quorum_loss(&ArgosError::IndeterminateCommit(
+        "outcome unknown".to_string(),
+    ));
+    assert!(fs.write_fence.lock().is_some());
 }
 
 #[test]
@@ -564,6 +600,52 @@ fn failed_inspection_of_new_block_member_blocks_deferred_commit() {
     assert!(matches!(err, ArgosError::QuorumUnavailable { .. }));
     assert!(fs.is_device_quarantined(&disk_id));
     assert!(fs.write_fence.lock().is_some());
+}
+
+#[test]
+fn dynamically_inspected_member_rejects_repointed_duplicate_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("identity-base.img");
+    let fs = ArgosFs::create_loop(
+        std::slice::from_ref(&base),
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            chunk_size: 4096,
+            compression: Compression::None,
+            defer_journal_flush: true,
+            defer_metadata_commit: true,
+            defer_data_flush: true,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "dynamic-identity",
+        false,
+    )
+    .unwrap();
+    let added_path = dir.path().join("identity-added.img");
+    let disk_id = fs
+        .add_block_device(added_path.clone(), 32 * 1024 * 1024, false)
+        .unwrap();
+    fs.sync().unwrap();
+    assert!(!fs.raw_superblocks.iter().any(|sb| sb.disk_id == disk_id));
+
+    // Replace the path with another readable ArgosFS member from this pool.
+    // Inspection must not accept disk-0000 as a second copy of disk-0001.
+    std::fs::remove_file(&added_path).unwrap();
+    std::fs::copy(&base, &added_path).unwrap();
+
+    let meta = fs.meta.read();
+    let superblocks = fs.metadata_superblocks_locked(&meta).unwrap();
+    assert!(!superblocks.iter().any(|sb| sb.disk_id == disk_id));
+    assert_eq!(
+        superblocks
+            .iter()
+            .filter(|sb| sb.disk_id == "disk-0000")
+            .count(),
+        1
+    );
+    assert!(fs.is_device_quarantined(&disk_id));
 }
 
 #[test]

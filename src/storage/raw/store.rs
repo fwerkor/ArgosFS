@@ -364,14 +364,25 @@ pub(crate) fn write_metadata_copies_quorum(
     let hash = sha256_hex(&bytes);
     let mut report = QuorumWriteReport::default();
     let mut durable = 0usize;
+    let mut uncertain_write = false;
     for sb in superblocks {
         match write_metadata_member(backend, sb, metadata, &bytes, &hash) {
             Ok(()) => durable += 1,
-            Err(err) => report.record_failure(&sb.disk_id, &err),
+            Err(err) => {
+                // DiskFull is raised while constructing the checkpoint before any
+                // member write occurs. Other write/flush failures can leave the new
+                // checkpoint exposed even when durability cannot be confirmed.
+                uncertain_write |= !matches!(err, ArgosError::DiskFull { .. });
+                report.record_failure(&sb.disk_id, &err);
+            }
         }
     }
     if durable < need {
-        return Err(quorum_unavailable("metadata checkpoint", need, durable));
+        return Err(if uncertain_write {
+            indeterminate_commit("metadata checkpoint", need, durable)
+        } else {
+            quorum_failure_before_write(&report, "metadata checkpoint", need, durable)
+        });
     }
     Ok(report)
 }
@@ -787,7 +798,8 @@ fn append_journal_quorum(
         }
     }
     if positions.len() < need {
-        return Err(quorum_unavailable(
+        return Err(quorum_failure_before_write(
+            &report,
             "metadata journal",
             need,
             positions.len(),
@@ -796,18 +808,22 @@ fn append_journal_quorum(
 
     if rollover {
         let mut durable = 0usize;
+        let mut uncertain_write = false;
         for (sb, _) in positions {
             match checkpoint_and_reset_journal(backend, sb, metadata) {
                 Ok(()) => durable += 1,
-                Err(err) => report.record_failure(&sb.disk_id, &err),
+                Err(err) => {
+                    uncertain_write |= !matches!(err, ArgosError::DiskFull { .. });
+                    report.record_failure(&sb.disk_id, &err);
+                }
             }
         }
         if durable < need {
-            return Err(quorum_unavailable(
-                "metadata journal rollover",
-                need,
-                durable,
-            ));
+            return Err(if uncertain_write {
+                indeterminate_commit("metadata journal rollover", need, durable)
+            } else {
+                quorum_failure_before_write(&report, "metadata journal rollover", need, durable)
+            });
         }
         return Ok(report);
     }
@@ -826,7 +842,7 @@ fn append_journal_quorum(
         ) {
             Ok(()) => {
                 appended.insert(sb.disk_id.clone());
-                if index + 1 < position_count {
+                if appended.len() < need && index + 1 < position_count {
                     journal::inject_crash(FaultPoint::AfterPartialJournalFanout.as_str())?;
                 }
             }
@@ -849,7 +865,15 @@ fn append_journal_quorum(
         appended
     };
     if durable.len() < need {
-        return Err(quorum_unavailable("metadata journal", need, durable.len()));
+        // Every candidate member has already been offered the new record/header.
+        // A write or flush error cannot prove that those bytes will disappear
+        // across reboot, so returning an ordinary uncommitted quorum error would
+        // allow caller rollback followed by recovery resurrecting the mutation.
+        return Err(indeterminate_commit(
+            "metadata journal",
+            need,
+            durable.len(),
+        ));
     }
     Ok(report)
 }
@@ -903,9 +927,31 @@ fn load_or_recover(
     report.selected_metadata_source = "raw-metadata-or-journal".to_string();
     if checkpoint_replay && report.replayed {
         journal::inject_crash(FaultPoint::DuringReplay.as_str())?;
-        write_metadata_copies(backend, superblocks, &metadata)?;
-        backend.flush_all()?;
-        reset_journals(backend, superblocks)?;
+        let checkpoint_report = write_metadata_copies_quorum(backend, superblocks, &metadata)?;
+        let failed_checkpoint_members = checkpoint_report
+            .failed_devices
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+
+        // Once the replayed checkpoint itself has a durable quorum, journal
+        // compaction is cleanup rather than a mount precondition. Reset only
+        // members that definitely received the checkpoint; a stale journal on
+        // another member is harmless because replay ignores records at/below the
+        // selected checkpoint txid.
+        for sb in superblocks {
+            if failed_checkpoint_members.contains(&sb.disk_id) {
+                continue;
+            }
+            if let Err(err) = initialize_journal_region(backend, &sb.disk_id, sb)
+                .and_then(|()| backend.flush_device(&sb.disk_id))
+            {
+                report.errors.push(format!(
+                    "raw journal reset after replay failed on {}: {err}",
+                    sb.disk_id
+                ));
+            }
+        }
     }
     Ok((metadata, report))
 }
@@ -950,6 +996,33 @@ fn quorum_unavailable(operation: &str, need: usize, have: usize) -> ArgosError {
         need,
         have,
     }
+}
+
+fn retryable_quorum_unavailable(operation: &str, need: usize, have: usize) -> ArgosError {
+    ArgosError::RetryableQuorumUnavailable {
+        operation: operation.to_string(),
+        need,
+        have,
+    }
+}
+
+fn quorum_failure_before_write(
+    report: &QuorumWriteReport,
+    operation: &str,
+    need: usize,
+    have: usize,
+) -> ArgosError {
+    if report.unavailable_devices.is_empty() {
+        retryable_quorum_unavailable(operation, need, have)
+    } else {
+        quorum_unavailable(operation, need, have)
+    }
+}
+
+fn indeterminate_commit(operation: &str, need: usize, durable: usize) -> ArgosError {
+    ArgosError::IndeterminateCommit(format!(
+        "{operation}: need {need} durable members, confirmed {durable}; additional members may have exposed the new state before their write/flush error"
+    ))
 }
 
 fn read_metadata_candidates(

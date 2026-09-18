@@ -62,6 +62,14 @@ pub enum ArgosError {
         need: usize,
         have: usize,
     },
+    #[error("{operation} quorum temporarily unavailable: need {need}, have {have}")]
+    RetryableQuorumUnavailable {
+        operation: String,
+        need: usize,
+        have: usize,
+    },
+    #[error("transaction commit outcome is indeterminate: {0}")]
+    IndeterminateCommit(String),
     #[error("committed transaction lost data durability: {0}")]
     CommittedDurabilityLoss(String),
     #[error("unsafe mount: {0}")]
@@ -108,6 +116,8 @@ impl ArgosError {
             ArgosError::MissingDevice(_) => libc::ENODEV,
             ArgosError::DegradedPool(_) => libc::EIO,
             ArgosError::QuorumUnavailable { .. } => libc::EROFS,
+            ArgosError::RetryableQuorumUnavailable { .. } => libc::EAGAIN,
+            ArgosError::IndeterminateCommit(_) => libc::EIO,
             ArgosError::CommittedDurabilityLoss(_) => libc::EIO,
             ArgosError::UnsafeMount(_) => libc::EROFS,
             ArgosError::JournalReplayRequired(_) => libc::EAGAIN,

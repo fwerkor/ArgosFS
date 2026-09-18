@@ -54,6 +54,15 @@ fn every_error_variant_has_the_expected_errno() {
             },
             libc::EROFS,
         ),
+        (
+            ArgosError::RetryableQuorumUnavailable {
+                operation: "metadata".into(),
+                need: 2,
+                have: 1,
+            },
+            libc::EAGAIN,
+        ),
+        (ArgosError::IndeterminateCommit("x".into()), libc::EIO),
         (ArgosError::CommittedDurabilityLoss("x".into()), libc::EIO),
         (ArgosError::UnsafeMount("x".into()), libc::EROFS),
         (ArgosError::JournalReplayRequired("x".into()), libc::EAGAIN),

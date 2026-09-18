@@ -593,7 +593,10 @@ impl ArgosFs {
         meta: &Metadata,
         report: raw_store::QuorumWriteReport,
     ) -> Result<()> {
-        if !report.unavailable_devices.is_empty() {
+        if report.unavailable_devices.is_empty() {
+            return Ok(());
+        }
+        {
             let mut quarantined = self.quarantined_devices.lock();
             quarantined.extend(report.unavailable_devices);
         }
@@ -612,7 +615,12 @@ impl ArgosFs {
     }
 
     fn fence_on_quorum_loss(&self, err: &ArgosError) {
-        if matches!(err, ArgosError::QuorumUnavailable { .. }) {
+        if matches!(
+            err,
+            ArgosError::QuorumUnavailable { .. }
+                | ArgosError::IndeterminateCommit(_)
+                | ArgosError::CommittedDurabilityLoss(_)
+        ) {
             let mut fence = self.write_fence.lock();
             if fence.is_none() {
                 *fence = Some(err.to_string());
@@ -1516,20 +1524,25 @@ impl ArgosFs {
     }
 
     fn transaction_error_is_committed(err: &ArgosError) -> bool {
-        matches!(err, ArgosError::CommittedDurabilityLoss(_))
-            || matches!(
-                err,
-                ArgosError::InjectedCrash(point)
-                    if matches!(
-                        point.as_str(),
-                        "after-journal"
-                            | "after-primary-metadata"
-                            | "after-secondary-metadata"
-                            | "after-compatible-metadata"
-                            | "after-journal-commit-before-metadata-commit"
-                            | "after-metadata-commit-before-superblock-update"
-                    )
-            )
+        // Indeterminate means the new state may already be recoverable after a
+        // reboot. Treat it as committed for rollback/block-reclaim decisions and
+        // fence the mount until recovery resolves the durable outcome.
+        matches!(
+            err,
+            ArgosError::CommittedDurabilityLoss(_) | ArgosError::IndeterminateCommit(_)
+        ) || matches!(
+            err,
+            ArgosError::InjectedCrash(point)
+                if matches!(
+                    point.as_str(),
+                    "after-journal"
+                        | "after-primary-metadata"
+                        | "after-secondary-metadata"
+                        | "after-compatible-metadata"
+                        | "after-journal-commit-before-metadata-commit"
+                        | "after-metadata-commit-before-superblock-update"
+                )
+        )
     }
 
     fn flush_deferred_data_locked(
@@ -1971,6 +1984,12 @@ impl ArgosFs {
             .iter()
             .map(|sb| sb.disk_id.clone())
             .collect::<BTreeSet<_>>();
+        let mut seen_device_uuid = superblocks
+            .iter()
+            .map(|sb| sb.device_uuid)
+            .collect::<BTreeSet<_>>();
+        let expected_pool_uuid = Uuid::parse_str(&meta.uuid)
+            .map_err(|err| ArgosError::Invalid(format!("invalid pool UUID: {err}")))?;
         for (disk_id, disk) in &meta.disks {
             if seen.contains(disk_id)
                 || quarantined.contains(disk_id)
@@ -1985,11 +2004,16 @@ impl ArgosFs {
             // rather than silently omitting it: deferred data may already reference
             // shards placed there, and durability validation must count it missing.
             match raw_store::inspect_device(meta.backend, disk.path.clone()) {
-                Ok((superblock, _)) => {
-                    seen.insert(superblock.disk_id.clone());
+                Ok((superblock, _))
+                    if superblock.pool_uuid == expected_pool_uuid
+                        && superblock.disk_id == *disk_id
+                        && !seen.contains(&superblock.disk_id)
+                        && seen_device_uuid.insert(superblock.device_uuid) =>
+                {
+                    seen.insert(disk_id.clone());
                     superblocks.push(superblock);
                 }
-                Err(_) => self.quarantine_device(disk_id),
+                Ok(_) | Err(_) => self.quarantine_device(disk_id),
             }
         }
         Ok(superblocks)
