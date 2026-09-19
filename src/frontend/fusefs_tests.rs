@@ -642,6 +642,40 @@ fn rejected_unlink_retains_failed_target_writeback() {
 }
 
 #[test]
+fn unlink_one_hard_link_retains_failed_target_writeback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let volume = ArgosFs::create(
+        tmp.path(),
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            ..VolumeConfig::default()
+        },
+        1,
+        false,
+    )
+    .unwrap();
+    let ino = volume.create_file_path("/primary", 0o644).unwrap();
+    let root = volume.resolve_path("/", true).unwrap();
+    volume.link_at(ino, root, OsStr::new("alias")).unwrap();
+    assert_eq!(volume.attr_inode(ino).unwrap().nlink, 2);
+    let fuse = ArgosFuse::new(volume.clone());
+
+    assert!(fuse.queue_writeback(ino, u64::MAX, b"pending"));
+    assert!(fuse.flush_inode_writeback(ino).is_err());
+    fuse.unlink_after_access(root, OsStr::new("primary"), unsafe { libc::geteuid() })
+        .unwrap();
+
+    assert!(matches!(
+        volume.lookup(root, OsStr::new("primary")),
+        Err(ArgosError::NotFound(_))
+    ));
+    assert_eq!(volume.lookup(root, OsStr::new("alias")).unwrap().ino, ino);
+    assert_eq!(volume.attr_inode(ino).unwrap().nlink, 1);
+    assert!(fuse.writeback.lock().dirty.contains_key(&ino));
+}
+
+#[test]
 fn unlink_preserves_inode_while_open_handle_exists() {
     let tmp = tempfile::tempdir().unwrap();
     let volume = ArgosFs::create(

@@ -98,7 +98,7 @@ fn journal_records(root: &std::path::Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn raw_journal_records(image: &std::path::Path) -> Vec<serde_json::Value> {
+fn raw_logical_journal_records(image: &std::path::Path) -> Vec<serde_json::Value> {
     let (superblock, _) =
         argosfs::raw_store::inspect_device(BackendKind::LoopBlock, image.to_path_buf()).unwrap();
     let disk = std::fs::File::open(image).unwrap();
@@ -119,7 +119,10 @@ fn raw_journal_records(image: &std::path::Path) -> Vec<serde_json::Value> {
         let mut bytes = vec![0u8; len];
         disk.read_at(&mut bytes, superblock.journal.offset + cursor + 36)
             .unwrap();
-        records.push(serde_json::from_slice(&bytes).unwrap());
+        let record: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        if record["action"] != "__argosfs_quorum_commit__" {
+            records.push(record);
+        }
         cursor += 36 + len as u64;
     }
     records

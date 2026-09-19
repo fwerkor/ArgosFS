@@ -393,8 +393,9 @@ impl ArgosFuse {
         // until the namespace mutation actually succeeds; otherwise a rejected
         // unlink (for example, sticky-directory permissions) would lose data.
         let target_flush_failed = self.flush_inode_writeback(attr.ino).is_err();
+        let removes_inode = attr.nlink <= 1;
         let result = self.volume.unlink_at_as(parent, name, uid);
-        if result.is_ok() && target_flush_failed {
+        if result.is_ok() && target_flush_failed && removes_inode {
             self.discard_inode_writeback(attr.ino);
         }
         result

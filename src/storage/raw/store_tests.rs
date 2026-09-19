@@ -440,6 +440,92 @@ fn quorum_journal_commit_survives_one_member_eio() {
 }
 
 #[test]
+fn quorum_certificate_preserves_commit_across_changing_member_failures() {
+    let (_dir, images, previous, superblocks) = quorum_fixture();
+    let next = next_metadata(&previous, "certified-changing-failure");
+    let backend = FailingBackend {
+        inner: block_backend_for(&images),
+        failed: BTreeSet::from(["disk-0002".to_string()]),
+    };
+    append_transaction_with_trusted_integrity_quorum(
+        &backend,
+        &superblocks,
+        &next,
+        Some(&previous),
+        "changing-failure-test",
+        serde_json::json!({}),
+    )
+    .unwrap();
+    drop(backend);
+
+    // The write quorum was disk-0000/disk-0001. On the next read quorum,
+    // disk-0000 is absent while disk-0002 has recovered and still carries the
+    // old checkpoint. The certificate on disk-0001 must preserve the acked tx.
+    std::fs::remove_file(&images[0]).unwrap();
+    let reopened = ArgosFs::open_loop(&images[1..], false).unwrap();
+    let recovered = reopened.metadata_snapshot();
+    assert_eq!(recovered.txid, next.txid);
+    assert_eq!(recovered.raw_pool.pool_name, "certified-changing-failure");
+}
+
+#[test]
+fn stale_same_txid_suffix_is_excluded_from_new_quorum_append() {
+    let (_dir, images, previous, superblocks) = quorum_fixture();
+    let stale = next_metadata(&previous, "stale-uncommitted");
+    let (stale_entry, _) = build_journal_entry(
+        &stale,
+        Some(&previous),
+        "stale-test",
+        serde_json::json!({}),
+        true,
+    )
+    .unwrap();
+    let backend = block_backend_for(&images);
+    let (header, write_offset, end, rollover) =
+        journal_append_position(&backend, &superblocks[0], stale_entry.len()).unwrap();
+    assert!(!rollover);
+    append_journal_member(
+        &backend,
+        &superblocks[0],
+        header,
+        write_offset,
+        end,
+        &stale_entry,
+        true,
+    )
+    .unwrap();
+    drop(backend);
+
+    let next = next_metadata(&previous, "new-same-txid");
+    let backend = FailingBackend {
+        inner: block_backend_for(&images),
+        failed: BTreeSet::from(["disk-0002".to_string()]),
+    };
+    let err = append_transaction_with_trusted_integrity_quorum(
+        &backend,
+        &superblocks,
+        &next,
+        Some(&previous),
+        "new-same-txid-test",
+        serde_json::json!({}),
+    )
+    .unwrap_err();
+    assert!(matches!(err, ArgosError::QuorumUnavailable { .. }));
+}
+
+#[test]
+fn dirty_superblock_marking_succeeds_with_one_write_rejecting_member() {
+    let (_dir, images, metadata, superblocks) = quorum_fixture();
+    let backend = WriteFailBackend {
+        inner: block_backend_for(&images),
+        failed: BTreeSet::from(["disk-0002".to_string()]),
+    };
+    let report =
+        write_superblock_clean_state_quorum(&backend, &superblocks, &metadata, false).unwrap();
+    assert!(report.failed_devices.contains_key("disk-0002"));
+}
+
+#[test]
 fn journal_flush_shortfall_is_indeterminate_after_quorum_exposure() {
     let (_dir, images, previous, superblocks) = quorum_fixture();
     let next = next_metadata(&previous, "indeterminate-flush");

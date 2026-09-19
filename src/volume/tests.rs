@@ -649,6 +649,33 @@ fn dynamically_inspected_member_rejects_repointed_duplicate_identity() {
 }
 
 #[test]
+fn metadata_fanout_excludes_raw_superblock_absent_from_membership() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = [
+        dir.path().join("member-a.img"),
+        dir.path().join("member-b.img"),
+    ];
+    let fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 1,
+            m: 1,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "orphan-superblock",
+        false,
+    )
+    .unwrap();
+    let mut meta = fs.metadata_snapshot();
+    meta.disks.remove("disk-0001");
+
+    let superblocks = fs.metadata_superblocks_locked(&meta).unwrap();
+    assert_eq!(superblocks.len(), 1);
+    assert_eq!(superblocks[0].disk_id, "disk-0000");
+}
+
+#[test]
 fn metadata_backend_helpers_cover_host_empty_and_removed_member_filtering() {
     let (_dir, host) = host_volume();
     let host_meta = host.meta.read();

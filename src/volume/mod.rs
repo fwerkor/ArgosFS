@@ -1918,22 +1918,20 @@ impl ArgosFs {
             };
             let superblocks = self.metadata_superblocks_locked(&journal_meta)?;
             let result = if self.open_backend_covers_superblocks(&superblocks) {
-                raw_store::append_transaction_quorum(
+                raw_store::append_event_quorum(
                     &*self.backend,
                     &superblocks,
                     &journal_meta,
-                    None,
                     action,
                     details,
                 )
             } else {
                 let backend =
                     self.metadata_block_backend_locked(&journal_meta, &superblocks, true)?;
-                raw_store::append_transaction_quorum(
+                raw_store::append_event_quorum(
                     &backend,
                     &superblocks,
                     &journal_meta,
-                    None,
                     action,
                     details,
                 )
@@ -1976,7 +1974,7 @@ impl ArgosFs {
                     && meta
                         .disks
                         .get(&sb.disk_id)
-                        .is_none_or(|disk| disk.status != DiskStatus::Removed)
+                        .is_some_and(|disk| disk.status != DiskStatus::Removed)
             })
             .cloned()
             .collect::<Vec<_>>();
