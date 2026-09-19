@@ -349,6 +349,24 @@ argosfs_qemu_wait_console_ready() {
 		fi
 		sleep 1
 	done
+
+	# SECONDS has one-second granularity. A marker can arrive during the final
+	# sleep that crosses the deadline, so perform one last observation before
+	# declaring timeout instead of spuriously triggering another QEMU attempt.
+	if [ -n "$reject" ] && grep -Eiq "$reject" "$log" 2>/dev/null; then
+		echo "QEMU rejected while waiting for $label: $reject" >&2
+		return 2
+	fi
+	prompt_count="$(grep -Fc 'Please press Enter to activate this console.' "$log" 2>/dev/null || true)"
+	login_count="$(grep -Ec "root login on 'tty[^']+'" "$log" 2>/dev/null || true)"
+	shell_count="$(grep -Fc 'built-in shell (ash)' "$log" 2>/dev/null || true)"
+	ready_count="$prompt_count"
+	[ "$login_count" -le "$ready_count" ] || ready_count="$login_count"
+	[ "$shell_count" -le "$ready_count" ] || ready_count="$shell_count"
+	if [ "$ready_count" -ge "$min_count" ]; then
+		return 0
+	fi
+
 	echo "timed out waiting for $label in $log" >&2
 	return 1
 }

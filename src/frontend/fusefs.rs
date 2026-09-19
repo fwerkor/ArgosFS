@@ -347,6 +347,59 @@ impl ArgosFuse {
             self.flush_inode_writeback(ino)?;
         }
     }
+
+    fn flush_all_writeback_best_effort(&self) {
+        let inodes = {
+            let writeback = self.writeback.lock();
+            writeback
+                .dirty
+                .keys()
+                .chain(writeback.reap_after_flush.iter())
+                .copied()
+                .collect::<BTreeSet<_>>()
+        };
+        for ino in inodes {
+            let _ = self.flush_inode_writeback(ino);
+        }
+    }
+
+    fn discard_inode_writeback(&self, ino: InodeId) {
+        let mut writeback = self.writeback.lock();
+        writeback.dirty.remove(&ino);
+        writeback.reap_after_flush.remove(&ino);
+    }
+
+    fn lookup_after_access(&self, parent: InodeId, name: &OsStr) -> Result<NodeAttr> {
+        let attr = self.volume.lookup(parent, name)?;
+        // Lookup is path resolution, not a durability boundary. Retry the target
+        // writeback so successful flushes refresh attributes, but do not make a
+        // failed dirty inode impossible to resolve for unlink/rename cleanup.
+        let _ = self.flush_inode_writeback(attr.ino);
+        self.volume.lookup(parent, name)
+    }
+
+    fn unlink_after_access(&self, parent: InodeId, name: &OsStr, uid: u32) -> Result<()> {
+        // Keep the open-handle decision atomic with the namespace mutation. A
+        // concurrent open/release must not turn a preserving unlink into a normal
+        // unlink (or vice versa) after we have inspected the reference count.
+        let handles = self.handles.lock();
+        let attr = self.volume.lookup(parent, name)?;
+        if handles.refs(attr.ino) > 0 {
+            return self.volume.unlink_at_as_preserving_open(parent, name, uid);
+        }
+
+        // Only the target inode matters for unlink. Unrelated dirty inodes must not
+        // block removal. If this inode cannot be flushed, retain its buffered data
+        // until the namespace mutation actually succeeds; otherwise a rejected
+        // unlink (for example, sticky-directory permissions) would lose data.
+        let target_flush_failed = self.flush_inode_writeback(attr.ino).is_err();
+        let removes_inode = attr.nlink <= 1;
+        let result = self.volume.unlink_at_as(parent, name, uid);
+        if result.is_ok() && target_flush_failed && removes_inode {
+            self.discard_inode_writeback(attr.ino);
+        }
+        result
+    }
 }
 
 impl Drop for ArgosFuse {
@@ -451,13 +504,9 @@ impl Filesystem for ArgosFuse {
     }
 
     fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        if let Err(err) = self.flush_all_writeback() {
-            reply.error(errno(&err));
-            return;
-        }
         match self
             .require_access(req, parent, libc::X_OK)
-            .and_then(|()| self.volume.lookup(parent.0, name))
+            .and_then(|()| self.lookup_after_access(parent.0, name))
         {
             Ok(attr) => reply.entry(&TTL, &to_file_attr(&attr), Generation(0)),
             Err(err) => reply.error(errno(&err)),
@@ -653,23 +702,9 @@ impl Filesystem for ArgosFuse {
     }
 
     fn unlink(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        if let Err(err) = self.flush_all_writeback() {
-            reply.error(errno(&err));
-            return;
-        }
-        let handles = self.handles.lock();
         let result = self
             .require_access(req, parent, libc::W_OK | libc::X_OK)
-            .and_then(|()| self.volume.lookup(parent.0, name))
-            .and_then(|attr| {
-                if handles.refs(attr.ino) > 0 {
-                    self.volume
-                        .unlink_at_as_preserving_open(parent.0, name, req.uid())
-                } else {
-                    self.volume.unlink_at_as(parent.0, name, req.uid())
-                }
-            });
-        drop(handles);
+            .and_then(|()| self.unlink_after_access(parent.0, name, req.uid()));
         match result {
             Ok(()) => reply.ok(),
             Err(err) => reply.error(errno(&err)),
@@ -1042,13 +1077,11 @@ impl Filesystem for ArgosFuse {
     }
 
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
-        if let Err(err) = self.flush_all_writeback() {
-            reply.error(errno(&err));
-            return;
-        }
+        self.flush_all_writeback_best_effort();
         let meta = self.volume.metadata_snapshot();
+        let unavailable = self.volume.runtime_unavailable_devices();
         let block = (meta.config.chunk_size as u64).max(4096);
-        let (usable, free) = statfs_bytes(&meta, self.volume.root());
+        let (usable, free) = statfs_bytes(&meta, self.volume.root(), &unavailable);
         reply.statfs(
             usable / block,
             free / block,
@@ -1302,10 +1335,7 @@ impl Filesystem for ArgosFuse {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        if let Err(err) = self.flush_all_writeback() {
-            reply.error(errno(&err));
-            return;
-        }
+        self.flush_all_writeback_best_effort();
         match self
             .require_access(req, ino, libc::R_OK)
             .and_then(|()| self.volume.readdir(ino.0))
@@ -1336,10 +1366,7 @@ impl Filesystem for ArgosFuse {
         offset: u64,
         mut reply: ReplyDirectoryPlus,
     ) {
-        if let Err(err) = self.flush_all_writeback() {
-            reply.error(errno(&err));
-            return;
-        }
+        self.flush_all_writeback_best_effort();
         match self
             .require_access(req, ino, libc::R_OK | libc::X_OK)
             .and_then(|()| self.volume.readdir(ino.0))
@@ -1376,7 +1403,11 @@ fn is_owner_managed_xattr(name: &str) -> bool {
     )
 }
 
-fn statfs_bytes(meta: &crate::types::Metadata, root: &Path) -> (u64, u64) {
+fn statfs_bytes(
+    meta: &crate::types::Metadata,
+    root: &Path,
+    unavailable: &BTreeSet<String>,
+) -> (u64, u64) {
     if meta.backend != crate::types::BackendKind::Host && !meta.raw_pool.allocators.is_empty() {
         let width = meta.config.k.saturating_add(meta.config.m);
         if meta.config.k == 0 || width == 0 {
@@ -1385,6 +1416,9 @@ fn statfs_bytes(meta: &crate::types::Metadata, root: &Path) -> (u64, u64) {
         let mut capacities = Vec::new();
         let mut free = Vec::new();
         for (disk_id, allocator) in &meta.raw_pool.allocators {
+            if unavailable.contains(disk_id) {
+                continue;
+            }
             let Some(disk) = meta.disks.get(disk_id) else {
                 continue;
             };
@@ -1407,7 +1441,7 @@ fn statfs_bytes(meta: &crate::types::Metadata, root: &Path) -> (u64, u64) {
     let (explicit_capacity, grouped_capacity) = meta
         .disks
         .values()
-        .filter(|disk| disk.status == DiskStatus::Online)
+        .filter(|disk| disk.status == DiskStatus::Online && !unavailable.contains(&disk.id))
         .fold((0u64, BTreeMap::<String, u64>::new()), |mut acc, disk| {
             if disk.capacity_source == CapacitySource::UserOverride {
                 acc.0 = acc.0.saturating_add(disk.capacity_bytes);
@@ -1434,13 +1468,16 @@ fn statfs_bytes(meta: &crate::types::Metadata, root: &Path) -> (u64, u64) {
     }
     let (capacity, free) = fallback_statfs_capacity(
         root,
-        meta.disks.values().map(|disk| {
-            if disk.path.is_absolute() {
-                disk.path.clone()
-            } else {
-                root.join(&disk.path)
-            }
-        }),
+        meta.disks
+            .values()
+            .filter(|disk| !unavailable.contains(&disk.id))
+            .map(|disk| {
+                if disk.path.is_absolute() {
+                    disk.path.clone()
+                } else {
+                    root.join(&disk.path)
+                }
+            }),
     );
     (
         capacity.saturating_mul(meta.config.k as u64) / width,

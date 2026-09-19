@@ -11,7 +11,7 @@ use crate::types::{
 };
 use crate::util::{now_f64, sha256_hex};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -20,6 +20,7 @@ const PROTECTIVE_MAGIC: &[u8; 16] = b"ARGOSFS-RAW-HD\0\0";
 const METADATA_MAGIC: &[u8; 16] = b"ARGOSFS-RAW-MD\0\0";
 const JOURNAL_MAGIC: &[u8; 16] = b"ARGOSFS-RAW-JN\0\0";
 const RAW_STORE_VERSION: u32 = 1;
+const RAW_QUORUM_COMMIT_ACTION: &str = "__argosfs_quorum_commit__";
 const RAW_HEADER_SIZE: usize = 4096;
 const METADATA_FORMAT_LEGACY: u32 = 0;
 const METADATA_FORMAT_TREE: u32 = 1;
@@ -34,6 +35,26 @@ pub struct RawOpen {
     pub metadata: Metadata,
     pub report: TransactionReport,
     pub superblocks: Vec<RawSuperblock>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct QuorumWriteReport {
+    pub failed_devices: BTreeMap<String, String>,
+    pub unavailable_devices: BTreeSet<String>,
+}
+
+impl QuorumWriteReport {
+    fn record_failure(&mut self, disk_id: &str, err: &ArgosError) {
+        self.failed_devices
+            .insert(disk_id.to_string(), err.to_string());
+        if member_failure_makes_data_unavailable(err) {
+            self.unavailable_devices.insert(disk_id.to_string());
+        }
+    }
+}
+
+fn member_failure_makes_data_unavailable(err: &ArgosError) -> bool {
+    err.is_fatal_device_error()
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -210,6 +231,10 @@ pub fn open_pool(kind: BackendKind, paths: &[PathBuf], write: bool) -> Result<Ra
             metadata.backend, kind
         )));
     }
+    // Recovery scans every same-pool device so it can discover the durable
+    // state, but only members named by that selected state may participate in
+    // subsequent writable fanout or be exposed to the mounted volume.
+    let superblocks = metadata_member_superblocks(&superblocks, &metadata);
     let present = superblocks
         .iter()
         .map(|sb| sb.disk_id.clone())
@@ -232,7 +257,13 @@ pub fn open_pool(kind: BackendKind, paths: &[PathBuf], write: bool) -> Result<Ra
             .push("pool was not cleanly unmounted".to_string());
     }
     if write {
-        write_superblock_clean_state(&*backend, &superblocks, false)?;
+        let dirty_report =
+            write_superblock_clean_state_quorum(&*backend, &superblocks, &metadata, false)?;
+        for (disk_id, error) in dirty_report.failed_devices {
+            report.errors.push(format!(
+                "failed to mark raw member {disk_id} dirty on writable open: {error}"
+            ));
+        }
     }
     Ok(RawOpen {
         backend,
@@ -272,24 +303,66 @@ pub fn append_transaction_with_previous(
     Ok(())
 }
 
-pub(crate) fn append_transaction_with_trusted_integrity(
+pub(crate) fn append_transaction_quorum(
     backend: &dyn StorageBackend,
     superblocks: &[RawSuperblock],
     metadata: &Metadata,
     previous_metadata: Option<&Metadata>,
     action: &str,
     details: serde_json::Value,
-) -> Result<()> {
-    append_journal_trusted(
+) -> Result<QuorumWriteReport> {
+    let report = append_journal_quorum(
         backend,
         superblocks,
         metadata,
         previous_metadata,
         action,
         details,
+        JournalQuorumMode::Transaction,
     )?;
     journal::inject_crash(FaultPoint::AfterJournalCommitBeforeMetadataCommit.as_str())?;
-    Ok(())
+    Ok(report)
+}
+
+pub(crate) fn append_event_quorum(
+    backend: &dyn StorageBackend,
+    superblocks: &[RawSuperblock],
+    metadata: &Metadata,
+    action: &str,
+    details: serde_json::Value,
+) -> Result<QuorumWriteReport> {
+    let report = append_journal_quorum(
+        backend,
+        superblocks,
+        metadata,
+        None,
+        action,
+        details,
+        JournalQuorumMode::Event,
+    )?;
+    journal::inject_crash(FaultPoint::AfterJournalCommitBeforeMetadataCommit.as_str())?;
+    Ok(report)
+}
+
+pub(crate) fn append_transaction_with_trusted_integrity_quorum(
+    backend: &dyn StorageBackend,
+    superblocks: &[RawSuperblock],
+    metadata: &Metadata,
+    previous_metadata: Option<&Metadata>,
+    action: &str,
+    details: serde_json::Value,
+) -> Result<QuorumWriteReport> {
+    let report = append_journal_quorum(
+        backend,
+        superblocks,
+        metadata,
+        previous_metadata,
+        action,
+        details,
+        JournalQuorumMode::TrustedTransaction,
+    )?;
+    journal::inject_crash(FaultPoint::AfterJournalCommitBeforeMetadataCommit.as_str())?;
+    Ok(report)
 }
 
 pub fn write_metadata_copies(
@@ -300,23 +373,65 @@ pub fn write_metadata_copies(
     let bytes = serde_json::to_vec_pretty(metadata)?;
     let hash = sha256_hex(&bytes);
     for sb in superblocks {
-        let slot_len = sb.metadata.length / 2;
-        let slot = (metadata.txid % 2) * slot_len;
-        let offset = sb.metadata.offset + slot;
-        write_metadata_slot(backend, sb, offset, slot_len, metadata, &bytes, &hash)?;
-        let mirror_slot = ((metadata.txid + 1) % 2) * slot_len;
-        let mirror_offset = sb.metadata.offset + mirror_slot;
-        write_metadata_slot(
-            backend,
-            sb,
-            mirror_offset,
-            slot_len,
-            metadata,
-            &bytes,
-            &hash,
-        )?;
+        write_metadata_member(backend, sb, metadata, &bytes, &hash)?;
     }
     Ok(())
+}
+
+pub(crate) fn write_metadata_copies_quorum(
+    backend: &dyn StorageBackend,
+    superblocks: &[RawSuperblock],
+    metadata: &Metadata,
+) -> Result<QuorumWriteReport> {
+    let need = metadata_quorum_requirement(metadata);
+    if superblocks.len() < need {
+        return Err(quorum_unavailable(
+            "metadata checkpoint",
+            need,
+            superblocks.len(),
+        ));
+    }
+    let bytes = serde_json::to_vec_pretty(metadata)?;
+    let hash = sha256_hex(&bytes);
+    let mut report = QuorumWriteReport::default();
+    let mut durable = 0usize;
+    let mut uncertain_write = false;
+    for sb in superblocks {
+        match write_metadata_member(backend, sb, metadata, &bytes, &hash) {
+            Ok(()) => durable += 1,
+            Err(err) => {
+                // DiskFull is raised while constructing the checkpoint before any
+                // member write occurs. Other write/flush failures can leave the new
+                // checkpoint exposed even when durability cannot be confirmed.
+                uncertain_write |= !matches!(err, ArgosError::DiskFull { .. });
+                report.record_failure(&sb.disk_id, &err);
+            }
+        }
+    }
+    if durable < need {
+        return Err(if uncertain_write {
+            indeterminate_commit("metadata checkpoint", need, durable)
+        } else {
+            quorum_failure_before_write(&report, "metadata checkpoint", need, durable)
+        });
+    }
+    Ok(report)
+}
+
+fn write_metadata_member(
+    backend: &dyn StorageBackend,
+    sb: &RawSuperblock,
+    metadata: &Metadata,
+    bytes: &[u8],
+    hash: &str,
+) -> Result<()> {
+    let slot_len = sb.metadata.length / 2;
+    let slot = (metadata.txid % 2) * slot_len;
+    let offset = sb.metadata.offset + slot;
+    write_metadata_slot(backend, sb, offset, slot_len, metadata, bytes, hash)?;
+    let mirror_slot = ((metadata.txid + 1) % 2) * slot_len;
+    let mirror_offset = sb.metadata.offset + mirror_slot;
+    write_metadata_slot(backend, sb, mirror_offset, slot_len, metadata, bytes, hash)
 }
 
 fn write_metadata_slot(
@@ -371,36 +486,77 @@ pub fn write_superblock_clean_state(
     clean: bool,
 ) -> Result<()> {
     for sb in superblocks {
-        let mut encoded_current = vec![0u8; SUPERBLOCK_SIZE];
-        let mut copy = if backend
-            .read_at(&sb.disk_id, PRIMARY_SUPERBLOCK_OFFSET, &mut encoded_current)
-            .is_ok()
-        {
-            RawSuperblock::decode(&encoded_current)
-                .ok()
-                .filter(|current| {
-                    current.pool_uuid == sb.pool_uuid && current.device_uuid == sb.device_uuid
-                })
-                .unwrap_or_else(|| sb.clone())
-        } else {
-            sb.clone()
-        };
-        copy.clean = clean;
-        copy.generation = copy.generation.saturating_add(1);
-        let now = now_f64().max(0.0) as u64;
-        if clean {
-            copy.last_clean_unmount_time = now;
-        } else {
-            copy.last_mount_time = now;
-        }
-        let encoded = copy.encode();
-        let label = copy.device_label().encode();
-        backend.write_at(&copy.disk_id, PRIMARY_SUPERBLOCK_OFFSET, &encoded)?;
-        backend.write_at(&copy.disk_id, DEVICE_LABEL_OFFSET, &label)?;
-        backend.write_at(&copy.disk_id, copy.backup_superblock_offset, &encoded)?;
-        backend.flush_device(&copy.disk_id)?;
+        write_superblock_clean_state_member(backend, sb, clean)?;
     }
     Ok(())
+}
+
+pub(crate) fn write_superblock_clean_state_quorum(
+    backend: &dyn StorageBackend,
+    superblocks: &[RawSuperblock],
+    metadata: &Metadata,
+    clean: bool,
+) -> Result<QuorumWriteReport> {
+    let need = metadata_quorum_requirement(metadata);
+    if superblocks.len() < need {
+        return Err(quorum_unavailable(
+            "superblock clean-state",
+            need,
+            superblocks.len(),
+        ));
+    }
+    let mut report = QuorumWriteReport::default();
+    let mut durable = 0usize;
+    for sb in superblocks {
+        match write_superblock_clean_state_member(backend, sb, clean) {
+            Ok(()) => durable += 1,
+            Err(err) => report.record_failure(&sb.disk_id, &err),
+        }
+    }
+    if durable < need {
+        return Err(quorum_failure_before_write(
+            &report,
+            "superblock clean-state",
+            need,
+            durable,
+        ));
+    }
+    Ok(report)
+}
+
+fn write_superblock_clean_state_member(
+    backend: &dyn StorageBackend,
+    sb: &RawSuperblock,
+    clean: bool,
+) -> Result<()> {
+    let mut encoded_current = vec![0u8; SUPERBLOCK_SIZE];
+    let mut copy = if backend
+        .read_at(&sb.disk_id, PRIMARY_SUPERBLOCK_OFFSET, &mut encoded_current)
+        .is_ok()
+    {
+        RawSuperblock::decode(&encoded_current)
+            .ok()
+            .filter(|current| {
+                current.pool_uuid == sb.pool_uuid && current.device_uuid == sb.device_uuid
+            })
+            .unwrap_or_else(|| sb.clone())
+    } else {
+        sb.clone()
+    };
+    copy.clean = clean;
+    copy.generation = copy.generation.saturating_add(1);
+    let now = now_f64().max(0.0) as u64;
+    if clean {
+        copy.last_clean_unmount_time = now;
+    } else {
+        copy.last_mount_time = now;
+    }
+    let encoded = copy.encode();
+    let label = copy.device_label().encode();
+    backend.write_at(&copy.disk_id, PRIMARY_SUPERBLOCK_OFFSET, &encoded)?;
+    backend.write_at(&copy.disk_id, DEVICE_LABEL_OFFSET, &label)?;
+    backend.write_at(&copy.disk_id, copy.backup_superblock_offset, &encoded)?;
+    backend.flush_device(&copy.disk_id)
 }
 
 fn preflight_empty(
@@ -512,34 +668,13 @@ fn append_journal(
     )
 }
 
-fn append_journal_trusted(
-    backend: &dyn StorageBackend,
-    superblocks: &[RawSuperblock],
-    metadata: &Metadata,
-    previous_metadata: Option<&Metadata>,
-    action: &str,
-    details: serde_json::Value,
-) -> Result<()> {
-    append_journal_with_previous_validation(
-        backend,
-        superblocks,
-        metadata,
-        previous_metadata,
-        action,
-        details,
-        true,
-    )
-}
-
-fn append_journal_with_previous_validation(
-    backend: &dyn StorageBackend,
-    superblocks: &[RawSuperblock],
+fn build_journal_entry(
     metadata: &Metadata,
     previous_metadata: Option<&Metadata>,
     action: &str,
     details: serde_json::Value,
     trust_integrity: bool,
-) -> Result<()> {
+) -> Result<(Vec<u8>, String)> {
     let delta_base = match previous_metadata {
         Some(previous)
             if previous.integrity.meta_hash == metadata.integrity.previous_meta_hash
@@ -586,32 +721,222 @@ fn append_journal_with_previous_validation(
         record_hash: String::new(),
     };
     record.record_hash = raw_record_hash(&record)?;
-    let record_bytes = serde_json::to_vec(&record)?;
+    let logical_record_hash = record.record_hash.clone();
+    Ok((encode_journal_record(&record)?, logical_record_hash))
+}
+
+fn encode_journal_record(record: &RawJournalRecord) -> Result<Vec<u8>> {
+    let record_bytes = serde_json::to_vec(record)?;
     let record_len = u32::try_from(record_bytes.len())
         .map_err(|_| ArgosError::Invalid("raw journal record is too large".to_string()))?;
-    let record_hash = sha256_hex(&record_bytes);
+    let payload_hash = sha256_hex(&record_bytes);
     let mut entry = Vec::with_capacity(4 + 32 + record_bytes.len());
     entry.extend_from_slice(&record_len.to_le_bytes());
-    let record_hash_bytes = hex::decode(record_hash)
+    let payload_hash_bytes = hex::decode(payload_hash)
         .map_err(|err| ArgosError::Invalid(format!("raw journal hash encode failed: {err}")))?;
-    entry.extend_from_slice(&record_hash_bytes);
+    entry.extend_from_slice(&payload_hash_bytes);
     entry.extend_from_slice(&record_bytes);
+    Ok(entry)
+}
 
+fn build_quorum_commit_entry(
+    metadata: &Metadata,
+    target_record_hash: Option<&str>,
+) -> Result<Vec<u8>> {
+    let meta_hash = metadata_hash_for_replay(metadata)?;
+    let mut record = RawJournalRecord {
+        version: RAW_STORE_VERSION,
+        time: now_f64(),
+        volume_uuid: metadata.uuid.clone(),
+        txid: metadata.txid,
+        generation: metadata.integrity.generation,
+        action: RAW_QUORUM_COMMIT_ACTION.to_string(),
+        details: serde_json::json!({
+            "target_record_hash": target_record_hash,
+            "checkpoint": target_record_hash.is_none(),
+            "quorum_need": metadata_quorum_requirement(metadata),
+        }),
+        meta_hash,
+        metadata: None,
+        metadata_delta: None,
+        record_hash: String::new(),
+    };
+    record.record_hash = raw_record_hash(&record)?;
+    encode_journal_record(&record)
+}
+
+fn journal_append_position(
+    backend: &dyn StorageBackend,
+    sb: &RawSuperblock,
+    entry_len: usize,
+) -> Result<(Vec<u8>, u64, u64, bool)> {
+    let mut header = vec![0u8; RAW_HEADER_SIZE];
+    backend.read_at(&sb.disk_id, sb.journal.offset, &mut header)?;
+    if &header[..16] != JOURNAL_MAGIC {
+        initialize_journal_region(backend, &sb.disk_id, sb)?;
+        backend.read_at(&sb.disk_id, sb.journal.offset, &mut header)?;
+    }
+    let write_offset = get_u64(&header, 24)?;
+    let end = write_offset.checked_add(entry_len as u64);
+    let rollover =
+        write_offset < RAW_HEADER_SIZE as u64 || end.is_none_or(|end| end > sb.journal.length);
+    Ok((header, write_offset, end.unwrap_or_default(), rollover))
+}
+
+fn journal_tip_identity(
+    backend: &dyn StorageBackend,
+    sb: &RawSuperblock,
+) -> Result<Option<(u64, String)>> {
+    let mut header = vec![0u8; RAW_HEADER_SIZE];
+    backend.read_at(&sb.disk_id, sb.journal.offset, &mut header)?;
+    if &header[..16] != JOURNAL_MAGIC {
+        return Ok(None);
+    }
+    let end = get_u64(&header, 24)?.min(sb.journal.length);
+    let mut cursor = RAW_HEADER_SIZE as u64;
+    let mut tip = None;
+    while cursor + 36 <= end {
+        let mut entry_header = [0u8; 36];
+        backend.read_at(&sb.disk_id, sb.journal.offset + cursor, &mut entry_header)?;
+        let len = u32::from_le_bytes(entry_header[..4].try_into().unwrap()) as usize;
+        if len == 0 || cursor + 36 + len as u64 > end {
+            return Err(ArgosError::CorruptedMetadata(format!(
+                "invalid raw journal extent at {}:{}",
+                sb.disk_id, cursor
+            )));
+        }
+        let mut bytes = vec![0u8; len];
+        backend.read_at(&sb.disk_id, sb.journal.offset + cursor + 36, &mut bytes)?;
+        if hex::encode(&entry_header[4..36]) != sha256_hex(&bytes) {
+            return Err(ArgosError::Checksum(format!(
+                "raw journal payload checksum mismatch at {}:{}",
+                sb.disk_id, cursor
+            )));
+        }
+        let record = serde_json::from_slice::<RawJournalRecord>(&bytes)?;
+        if raw_record_hash(&record)? != record.record_hash {
+            return Err(ArgosError::Checksum(format!(
+                "raw journal record hash mismatch at {}:{}",
+                sb.disk_id, cursor
+            )));
+        }
+        tip = Some((record.txid, record.meta_hash));
+        cursor += 36 + len as u64;
+    }
+    Ok(tip)
+}
+
+fn journal_tip_accepts_transaction(
+    backend: &dyn StorageBackend,
+    sb: &RawSuperblock,
+    metadata: &Metadata,
+    allow_same_txid: bool,
+) -> Result<bool> {
+    let Some((tip_txid, tip_hash)) = journal_tip_identity(backend, sb)? else {
+        return Ok(true);
+    };
+    if tip_txid > metadata.txid {
+        return Ok(false);
+    }
+    if tip_txid == metadata.txid {
+        return Ok(allow_same_txid || tip_hash == metadata_hash_for_replay(metadata)?);
+    }
+    // Older suffixes are safe to supersede: replay starts from the selected
+    // durable base and ignores records at/below that base txid. The dangerous
+    // case is a divergent record for the transaction txid being appended now,
+    // because it would otherwise shadow the later record during replay.
+    Ok(true)
+}
+
+fn append_journal_member(
+    backend: &dyn StorageBackend,
+    sb: &RawSuperblock,
+    mut header: Vec<u8>,
+    write_offset: u64,
+    end: u64,
+    entry: &[u8],
+    flush: bool,
+) -> Result<()> {
+    backend.write_at(&sb.disk_id, sb.journal.offset + write_offset, entry)?;
+    put_u64(&mut header, 24, end);
+    backend.write_at(&sb.disk_id, sb.journal.offset, &header)?;
+    if flush {
+        backend.flush_device(&sb.disk_id)?;
+    }
+    Ok(())
+}
+
+fn append_quorum_commit_certificate(
+    backend: &dyn StorageBackend,
+    superblocks: &[RawSuperblock],
+    eligible: &BTreeSet<String>,
+    certificate: &[u8],
+    need: usize,
+    report: &mut QuorumWriteReport,
+) -> Result<()> {
+    let mut durable = 0usize;
+    for sb in superblocks {
+        if !eligible.contains(&sb.disk_id) {
+            continue;
+        }
+        match journal_append_position(backend, sb, certificate.len()) {
+            Ok((header, write_offset, end, false)) => {
+                match append_journal_member(
+                    backend,
+                    sb,
+                    header,
+                    write_offset,
+                    end,
+                    certificate,
+                    true,
+                ) {
+                    Ok(()) => durable += 1,
+                    Err(err) => report.record_failure(&sb.disk_id, &err),
+                }
+            }
+            Ok((_, _, _, true)) => report.record_failure(
+                &sb.disk_id,
+                &ArgosError::DiskFull {
+                    disk_id: sb.disk_id.clone(),
+                    required: certificate.len() as u64,
+                    available: sb.journal.length,
+                },
+            ),
+            Err(err) => report.record_failure(&sb.disk_id, &err),
+        }
+    }
+    if durable < need {
+        return Err(indeterminate_commit(
+            "metadata quorum certificate",
+            need,
+            durable,
+        ));
+    }
+    Ok(())
+}
+
+fn append_journal_with_previous_validation(
+    backend: &dyn StorageBackend,
+    superblocks: &[RawSuperblock],
+    metadata: &Metadata,
+    previous_metadata: Option<&Metadata>,
+    action: &str,
+    details: serde_json::Value,
+    trust_integrity: bool,
+) -> Result<()> {
+    let (entry, _) = build_journal_entry(
+        metadata,
+        previous_metadata,
+        action,
+        details,
+        trust_integrity,
+    )?;
     let mut append_positions = Vec::with_capacity(superblocks.len());
     let mut rollover = false;
     for sb in superblocks {
-        let mut header = vec![0u8; RAW_HEADER_SIZE];
-        backend.read_at(&sb.disk_id, sb.journal.offset, &mut header)?;
-        if &header[..16] != JOURNAL_MAGIC {
-            initialize_journal_region(backend, &sb.disk_id, sb)?;
-            backend.read_at(&sb.disk_id, sb.journal.offset, &mut header)?;
-        }
-        let write_offset = get_u64(&header, 24)?;
-        let end = write_offset.checked_add(entry.len() as u64);
-        if write_offset < RAW_HEADER_SIZE as u64 || end.is_none_or(|end| end > sb.journal.length) {
-            rollover = true;
-        }
-        append_positions.push((header, write_offset, end.unwrap_or_default()));
+        let position = journal_append_position(backend, sb, entry.len())?;
+        rollover |= position.3;
+        append_positions.push(position);
     }
     if rollover {
         for sb in superblocks {
@@ -622,16 +947,19 @@ fn append_journal_with_previous_validation(
 
     let mut rollback_headers: Vec<(String, u64, Vec<u8>)> = Vec::new();
     let result = (|| -> Result<()> {
-        for (index, (sb, (mut header, write_offset, end))) in
+        for (index, (sb, (header, write_offset, end, _))) in
             superblocks.iter().zip(append_positions).enumerate()
         {
             rollback_headers.push((sb.disk_id.clone(), sb.journal.offset, header.clone()));
-            backend.write_at(&sb.disk_id, sb.journal.offset + write_offset, &entry)?;
-            put_u64(&mut header, 24, end);
-            backend.write_at(&sb.disk_id, sb.journal.offset, &header)?;
-            if !metadata.config.defer_journal_flush {
-                backend.flush_device(&sb.disk_id)?;
-            }
+            append_journal_member(
+                backend,
+                sb,
+                header,
+                write_offset,
+                end,
+                &entry,
+                !metadata.config.defer_journal_flush,
+            )?;
             if index + 1 < superblocks.len() {
                 journal::inject_crash(FaultPoint::AfterPartialJournalFanout.as_str())?;
             }
@@ -648,6 +976,170 @@ fn append_journal_with_previous_validation(
         }
     }
     result
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JournalQuorumMode {
+    Transaction,
+    TrustedTransaction,
+    Event,
+}
+
+fn append_journal_quorum(
+    backend: &dyn StorageBackend,
+    superblocks: &[RawSuperblock],
+    metadata: &Metadata,
+    previous_metadata: Option<&Metadata>,
+    action: &str,
+    details: serde_json::Value,
+    mode: JournalQuorumMode,
+) -> Result<QuorumWriteReport> {
+    let trust_integrity = matches!(mode, JournalQuorumMode::TrustedTransaction);
+    let allow_same_txid = matches!(mode, JournalQuorumMode::Event);
+    let need = metadata_quorum_requirement(metadata);
+    if superblocks.len() < need {
+        return Err(quorum_unavailable(
+            "metadata journal",
+            need,
+            superblocks.len(),
+        ));
+    }
+    let (entry, target_record_hash) = build_journal_entry(
+        metadata,
+        previous_metadata,
+        action,
+        details,
+        trust_integrity,
+    )?;
+    let journal_certificate =
+        build_quorum_commit_entry(metadata, Some(target_record_hash.as_str()))?;
+    let mut report = QuorumWriteReport::default();
+    let mut positions = Vec::with_capacity(superblocks.len());
+    let mut rollover = false;
+    for sb in superblocks {
+        match journal_tip_accepts_transaction(backend, sb, metadata, allow_same_txid) {
+            Ok(true) => match journal_append_position(backend, sb, entry.len()) {
+                Ok(position) => {
+                    let certificate_end = position.2.checked_add(journal_certificate.len() as u64);
+                    rollover |=
+                        position.3 || certificate_end.is_none_or(|end| end > sb.journal.length);
+                    positions.push((sb, position));
+                }
+                Err(err) => report.record_failure(&sb.disk_id, &err),
+            },
+            Ok(false) => report.record_failure(
+                &sb.disk_id,
+                &ArgosError::Conflict(format!(
+                    "raw journal tip on {} does not chain from the selected durable metadata",
+                    sb.disk_id
+                )),
+            ),
+            Err(err) => report.record_failure(&sb.disk_id, &err),
+        }
+    }
+    if positions.len() < need {
+        return Err(quorum_failure_before_write(
+            &report,
+            "metadata journal",
+            need,
+            positions.len(),
+        ));
+    }
+
+    if rollover {
+        let mut durable = BTreeSet::new();
+        let mut uncertain_write = false;
+        for (sb, _) in positions {
+            match checkpoint_and_reset_journal(backend, sb, metadata) {
+                Ok(()) => {
+                    durable.insert(sb.disk_id.clone());
+                }
+                Err(err) => {
+                    uncertain_write |= !matches!(err, ArgosError::DiskFull { .. });
+                    report.record_failure(&sb.disk_id, &err);
+                }
+            }
+        }
+        if durable.len() < need {
+            return Err(if uncertain_write {
+                indeterminate_commit("metadata journal rollover", need, durable.len())
+            } else {
+                quorum_failure_before_write(
+                    &report,
+                    "metadata journal rollover",
+                    need,
+                    durable.len(),
+                )
+            });
+        }
+        let checkpoint_certificate = build_quorum_commit_entry(metadata, None)?;
+        append_quorum_commit_certificate(
+            backend,
+            superblocks,
+            &durable,
+            &checkpoint_certificate,
+            need,
+            &mut report,
+        )?;
+        return Ok(report);
+    }
+
+    let position_count = positions.len();
+    let mut appended = BTreeSet::new();
+    for (index, (sb, (header, write_offset, end, _))) in positions.into_iter().enumerate() {
+        match append_journal_member(
+            backend,
+            sb,
+            header,
+            write_offset,
+            end,
+            &entry,
+            !metadata.config.defer_journal_flush,
+        ) {
+            Ok(()) => {
+                appended.insert(sb.disk_id.clone());
+                if appended.len() < need && index + 1 < position_count {
+                    journal::inject_crash(FaultPoint::AfterPartialJournalFanout.as_str())?;
+                }
+            }
+            Err(err) => report.record_failure(&sb.disk_id, &err),
+        }
+    }
+
+    let durable = if metadata.config.defer_journal_flush {
+        let mut durable = BTreeSet::new();
+        for disk_id in appended {
+            match backend.flush_device(&disk_id) {
+                Ok(()) => {
+                    durable.insert(disk_id);
+                }
+                Err(err) => report.record_failure(&disk_id, &err),
+            }
+        }
+        durable
+    } else {
+        appended
+    };
+    if durable.len() < need {
+        // Every candidate member has already been offered the new record/header.
+        // A write or flush error cannot prove that those bytes will disappear
+        // across reboot, so returning an ordinary uncommitted quorum error would
+        // allow caller rollback followed by recovery resurrecting the mutation.
+        return Err(indeterminate_commit(
+            "metadata journal",
+            need,
+            durable.len(),
+        ));
+    }
+    append_quorum_commit_certificate(
+        backend,
+        superblocks,
+        &durable,
+        &journal_certificate,
+        need,
+        &mut report,
+    )?;
+    Ok(report)
 }
 
 fn checkpoint_and_reset_journal(
@@ -699,11 +1191,53 @@ fn load_or_recover(
     report.selected_metadata_source = "raw-metadata-or-journal".to_string();
     if checkpoint_replay && report.replayed {
         journal::inject_crash(FaultPoint::DuringReplay.as_str())?;
-        write_metadata_copies(backend, superblocks, &metadata)?;
-        backend.flush_all()?;
-        reset_journals(backend, superblocks)?;
+        let member_superblocks = metadata_member_superblocks(superblocks, &metadata);
+        let checkpoint_report =
+            write_metadata_copies_quorum(backend, &member_superblocks, &metadata)?;
+        let failed_checkpoint_members = checkpoint_report
+            .failed_devices
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+
+        // Once the replayed checkpoint itself has a durable quorum, journal
+        // compaction is cleanup rather than a mount precondition. Reset only
+        // members that definitely received the checkpoint; a stale journal on
+        // another member is harmless because replay ignores records at/below the
+        // selected checkpoint txid.
+        for sb in &member_superblocks {
+            if failed_checkpoint_members.contains(&sb.disk_id) {
+                continue;
+            }
+            if let Err(err) = initialize_journal_region(backend, &sb.disk_id, sb)
+                .and_then(|()| backend.flush_device(&sb.disk_id))
+            {
+                report.errors.push(format!(
+                    "raw journal reset after replay failed on {}: {err}",
+                    sb.disk_id
+                ));
+            }
+        }
     }
     Ok((metadata, report))
+}
+
+fn metadata_has_voting_member(metadata: &Metadata, disk_id: &str) -> bool {
+    metadata
+        .disks
+        .get(disk_id)
+        .is_some_and(|disk| disk.status != DiskStatus::Removed)
+}
+
+fn metadata_member_superblocks(
+    superblocks: &[RawSuperblock],
+    metadata: &Metadata,
+) -> Vec<RawSuperblock> {
+    superblocks
+        .iter()
+        .filter(|sb| metadata_has_voting_member(metadata, &sb.disk_id))
+        .cloned()
+        .collect()
 }
 
 fn select_quorum_metadata_candidate(
@@ -715,6 +1249,9 @@ fn select_quorum_metadata_candidate(
         let Some(metadata) = metadata else {
             continue;
         };
+        if !metadata_has_voting_member(metadata, disk_id) {
+            continue;
+        }
         let hash = metadata_hash_for_replay(metadata)?;
         supported
             .entry((metadata.txid, metadata.integrity.generation, hash))
@@ -729,7 +1266,7 @@ fn select_quorum_metadata_candidate(
         .map(|(_, (metadata, _))| metadata))
 }
 
-fn metadata_quorum_requirement(metadata: &Metadata) -> usize {
+pub(crate) fn metadata_quorum_requirement(metadata: &Metadata) -> usize {
     metadata
         .disks
         .values()
@@ -738,6 +1275,41 @@ fn metadata_quorum_requirement(metadata: &Metadata) -> usize {
         .max(1)
         / 2
         + 1
+}
+
+fn quorum_unavailable(operation: &str, need: usize, have: usize) -> ArgosError {
+    ArgosError::QuorumUnavailable {
+        operation: operation.to_string(),
+        need,
+        have,
+    }
+}
+
+fn retryable_quorum_unavailable(operation: &str, need: usize, have: usize) -> ArgosError {
+    ArgosError::RetryableQuorumUnavailable {
+        operation: operation.to_string(),
+        need,
+        have,
+    }
+}
+
+fn quorum_failure_before_write(
+    report: &QuorumWriteReport,
+    operation: &str,
+    need: usize,
+    have: usize,
+) -> ArgosError {
+    if report.unavailable_devices.is_empty() {
+        retryable_quorum_unavailable(operation, need, have)
+    } else {
+        quorum_unavailable(operation, need, have)
+    }
+}
+
+fn indeterminate_commit(operation: &str, need: usize, durable: usize) -> ArgosError {
+    ArgosError::IndeterminateCommit(format!(
+        "{operation}: need {need} durable members, confirmed {durable}; additional members may have exposed the new state before their write/flush error"
+    ))
 }
 
 fn read_metadata_candidates(
@@ -923,6 +1495,8 @@ fn read_latest_journal_metadata(
 ) -> Result<Option<Metadata>> {
     let mut supported =
         BTreeMap::<(u64, u64, String), (Metadata, std::collections::BTreeSet<String>)>::new();
+    let mut certified =
+        BTreeMap::<(u64, u64, String), (Metadata, std::collections::BTreeSet<String>)>::new();
     let mut members = Vec::new();
     for sb in superblocks {
         let valid_before = report.valid_entries;
@@ -933,6 +1507,13 @@ fn read_latest_journal_metadata(
         };
         let mut latest = base_metadata.cloned();
         let mut member_candidates = BTreeMap::<(u64, u64, String), Metadata>::new();
+        let mut record_candidates = BTreeMap::<String, Metadata>::new();
+        let mut checkpoint_candidates = BTreeMap::<String, Metadata>::new();
+        for (candidate, _) in read_metadata_candidates(backend, sb)? {
+            if let Some(candidate) = candidate {
+                checkpoint_candidates.insert(metadata_hash_for_replay(&candidate)?, candidate);
+            }
+        }
         let mut header = vec![0u8; RAW_HEADER_SIZE];
         if let Err(err) = backend.read_at(&sb.disk_id, sb.journal.offset, &mut header) {
             member.error = Some(err.to_string());
@@ -963,7 +1544,17 @@ fn read_latest_journal_metadata(
                 break;
             }
             let mut bytes = vec![0u8; len];
-            backend.read_at(&sb.disk_id, sb.journal.offset + cursor + 36, &mut bytes)?;
+            if let Err(err) =
+                backend.read_at(&sb.disk_id, sb.journal.offset + cursor + 36, &mut bytes)
+            {
+                member.error = Some(err.to_string());
+                report.invalid_entries += 1;
+                report.errors.push(format!(
+                    "raw journal payload at {}:{} could not be read: {err}",
+                    sb.disk_id, cursor
+                ));
+                break;
+            }
             if hex::encode(&entry_header[4..36]) != sha256_hex(&bytes) {
                 report.invalid_entries += 1;
                 break;
@@ -985,6 +1576,69 @@ fn read_latest_journal_metadata(
                     member.last_valid_txid = record.txid;
                     member.last_valid_generation = record.generation;
                     member.last_valid_record_hash = record.record_hash.clone();
+                    if record.action == RAW_QUORUM_COMMIT_ACTION {
+                        if base_metadata.is_some_and(|base| record.txid <= base.txid) {
+                            cursor += 36 + len as u64;
+                            continue;
+                        }
+                        let target_record_hash = record
+                            .details
+                            .get("target_record_hash")
+                            .and_then(serde_json::Value::as_str);
+                        let checkpoint = record
+                            .details
+                            .get("checkpoint")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false);
+                        let certified_candidate = if checkpoint {
+                            checkpoint_candidates.get(&record.meta_hash)
+                        } else {
+                            target_record_hash.and_then(|hash| record_candidates.get(hash))
+                        };
+                        let Some(candidate) = certified_candidate else {
+                            report.invalid_entries += 1;
+                            report.errors.push(format!(
+                                "raw quorum certificate at {}:{} has no local target state",
+                                sb.disk_id, cursor
+                            ));
+                            break;
+                        };
+                        let candidate_hash = metadata_hash_for_replay(candidate)?;
+                        let claimed_need = record
+                            .details
+                            .get("quorum_need")
+                            .and_then(serde_json::Value::as_u64)
+                            .and_then(|value| usize::try_from(value).ok());
+                        if candidate.txid != record.txid
+                            || candidate.integrity.generation != record.generation
+                            || candidate_hash != record.meta_hash
+                            || claimed_need != Some(metadata_quorum_requirement(candidate))
+                            || candidate
+                                .disks
+                                .get(&sb.disk_id)
+                                .is_none_or(|disk| disk.status == DiskStatus::Removed)
+                        {
+                            report.invalid_entries += 1;
+                            report.errors.push(format!(
+                                "raw quorum certificate at {}:{} does not match its target state",
+                                sb.disk_id, cursor
+                            ));
+                            break;
+                        }
+                        certified
+                            .entry((
+                                candidate.txid,
+                                candidate.integrity.generation,
+                                candidate_hash,
+                            ))
+                            .or_insert_with(|| {
+                                (candidate.clone(), std::collections::BTreeSet::new())
+                            })
+                            .1
+                            .insert(sb.disk_id.clone());
+                        cursor += 36 + len as u64;
+                        continue;
+                    }
                     let candidate = if let Some(metadata) = record.metadata {
                         let metadata_hash = journal::canonical_metadata_hash(&metadata)?;
                         if metadata_hash != record.meta_hash {
@@ -1083,6 +1737,7 @@ fn read_latest_journal_metadata(
                     let Some(candidate) = candidate else {
                         break;
                     };
+                    record_candidates.insert(record.record_hash.clone(), candidate.clone());
                     if latest
                         .as_ref()
                         .map(|metadata| candidate.txid <= metadata.txid)
@@ -1117,6 +1772,9 @@ fn read_latest_journal_metadata(
         member.invalid_entries = report.invalid_entries.saturating_sub(invalid_before);
         if member.invalid_entries == 0 {
             for (key, metadata) in member_candidates {
+                if !metadata_has_voting_member(&metadata, &sb.disk_id) {
+                    continue;
+                }
                 supported
                     .entry(key)
                     .or_insert_with(|| (metadata, std::collections::BTreeSet::new()))
@@ -1126,13 +1784,43 @@ fn read_latest_journal_metadata(
         }
         members.push(member);
     }
-    let best = supported
+    let best_supported = supported
         .into_iter()
         .filter(|(_, (metadata, member_ids))| {
             member_ids.len() >= metadata_quorum_requirement(metadata)
         })
         .max_by_key(|((txid, generation, _), _)| (*txid, *generation))
         .map(|(_, (metadata, _))| metadata);
+    let present = superblocks
+        .iter()
+        .map(|sb| sb.disk_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let best_certified = certified
+        .into_iter()
+        .filter(|(_, (metadata, certificate_members))| {
+            !certificate_members.is_empty()
+                && metadata
+                    .disks
+                    .iter()
+                    .filter(|(disk_id, disk)| {
+                        disk.status != DiskStatus::Removed && present.contains(disk_id.as_str())
+                    })
+                    .count()
+                    >= metadata_quorum_requirement(metadata)
+        })
+        .max_by_key(|((txid, generation, _), _)| (*txid, *generation))
+        .map(|(_, (metadata, _))| metadata);
+    let best = match (best_supported, best_certified) {
+        (Some(left), Some(right)) => {
+            if (right.txid, right.integrity.generation) > (left.txid, left.integrity.generation) {
+                Some(right)
+            } else {
+                Some(left)
+            }
+        }
+        (Some(metadata), None) | (None, Some(metadata)) => Some(metadata),
+        (None, None) => None,
+    };
     let total_members = base_metadata
         .map(|metadata| {
             metadata

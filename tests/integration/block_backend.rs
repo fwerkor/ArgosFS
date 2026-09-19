@@ -1001,11 +1001,11 @@ fn raw_group_commit_batches_transactions_into_one_durable_record() {
         )
         .unwrap();
     }
-    assert_eq!(raw_journal_records(&images[0]).len(), 1);
+    assert_eq!(raw_logical_journal_records(&images[0]).len(), 1);
 
     let expected_txid = fs.metadata_snapshot().txid;
     fs.sync().unwrap();
-    let records = raw_journal_records(&images[0]);
+    let records = raw_logical_journal_records(&images[0]);
     assert_eq!(records.len(), 2);
     let group = records.last().unwrap();
     assert_eq!(group["action"], "group-commit");
@@ -1036,10 +1036,10 @@ fn raw_group_commit_forces_at_transaction_limit() {
     let fs = ArgosFs::create_loop(&images, cfg, 32 * 1024 * 1024, "group-limit", false).unwrap();
 
     fs.write_file("/one", &vec![1u8; 2048], 0o644).unwrap();
-    assert_eq!(raw_journal_records(&images[0]).len(), 1);
+    assert_eq!(raw_logical_journal_records(&images[0]).len(), 1);
     fs.write_file("/two", &vec![2u8; 2048], 0o644).unwrap();
 
-    let records = raw_journal_records(&images[0]);
+    let records = raw_logical_journal_records(&images[0]);
     assert_eq!(records.len(), 2);
     assert_eq!(records.last().unwrap()["action"], "group-commit");
     assert_eq!(records.last().unwrap()["details"]["transactions"], 4);
@@ -1067,7 +1067,7 @@ fn raw_group_commit_limit_failure_is_reported_and_retryable() {
     assert!(matches!(err, ArgosError::InjectedCrash(_)));
     drop(_crash);
 
-    assert_eq!(raw_journal_records(&images[0]).len(), 1);
+    assert_eq!(raw_logical_journal_records(&images[0]).len(), 1);
     fs.sync().unwrap();
     drop(fs);
 
@@ -1218,7 +1218,7 @@ fn raw_hot_file_transactions_use_metadata_deltas() {
     }
     drop(fs);
 
-    let records = raw_journal_records(&images[0]);
+    let records = raw_logical_journal_records(&images[0]);
     let hot_records = records
         .iter()
         .filter(|record| record["action"] == "mknod" || record["action"] == "write")

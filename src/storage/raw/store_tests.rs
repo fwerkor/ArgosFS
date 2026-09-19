@@ -2,9 +2,224 @@ use super::*;
 use crate::raw_format::MIN_DEVICE_BYTES;
 use crate::types::{Disk, MetadataIntegrity, VolumeConfig};
 use crate::volume::ArgosFs;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 use tempfile::tempdir;
+
+struct FailingBackend {
+    inner: FileBlockBackend,
+    failed: BTreeSet<String>,
+}
+
+struct JournalPayloadFailBackend {
+    inner: FileBlockBackend,
+    failed_device: String,
+    fail_from: u64,
+    fail_to: u64,
+}
+
+struct FlushFailBackend {
+    inner: FileBlockBackend,
+    failed: BTreeSet<String>,
+}
+
+impl StorageBackend for FlushFailBackend {
+    fn backend_kind(&self) -> BackendKind {
+        self.inner.backend_kind()
+    }
+
+    fn list_devices(&self) -> Result<Vec<crate::backend::BackendDeviceInfo>> {
+        self.inner.list_devices()
+    }
+
+    fn read_at(&self, device_id: &String, offset: u64, buf: &mut [u8]) -> Result<()> {
+        self.inner.read_at(device_id, offset, buf)
+    }
+
+    fn write_at(&self, device_id: &String, offset: u64, data: &[u8]) -> Result<()> {
+        self.inner.write_at(device_id, offset, data)
+    }
+
+    fn flush_device(&self, device_id: &String) -> Result<()> {
+        if self.failed.contains(device_id) {
+            return Err(ArgosError::Io(std::io::Error::from_raw_os_error(libc::EIO)));
+        }
+        self.inner.flush_device(device_id)
+    }
+
+    fn flush_all(&self) -> Result<()> {
+        for device in self.inner.list_devices()? {
+            self.flush_device(&device.device_id)?;
+        }
+        Ok(())
+    }
+
+    fn capacity(&self, device_id: &String) -> Result<u64> {
+        self.inner.capacity(device_id)
+    }
+
+    fn device_status(&self, device_id: &String) -> Result<DiskStatus> {
+        self.inner.device_status(device_id)
+    }
+
+    fn capabilities(&self) -> crate::backend::BackendCapabilities {
+        self.inner.capabilities()
+    }
+}
+
+struct WriteFailBackend {
+    inner: FileBlockBackend,
+    failed: BTreeSet<String>,
+}
+
+impl StorageBackend for WriteFailBackend {
+    fn backend_kind(&self) -> BackendKind {
+        self.inner.backend_kind()
+    }
+
+    fn list_devices(&self) -> Result<Vec<crate::backend::BackendDeviceInfo>> {
+        self.inner.list_devices()
+    }
+
+    fn read_at(&self, device_id: &String, offset: u64, buf: &mut [u8]) -> Result<()> {
+        self.inner.read_at(device_id, offset, buf)
+    }
+
+    fn write_at(&self, device_id: &String, offset: u64, data: &[u8]) -> Result<()> {
+        if self.failed.contains(device_id) {
+            return Err(ArgosError::Io(std::io::Error::from_raw_os_error(libc::EIO)));
+        }
+        self.inner.write_at(device_id, offset, data)
+    }
+
+    fn flush_device(&self, device_id: &String) -> Result<()> {
+        if self.failed.contains(device_id) {
+            return Err(ArgosError::Io(std::io::Error::from_raw_os_error(libc::EIO)));
+        }
+        self.inner.flush_device(device_id)
+    }
+
+    fn flush_all(&self) -> Result<()> {
+        for device in self.inner.list_devices()? {
+            self.flush_device(&device.device_id)?;
+        }
+        Ok(())
+    }
+
+    fn capacity(&self, device_id: &String) -> Result<u64> {
+        self.inner.capacity(device_id)
+    }
+
+    fn device_status(&self, device_id: &String) -> Result<DiskStatus> {
+        self.inner.device_status(device_id)
+    }
+
+    fn capabilities(&self) -> crate::backend::BackendCapabilities {
+        self.inner.capabilities()
+    }
+}
+
+impl StorageBackend for JournalPayloadFailBackend {
+    fn backend_kind(&self) -> BackendKind {
+        self.inner.backend_kind()
+    }
+
+    fn list_devices(&self) -> Result<Vec<crate::backend::BackendDeviceInfo>> {
+        self.inner.list_devices()
+    }
+
+    fn read_at(&self, device_id: &String, offset: u64, buf: &mut [u8]) -> Result<()> {
+        if device_id == &self.failed_device && offset >= self.fail_from && offset < self.fail_to {
+            return Err(ArgosError::Io(std::io::Error::from_raw_os_error(libc::EIO)));
+        }
+        self.inner.read_at(device_id, offset, buf)
+    }
+
+    fn write_at(&self, device_id: &String, offset: u64, data: &[u8]) -> Result<()> {
+        self.inner.write_at(device_id, offset, data)
+    }
+
+    fn flush_device(&self, device_id: &String) -> Result<()> {
+        self.inner.flush_device(device_id)
+    }
+
+    fn flush_all(&self) -> Result<()> {
+        self.inner.flush_all()
+    }
+
+    fn capacity(&self, device_id: &String) -> Result<u64> {
+        self.inner.capacity(device_id)
+    }
+
+    fn device_status(&self, device_id: &String) -> Result<DiskStatus> {
+        self.inner.device_status(device_id)
+    }
+
+    fn capabilities(&self) -> crate::backend::BackendCapabilities {
+        self.inner.capabilities()
+    }
+}
+
+impl FailingBackend {
+    fn eio() -> ArgosError {
+        ArgosError::Io(std::io::Error::from_raw_os_error(libc::EIO))
+    }
+
+    fn fails(&self, device_id: &str) -> bool {
+        self.failed.contains(device_id)
+    }
+}
+
+impl StorageBackend for FailingBackend {
+    fn backend_kind(&self) -> BackendKind {
+        self.inner.backend_kind()
+    }
+
+    fn list_devices(&self) -> Result<Vec<crate::backend::BackendDeviceInfo>> {
+        self.inner.list_devices()
+    }
+
+    fn read_at(&self, device_id: &String, offset: u64, buf: &mut [u8]) -> Result<()> {
+        if self.fails(device_id) {
+            return Err(Self::eio());
+        }
+        self.inner.read_at(device_id, offset, buf)
+    }
+
+    fn write_at(&self, device_id: &String, offset: u64, data: &[u8]) -> Result<()> {
+        if self.fails(device_id) {
+            return Err(Self::eio());
+        }
+        self.inner.write_at(device_id, offset, data)
+    }
+
+    fn flush_device(&self, device_id: &String) -> Result<()> {
+        if self.fails(device_id) {
+            return Err(Self::eio());
+        }
+        self.inner.flush_device(device_id)
+    }
+
+    fn flush_all(&self) -> Result<()> {
+        for device in self.inner.list_devices()? {
+            self.flush_device(&device.device_id)?;
+        }
+        Ok(())
+    }
+
+    fn capacity(&self, device_id: &String) -> Result<u64> {
+        self.inner.capacity(device_id)
+    }
+
+    fn device_status(&self, device_id: &String) -> Result<DiskStatus> {
+        self.inner.device_status(device_id)
+    }
+
+    fn capabilities(&self) -> crate::backend::BackendCapabilities {
+        self.inner.capabilities()
+    }
+}
 
 fn metadata() -> Metadata {
     let dir = tempdir().unwrap();
@@ -47,6 +262,70 @@ fn create_loop_pool(dir: &Path, name: &str) -> (PathBuf, ArgosFs) {
     )
     .unwrap();
     (image, fs)
+}
+
+fn quorum_fixture() -> (
+    tempfile::TempDir,
+    Vec<PathBuf>,
+    Metadata,
+    Vec<RawSuperblock>,
+) {
+    let dir = tempdir().unwrap();
+    let images = (0..3)
+        .map(|index| dir.path().join(format!("quorum-{index}.img")))
+        .collect::<Vec<_>>();
+    let fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            ..VolumeConfig::default()
+        },
+        MIN_DEVICE_BYTES,
+        "quorum-test",
+        false,
+    )
+    .unwrap();
+    fs.write_file("/base", b"durable-base", 0o600).unwrap();
+    fs.sync().unwrap();
+    let metadata = fs.metadata_snapshot();
+    drop(fs);
+    let superblocks = images
+        .iter()
+        .map(|path| {
+            inspect_device(BackendKind::LoopBlock, path.clone())
+                .unwrap()
+                .0
+        })
+        .collect();
+    (dir, images, metadata, superblocks)
+}
+
+fn block_backend_for(images: &[PathBuf]) -> FileBlockBackend {
+    FileBlockBackend::open_with_ids(
+        BackendKind::LoopBlock,
+        images
+            .iter()
+            .enumerate()
+            .map(|(index, path)| (format!("disk-{index:04}"), path.clone()))
+            .collect(),
+        true,
+    )
+    .unwrap()
+}
+
+fn next_metadata(previous: &Metadata, pool_name: &str) -> Metadata {
+    let mut next = previous.clone();
+    next.raw_pool.pool_name = pool_name.to_string();
+    next.txid += 1;
+    next.updated_at = crate::util::now_f64();
+    journal::prepare_metadata_integrity_with_previous(
+        &mut next,
+        previous.integrity.meta_hash.clone(),
+    )
+    .unwrap();
+    next
 }
 
 #[test]
@@ -134,6 +413,297 @@ fn raw_journal_quorum_ignores_unreadable_and_invalid_members() {
 }
 
 #[test]
+fn quorum_journal_commit_survives_one_member_eio() {
+    let (_dir, images, previous, superblocks) = quorum_fixture();
+    let next = next_metadata(&previous, "committed-with-one-eio");
+    let backend = FailingBackend {
+        inner: block_backend_for(&images),
+        failed: BTreeSet::from(["disk-0002".to_string()]),
+    };
+
+    let report = append_transaction_with_trusted_integrity_quorum(
+        &backend,
+        &superblocks,
+        &next,
+        Some(&previous),
+        "quorum-eio-test",
+        serde_json::json!({}),
+    )
+    .unwrap();
+    assert!(report.failed_devices.contains_key("disk-0002"));
+    drop(backend);
+
+    let reopened = ArgosFs::open_loop(&images, false).unwrap();
+    let recovered = reopened.metadata_snapshot();
+    assert_eq!(recovered.txid, next.txid);
+    assert_eq!(recovered.raw_pool.pool_name, "committed-with-one-eio");
+}
+
+#[test]
+fn quorum_certificate_preserves_commit_across_changing_member_failures() {
+    let (_dir, images, previous, superblocks) = quorum_fixture();
+    let next = next_metadata(&previous, "certified-changing-failure");
+    let backend = FailingBackend {
+        inner: block_backend_for(&images),
+        failed: BTreeSet::from(["disk-0002".to_string()]),
+    };
+    append_transaction_with_trusted_integrity_quorum(
+        &backend,
+        &superblocks,
+        &next,
+        Some(&previous),
+        "changing-failure-test",
+        serde_json::json!({}),
+    )
+    .unwrap();
+    drop(backend);
+
+    // The write quorum was disk-0000/disk-0001. On the next read quorum,
+    // disk-0000 is absent while disk-0002 has recovered and still carries the
+    // old checkpoint. The certificate on disk-0001 must preserve the acked tx.
+    std::fs::remove_file(&images[0]).unwrap();
+    let reopened = ArgosFs::open_loop(&images[1..], false).unwrap();
+    let recovered = reopened.metadata_snapshot();
+    assert_eq!(recovered.txid, next.txid);
+    assert_eq!(recovered.raw_pool.pool_name, "certified-changing-failure");
+}
+
+#[test]
+fn stale_same_txid_suffix_is_excluded_from_new_quorum_append() {
+    let (_dir, images, previous, superblocks) = quorum_fixture();
+    let stale = next_metadata(&previous, "stale-uncommitted");
+    let (stale_entry, _) = build_journal_entry(
+        &stale,
+        Some(&previous),
+        "stale-test",
+        serde_json::json!({}),
+        true,
+    )
+    .unwrap();
+    let backend = block_backend_for(&images);
+    let (header, write_offset, end, rollover) =
+        journal_append_position(&backend, &superblocks[0], stale_entry.len()).unwrap();
+    assert!(!rollover);
+    append_journal_member(
+        &backend,
+        &superblocks[0],
+        header,
+        write_offset,
+        end,
+        &stale_entry,
+        true,
+    )
+    .unwrap();
+    drop(backend);
+
+    let next = next_metadata(&previous, "new-same-txid");
+    let backend = FailingBackend {
+        inner: block_backend_for(&images),
+        failed: BTreeSet::from(["disk-0002".to_string()]),
+    };
+    let err = append_transaction_with_trusted_integrity_quorum(
+        &backend,
+        &superblocks,
+        &next,
+        Some(&previous),
+        "new-same-txid-test",
+        serde_json::json!({}),
+    )
+    .unwrap_err();
+    assert!(matches!(err, ArgosError::QuorumUnavailable { .. }));
+}
+
+#[test]
+fn dirty_superblock_marking_succeeds_with_one_write_rejecting_member() {
+    let (_dir, images, metadata, superblocks) = quorum_fixture();
+    let backend = WriteFailBackend {
+        inner: block_backend_for(&images),
+        failed: BTreeSet::from(["disk-0002".to_string()]),
+    };
+    let report =
+        write_superblock_clean_state_quorum(&backend, &superblocks, &metadata, false).unwrap();
+    assert!(report.failed_devices.contains_key("disk-0002"));
+}
+
+#[test]
+fn journal_flush_shortfall_is_indeterminate_after_quorum_exposure() {
+    let (_dir, images, previous, superblocks) = quorum_fixture();
+    let next = next_metadata(&previous, "indeterminate-flush");
+    let backend = FlushFailBackend {
+        inner: block_backend_for(&images),
+        failed: BTreeSet::from(["disk-0001".to_string(), "disk-0002".to_string()]),
+    };
+
+    let err = append_transaction_with_trusted_integrity_quorum(
+        &backend,
+        &superblocks,
+        &next,
+        Some(&previous),
+        "indeterminate-flush-test",
+        serde_json::json!({}),
+    )
+    .unwrap_err();
+    assert!(matches!(err, ArgosError::IndeterminateCommit(_)));
+    drop(backend);
+
+    // The failed flushes do not prove absence: the just-written journal copies
+    // can still be visible to recovery, which is why callers must not roll back
+    // this result as an ordinary uncommitted quorum failure.
+    let reopened = ArgosFs::open_loop(&images, false).unwrap();
+    let recovered = reopened.metadata_snapshot();
+    assert_eq!(recovered.txid, next.txid);
+    assert_eq!(recovered.raw_pool.pool_name, "indeterminate-flush");
+}
+
+#[test]
+fn writable_replay_checkpoint_tolerates_one_persistent_member_write_failure() {
+    let (_dir, images, previous, superblocks) = quorum_fixture();
+    let next = next_metadata(&previous, "replay-checkpoint-quorum");
+    let backend = block_backend_for(&images);
+    append_transaction_with_trusted_integrity_quorum(
+        &backend,
+        &superblocks,
+        &next,
+        Some(&previous),
+        "replay-checkpoint-source",
+        serde_json::json!({}),
+    )
+    .unwrap();
+    drop(backend);
+
+    let backend = WriteFailBackend {
+        inner: block_backend_for(&images),
+        failed: BTreeSet::from(["disk-0002".to_string()]),
+    };
+    let (recovered, report) = load_or_recover(&backend, &superblocks, true).unwrap();
+    assert!(report.replayed);
+    assert_eq!(recovered.txid, next.txid);
+    assert_eq!(recovered.raw_pool.pool_name, "replay-checkpoint-quorum");
+    drop(backend);
+
+    let reopened = ArgosFs::open_loop(&images, false).unwrap();
+    assert_eq!(reopened.metadata_snapshot().txid, next.txid);
+}
+
+#[test]
+fn journal_recovery_ignores_one_member_payload_eio_when_quorum_is_readable() {
+    let (_dir, images, previous, superblocks) = quorum_fixture();
+    let next = next_metadata(&previous, "recover-with-payload-eio");
+    let backend = block_backend_for(&images);
+    append_transaction_with_trusted_integrity_quorum(
+        &backend,
+        &superblocks,
+        &next,
+        Some(&previous),
+        "payload-eio-recovery",
+        serde_json::json!({}),
+    )
+    .unwrap();
+    drop(backend);
+
+    let failed = &superblocks[2];
+    let backend = JournalPayloadFailBackend {
+        inner: block_backend_for(&images),
+        failed_device: failed.disk_id.clone(),
+        fail_from: failed.journal.offset + RAW_HEADER_SIZE as u64 + 36,
+        fail_to: failed.journal.offset + failed.journal.length,
+    };
+    let mut report = TransactionReport::default();
+    let recovered =
+        read_latest_journal_metadata(&backend, &superblocks, &mut report, Some(&previous))
+            .unwrap()
+            .unwrap();
+
+    assert_eq!(recovered.txid, next.txid);
+    assert_eq!(recovered.raw_pool.pool_name, "recover-with-payload-eio");
+    let failed_member = report
+        .raw_journal_members
+        .iter()
+        .find(|member| member.disk_id == failed.disk_id)
+        .unwrap();
+    assert!(failed_member
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("I/O error"));
+    assert!(failed_member.invalid_entries > 0);
+    assert_eq!(report.raw_journal_quorum, Some(true));
+}
+
+#[test]
+fn quorum_report_distinguishes_metadata_failure_from_device_unavailability() {
+    let mut report = QuorumWriteReport::default();
+    report.record_failure(
+        "metadata-full",
+        &ArgosError::DiskFull {
+            disk_id: "metadata-full".to_string(),
+            required: 2,
+            available: 1,
+        },
+    );
+    report.record_failure(
+        "eio",
+        &ArgosError::Io(std::io::Error::from_raw_os_error(libc::EIO)),
+    );
+
+    assert!(report.failed_devices.contains_key("metadata-full"));
+    assert!(!report.unavailable_devices.contains("metadata-full"));
+    assert!(report.failed_devices.contains_key("eio"));
+    assert!(report.unavailable_devices.contains("eio"));
+
+    let retryable = quorum_failure_before_write(&report, "metadata", 3, 2);
+    assert!(matches!(retryable, ArgosError::QuorumUnavailable { .. }));
+
+    let mut metadata_only = QuorumWriteReport::default();
+    metadata_only.record_failure(
+        "metadata-full",
+        &ArgosError::DiskFull {
+            disk_id: "metadata-full".to_string(),
+            required: 2,
+            available: 1,
+        },
+    );
+    assert!(matches!(
+        quorum_failure_before_write(&metadata_only, "metadata", 3, 2),
+        ArgosError::RetryableQuorumUnavailable { .. }
+    ));
+}
+
+#[test]
+fn quorum_journal_commit_rejects_loss_of_majority() {
+    let (_dir, images, previous, superblocks) = quorum_fixture();
+    let next = next_metadata(&previous, "must-not-commit");
+    let backend = FailingBackend {
+        inner: block_backend_for(&images),
+        failed: BTreeSet::from(["disk-0001".to_string(), "disk-0002".to_string()]),
+    };
+
+    let err = append_transaction_with_trusted_integrity_quorum(
+        &backend,
+        &superblocks,
+        &next,
+        Some(&previous),
+        "quorum-loss-test",
+        serde_json::json!({}),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        err,
+        ArgosError::QuorumUnavailable {
+            need: 2,
+            have: 1,
+            ..
+        }
+    ));
+    drop(backend);
+
+    let reopened = ArgosFs::open_loop(&images, false).unwrap();
+    let recovered = reopened.metadata_snapshot();
+    assert_eq!(recovered.txid, previous.txid);
+    assert_eq!(recovered.raw_pool.pool_name, previous.raw_pool.pool_name);
+}
+
+#[test]
 fn record_hash_and_previous_metadata_hash_are_stable_and_optional() {
     let meta = metadata();
     let mut record = RawJournalRecord {
@@ -205,17 +775,18 @@ fn metadata_tree_checkpoint_covers_pages_headers_and_capacity_errors() {
 #[test]
 fn quorum_selection_uses_distinct_devices_and_highest_supported_generation() {
     let first = metadata();
+    let member = first.disks.keys().next().unwrap().clone();
     let mut second = first.clone();
     second.txid += 1;
     second.integrity.generation = second.txid;
     second.integrity.meta_hash = journal::canonical_metadata_hash(&second).unwrap();
     let report = MetadataCandidateReport::default();
     let candidates = vec![
-        ("a".to_string(), Some(first.clone()), report.clone()),
-        ("b".to_string(), Some(first.clone()), report.clone()),
-        ("a".to_string(), Some(second.clone()), report.clone()),
-        ("b".to_string(), Some(second.clone()), report.clone()),
-        ("c".to_string(), None, report),
+        (member.clone(), Some(first.clone()), report.clone()),
+        ("orphan".to_string(), Some(first.clone()), report.clone()),
+        (member.clone(), Some(second.clone()), report.clone()),
+        ("orphan".to_string(), Some(second.clone()), report.clone()),
+        ("missing".to_string(), None, report),
     ];
     let selected = select_quorum_metadata_candidate(&candidates)
         .unwrap()
@@ -237,12 +808,65 @@ fn quorum_selection_uses_distinct_devices_and_highest_supported_generation() {
     }
     assert_eq!(metadata_quorum_requirement(&multi), 2);
     assert!(select_quorum_metadata_candidate(&[(
-        "a".to_string(),
+        member,
         Some(multi),
         MetadataCandidateReport::default()
     )])
     .unwrap()
     .is_none());
+}
+
+#[test]
+fn recovery_quorum_ignores_orphan_supporters_and_replay_targets() {
+    let (_dir, _images, metadata, superblocks) = quorum_fixture();
+    let mut candidate = metadata.clone();
+    candidate.txid += 1;
+    candidate.integrity.generation = candidate.txid;
+    candidate.integrity.meta_hash = journal::canonical_metadata_hash(&candidate).unwrap();
+
+    let real_a = candidate.disks.keys().next().unwrap().clone();
+    let orphan = "disk-orphan".to_string();
+    let report = MetadataCandidateReport::default();
+    assert!(
+        select_quorum_metadata_candidate(&[
+            (real_a.clone(), Some(candidate.clone()), report.clone()),
+            (orphan.clone(), Some(candidate.clone()), report.clone()),
+        ])
+        .unwrap()
+        .is_none(),
+        "one real member plus an orphan must not satisfy a 3-member quorum"
+    );
+
+    let real_b = candidate
+        .disks
+        .keys()
+        .find(|disk_id| **disk_id != real_a)
+        .unwrap()
+        .clone();
+    assert!(select_quorum_metadata_candidate(&[
+        (real_a, Some(candidate.clone()), report.clone()),
+        (real_b, Some(candidate.clone()), report),
+    ])
+    .unwrap()
+    .is_some());
+
+    let pool_uuid = Uuid::parse_str(&candidate.uuid).unwrap();
+    let orphan_sb = superblock_for_device(
+        pool_uuid,
+        99,
+        &orphan,
+        candidate.config.k,
+        candidate.config.m,
+        candidate.config.chunk_size,
+        MIN_DEVICE_BYTES,
+        &candidate.raw_pool.pool_name,
+    )
+    .unwrap();
+    let mut scanned = superblocks;
+    scanned.push(orphan_sb);
+    let replay_targets = metadata_member_superblocks(&scanned, &candidate);
+    assert_eq!(replay_targets.len(), candidate.disks.len());
+    assert!(!replay_targets.iter().any(|sb| sb.disk_id == orphan));
 }
 
 #[test]

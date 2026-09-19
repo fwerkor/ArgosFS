@@ -46,6 +46,24 @@ fn every_error_variant_has_the_expected_errno() {
         (ArgosError::IncompatibleFormat("x".into()), libc::EINVAL),
         (ArgosError::MissingDevice("x".into()), libc::ENODEV),
         (ArgosError::DegradedPool("x".into()), libc::EIO),
+        (
+            ArgosError::QuorumUnavailable {
+                operation: "metadata".into(),
+                need: 2,
+                have: 1,
+            },
+            libc::EROFS,
+        ),
+        (
+            ArgosError::RetryableQuorumUnavailable {
+                operation: "metadata".into(),
+                need: 2,
+                have: 1,
+            },
+            libc::EAGAIN,
+        ),
+        (ArgosError::IndeterminateCommit("x".into()), libc::EIO),
+        (ArgosError::CommittedDurabilityLoss("x".into()), libc::EIO),
         (ArgosError::UnsafeMount("x".into()), libc::EROFS),
         (ArgosError::JournalReplayRequired("x".into()), libc::EAGAIN),
         (ArgosError::ReadonlyRequired("x".into()), libc::EROFS),
@@ -61,4 +79,17 @@ fn every_error_variant_has_the_expected_errno() {
         ArgosError::Io(std::io::Error::other("no errno")).errno(),
         libc::EIO
     );
+}
+
+#[test]
+fn fatal_device_error_classification_excludes_capacity_and_transient_io() {
+    for errno in [libc::EIO, libc::ENODEV, libc::ENXIO, libc::EREMOTEIO] {
+        assert!(ArgosError::Io(std::io::Error::from_raw_os_error(errno)).is_fatal_device_error());
+    }
+    assert!(ArgosError::MissingDevice("disk-0001".to_string()).is_fatal_device_error());
+
+    for errno in [libc::ENOSPC, libc::EDQUOT, libc::EAGAIN, libc::EINTR] {
+        assert!(!ArgosError::Io(std::io::Error::from_raw_os_error(errno)).is_fatal_device_error());
+    }
+    assert!(!ArgosError::Io(std::io::Error::other("no errno")).is_fatal_device_error());
 }
