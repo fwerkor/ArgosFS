@@ -775,17 +775,18 @@ fn metadata_tree_checkpoint_covers_pages_headers_and_capacity_errors() {
 #[test]
 fn quorum_selection_uses_distinct_devices_and_highest_supported_generation() {
     let first = metadata();
+    let member = first.disks.keys().next().unwrap().clone();
     let mut second = first.clone();
     second.txid += 1;
     second.integrity.generation = second.txid;
     second.integrity.meta_hash = journal::canonical_metadata_hash(&second).unwrap();
     let report = MetadataCandidateReport::default();
     let candidates = vec![
-        ("a".to_string(), Some(first.clone()), report.clone()),
-        ("b".to_string(), Some(first.clone()), report.clone()),
-        ("a".to_string(), Some(second.clone()), report.clone()),
-        ("b".to_string(), Some(second.clone()), report.clone()),
-        ("c".to_string(), None, report),
+        (member.clone(), Some(first.clone()), report.clone()),
+        ("orphan".to_string(), Some(first.clone()), report.clone()),
+        (member.clone(), Some(second.clone()), report.clone()),
+        ("orphan".to_string(), Some(second.clone()), report.clone()),
+        ("missing".to_string(), None, report),
     ];
     let selected = select_quorum_metadata_candidate(&candidates)
         .unwrap()
@@ -807,12 +808,65 @@ fn quorum_selection_uses_distinct_devices_and_highest_supported_generation() {
     }
     assert_eq!(metadata_quorum_requirement(&multi), 2);
     assert!(select_quorum_metadata_candidate(&[(
-        "a".to_string(),
+        member,
         Some(multi),
         MetadataCandidateReport::default()
     )])
     .unwrap()
     .is_none());
+}
+
+#[test]
+fn recovery_quorum_ignores_orphan_supporters_and_replay_targets() {
+    let (_dir, _images, metadata, superblocks) = quorum_fixture();
+    let mut candidate = metadata.clone();
+    candidate.txid += 1;
+    candidate.integrity.generation = candidate.txid;
+    candidate.integrity.meta_hash = journal::canonical_metadata_hash(&candidate).unwrap();
+
+    let real_a = candidate.disks.keys().next().unwrap().clone();
+    let orphan = "disk-orphan".to_string();
+    let report = MetadataCandidateReport::default();
+    assert!(
+        select_quorum_metadata_candidate(&[
+            (real_a.clone(), Some(candidate.clone()), report.clone()),
+            (orphan.clone(), Some(candidate.clone()), report.clone()),
+        ])
+        .unwrap()
+        .is_none(),
+        "one real member plus an orphan must not satisfy a 3-member quorum"
+    );
+
+    let real_b = candidate
+        .disks
+        .keys()
+        .find(|disk_id| **disk_id != real_a)
+        .unwrap()
+        .clone();
+    assert!(select_quorum_metadata_candidate(&[
+        (real_a, Some(candidate.clone()), report.clone()),
+        (real_b, Some(candidate.clone()), report),
+    ])
+    .unwrap()
+    .is_some());
+
+    let pool_uuid = Uuid::parse_str(&candidate.uuid).unwrap();
+    let orphan_sb = superblock_for_device(
+        pool_uuid,
+        99,
+        &orphan,
+        candidate.config.k,
+        candidate.config.m,
+        candidate.config.chunk_size,
+        MIN_DEVICE_BYTES,
+        &candidate.raw_pool.pool_name,
+    )
+    .unwrap();
+    let mut scanned = superblocks;
+    scanned.push(orphan_sb);
+    let replay_targets = metadata_member_superblocks(&scanned, &candidate);
+    assert_eq!(replay_targets.len(), candidate.disks.len());
+    assert!(!replay_targets.iter().any(|sb| sb.disk_id == orphan));
 }
 
 #[test]

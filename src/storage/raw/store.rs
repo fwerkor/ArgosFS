@@ -231,6 +231,10 @@ pub fn open_pool(kind: BackendKind, paths: &[PathBuf], write: bool) -> Result<Ra
             metadata.backend, kind
         )));
     }
+    // Recovery scans every same-pool device so it can discover the durable
+    // state, but only members named by that selected state may participate in
+    // subsequent writable fanout or be exposed to the mounted volume.
+    let superblocks = metadata_member_superblocks(&superblocks, &metadata);
     let present = superblocks
         .iter()
         .map(|sb| sb.disk_id.clone())
@@ -1187,7 +1191,9 @@ fn load_or_recover(
     report.selected_metadata_source = "raw-metadata-or-journal".to_string();
     if checkpoint_replay && report.replayed {
         journal::inject_crash(FaultPoint::DuringReplay.as_str())?;
-        let checkpoint_report = write_metadata_copies_quorum(backend, superblocks, &metadata)?;
+        let member_superblocks = metadata_member_superblocks(superblocks, &metadata);
+        let checkpoint_report =
+            write_metadata_copies_quorum(backend, &member_superblocks, &metadata)?;
         let failed_checkpoint_members = checkpoint_report
             .failed_devices
             .keys()
@@ -1199,7 +1205,7 @@ fn load_or_recover(
         // members that definitely received the checkpoint; a stale journal on
         // another member is harmless because replay ignores records at/below the
         // selected checkpoint txid.
-        for sb in superblocks {
+        for sb in &member_superblocks {
             if failed_checkpoint_members.contains(&sb.disk_id) {
                 continue;
             }
@@ -1216,6 +1222,24 @@ fn load_or_recover(
     Ok((metadata, report))
 }
 
+fn metadata_has_voting_member(metadata: &Metadata, disk_id: &str) -> bool {
+    metadata
+        .disks
+        .get(disk_id)
+        .is_some_and(|disk| disk.status != DiskStatus::Removed)
+}
+
+fn metadata_member_superblocks(
+    superblocks: &[RawSuperblock],
+    metadata: &Metadata,
+) -> Vec<RawSuperblock> {
+    superblocks
+        .iter()
+        .filter(|sb| metadata_has_voting_member(metadata, &sb.disk_id))
+        .cloned()
+        .collect()
+}
+
 fn select_quorum_metadata_candidate(
     candidates: &[(String, Option<Metadata>, MetadataCandidateReport)],
 ) -> Result<Option<Metadata>> {
@@ -1225,6 +1249,9 @@ fn select_quorum_metadata_candidate(
         let Some(metadata) = metadata else {
             continue;
         };
+        if !metadata_has_voting_member(metadata, disk_id) {
+            continue;
+        }
         let hash = metadata_hash_for_replay(metadata)?;
         supported
             .entry((metadata.txid, metadata.integrity.generation, hash))
@@ -1745,6 +1772,9 @@ fn read_latest_journal_metadata(
         member.invalid_entries = report.invalid_entries.saturating_sub(invalid_before);
         if member.invalid_entries == 0 {
             for (key, metadata) in member_candidates {
+                if !metadata_has_voting_member(&metadata, &sb.disk_id) {
+                    continue;
+                }
                 supported
                     .entry(key)
                     .or_insert_with(|| (metadata, std::collections::BTreeSet::new()))
