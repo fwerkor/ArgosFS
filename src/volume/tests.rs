@@ -417,7 +417,7 @@ fn raw_journal_events_refresh_stale_read_telemetry_integrity() {
     }
 
     let report = fs.transaction_report().unwrap();
-    assert_eq!(report.invalid_entries, 0, "{:#?}", report.errors);
+    assert_eq!(report.invalid_entries, 0);
     assert_eq!(report.raw_journal_quorum, Some(true));
     assert!(fs.deferred_commit.lock().raw_uncommitted_metadata_dirty);
 }
