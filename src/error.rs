@@ -56,6 +56,22 @@ pub enum ArgosError {
     MissingDevice(String),
     #[error("degraded pool: {0}")]
     DegradedPool(String),
+    #[error("{operation} quorum unavailable: need {need}, have {have}")]
+    QuorumUnavailable {
+        operation: String,
+        need: usize,
+        have: usize,
+    },
+    #[error("{operation} quorum temporarily unavailable: need {need}, have {have}")]
+    RetryableQuorumUnavailable {
+        operation: String,
+        need: usize,
+        have: usize,
+    },
+    #[error("transaction commit outcome is indeterminate: {0}")]
+    IndeterminateCommit(String),
+    #[error("committed transaction lost data durability: {0}")]
+    CommittedDurabilityLoss(String),
     #[error("unsafe mount: {0}")]
     UnsafeMount(String),
     #[error("journal replay required: {0}")]
@@ -65,6 +81,17 @@ pub enum ArgosError {
 }
 
 impl ArgosError {
+    pub(crate) fn is_fatal_device_error(&self) -> bool {
+        match self {
+            ArgosError::MissingDevice(_) => true,
+            ArgosError::Io(err) => matches!(
+                err.raw_os_error(),
+                Some(libc::EIO | libc::ENODEV | libc::ENXIO | libc::EREMOTEIO)
+            ),
+            _ => false,
+        }
+    }
+
     pub fn errno(&self) -> i32 {
         match self {
             ArgosError::NotFound(_) => libc::ENOENT,
@@ -88,6 +115,10 @@ impl ArgosError {
             ArgosError::IncompatibleFormat(_) => libc::EINVAL,
             ArgosError::MissingDevice(_) => libc::ENODEV,
             ArgosError::DegradedPool(_) => libc::EIO,
+            ArgosError::QuorumUnavailable { .. } => libc::EROFS,
+            ArgosError::RetryableQuorumUnavailable { .. } => libc::EAGAIN,
+            ArgosError::IndeterminateCommit(_) => libc::EIO,
+            ArgosError::CommittedDurabilityLoss(_) => libc::EIO,
             ArgosError::UnsafeMount(_) => libc::EROFS,
             ArgosError::JournalReplayRequired(_) => libc::EAGAIN,
             ArgosError::ReadonlyRequired(_) => libc::EROFS,

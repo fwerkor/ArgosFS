@@ -199,7 +199,9 @@ set_error() {
 restore_linear() {
   local index="$1"
   local name="${mapper_names[$index]}" count="${sectors[$index]}" loop="${loops[$index]}"
-  sudo dmsetup suspend "$name"
+  # The current target intentionally returns EIO, so flushing it while suspending
+  # would make the fault-recovery operation fail before the linear table is restored.
+  sudo dmsetup suspend --noflush "$name"
   sudo dmsetup reload "$name" --table "0 $count linear $loop 0"
   sudo dmsetup resume "$name"
   sudo blockdev --flushbufs "${mappers[$index]}" || true

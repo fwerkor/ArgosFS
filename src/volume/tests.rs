@@ -127,7 +127,36 @@ fn deferred_state_and_interval_distinguish_host_writable_and_readonly_block_back
     assert!(readonly
         .ensure_block_backend_writable_locked(&meta)
         .is_err());
-    assert!(readonly.active_block_backend_locked(&meta, false).is_ok());
+    let superblocks = readonly.metadata_superblocks_locked(&meta).unwrap();
+    assert!(readonly
+        .metadata_block_backend_locked(&meta, &superblocks, false)
+        .is_ok());
+}
+
+#[test]
+fn quorum_loss_write_fence_stops_mutations_and_background_retries() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = dir.path().join("write-fence.img");
+    let fs = ArgosFs::create_loop(
+        std::slice::from_ref(&image),
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            defer_metadata_commit: true,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "write-fence",
+        false,
+    )
+    .unwrap();
+    *fs.write_fence.lock() = Some("metadata quorum unavailable".to_string());
+
+    assert!(matches!(
+        fs.write_file("/rejected", b"data", 0o600),
+        Err(ArgosError::ReadonlyRequired(_))
+    ));
+    assert!(!fs.sync_deferred_if_dirty().unwrap());
 }
 
 #[test]
@@ -297,24 +326,366 @@ fn transaction_error_classification_covers_committed_and_uncommitted_points() {
             &ArgosError::InjectedCrash(point.to_string())
         ));
     }
+    assert!(ArgosFs::transaction_error_is_committed(
+        &ArgosError::CommittedDurabilityLoss("data quorum lost".to_string())
+    ));
+    assert!(ArgosFs::transaction_error_is_committed(
+        &ArgosError::IndeterminateCommit("flush outcome unknown".to_string())
+    ));
     for error in [
         ArgosError::InjectedCrash("before-journal".to_string()),
         ArgosError::Invalid("x".to_string()),
         ArgosError::Conflict("x".to_string()),
+        ArgosError::RetryableQuorumUnavailable {
+            operation: "metadata".to_string(),
+            need: 2,
+            have: 1,
+        },
     ] {
         assert!(!ArgosFs::transaction_error_is_committed(&error));
     }
 }
 
 #[test]
-fn active_backend_helpers_cover_host_empty_and_loop_status_filtering() {
+fn retryable_quorum_shortfall_does_not_write_fence_mount() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fs = ArgosFs::create(
+        tmp.path(),
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            ..VolumeConfig::default()
+        },
+        1,
+        false,
+    )
+    .unwrap();
+    let retryable = ArgosError::RetryableQuorumUnavailable {
+        operation: "metadata".to_string(),
+        need: 2,
+        have: 1,
+    };
+    fs.fence_on_quorum_loss(&retryable);
+    assert!(fs.write_fence.lock().is_none());
+
+    fs.fence_on_quorum_loss(&ArgosError::IndeterminateCommit(
+        "outcome unknown".to_string(),
+    ));
+    assert!(fs.write_fence.lock().is_some());
+}
+
+#[test]
+fn raw_journal_events_refresh_stale_read_telemetry_integrity() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = dir.path().join("event-integrity.img");
+    let fs = ArgosFs::create_loop(
+        std::slice::from_ref(&image),
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            compression: Compression::None,
+            defer_journal_flush: true,
+            defer_metadata_commit: true,
+            defer_data_flush: true,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "event-integrity",
+        false,
+    )
+    .unwrap();
+    fs.write_file("/value", b"telemetry", 0o600).unwrap();
+    fs.sync().unwrap();
+
+    let durable = fs.metadata_snapshot();
+    assert_eq!(
+        journal::canonical_metadata_hash(&durable).unwrap(),
+        durable.integrity.meta_hash
+    );
+    assert_eq!(fs.read_file("/value", true).unwrap(), b"telemetry");
+    let dirty = fs.metadata_snapshot();
+    assert_ne!(
+        journal::canonical_metadata_hash(&dirty).unwrap(),
+        dirty.integrity.meta_hash
+    );
+    assert!(fs.deferred_commit.lock().raw_uncommitted_metadata_dirty);
+
+    {
+        let meta = fs.meta.read();
+        fs.journal_locked(&meta, "self-heal-deferred", json!({"reason": "test-event"}))
+            .unwrap();
+    }
+
+    let report = fs.transaction_report().unwrap();
+    assert_eq!(report.invalid_entries, 0);
+    assert_eq!(report.raw_journal_quorum, Some(true));
+    assert!(fs.deferred_commit.lock().raw_uncommitted_metadata_dirty);
+}
+
+#[test]
+fn quorum_report_fences_when_failed_member_owns_required_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|index| dir.path().join(format!("fanout-{index}.img")))
+        .collect::<Vec<_>>();
+    let fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            compression: Compression::None,
+            chunk_size: 4096,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "fanout-durability",
+        false,
+    )
+    .unwrap();
+    fs.write_file("/payload", &vec![7u8; 64 * 1024], 0o600)
+        .unwrap();
+    fs.sync().unwrap();
+
+    let meta = fs.metadata_snapshot();
+    let failed_disk = meta
+        .inodes
+        .values()
+        .find(|inode| inode.kind == NodeKind::File)
+        .and_then(|inode| inode.blocks.first())
+        .and_then(|block| block.shards.first())
+        .map(|shard| shard.disk_id.clone())
+        .unwrap();
+    let mut report = raw_store::QuorumWriteReport::default();
+    report
+        .failed_devices
+        .insert(failed_disk.clone(), "simulated metadata EIO".to_string());
+    report.unavailable_devices.insert(failed_disk.clone());
+
+    let err = fs.apply_quorum_write_report(&meta, report).unwrap_err();
+    assert!(matches!(err, ArgosError::CommittedDurabilityLoss(_)));
+    assert!(fs.is_device_quarantined(&failed_disk));
+    assert!(fs.write_fence.lock().is_some());
+}
+
+#[test]
+fn durability_validation_counts_offline_and_quarantined_shards_together() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|index| dir.path().join(format!("admin-unavailable-{index}.img")))
+        .collect::<Vec<_>>();
+    let fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            compression: Compression::None,
+            chunk_size: 4096,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "admin-unavailable",
+        false,
+    )
+    .unwrap();
+    fs.write_file("/payload", &vec![5u8; 64 * 1024], 0o600)
+        .unwrap();
+    fs.sync().unwrap();
+
+    let meta = fs.metadata_snapshot();
+    let block = meta
+        .inodes
+        .values()
+        .find(|inode| inode.kind == NodeKind::File)
+        .and_then(|inode| inode.blocks.first())
+        .unwrap();
+    let offline = block.shards[0].disk_id.clone();
+    let quarantined = block.shards[1].disk_id.clone();
+
+    let mut degraded = meta.clone();
+    degraded.disks.get_mut(&offline).unwrap().status = DiskStatus::Offline;
+    let unavailable = BTreeSet::from([quarantined]);
+    assert!(matches!(
+        fs.validate_data_durability_locked(&degraded, &unavailable),
+        Err(ArgosError::QuorumUnavailable { .. })
+    ));
+}
+
+#[test]
+fn immediate_precommit_durability_rejection_rolls_back_namespace_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|index| dir.path().join(format!("rollback-{index}.img")))
+        .collect::<Vec<_>>();
+    let fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            compression: Compression::None,
+            chunk_size: 4096,
+            defer_metadata_commit: false,
+            defer_journal_flush: false,
+            defer_data_flush: false,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "rollback-precommit",
+        false,
+    )
+    .unwrap();
+    fs.write_file("/payload", &vec![9u8; 64 * 1024], 0o600)
+        .unwrap();
+    fs.sync().unwrap();
+
+    let snapshot = fs.metadata_snapshot();
+    let block = snapshot
+        .inodes
+        .values()
+        .find(|inode| inode.kind == NodeKind::File)
+        .and_then(|inode| inode.blocks.first())
+        .unwrap();
+    let offline = block.shards[0].disk_id.clone();
+    let quarantined = block.shards[1].disk_id.clone();
+    fs.mark_disk(&offline, DiskStatus::Offline).unwrap();
+    fs.quarantine_device(&quarantined);
+
+    assert!(matches!(
+        fs.mkdir("/rejected", 0o755),
+        Err(ArgosError::QuorumUnavailable { .. })
+    ));
+    assert!(matches!(
+        fs.resolve_path("/rejected", true),
+        Err(ArgosError::NotFound(_))
+    ));
+    assert!(fs.write_fence.lock().is_some());
+}
+
+#[test]
+fn failed_inspection_of_new_block_member_blocks_deferred_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("base.img");
+    let fs = ArgosFs::create_loop(
+        std::slice::from_ref(&base),
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            chunk_size: 4096,
+            compression: Compression::None,
+            defer_journal_flush: true,
+            defer_metadata_commit: true,
+            defer_data_flush: true,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "dynamic-member",
+        false,
+    )
+    .unwrap();
+    let added_path = dir.path().join("added.img");
+    let disk_id = fs
+        .add_block_device(added_path.clone(), 32 * 1024 * 1024, false)
+        .unwrap();
+    fs.sync().unwrap();
+    assert!(!fs.raw_superblocks.iter().any(|sb| sb.disk_id == disk_id));
+
+    // Force new data onto the dynamically added member, then make its path
+    // disappear before the bounded group commit tries to inspect/flush it.
+    fs.mark_disk("disk-0000", DiskStatus::Offline).unwrap();
+    fs.sync().unwrap();
+    fs.write_file("/new-data", &vec![3u8; 64 * 1024], 0o600)
+        .unwrap();
+    std::fs::remove_file(&added_path).unwrap();
+
+    let err = fs.sync().unwrap_err();
+    assert!(matches!(err, ArgosError::QuorumUnavailable { .. }));
+    assert!(fs.is_device_quarantined(&disk_id));
+    assert!(fs.write_fence.lock().is_some());
+}
+
+#[test]
+fn dynamically_inspected_member_rejects_repointed_duplicate_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let base = dir.path().join("identity-base.img");
+    let fs = ArgosFs::create_loop(
+        std::slice::from_ref(&base),
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            chunk_size: 4096,
+            compression: Compression::None,
+            defer_journal_flush: true,
+            defer_metadata_commit: true,
+            defer_data_flush: true,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "dynamic-identity",
+        false,
+    )
+    .unwrap();
+    let added_path = dir.path().join("identity-added.img");
+    let disk_id = fs
+        .add_block_device(added_path.clone(), 32 * 1024 * 1024, false)
+        .unwrap();
+    fs.sync().unwrap();
+    assert!(!fs.raw_superblocks.iter().any(|sb| sb.disk_id == disk_id));
+
+    // Replace the path with another readable ArgosFS member from this pool.
+    // Inspection must not accept disk-0000 as a second copy of disk-0001.
+    std::fs::remove_file(&added_path).unwrap();
+    std::fs::copy(&base, &added_path).unwrap();
+
+    let meta = fs.meta.read();
+    let superblocks = fs.metadata_superblocks_locked(&meta).unwrap();
+    assert!(!superblocks.iter().any(|sb| sb.disk_id == disk_id));
+    assert_eq!(
+        superblocks
+            .iter()
+            .filter(|sb| sb.disk_id == "disk-0000")
+            .count(),
+        1
+    );
+    assert!(fs.is_device_quarantined(&disk_id));
+}
+
+#[test]
+fn metadata_fanout_excludes_raw_superblock_absent_from_membership() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = [
+        dir.path().join("member-a.img"),
+        dir.path().join("member-b.img"),
+    ];
+    let fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 1,
+            m: 1,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "orphan-superblock",
+        false,
+    )
+    .unwrap();
+    let mut meta = fs.metadata_snapshot();
+    meta.disks.remove("disk-0001");
+
+    let superblocks = fs.metadata_superblocks_locked(&meta).unwrap();
+    assert_eq!(superblocks.len(), 1);
+    assert_eq!(superblocks[0].disk_id, "disk-0000");
+}
+
+#[test]
+fn metadata_backend_helpers_cover_host_empty_and_removed_member_filtering() {
     let (_dir, host) = host_volume();
     let host_meta = host.meta.read();
     assert!(host
-        .active_superblocks_locked(&host_meta)
+        .metadata_superblocks_locked(&host_meta)
         .unwrap()
         .is_empty());
-    assert!(host.active_block_backend_locked(&host_meta, false).is_err());
+    assert!(host
+        .metadata_block_backend_locked(&host_meta, &[], false)
+        .is_err());
     assert!(host.open_backend_covers_superblocks(&[]));
     drop(host_meta);
 
@@ -334,13 +705,17 @@ fn active_backend_helpers_cover_host_empty_and_loop_status_filtering() {
     .unwrap();
     let mut meta = loop_fs.meta.write();
     assert!(loop_fs.open_backend_covers_superblocks(&loop_fs.raw_superblocks));
-    assert_eq!(loop_fs.active_superblocks_locked(&meta).unwrap().len(), 2);
+    assert_eq!(loop_fs.metadata_superblocks_locked(&meta).unwrap().len(), 2);
     let first = meta.disks.keys().next().unwrap().clone();
     meta.disks.get_mut(&first).unwrap().status = DiskStatus::Removed;
-    assert_eq!(loop_fs.active_superblocks_locked(&meta).unwrap().len(), 1);
+    assert_eq!(loop_fs.metadata_superblocks_locked(&meta).unwrap().len(), 1);
     assert_eq!(
         loop_fs
-            .active_block_backend_locked(&meta, false)
+            .metadata_block_backend_locked(
+                &meta,
+                &loop_fs.metadata_superblocks_locked(&meta).unwrap(),
+                false,
+            )
             .unwrap()
             .list_devices()
             .unwrap()
