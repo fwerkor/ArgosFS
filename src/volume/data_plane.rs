@@ -757,15 +757,21 @@ impl ArgosFs {
                 continue;
             }
             let compressed = compress(raw, meta.config.compression, meta.config.compression_level)?;
+            let (transformed, codec) =
+                if meta.config.compression != Compression::None && compressed.len() >= raw.len() {
+                    (raw.to_vec(), Compression::None)
+                } else {
+                    (compressed, meta.config.compression)
+                };
             let (payload, encrypted, nonce_hex) = if let Some(key) = encrypt_key.as_ref() {
                 let (nonce, ciphertext) = crypto::encrypt_with_key(
                     key,
-                    &compressed,
+                    &transformed,
                     &encryption_aad(&meta.uuid, &stripe_id),
                 )?;
                 (ciphertext, true, hex::encode(nonce))
             } else {
-                (compressed, false, String::new())
+                (transformed, false, String::new())
             };
             let (shard_size, encoded) = if layout.k == 1 && layout.m == 0 {
                 (payload.len().max(1), vec![payload.clone()])
@@ -783,19 +789,16 @@ impl ArgosFs {
                     .collect::<Vec<_>>();
                 (shard_size, codec.encode(&data_shards)?)
             };
-            let single_raw_shard_integrity = if layout.k == 1
-                && layout.m == 0
-                && !encrypted
-                && meta.config.compression == Compression::None
-            {
-                Some(ShardIntegrity {
-                    sha256: raw_sha256.clone(),
-                    checksum_block_size: SHARD_CHECKSUM_BLOCK_SIZE,
-                    subblock_sha256: shard_subblock_hashes(raw, &raw_sha256),
-                })
-            } else {
-                None
-            };
+            let single_raw_shard_integrity =
+                if layout.k == 1 && layout.m == 0 && !encrypted && codec == Compression::None {
+                    Some(ShardIntegrity {
+                        sha256: raw_sha256.clone(),
+                        checksum_block_size: SHARD_CHECKSUM_BLOCK_SIZE,
+                        subblock_sha256: shard_subblock_hashes(raw, &raw_sha256),
+                    })
+                } else {
+                    None
+                };
             let placements = self.choose_disks_locked(
                 meta,
                 PlacementRequest {
@@ -836,7 +839,7 @@ impl ArgosFs {
                 raw_offset,
                 raw_size: raw.len(),
                 raw_sha256,
-                codec: meta.config.compression,
+                codec,
                 encrypted,
                 nonce_hex,
                 compressed_size: payload.len(),
