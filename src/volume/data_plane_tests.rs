@@ -406,6 +406,139 @@ fn configured_host_volume(config: VolumeConfig, disks: usize) -> (tempfile::Temp
     (dir, fs)
 }
 
+fn incompressible_bytes(len: usize) -> Vec<u8> {
+    let mut state = 0x4d595df4d0f33173_u64;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect()
+}
+
+#[test]
+fn incompressible_stripes_fall_back_to_raw_storage() {
+    let raw = incompressible_bytes(4096);
+    for codec in [Compression::Lz4, Compression::Zstd] {
+        assert!(compress(&raw, codec, 3).unwrap().len() >= raw.len());
+        let (_dir, fs) = configured_host_volume(
+            VolumeConfig {
+                k: 1,
+                m: 0,
+                compression: codec,
+                compression_level: 3,
+                chunk_size: raw.len(),
+                ..VolumeConfig::default()
+            },
+            1,
+        );
+        let mut meta = fs.meta.write();
+        let block = fs
+            .encode_data_locked(
+                &mut meta,
+                &raw,
+                0,
+                StorageTier::Warm,
+                false,
+                &BTreeSet::new(),
+            )
+            .unwrap()
+            .remove(0);
+
+        assert_eq!(block.codec, Compression::None);
+        assert_eq!(block.compressed_size, raw.len());
+        assert_eq!(block.shard_size, raw.len());
+        assert_eq!(
+            block.shards[0].checksum_block_size,
+            SHARD_CHECKSUM_BLOCK_SIZE
+        );
+        assert_eq!(
+            fs.decode_block_locked(&mut meta, &block, None, &mut Vec::new())
+                .unwrap(),
+            raw
+        );
+    }
+}
+
+#[test]
+fn compressible_stripes_keep_configured_codec() {
+    let raw = b"compressible stripe payload ".repeat(256);
+    let (_dir, fs) = configured_host_volume(
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            compression: Compression::Zstd,
+            compression_level: 3,
+            chunk_size: raw.len(),
+            ..VolumeConfig::default()
+        },
+        1,
+    );
+    let mut meta = fs.meta.write();
+    let block = fs
+        .encode_data_locked(
+            &mut meta,
+            &raw,
+            0,
+            StorageTier::Warm,
+            false,
+            &BTreeSet::new(),
+        )
+        .unwrap()
+        .remove(0);
+
+    assert_eq!(block.codec, Compression::Zstd);
+    assert!(block.compressed_size < raw.len());
+    assert_eq!(
+        fs.decode_block_locked(&mut meta, &block, None, &mut Vec::new())
+            .unwrap(),
+        raw
+    );
+}
+
+#[test]
+fn encrypted_incompressible_stripes_fall_back_before_encryption() {
+    let _env_guard = crypto::test_env_lock();
+    let raw = incompressible_bytes(4096);
+    let (_dir, fs) = configured_host_volume(
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            compression: Compression::Zstd,
+            compression_level: 3,
+            chunk_size: raw.len(),
+            ..VolumeConfig::default()
+        },
+        1,
+    );
+    std::env::set_var("ARGOSFS_KEY", "compression-fallback-secret");
+    fs.enable_encryption("compression-fallback-secret").unwrap();
+    let mut meta = fs.meta.write();
+    let block = fs
+        .encode_data_locked(
+            &mut meta,
+            &raw,
+            0,
+            StorageTier::Warm,
+            false,
+            &BTreeSet::new(),
+        )
+        .unwrap()
+        .remove(0);
+
+    assert_eq!(block.codec, Compression::None);
+    assert!(block.encrypted);
+    let key = fs.encryption_key_locked(&meta).unwrap();
+    assert_eq!(
+        fs.decode_block_locked(&mut meta, &block, Some(&key), &mut Vec::new())
+            .unwrap(),
+        raw
+    );
+    std::env::remove_var("ARGOSFS_KEY");
+}
+
 #[test]
 fn erasure_decode_tolerates_one_missing_shard_and_records_all_damage_classes() {
     let (_dir, fs) = configured_host_volume(
