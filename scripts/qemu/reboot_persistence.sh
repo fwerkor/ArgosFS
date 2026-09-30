@@ -53,28 +53,6 @@ send_command_file() {
 	argosfs_qemu_stream_script "$file" 3 "$remote" "$log"
 }
 
-wait_for_log_count() {
-	local pattern="$1"
-	local min_count="$2"
-	local wait_s="$3"
-	local label="$4"
-	local deadline=$((SECONDS + wait_s))
-	while [ "$SECONDS" -lt "$deadline" ]; do
-		if grep -Eiq "$reject" "$log" 2>/dev/null; then
-			echo "QEMU reboot persistence failed while waiting for $label; rejected pattern: $reject" >&2
-			return 2
-		fi
-		local count
-		count="$(grep -Ec "$pattern" "$log" 2>/dev/null || true)"
-		if [ "$count" -ge "$min_count" ]; then
-			return 0
-		fi
-		sleep 1
-	done
-	echo "timed out waiting for $label in $log" >&2
-	return 1
-}
-
 stdin_fifo="$artifacts/qemu-reboot-$arch.stdin"
 rm -f "$stdin_fifo"
 mkfifo "$stdin_fifo"
@@ -86,7 +64,7 @@ qemu_pid=$!
 exec 3>"$stdin_fifo"
 
 wait_status=0
-wait_for_log_count 'Please press Enter to activate this console\.' 1 "$login_delay_s" 'first login prompt' || wait_status=$?
+argosfs_qemu_wait_console_ready "$log" 1 "$login_delay_s" "$reject" "first reboot-persistence console" 3 || wait_status=$?
 if [ "$wait_status" -eq 0 ]; then
 	send_command_file "$commands1" /tmp/argosfs-qemu-reboot-phase1.sh || wait_status=$?
 fi
@@ -102,7 +80,7 @@ if [ "$wait_status" -eq 0 ]; then
 	fi
 fi
 if [ "$wait_status" -eq 0 ]; then
-	wait_for_log_count 'Please press Enter to activate this console\.' 2 "$reboot_delay_s" 'second login prompt' || wait_status=$?
+	argosfs_qemu_wait_console_ready "$log" 2 "$reboot_delay_s" "$reject" "second reboot-persistence console" 3 || wait_status=$?
 fi
 if [ "$wait_status" -eq 0 ]; then
 	send_command_file "$commands2" /tmp/argosfs-qemu-reboot-phase2.sh || wait_status=$?

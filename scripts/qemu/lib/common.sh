@@ -320,7 +320,7 @@ argosfs_qemu_wait_console_ready() {
 	local deadline=$((SECONDS + timeout_s))
 	local wake_interval="${ARGOSFS_QEMU_CONSOLE_WAKE_INTERVAL:-5}"
 	local next_wake="$SECONDS"
-	local prompt_count login_count shell_count ready_count
+	local prompt_count login_count shell_count ready_count procd_count
 
 	while [ "$SECONDS" -lt "$deadline" ]; do
 		if [ -n "$reject" ] && grep -Eiq "$reject" "$log" 2>/dev/null; then
@@ -342,8 +342,9 @@ argosfs_qemu_wait_console_ready() {
 		# guest is otherwise healthy. Nudge the serial line after userspace has
 		# reached procd init; the subsequent shell-marker handshake remains the
 		# authoritative proof that commands can actually execute.
+		procd_count="$(grep -Fc 'procd: - init -' "$log" 2>/dev/null || true)"
 		if [ "${arch:-}" = "arm64" ] && [ -n "$fd" ] && [ "$SECONDS" -ge "$next_wake" ] && \
-			grep -Fq 'procd: - init -' "$log" 2>/dev/null; then
+			[ "$procd_count" -ge "$min_count" ]; then
 			printf '\r' >&"$fd"
 			next_wake=$((SECONDS + wake_interval))
 		fi
