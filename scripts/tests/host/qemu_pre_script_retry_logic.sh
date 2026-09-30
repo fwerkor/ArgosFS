@@ -41,10 +41,23 @@ cat
 QEMU
 chmod +x "$tmp/qemu-second-console"
 
+cat >"$tmp/qemu-rejected" <<'QEMU'
+#!/usr/bin/env bash
+set -euo pipefail
+count=0
+[ ! -s "$FAKE_QEMU_COUNT" ] || count="$(cat "$FAKE_QEMU_COUNT")"
+count=$((count + 1))
+printf '%s\n' "$count" >"$FAKE_QEMU_COUNT"
+printf '%s\n' 'Kernel panic - not syncing: synthetic regression'
+cat >/dev/null
+QEMU
+chmod +x "$tmp/qemu-rejected"
+
 suite_console_timeout_var() {
   case "$1" in
     full_guest.sh) printf '%s\n' ARGOSFS_QEMU_FULL_CONSOLE_TIMEOUT ;;
     block_lifecycle_stress.sh) printf '%s\n' ARGOSFS_QEMU_LIFECYCLE_CONSOLE_TIMEOUT ;;
+    hotplug.sh) printf '%s\n' ARGOSFS_QEMU_HOTPLUG_CONSOLE_TIMEOUT ;;
     *) return 2 ;;
   esac
 }
@@ -86,6 +99,39 @@ run_no_retry_case() {
   [ "$(grep -c 'retrying pre-script startup' "$output" || true)" -eq 0 ]
 }
 
+run_reject_no_retry_case() {
+  local script="$1"
+  local name="${script%.sh}"
+  local timeout_var
+  local artifacts="$tmp/reject-$name"
+  local output="$tmp/reject-$name.out"
+  local count_file="$tmp/reject-$name.count"
+  local status
+
+  timeout_var="$(suite_console_timeout_var "$script")"
+  mkdir -p "$artifacts"
+  set +e
+  env \
+    PATH="$tmp:$PATH" \
+    FAKE_QEMU_COUNT="$count_file" \
+    ARGOSFS_QEMU_ARCH=arm64 \
+    ARGOSFS_QEMU_BIN="$tmp/qemu-rejected" \
+    ARGOSFS_QEMU_KERNEL="$kernel" \
+    ARGOSFS_QEMU_ROOTFS="$rootfs" \
+    ARGOSFS_TEST_ARTIFACTS="$artifacts" \
+    ARGOSFS_QEMU_TIMEOUT=12 \
+    ARGOSFS_QEMU_PRE_SCRIPT_CONSOLE_ATTEMPTS=3 \
+    "$timeout_var=3" \
+    "$repo/scripts/qemu/$script" >"$output" 2>&1
+  status=$?
+  set -e
+
+  [ "$status" -ne 0 ]
+  [ "$(cat "$count_file")" -eq 1 ]
+  [ "$(grep -c 'retrying pre-script startup' "$output" || true)" -eq 0 ]
+  grep -q 'QEMU rejected while waiting for .* console prompt' "$output"
+}
+
 run_retry_boundary_case() {
   local script="$1"
   local name="${script%.sh}"
@@ -122,9 +168,10 @@ run_retry_boundary_case() {
   [ "$(grep -c 'timed out waiting for QEMU guest shell' "$output" || true)" -eq 1 ]
 }
 
-for script in full_guest.sh block_lifecycle_stress.sh; do
+for script in full_guest.sh block_lifecycle_stress.sh hotplug.sh; do
   run_no_retry_case "$script"
   run_retry_boundary_case "$script"
 done
+run_reject_no_retry_case hotplug.sh
 
 printf 'QEMU pre-script console retry tests passed\n'
