@@ -100,4 +100,30 @@ prompt_log="$tmp/qemu-console-prompt.log"
 printf '%s\n' 'Please press Enter to activate this console.' >"$prompt_log"
 argosfs_qemu_wait_console_ready "$prompt_log" 1 2 "" "prompt readiness"
 
+second_boot_log="$tmp/qemu-second-boot.log"
+second_boot_input="$tmp/qemu-second-boot.input"
+{
+	printf '%s\n' '[   72.391219] procd: - init -'
+	printf '%s\n' "login[1300]: root login on 'ttyAMA0'"
+} >"$second_boot_log"
+exec 8>"$second_boot_input"
+(
+	sleep 1
+	if [ -s "$second_boot_input" ]; then
+		touch "$tmp/second-boot-early-wake"
+	fi
+	printf '%s\n' '[   73.000000] procd: - init -' >>"$second_boot_log"
+	sleep 1
+	printf '%s\n' "login[1400]: root login on 'ttyAMA0'" >>"$second_boot_log"
+) &
+second_boot_writer_pid=$!
+arch=arm64 ARGOSFS_QEMU_CONSOLE_WAKE_INTERVAL=1 \
+	argosfs_qemu_wait_console_ready "$second_boot_log" 2 5 "" "second arm64 console readiness" 8
+wait "$second_boot_writer_pid"
+exec 8>&-
+if [ -e "$tmp/second-boot-early-wake" ] || [ ! -s "$second_boot_input" ]; then
+	echo "QEMU console readiness helper did not respect the requested reboot phase" >&2
+	exit 1
+fi
+
 printf 'QEMU helper marker tests passed\n'

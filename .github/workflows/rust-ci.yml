@@ -260,6 +260,7 @@ jobs:
       - name: Test QEMU helper synchronization
         run: |
           scripts/tests/host/qemu_helper_logic.sh
+          scripts/tests/host/qemu_reboot_persistence_console_logic.sh
           scripts/tests/host/qemu_phase1_retry_logic.sh
           scripts/tests/host/qemu_pre_script_retry_logic.sh
 
