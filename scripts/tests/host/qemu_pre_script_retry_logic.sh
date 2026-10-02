@@ -58,6 +58,9 @@ suite_console_timeout_var() {
     full_guest.sh) printf '%s\n' ARGOSFS_QEMU_FULL_CONSOLE_TIMEOUT ;;
     block_lifecycle_stress.sh) printf '%s\n' ARGOSFS_QEMU_LIFECYCLE_CONSOLE_TIMEOUT ;;
     hotplug.sh) printf '%s\n' ARGOSFS_QEMU_HOTPLUG_CONSOLE_TIMEOUT ;;
+    rootfs_stress.sh) printf '%s\n' ARGOSFS_QEMU_STRESS_CONSOLE_TIMEOUT ;;
+    degraded_rootfs.sh) printf '%s\n' ARGOSFS_QEMU_DEGRADED_CONSOLE_TIMEOUT ;;
+    ops.sh) printf '%s\n' ARGOSFS_QEMU_OPS_CONSOLE_TIMEOUT ;;
     *) return 2 ;;
   esac
 }
@@ -168,10 +171,10 @@ run_retry_boundary_case() {
   [ "$(grep -c 'timed out waiting for QEMU guest shell' "$output" || true)" -eq 1 ]
 }
 
-for script in full_guest.sh block_lifecycle_stress.sh hotplug.sh; do
+for script in full_guest.sh block_lifecycle_stress.sh hotplug.sh rootfs_stress.sh degraded_rootfs.sh ops.sh; do
   run_no_retry_case "$script"
   run_retry_boundary_case "$script"
+  run_reject_no_retry_case "$script"
 done
-run_reject_no_retry_case hotplug.sh
 
 printf 'QEMU pre-script console retry tests passed\n'

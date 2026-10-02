@@ -16,6 +16,7 @@ reject="${ARGOSFS_QEMU_REJECT:-Kernel panic|Bad file descriptor|argosfs-initrd: 
 timeout_s="${ARGOSFS_QEMU_TIMEOUT:-240}"
 console_timeout_s="${ARGOSFS_QEMU_OPS_CONSOLE_TIMEOUT:-600}"
 done_marker="ARGOSFS_QEMU_OPS_DONE"
+console_ready_file="$artifacts/ops-console-ready"
 
 cat >"$commands" <<'CMDS'
 echo ARGOSFS_QEMU_OPS_BEGIN
@@ -41,10 +42,11 @@ argosfs_qemu_build_args
 qemu_feeder() {
 	set -e
 	argosfs_qemu_wait_console_ready "$log" 1 "$console_timeout_s" "$reject" "ops console prompt" 1
+	: >"$console_ready_file"
 	argosfs_qemu_stream_script "$commands" 1 /tmp/argosfs-qemu-ops.sh "$log"
 }
 
-argosfs_qemu_run_with_feeder "$log" "$timeout_s" qemu_feeder "$qemu_bin" "${qemu_args[@]}"
+argosfs_qemu_run_with_pre_script_retry "$log" "$timeout_s" "$console_ready_file" "ops" "" qemu_feeder "$qemu_bin" "${qemu_args[@]}"
 feeder_status="$ARGOSFS_QEMU_FEEDER_STATUS"
 status="$ARGOSFS_QEMU_STATUS"
 

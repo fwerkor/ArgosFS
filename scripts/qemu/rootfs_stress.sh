@@ -16,6 +16,7 @@ console_timeout_s="${ARGOSFS_QEMU_STRESS_CONSOLE_TIMEOUT:-600}"
 stress_s="${ARGOSFS_QEMU_STRESS_SECONDS:-1800}"
 workers="${ARGOSFS_QEMU_STRESS_WORKERS:-6}"
 done_marker="ARGOSFS_QEMU_ROOTFS_STRESS_DONE"
+console_ready_file="$artifacts/rootfs-stress-console-ready"
 
 cat >"$commands" <<CMDS
 set -eu
@@ -78,10 +79,11 @@ argosfs_qemu_build_args
 qemu_feeder() {
   set -e
   argosfs_qemu_wait_console_ready "$log" 1 "$console_timeout_s" "$reject" "rootfs-stress console prompt" 1
+  : >"$console_ready_file"
   argosfs_qemu_stream_script "$commands" 1 /tmp/argosfs-qemu-rootfs-stress.sh "$log"
 }
 
-argosfs_qemu_run_with_feeder "$log" "$timeout_s" qemu_feeder "$qemu_bin" "${qemu_args[@]}"
+argosfs_qemu_run_with_pre_script_retry "$log" "$timeout_s" "$console_ready_file" "rootfs stress" "" qemu_feeder "$qemu_bin" "${qemu_args[@]}"
 feeder_status="$ARGOSFS_QEMU_FEEDER_STATUS"
 status="$ARGOSFS_QEMU_STATUS"
 

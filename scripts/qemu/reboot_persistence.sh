@@ -18,6 +18,7 @@ timeout_s="${ARGOSFS_QEMU_TIMEOUT:-600}"
 login_delay_s="${ARGOSFS_QEMU_REBOOT_LOGIN_DELAY:-420}"
 reboot_delay_s="${ARGOSFS_QEMU_REBOOT_DELAY:-600}"
 done_marker="ARGOSFS_QEMU_REBOOT_DONE"
+console_ready_file="$artifacts/reboot-console-ready"
 
 cat >"$commands1" <<'CMDS'
 set -eu
@@ -54,67 +55,83 @@ send_command_file() {
 }
 
 stdin_fifo="$artifacts/qemu-reboot-$arch.stdin"
-rm -f "$stdin_fifo"
-mkfifo "$stdin_fifo"
-: >"$log"
+console_attempts="$(argosfs_qemu_pre_script_attempts)"
+attempt=1
 
 set +e
-timeout --kill-after="${ARGOSFS_QEMU_KILL_AFTER:-10}" "$timeout_s" "$qemu_bin" "${qemu_args[@]}" <"$stdin_fifo" >"$log" 2>&1 &
-qemu_pid=$!
-exec 3>"$stdin_fifo"
+while true; do
+	rm -f "$stdin_fifo" "$console_ready_file"
+	mkfifo "$stdin_fifo"
+	: >"$log"
 
-wait_status=0
-argosfs_qemu_wait_console_ready "$log" 1 "$login_delay_s" "$reject" "first reboot-persistence console" 3 || wait_status=$?
-if [ "$wait_status" -eq 0 ]; then
-	send_command_file "$commands1" /tmp/argosfs-qemu-reboot-phase1.sh || wait_status=$?
-fi
-if [ "$wait_status" -eq 0 ]; then
-	deadline=$((SECONDS + 120))
-	while [ "$SECONDS" -lt "$deadline" ]; do
-		if [ "$(argosfs_qemu_log_marker_count "$log" ARGOSFS_REBOOT_REQUESTED)" -ge 1 ]; then break; fi
-		sleep 1
-	done
-	if [ "$(argosfs_qemu_log_marker_count "$log" ARGOSFS_REBOOT_REQUESTED)" -lt 1 ]; then
-		echo "timed out waiting for phase1 reboot request in $log" >&2
-		wait_status=1
+	timeout --kill-after="${ARGOSFS_QEMU_KILL_AFTER:-10}" "$timeout_s" "$qemu_bin" "${qemu_args[@]}" <"$stdin_fifo" >"$log" 2>&1 &
+	qemu_pid=$!
+	exec 3>"$stdin_fifo"
+
+	wait_status=0
+	first_console_status=0
+	argosfs_qemu_wait_console_ready "$log" 1 "$login_delay_s" "$reject" "first reboot-persistence console" 3 || wait_status=$?
+	first_console_status="$wait_status"
+	if [ "$wait_status" -eq 0 ]; then
+		: >"$console_ready_file"
+		send_command_file "$commands1" /tmp/argosfs-qemu-reboot-phase1.sh || wait_status=$?
 	fi
-fi
-if [ "$wait_status" -eq 0 ]; then
-	argosfs_qemu_wait_console_ready "$log" 2 "$reboot_delay_s" "$reject" "second reboot-persistence console" 3 || wait_status=$?
-fi
-if [ "$wait_status" -eq 0 ]; then
-	send_command_file "$commands2" /tmp/argosfs-qemu-reboot-phase2.sh || wait_status=$?
-fi
-if [ "$wait_status" -eq 0 ]; then
-	deadline=$((SECONDS + 180))
-	while [ "$SECONDS" -lt "$deadline" ]; do
-		if [ "$(argosfs_qemu_log_marker_count "$log" "$done_marker")" -ge 1 ]; then break; fi
-		sleep 1
-	done
-	if [ "$(argosfs_qemu_log_marker_count "$log" "$done_marker")" -lt 1 ]; then
-		echo "timed out waiting for reboot persistence completion in $log" >&2
-		wait_status=1
-	fi
-fi
-exec 3>&-
-if [ "$wait_status" -eq 0 ]; then
-	# Give the guest a short window to honor poweroff before collecting status.
-	for _ in $(seq 1 10); do
-		if ! kill -0 "$qemu_pid" 2>/dev/null; then
-			break
+	if [ "$wait_status" -eq 0 ]; then
+		deadline=$((SECONDS + 120))
+		while [ "$SECONDS" -lt "$deadline" ]; do
+			if [ "$(argosfs_qemu_log_marker_count "$log" ARGOSFS_REBOOT_REQUESTED)" -ge 1 ]; then break; fi
+			sleep 1
+		done
+		if [ "$(argosfs_qemu_log_marker_count "$log" ARGOSFS_REBOOT_REQUESTED)" -lt 1 ]; then
+			echo "timed out waiting for phase1 reboot request in $log" >&2
+			wait_status=1
 		fi
-		sleep 1
-	done
-fi
-if kill -0 "$qemu_pid" 2>/dev/null; then
-	kill "$qemu_pid" 2>/dev/null || true
-fi
-wait "$qemu_pid"
-status=$?
-rm -f "$stdin_fifo"
-if [ "$wait_status" -ne 0 ]; then
-	status="$wait_status"
-fi
+	fi
+	if [ "$wait_status" -eq 0 ]; then
+		argosfs_qemu_wait_console_ready "$log" 2 "$reboot_delay_s" "$reject" "second reboot-persistence console" 3 || wait_status=$?
+	fi
+	if [ "$wait_status" -eq 0 ]; then
+		send_command_file "$commands2" /tmp/argosfs-qemu-reboot-phase2.sh || wait_status=$?
+	fi
+	if [ "$wait_status" -eq 0 ]; then
+		deadline=$((SECONDS + 180))
+		while [ "$SECONDS" -lt "$deadline" ]; do
+			if [ "$(argosfs_qemu_log_marker_count "$log" "$done_marker")" -ge 1 ]; then break; fi
+			sleep 1
+		done
+		if [ "$(argosfs_qemu_log_marker_count "$log" "$done_marker")" -lt 1 ]; then
+			echo "timed out waiting for reboot persistence completion in $log" >&2
+			wait_status=1
+		fi
+	fi
+
+	exec 3>&-
+	if [ "$wait_status" -eq 0 ]; then
+		for _ in $(seq 1 10); do
+			if ! kill -0 "$qemu_pid" 2>/dev/null; then
+				break
+			fi
+			sleep 1
+		done
+	fi
+	if kill -0 "$qemu_pid" 2>/dev/null; then
+		kill "$qemu_pid" 2>/dev/null || true
+	fi
+	wait "$qemu_pid"
+	status=$?
+	rm -f "$stdin_fifo"
+	if [ "$wait_status" -ne 0 ]; then
+		status="$wait_status"
+	fi
+
+	if argosfs_qemu_pre_script_should_retry "$attempt" "$console_attempts" "$console_ready_file" "$first_console_status"; then
+		cp "$log" "${log%.log}-console-attempt-$attempt.log"
+		echo "QEMU reboot persistence arm64 console did not become ready; retrying pre-script startup ($attempt/$console_attempts)" >&2
+		attempt=$((attempt + 1))
+		continue
+	fi
+	break
+done
 set -e
 
 if grep -Eiq "$reject" "$log"; then

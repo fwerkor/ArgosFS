@@ -85,35 +85,14 @@ qemu_feeder() {
 	argosfs_qemu_monitor_command "$monitor" "drive_del hot0" "$monitor_log" "Device '[^']+' not found" || true
 }
 
-# Retry only an arm64 startup that never obtained a usable console. Once the
-# console is ready, any later feeder failure belongs to the hotplug workload and
-# must remain fatal rather than being hidden by a fresh VM.
-console_attempts=1
-if [ "$arch" = "arm64" ]; then
-	console_attempts="${ARGOSFS_QEMU_PRE_SCRIPT_CONSOLE_ATTEMPTS:-2}"
-fi
-case "$console_attempts" in
-	''|*[!0-9]*|0)
-		echo "ARGOSFS_QEMU_PRE_SCRIPT_CONSOLE_ATTEMPTS must be a positive integer" >&2
-		exit 2
-		;;
-esac
+# shellcheck disable=SC2317 # Invoked indirectly by the common QEMU retry helper.
+qemu_prepare_attempt() {
+	rm -f "$monitor"
+}
 
-attempt=1
-while true; do
-	rm -f "$console_ready_file" "$monitor"
-	argosfs_qemu_run_with_feeder "$log" "$timeout_s" qemu_feeder "$qemu_bin" "${qemu_args[@]}"
-	feeder_status="$ARGOSFS_QEMU_FEEDER_STATUS"
-	status="$ARGOSFS_QEMU_STATUS"
-	if [ "$feeder_status" -eq 0 ] || [ "$attempt" -ge "$console_attempts" ] || \
-		[ -e "$console_ready_file" ] || [ "$feeder_status" -ne 1 ]; then
-		break
-	fi
-
-	cp "$log" "${log%.log}-console-attempt-$attempt.log"
-	echo "QEMU hotplug arm64 console did not become ready; retrying pre-script startup ($attempt/$console_attempts)" >&2
-	attempt=$((attempt + 1))
-done
+argosfs_qemu_run_with_pre_script_retry "$log" "$timeout_s" "$console_ready_file" "hotplug" qemu_prepare_attempt qemu_feeder "$qemu_bin" "${qemu_args[@]}"
+feeder_status="$ARGOSFS_QEMU_FEEDER_STATUS"
+status="$ARGOSFS_QEMU_STATUS"
 
 if [ "$feeder_status" -ne 0 ]; then
 	echo "QEMU hotplug feeder failed; status=$feeder_status" >&2

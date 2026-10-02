@@ -96,6 +96,26 @@ if [ ! -s "$console_input" ]; then
 	exit 1
 fi
 
+probe_log="$tmp/qemu-console-probe.log"
+probe_fifo="$tmp/qemu-console-probe.input"
+mkfifo "$probe_fifo"
+printf '%s\n' '[   80.000000] procd: - init -' >"$probe_log"
+(
+	while IFS= read -r -d $'\r' input; do
+		if [[ "$input" == *"ARGOSFS_QEMU_CONSOLE_PROBE_%s"* ]]; then
+			printf '%s\n' ARGOSFS_QEMU_CONSOLE_PROBE_READY >>"$probe_log"
+			break
+		fi
+	done <"$probe_fifo"
+) &
+probe_reader_pid=$!
+exec 7>"$probe_fifo"
+arch=arm64 ARGOSFS_QEMU_CONSOLE_WAKE_INTERVAL=1 \
+	argosfs_qemu_wait_console_ready "$probe_log" 1 5 "" "arm64 execution probe" 7
+exec 7>&-
+wait "$probe_reader_pid"
+argosfs_qemu_log_has_marker "$probe_log" ARGOSFS_QEMU_CONSOLE_PROBE_READY
+
 prompt_log="$tmp/qemu-console-prompt.log"
 printf '%s\n' 'Please press Enter to activate this console.' >"$prompt_log"
 argosfs_qemu_wait_console_ready "$prompt_log" 1 2 "" "prompt readiness"
