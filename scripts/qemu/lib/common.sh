@@ -156,6 +156,58 @@ argosfs_qemu_run_with_feeder() {
 	ARGOSFS_QEMU_STATUS="$qemu_status"
 }
 
+argosfs_qemu_pre_script_attempts() {
+	local attempts=1
+	if [ "${arch:-}" = "arm64" ]; then
+		attempts="${ARGOSFS_QEMU_PRE_SCRIPT_CONSOLE_ATTEMPTS:-2}"
+	fi
+	case "$attempts" in
+		''|*[!0-9]*|0)
+			echo "ARGOSFS_QEMU_PRE_SCRIPT_CONSOLE_ATTEMPTS must be a positive integer" >&2
+			return 2
+			;;
+	esac
+	printf '%s\n' "$attempts"
+}
+
+argosfs_qemu_pre_script_should_retry() {
+	local attempt="$1"
+	local attempts="$2"
+	local console_ready_file="$3"
+	local feeder_status="$4"
+
+	[ "$feeder_status" -eq 1 ] && [ "$attempt" -lt "$attempts" ] && [ ! -e "$console_ready_file" ]
+}
+
+argosfs_qemu_run_with_pre_script_retry() {
+	local log="$1"
+	local timeout_s="$2"
+	local console_ready_file="$3"
+	local label="$4"
+	local prepare_attempt="$5"
+	local feeder="$6"
+	shift 6
+
+	local attempts attempt
+	attempts="$(argosfs_qemu_pre_script_attempts)" || return $?
+	attempt=1
+	while true; do
+		rm -f "$console_ready_file"
+		if [ -n "$prepare_attempt" ]; then
+			"$prepare_attempt"
+		fi
+
+		argosfs_qemu_run_with_feeder "$log" "$timeout_s" "$feeder" "$@"
+		if ! argosfs_qemu_pre_script_should_retry "$attempt" "$attempts" "$console_ready_file" "$ARGOSFS_QEMU_FEEDER_STATUS"; then
+			break
+		fi
+
+		cp "$log" "${log%.log}-console-attempt-$attempt.log"
+		echo "QEMU $label arm64 console did not become ready; retrying pre-script startup ($attempt/$attempts)" >&2
+		attempt=$((attempt + 1))
+	done
+}
+
 argosfs_qemu_add_hotplug_ports() {
 	local count="$1"
 	local prefix="$2"
@@ -320,7 +372,8 @@ argosfs_qemu_wait_console_ready() {
 	local deadline=$((SECONDS + timeout_s))
 	local wake_interval="${ARGOSFS_QEMU_CONSOLE_WAKE_INTERVAL:-5}"
 	local next_wake="$SECONDS"
-	local prompt_count login_count shell_count ready_count procd_count
+	local probe_marker="ARGOSFS_QEMU_CONSOLE_PROBE_READY_$min_count"
+	local prompt_count login_count shell_count probe_count ready_count procd_count
 
 	while [ "$SECONDS" -lt "$deadline" ]; do
 		if [ -n "$reject" ] && grep -Eiq "$reject" "$log" 2>/dev/null; then
@@ -330,30 +383,27 @@ argosfs_qemu_wait_console_ready() {
 		prompt_count="$(grep -Fc 'Please press Enter to activate this console.' "$log" 2>/dev/null || true)"
 		login_count="$(grep -Ec "root login on 'tty[^']+'" "$log" 2>/dev/null || true)"
 		shell_count="$(grep -Fc 'built-in shell (ash)' "$log" 2>/dev/null || true)"
+		probe_count="$(argosfs_qemu_log_marker_count "$log" "$probe_marker")"
 		ready_count="$prompt_count"
 		[ "$login_count" -le "$ready_count" ] || ready_count="$login_count"
 		[ "$shell_count" -le "$ready_count" ] || ready_count="$shell_count"
-		if [ "$ready_count" -ge "$min_count" ]; then
+		if [ "$ready_count" -ge "$min_count" ] || [ "$probe_count" -ge 1 ]; then
 			return 0
 		fi
 
-		# OpenWrt normally prints an activation prompt once procd starts the
-		# console getty. Under arm64 TCG that prompt can be lost even though the
-		# guest is otherwise healthy. Nudge the serial line after userspace has
-		# reached procd init; the subsequent shell-marker handshake remains the
-		# authoritative proof that commands can actually execute.
+		# arm64 TCG can lose OpenWrt's activation/login text even after procd has
+		# started the console. Wake the serial line and issue an execution probe;
+		# the exact output marker proves a usable shell without trusting echoed input.
 		procd_count="$(grep -Fc 'procd: - init -' "$log" 2>/dev/null || true)"
 		if [ "${arch:-}" = "arm64" ] && [ -n "$fd" ] && [ "$SECONDS" -ge "$next_wake" ] && \
 			[ "$procd_count" -ge "$min_count" ]; then
 			printf '\r' >&"$fd"
+			printf '%s\r' "printf 'ARGOSFS_QEMU_CONSOLE_PROBE_READY_${min_count}\\n'" >&"$fd"
 			next_wake=$((SECONDS + wake_interval))
 		fi
 		sleep 1
 	done
 
-	# SECONDS has one-second granularity. A marker can arrive during the final
-	# sleep that crosses the deadline, so perform one last observation before
-	# declaring timeout instead of spuriously triggering another QEMU attempt.
 	if [ -n "$reject" ] && grep -Eiq "$reject" "$log" 2>/dev/null; then
 		echo "QEMU rejected while waiting for $label: $reject" >&2
 		return 2
@@ -361,17 +411,17 @@ argosfs_qemu_wait_console_ready() {
 	prompt_count="$(grep -Fc 'Please press Enter to activate this console.' "$log" 2>/dev/null || true)"
 	login_count="$(grep -Ec "root login on 'tty[^']+'" "$log" 2>/dev/null || true)"
 	shell_count="$(grep -Fc 'built-in shell (ash)' "$log" 2>/dev/null || true)"
+	probe_count="$(argosfs_qemu_log_marker_count "$log" "$probe_marker")"
 	ready_count="$prompt_count"
 	[ "$login_count" -le "$ready_count" ] || ready_count="$login_count"
 	[ "$shell_count" -le "$ready_count" ] || ready_count="$shell_count"
-	if [ "$ready_count" -ge "$min_count" ]; then
+	if [ "$ready_count" -ge "$min_count" ] || [ "$probe_count" -ge 1 ]; then
 		return 0
 	fi
 
 	echo "timed out waiting for $label in $log" >&2
 	return 1
 }
-
 argosfs_qemu_monitor_command() {
 	local monitor="$1"
 	local command="$2"

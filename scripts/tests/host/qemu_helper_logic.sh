@@ -96,6 +96,48 @@ if [ ! -s "$console_input" ]; then
 	exit 1
 fi
 
+probe_log="$tmp/qemu-console-probe.log"
+probe_fifo="$tmp/qemu-console-probe.input"
+mkfifo "$probe_fifo"
+printf '%s\n' '[   80.000000] procd: - init -' >"$probe_log"
+(
+	while IFS= read -r -d $'\r' input; do
+		if [[ "$input" == *"ARGOSFS_QEMU_CONSOLE_PROBE_READY_1"* ]]; then
+			printf '%s\n' ARGOSFS_QEMU_CONSOLE_PROBE_READY_1 >>"$probe_log"
+			break
+		fi
+	done <"$probe_fifo"
+) &
+probe_reader_pid=$!
+exec 7>"$probe_fifo"
+arch=arm64 ARGOSFS_QEMU_CONSOLE_WAKE_INTERVAL=1 \
+	argosfs_qemu_wait_console_ready "$probe_log" 1 5 "" "arm64 execution probe" 7
+exec 7>&-
+wait "$probe_reader_pid"
+argosfs_qemu_log_has_marker "$probe_log" ARGOSFS_QEMU_CONSOLE_PROBE_READY_1
+
+phase_probe_log="$tmp/qemu-console-phase-probe.log"
+phase_probe_input="$tmp/qemu-console-phase-probe.input"
+{
+	printf '%s\n' '[   80.000000] procd: - init -'
+	printf '%s\n' ARGOSFS_QEMU_CONSOLE_PROBE_READY_1
+	printf '%s\n' ARGOSFS_QEMU_CONSOLE_PROBE_READY_1
+} >"$phase_probe_log"
+exec 6>"$phase_probe_input"
+start_seconds="$SECONDS"
+set +e
+arch=arm64 ARGOSFS_QEMU_CONSOLE_WAKE_INTERVAL=1 \
+	argosfs_qemu_wait_console_ready "$phase_probe_log" 2 2 "" "second boot probe isolation" 6
+phase_probe_status=$?
+set -e
+elapsed=$((SECONDS - start_seconds))
+exec 6>&-
+[ "$phase_probe_status" -ne 0 ]
+if [ "$elapsed" -lt 1 ]; then
+	echo "QEMU console readiness accepted duplicate probe markers from a prior boot phase" >&2
+	exit 1
+fi
+
 prompt_log="$tmp/qemu-console-prompt.log"
 printf '%s\n' 'Please press Enter to activate this console.' >"$prompt_log"
 argosfs_qemu_wait_console_ready "$prompt_log" 1 2 "" "prompt readiness"

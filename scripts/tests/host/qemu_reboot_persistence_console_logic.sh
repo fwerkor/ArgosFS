@@ -93,4 +93,45 @@ fi
 [ "$(grep -Fc "root login on 'ttyAMA0'" "$log")" -eq 2 ]
 grep -Fxq 'ARGOSFS_QEMU_REBOOT_DONE' "$log"
 
-printf 'QEMU reboot persistence lost-prompt test passed\n'
+cat >"$tmp/qemu-retry-first-console" <<'QEMU'
+#!/usr/bin/env bash
+set -euo pipefail
+count=0
+[ ! -s "$FAKE_QEMU_COUNT" ] || count="$(cat "$FAKE_QEMU_COUNT")"
+count=$((count + 1))
+printf '%s\n' "$count" >"$FAKE_QEMU_COUNT"
+if [ "$count" -eq 1 ]; then
+  printf '%s\n' '[   80.000000] procd: - init -'
+  cat >/dev/null
+  exit 0
+fi
+exec "$FAKE_QEMU_WORKING" "$@"
+QEMU
+chmod +x "$tmp/qemu-retry-first-console"
+
+retry_artifacts="$tmp/retry-artifacts"
+retry_count="$tmp/retry-count"
+retry_output="$tmp/retry-output"
+mkdir -p "$retry_artifacts"
+FAKE_QEMU_COUNT="$retry_count" \
+FAKE_QEMU_WORKING="$tmp/qemu-lost-prompts" \
+ARGOSFS_QEMU_ARCH=arm64 \
+ARGOSFS_QEMU_BIN="$tmp/qemu-retry-first-console" \
+ARGOSFS_QEMU_KERNEL="$kernel" \
+ARGOSFS_QEMU_ROOTFS="$rootfs" \
+ARGOSFS_TEST_ARTIFACTS="$retry_artifacts" \
+ARGOSFS_QEMU_TIMEOUT=20 \
+ARGOSFS_QEMU_REBOOT_LOGIN_DELAY=1 \
+ARGOSFS_QEMU_REBOOT_DELAY=5 \
+ARGOSFS_QEMU_PRE_SCRIPT_CONSOLE_ATTEMPTS=2 \
+ARGOSFS_QEMU_CONSOLE_WAKE_INTERVAL=1 \
+ARGOSFS_QEMU_SHELL_READY_TIMEOUT=3 \
+ARGOSFS_QEMU_SCRIPT_READY_TIMEOUT=3 \
+  "$repo/scripts/qemu/reboot_persistence.sh" >"$retry_output" 2>&1
+
+[ "$(cat "$retry_count")" -eq 2 ]
+[ -f "$retry_artifacts/qemu-reboot-arm64-console-attempt-1.log" ]
+grep -q 'retrying pre-script startup (1/2)' "$retry_output"
+grep -Fxq 'ARGOSFS_QEMU_REBOOT_DONE' "$retry_artifacts/qemu-reboot-arm64.log"
+
+printf 'QEMU reboot persistence lost-prompt and retry tests passed\n'

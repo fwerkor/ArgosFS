@@ -16,6 +16,7 @@ reject="${ARGOSFS_QEMU_REJECT:-Kernel panic|Bad file descriptor|argosfs-initrd: 
 timeout_s="${ARGOSFS_QEMU_TIMEOUT:-1200}"
 console_timeout_s="${ARGOSFS_QEMU_DEGRADED_CONSOLE_TIMEOUT:-600}"
 done_marker="ARGOSFS_QEMU_DEGRADED_ROOTFS_DONE"
+console_ready_file="$artifacts/degraded-rootfs-console-ready"
 
 disks=()
 for idx in 0 1 2; do
@@ -92,6 +93,7 @@ qemu_device_add() {
 qemu_feeder() {
   set -e
   argosfs_qemu_wait_console_ready "$log" 1 "$console_timeout_s" "$reject" "degraded-rootfs console prompt" 1
+  : >"$console_ready_file"
   argosfs_qemu_stream_script "$commands" 1 /tmp/argosfs-qemu-degraded-rootfs.sh "$log"
   argosfs_qemu_wait_log_marker "$log" ARGOSFS_WAIT_DEGRADED_HOTPLUG 300
   argosfs_qemu_wait_monitor "$monitor" 60
@@ -102,7 +104,12 @@ qemu_feeder() {
   done
 }
 
-argosfs_qemu_run_with_feeder "$log" "$timeout_s" qemu_feeder "$qemu_bin" "${qemu_args[@]}"
+# shellcheck disable=SC2317 # Invoked indirectly by the common QEMU retry helper.
+qemu_prepare_attempt() {
+  rm -f "$monitor"
+}
+
+argosfs_qemu_run_with_pre_script_retry "$log" "$timeout_s" "$console_ready_file" "degraded rootfs" qemu_prepare_attempt qemu_feeder "$qemu_bin" "${qemu_args[@]}"
 feeder_status="$ARGOSFS_QEMU_FEEDER_STATUS"
 status="$ARGOSFS_QEMU_STATUS"
 
