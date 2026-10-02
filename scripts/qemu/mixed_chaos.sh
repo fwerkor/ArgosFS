@@ -16,7 +16,6 @@ commands1="$artifacts/qemu-mixed-chaos-phase1.commands"
 commands2="$artifacts/qemu-mixed-chaos-phase2.commands"
 feeder_status_file="$artifacts/mixed-phase1-feeder.status"
 console_ready_file="$artifacts/mixed-phase1-console-ready"
-phase2_console_ready_file="$artifacts/mixed-phase2-console-ready"
 reject="${ARGOSFS_QEMU_REJECT:-Kernel panic|Bad file descriptor|argosfs-initrd: emergency|Oops:|BUG:|segfault}"
 timeout_s="${ARGOSFS_QEMU_TIMEOUT:-3000}"
 console_timeout_s="${ARGOSFS_QEMU_CHAOS_CONSOLE_TIMEOUT:-600}"
@@ -269,7 +268,6 @@ run_phase2() {
   mixed_phase2_feeder() {
     set -e
     argosfs_qemu_wait_console_ready "$log2" 1 "$console_timeout_s" "$reject" "mixed-chaos phase2 console prompt" 1
-    : >"$phase2_console_ready_file"
     argosfs_qemu_stream_script "$commands2" 1 /tmp/argosfs-qemu-mixed-phase2.sh "$log2"
     argosfs_qemu_wait_log_marker "$log2" ARGOSFS_WAIT_CHAOS_REATTACH 300
     argosfs_qemu_wait_monitor "$monitor" 60
@@ -279,11 +277,7 @@ run_phase2() {
     qemu_device_add recover 3 "${disks[4]}"
     qemu_device_add recover 4 "${disks[5]}"
   }
-# shellcheck disable=SC2317 # Invoked indirectly by the common QEMU retry helper.
-  mixed_phase2_prepare_attempt() {
-    rm -f "$monitor"
-  }
-  argosfs_qemu_run_with_pre_script_retry "$log2" "$timeout_s" "$phase2_console_ready_file" "mixed chaos phase2" mixed_phase2_prepare_attempt mixed_phase2_feeder "$qemu_bin" "${qemu_args[@]}"
+  argosfs_qemu_run_with_feeder "$log2" "$timeout_s" mixed_phase2_feeder "$qemu_bin" "${qemu_args[@]}"
   [ "$ARGOSFS_QEMU_FEEDER_STATUS" -eq 0 ] || return "$ARGOSFS_QEMU_FEEDER_STATUS"
   return "$ARGOSFS_QEMU_STATUS"
 }

@@ -372,7 +372,7 @@ argosfs_qemu_wait_console_ready() {
 	local deadline=$((SECONDS + timeout_s))
 	local wake_interval="${ARGOSFS_QEMU_CONSOLE_WAKE_INTERVAL:-5}"
 	local next_wake="$SECONDS"
-	local probe_marker="ARGOSFS_QEMU_CONSOLE_PROBE_READY"
+	local probe_marker="ARGOSFS_QEMU_CONSOLE_PROBE_READY_$min_count"
 	local prompt_count login_count shell_count probe_count ready_count procd_count
 
 	while [ "$SECONDS" -lt "$deadline" ]; do
@@ -387,8 +387,7 @@ argosfs_qemu_wait_console_ready() {
 		ready_count="$prompt_count"
 		[ "$login_count" -le "$ready_count" ] || ready_count="$login_count"
 		[ "$shell_count" -le "$ready_count" ] || ready_count="$shell_count"
-		[ "$probe_count" -le "$ready_count" ] || ready_count="$probe_count"
-		if [ "$ready_count" -ge "$min_count" ]; then
+		if [ "$ready_count" -ge "$min_count" ] || [ "$probe_count" -ge 1 ]; then
 			return 0
 		fi
 
@@ -399,7 +398,7 @@ argosfs_qemu_wait_console_ready() {
 		if [ "${arch:-}" = "arm64" ] && [ -n "$fd" ] && [ "$SECONDS" -ge "$next_wake" ] && \
 			[ "$procd_count" -ge "$min_count" ]; then
 			printf '\r' >&"$fd"
-			printf '%s\r' "printf 'ARGOSFS_QEMU_CONSOLE_PROBE_%s\\n' READY" >&"$fd"
+			printf '%s\r' "printf 'ARGOSFS_QEMU_CONSOLE_PROBE_READY_${min_count}\\n'" >&"$fd"
 			next_wake=$((SECONDS + wake_interval))
 		fi
 		sleep 1
@@ -416,8 +415,7 @@ argosfs_qemu_wait_console_ready() {
 	ready_count="$prompt_count"
 	[ "$login_count" -le "$ready_count" ] || ready_count="$login_count"
 	[ "$shell_count" -le "$ready_count" ] || ready_count="$shell_count"
-	[ "$probe_count" -le "$ready_count" ] || ready_count="$probe_count"
-	if [ "$ready_count" -ge "$min_count" ]; then
+	if [ "$ready_count" -ge "$min_count" ] || [ "$probe_count" -ge 1 ]; then
 		return 0
 	fi
 

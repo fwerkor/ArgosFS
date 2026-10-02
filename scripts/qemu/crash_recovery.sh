@@ -16,7 +16,6 @@ commands1="$artifacts/qemu-crash-recovery-phase1.commands"
 commands2="$artifacts/qemu-crash-recovery-phase2.commands"
 feeder_status_file="$artifacts/crash-phase1-feeder.status"
 console_ready_file="$artifacts/crash-phase1-console-ready"
-phase2_console_ready_file="$artifacts/crash-phase2-console-ready"
 reject="${ARGOSFS_QEMU_REJECT:-Kernel panic|Bad file descriptor|argosfs-initrd: emergency|Oops:|BUG:|segfault}"
 timeout_s="${ARGOSFS_QEMU_TIMEOUT:-1800}"
 console_timeout_s="${ARGOSFS_QEMU_CRASH_CONSOLE_TIMEOUT:-600}"
@@ -168,10 +167,9 @@ run_phase2() {
   crash_phase2_feeder() {
     set -e
     argosfs_qemu_wait_console_ready "$log2" 1 "$console_timeout_s" "$reject" "crash-recovery phase2 console prompt" 1
-    : >"$phase2_console_ready_file"
     argosfs_qemu_stream_script "$commands2" 1 /tmp/argosfs-qemu-crash-phase2.sh "$log2"
   }
-  argosfs_qemu_run_with_pre_script_retry "$log2" "$timeout_s" "$phase2_console_ready_file" "crash recovery phase2" "" crash_phase2_feeder "$qemu_bin" "${qemu_args[@]}"
+  argosfs_qemu_run_with_feeder "$log2" "$timeout_s" crash_phase2_feeder "$qemu_bin" "${qemu_args[@]}"
   [ "$ARGOSFS_QEMU_FEEDER_STATUS" -eq 0 ] || return "$ARGOSFS_QEMU_FEEDER_STATUS"
   return "$ARGOSFS_QEMU_STATUS"
 }
