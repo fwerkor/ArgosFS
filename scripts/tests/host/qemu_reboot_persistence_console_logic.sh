@@ -69,29 +69,35 @@ done
 QEMU
 chmod +x "$tmp/qemu-lost-prompts"
 
-artifacts="$tmp/artifacts"
-mkdir -p "$artifacts"
+run_lost_prompt_case() {
+  local arch="$1"
+  local artifacts="$tmp/artifacts-$arch"
+  local log="$artifacts/qemu-reboot-$arch.log"
 
-ARGOSFS_QEMU_ARCH=arm64 \
-ARGOSFS_QEMU_BIN="$tmp/qemu-lost-prompts" \
-ARGOSFS_QEMU_KERNEL="$kernel" \
-ARGOSFS_QEMU_ROOTFS="$rootfs" \
-ARGOSFS_TEST_ARTIFACTS="$artifacts" \
-ARGOSFS_QEMU_TIMEOUT=20 \
-ARGOSFS_QEMU_REBOOT_LOGIN_DELAY=5 \
-ARGOSFS_QEMU_REBOOT_DELAY=5 \
-ARGOSFS_QEMU_CONSOLE_WAKE_INTERVAL=1 \
-ARGOSFS_QEMU_SHELL_READY_TIMEOUT=3 \
-ARGOSFS_QEMU_SCRIPT_READY_TIMEOUT=3 \
-  "$repo/scripts/qemu/reboot_persistence.sh"
+  mkdir -p "$artifacts"
+  ARGOSFS_QEMU_ARCH="$arch" \
+  ARGOSFS_QEMU_BIN="$tmp/qemu-lost-prompts" \
+  ARGOSFS_QEMU_KERNEL="$kernel" \
+  ARGOSFS_QEMU_ROOTFS="$rootfs" \
+  ARGOSFS_TEST_ARTIFACTS="$artifacts" \
+  ARGOSFS_QEMU_TIMEOUT=20 \
+  ARGOSFS_QEMU_REBOOT_LOGIN_DELAY=5 \
+  ARGOSFS_QEMU_REBOOT_DELAY=5 \
+  ARGOSFS_QEMU_CONSOLE_WAKE_INTERVAL=1 \
+  ARGOSFS_QEMU_SHELL_READY_TIMEOUT=3 \
+  ARGOSFS_QEMU_SCRIPT_READY_TIMEOUT=3 \
+    "$repo/scripts/qemu/reboot_persistence.sh"
 
-log="$artifacts/qemu-reboot-arm64.log"
-if grep -Fq 'Please press Enter to activate this console.' "$log"; then
-  echo "fake QEMU unexpectedly emitted an activation prompt" >&2
-  exit 1
-fi
-[ "$(grep -Fc "root login on 'ttyAMA0'" "$log")" -eq 2 ]
-grep -Fxq 'ARGOSFS_QEMU_REBOOT_DONE' "$log"
+  if grep -Fq 'Please press Enter to activate this console.' "$log"; then
+    echo "fake QEMU unexpectedly emitted an activation prompt for $arch" >&2
+    exit 1
+  fi
+  [ "$(grep -Fc "root login on 'ttyAMA0'" "$log")" -eq 2 ]
+  grep -Fxq 'ARGOSFS_QEMU_REBOOT_DONE' "$log"
+}
+
+run_lost_prompt_case arm64
+run_lost_prompt_case x86_64
 
 cat >"$tmp/qemu-retry-first-console" <<'QEMU'
 #!/usr/bin/env bash
