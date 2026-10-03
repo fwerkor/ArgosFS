@@ -60,6 +60,7 @@ impl ArgosFs {
             }
             return Err(err);
         }
+        self.rebuild_quota_runtime_locked(&meta)?;
         Ok(())
     }
 
@@ -85,6 +86,7 @@ impl ArgosFs {
             }
             return Err(err);
         }
+        self.rebuild_quota_runtime_locked(&meta)?;
         Ok(())
     }
 
@@ -597,7 +599,7 @@ impl ArgosFs {
         clear_setid: bool,
     ) -> Result<()> {
         let rollback = commit_previous_snapshot(meta);
-        let (storage_class, boot_critical, existing_inline, had_blocks) = {
+        let (storage_class, boot_critical, old_size, existing_inline, had_blocks) = {
             let inode = meta
                 .inodes
                 .get(&ino)
@@ -610,6 +612,7 @@ impl ArgosFs {
             (
                 inode.storage_class,
                 inode.boot_critical,
+                inode.size,
                 decode_inline_data(inode)?,
                 !inode.blocks.is_empty(),
             )
@@ -703,6 +706,7 @@ impl ArgosFs {
             }
             return Err(err);
         }
+        self.adjust_quota_usage_for_resize(ino, old_size, new_size as u64);
         Ok(())
     }
 
@@ -1059,7 +1063,7 @@ impl ArgosFs {
                 "cannot hard link a directory".to_string(),
             ));
         }
-        let quota_rollback = meta.clone();
+        let quota_rollback = self.has_directory_quotas().then(|| meta.clone());
         self.dir_inode_mut_locked(&mut meta, new_parent)?
             .entries
             .insert(name.clone(), ino);
@@ -1068,15 +1072,20 @@ impl ArgosFs {
             inode.ctime = now_f64();
         }
         self.touch_inode_locked(&mut meta, new_parent, true, true);
-        if let Err(err) = self.validate_all_directory_quotas_locked(&meta) {
-            *meta = quota_rollback;
-            return Err(err);
+        if quota_rollback.is_some() {
+            if let Err(err) = self.validate_all_directory_quotas_locked(&meta) {
+                if let Some(rollback) = quota_rollback {
+                    *meta = rollback;
+                }
+                return Err(err);
+            }
         }
         self.commit_locked(
             &mut meta,
             "link",
             json!({"inode": ino, "new_parent": new_parent, "name": name}),
         )?;
+        self.rebuild_quota_runtime_locked(&meta)?;
         Ok(Self::attr_from_inode(
             meta.inodes
                 .get(&ino)

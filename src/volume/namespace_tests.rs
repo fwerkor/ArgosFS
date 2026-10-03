@@ -567,3 +567,44 @@ fn directory_quota_persists_across_reopen() {
         }
     ));
 }
+
+#[test]
+fn directory_quota_enforces_whole_file_replacements() {
+    let (_dir, fs) = volume();
+    fs.mkdir("/q", 0o755).unwrap();
+    fs.set_directory_quota("/q", 5).unwrap();
+
+    let err = fs.write_file("/q/file", b"123456", 0o644).unwrap_err();
+    assert!(matches!(
+        err,
+        ArgosError::QuotaExceeded {
+            limit: 5,
+            used: 6,
+            ..
+        }
+    ));
+    let file = fs.resolve_path("/q/file", true).unwrap();
+    assert_eq!(fs.attr_inode(file).unwrap().size, 0);
+    assert_eq!(fs.directory_quota("/q").unwrap(), (Some(5), 0));
+
+    fs.write_file("/q/file", b"12345", 0o644).unwrap();
+    assert_eq!(fs.directory_quota("/q").unwrap(), (Some(5), 5));
+    assert!(matches!(
+        fs.write_file("/q/file", b"1234567", 0o644).unwrap_err(),
+        ArgosError::QuotaExceeded {
+            limit: 5,
+            used: 7,
+            ..
+        }
+    ));
+    assert_eq!(fs.read_file("/q/file", false).unwrap(), b"12345");
+}
+
+#[test]
+fn symlinks_do_not_consume_regular_file_quota() {
+    let (_dir, fs) = volume();
+    fs.mkdir("/q", 0o755).unwrap();
+    fs.set_directory_quota("/q", 0).unwrap();
+    fs.symlink_path("a/long/symlink/target", "/q/link").unwrap();
+    assert_eq!(fs.directory_quota("/q").unwrap(), (Some(0), 0));
+}

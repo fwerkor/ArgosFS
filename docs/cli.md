@@ -91,7 +91,7 @@ command names for compatibility with service files and scripts.
 
 ## Directory quotas
 
-Directory quotas limit the logical bytes reachable beneath a directory. They are
+Directory quotas limit the logical regular-file bytes reachable beneath a directory. They are
 independent of physical shard usage, compression ratio, and erasure-coding
 overhead.
 

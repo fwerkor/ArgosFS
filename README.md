@@ -73,7 +73,7 @@ reuse. The data plane uses mature crates rather than hand-rolled primitives:
 - Hard capacity enforcement: disks with insufficient free ArgosFS shard capacity
   are excluded from placement, and shard writes fail with `ENOSPC` before
   exceeding the recorded capacity.
-- Hierarchical directory quotas on logical file bytes. Quotas apply to the full
+- Hierarchical directory quotas on logical regular-file bytes. Quotas apply to the full
   subtree, nested quotas are enforced independently, hard links are counted once
   per quota subtree, and rejected growth/moves fail with `EDQUOT`.
 - Real SMART refresh through `smartctl -j -a` when a backing block device is
@@ -212,7 +212,7 @@ argosfs inspect-pool --pool-config /etc/argosfs/root-pool.json
 argosfs fsck --pool-config /etc/argosfs/root-pool.json --repair
 ```
 
-Directory quotas are based on logical namespace bytes rather than encoded shard
+Directory quotas are based on logical regular-file bytes rather than encoded shard
 bytes, so compression and erasure-layout changes do not alter quota accounting.
 Setting a quota below the directory's current usage is rejected. File growth,
 `truncate`, hard-link creation, and cross-directory `rename` all enforce active

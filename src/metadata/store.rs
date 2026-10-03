@@ -181,6 +181,8 @@ pub struct InodeCorePage {
     pub inline_data: Option<Vec<u8>>,
     #[serde(default)]
     pub inline_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_bytes: Option<u64>,
     #[serde(default)]
     pub posix_acl_access: Option<PosixAcl>,
     #[serde(default)]
@@ -219,6 +221,7 @@ impl From<&Inode> for InodeCorePage {
             target: inode.target.clone(),
             inline_data: inode.inline_data.clone(),
             inline_sha256: inode.inline_sha256.clone(),
+            quota_bytes: inode.quota_bytes,
             posix_acl_access: inode.posix_acl_access.clone(),
             posix_acl_default: inode.posix_acl_default.clone(),
             nfs4_acl: inode.nfs4_acl.clone(),
@@ -260,7 +263,7 @@ impl InodeCorePage {
             inline_sha256: self.inline_sha256,
             blocks,
             xattrs,
-            quota_bytes: None,
+            quota_bytes: self.quota_bytes,
             posix_acl_access: self.posix_acl_access,
             posix_acl_default: self.posix_acl_default,
             nfs4_acl: self.nfs4_acl,
