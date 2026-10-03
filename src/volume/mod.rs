@@ -262,6 +262,7 @@ impl ArgosFs {
             inline_sha256: String::new(),
             blocks: Vec::new(),
             xattrs: BTreeMap::new(),
+            quota_bytes: None,
             posix_acl_access: None,
             posix_acl_default: None,
             nfs4_acl: None,
@@ -919,6 +920,7 @@ impl ArgosFs {
             inline_sha256: String::new(),
             blocks: Vec::new(),
             xattrs: BTreeMap::new(),
+            quota_bytes: None,
             posix_acl_access: inherited_access_acl,
             posix_acl_default: inherited_default_acl,
             nfs4_acl: None,
@@ -1032,6 +1034,7 @@ impl ArgosFs {
             inline_sha256: String::new(),
             blocks: Vec::new(),
             xattrs: BTreeMap::new(),
+            quota_bytes: None,
             posix_acl_access: inherited_acl,
             posix_acl_default: None,
             nfs4_acl: None,
@@ -1194,6 +1197,7 @@ impl ArgosFs {
             return Ok(());
         }
         self.ensure_block_backend_writable_locked(meta)?;
+        let quota_rollback = meta.clone();
         if policy.exchange {
             let existing = existing.ok_or_else(|| ArgosError::NotFound(new_name.to_string()))?;
             self.check_sticky_locked(meta, new_parent, existing, policy.uid)?;
@@ -1237,6 +1241,10 @@ impl ArgosFs {
             self.touch_inode_locked(meta, new_parent, true, true);
             self.touch_inode_locked(meta, child, false, true);
             self.touch_inode_locked(meta, existing, false, true);
+            if let Err(err) = self.validate_all_directory_quotas_locked(meta) {
+                *meta = quota_rollback;
+                return Err(err);
+            }
             self.commit_locked(
                 meta,
                 "rename-exchange",
@@ -1305,6 +1313,10 @@ impl ArgosFs {
         self.touch_inode_locked(meta, old_parent, true, true);
         self.touch_inode_locked(meta, new_parent, true, true);
         self.touch_inode_locked(meta, child, false, true);
+        if let Err(err) = self.validate_all_directory_quotas_locked(meta) {
+            *meta = quota_rollback;
+            return Err(err);
+        }
         self.commit_locked(
             meta,
             "rename",
@@ -1433,6 +1445,96 @@ impl ArgosFs {
             .entries
             .values()
             .any(|child| Self::directory_contains_inode(meta, *child, needle))
+    }
+
+    fn directory_quota_limit(inode: &Inode) -> Result<Option<u64>> {
+        Ok(inode.quota_bytes)
+    }
+
+    fn subtree_logical_usage_locked(meta: &Metadata, root: InodeId) -> Result<u64> {
+        fn visit(meta: &Metadata, ino: InodeId, seen: &mut BTreeSet<InodeId>) -> Result<u64> {
+            if !seen.insert(ino) {
+                return Ok(0);
+            }
+            let inode = meta
+                .inodes
+                .get(&ino)
+                .ok_or_else(|| ArgosError::NotFound(format!("inode {ino}")))?;
+            if inode.kind != NodeKind::Directory {
+                return Ok(inode.size);
+            }
+            let mut total = 0u64;
+            for child in inode.entries.values() {
+                total = total.saturating_add(visit(meta, *child, seen)?);
+            }
+            Ok(total)
+        }
+
+        let root_inode = meta
+            .inodes
+            .get(&root)
+            .ok_or_else(|| ArgosError::NotFound(format!("inode {root}")))?;
+        if root_inode.kind != NodeKind::Directory {
+            return Err(ArgosError::NotDirectory(format!("inode {root}")));
+        }
+        visit(meta, root, &mut BTreeSet::new())
+    }
+
+    fn validate_all_directory_quotas_locked(&self, meta: &Metadata) -> Result<()> {
+        for (ino, inode) in &meta.inodes {
+            if inode.kind != NodeKind::Directory {
+                continue;
+            }
+            let Some(limit) = Self::directory_quota_limit(inode)? else {
+                continue;
+            };
+            let used = Self::subtree_logical_usage_locked(meta, *ino)?;
+            if used > limit {
+                return Err(ArgosError::QuotaExceeded {
+                    inode: *ino,
+                    used,
+                    limit,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_resize_within_quotas_locked(
+        &self,
+        meta: &Metadata,
+        ino: InodeId,
+        new_size: u64,
+    ) -> Result<()> {
+        let inode = meta
+            .inodes
+            .get(&ino)
+            .ok_or_else(|| ArgosError::NotFound(format!("inode {ino}")))?;
+        if new_size <= inode.size {
+            return Ok(());
+        }
+        let growth = new_size - inode.size;
+        for (quota_ino, quota_inode) in &meta.inodes {
+            if quota_inode.kind != NodeKind::Directory {
+                continue;
+            }
+            let Some(limit) = Self::directory_quota_limit(quota_inode)? else {
+                continue;
+            };
+            if !Self::directory_contains_inode(meta, *quota_ino, ino) {
+                continue;
+            }
+            let used = Self::subtree_logical_usage_locked(meta, *quota_ino)?;
+            let projected = used.saturating_add(growth);
+            if projected > limit {
+                return Err(ArgosError::QuotaExceeded {
+                    inode: *quota_ino,
+                    used: projected,
+                    limit,
+                });
+            }
+        }
+        Ok(())
     }
 
     fn check_sticky_locked(

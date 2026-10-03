@@ -260,6 +260,7 @@ impl InodeCorePage {
             inline_sha256: self.inline_sha256,
             blocks,
             xattrs,
+            quota_bytes: None,
             posix_acl_access: self.posix_acl_access,
             posix_acl_default: self.posix_acl_default,
             nfs4_acl: self.nfs4_acl,

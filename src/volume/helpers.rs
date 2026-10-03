@@ -107,6 +107,7 @@ pub(super) fn root_inode(created_at: f64) -> Inode {
         inline_sha256: String::new(),
         blocks: Vec::new(),
         xattrs: BTreeMap::new(),
+        quota_bytes: None,
         posix_acl_access: None,
         posix_acl_default: None,
         nfs4_acl: None,

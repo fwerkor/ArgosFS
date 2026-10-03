@@ -240,6 +240,8 @@ impl ArgosFs {
             )
         };
 
+        self.ensure_resize_within_quotas_locked(meta, ino, new_size as u64)?;
+
         let mut merged = Vec::new();
         let mut replaced = Vec::new();
         for block in old_blocks {

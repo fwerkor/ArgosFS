@@ -87,3 +87,22 @@ argosfs --version
 
 Top-level help includes functional command groups while retaining the existing
 command names for compatibility with service files and scripts.
+
+
+## Directory quotas
+
+Directory quotas limit the logical bytes reachable beneath a directory. They are
+independent of physical shard usage, compression ratio, and erasure-coding
+overhead.
+
+```bash
+argosfs set-quota ROOT /srv/team 100GiB
+argosfs quota ROOT /srv/team
+argosfs clear-quota ROOT /srv/team
+```
+
+`quota` reports `limit_bytes`, `used_bytes`, and `available_bytes` as JSON.
+Nested quotas are enforced independently. A hard-linked inode is counted once
+within each quota subtree that contains at least one link to it. Growth through
+writes or `truncate`, hard-link insertion, and rename/move operations that would
+exceed a quota fail with `EDQUOT`.
