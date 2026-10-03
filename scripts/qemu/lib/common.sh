@@ -391,11 +391,12 @@ argosfs_qemu_wait_console_ready() {
 			return 0
 		fi
 
-		# arm64 TCG can lose OpenWrt's activation/login text even after procd has
-		# started the console. Wake the serial line and issue an execution probe;
-		# the exact output marker proves a usable shell without trusting echoed input.
+		# QEMU/OpenWrt can lose activation/login text after procd has started the
+		# console, including across an in-guest reboot. Wake the serial line and
+		# issue an execution probe; the exact output marker proves a usable shell
+		# without trusting echoed input.
 		procd_count="$(grep -Fc 'procd: - init -' "$log" 2>/dev/null || true)"
-		if [ "${arch:-}" = "arm64" ] && [ -n "$fd" ] && [ "$SECONDS" -ge "$next_wake" ] && \
+		if [ -n "$fd" ] && [ "$SECONDS" -ge "$next_wake" ] && \
 			[ "$procd_count" -ge "$min_count" ]; then
 			printf '\r' >&"$fd"
 			printf '%s\r' "printf 'ARGOSFS_QEMU_CONSOLE_PROBE_READY_${min_count}\\n'" >&"$fd"
