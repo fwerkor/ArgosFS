@@ -35,7 +35,7 @@ impl ArgosFs {
     ) -> Result<()> {
         self.ensure_block_backend_writable_locked(meta)?;
         let rollback = commit_previous_snapshot(meta);
-        let (storage_class, boot_critical) = {
+        let (storage_class, boot_critical, old_size) = {
             let inode = meta
                 .inodes
                 .get(&ino)
@@ -49,8 +49,9 @@ impl ArgosFs {
                     return Err(ArgosError::Unsupported("not a regular file".to_string()));
                 }
             }
-            (inode.storage_class, inode.boot_critical)
+            (inode.storage_class, inode.boot_critical, inode.size)
         };
+        self.ensure_resize_within_quotas_locked(meta, ino, data.len() as u64)?;
         let old_blocks = meta.inodes.get(&ino).unwrap().blocks.clone();
         let inline_payload = inline_payload_for(meta, data);
         let new_blocks = if inline_payload.is_some() {
@@ -90,6 +91,7 @@ impl ArgosFs {
             return Err(err);
         }
         self.finish_block_reclamation_locked(meta, &old_blocks);
+        self.adjust_quota_usage_for_resize(ino, old_size, data.len() as u64);
         Ok(())
     }
 
@@ -223,7 +225,7 @@ impl ArgosFs {
         details: serde_json::Value,
     ) -> Result<()> {
         let rollback = commit_previous_snapshot(meta);
-        let (storage_class, boot_critical, old_blocks) = {
+        let (storage_class, boot_critical, old_size, old_blocks) = {
             let inode = meta
                 .inodes
                 .get(&ino)
@@ -236,9 +238,12 @@ impl ArgosFs {
             (
                 inode.storage_class,
                 inode.boot_critical,
+                inode.size,
                 inode.blocks.clone(),
             )
         };
+
+        self.ensure_resize_within_quotas_locked(meta, ino, new_size as u64)?;
 
         let mut merged = Vec::new();
         let mut replaced = Vec::new();
@@ -311,6 +316,7 @@ impl ArgosFs {
             return Err(err);
         }
         self.finish_block_reclamation_locked(meta, &replaced);
+        self.adjust_quota_usage_for_resize(ino, old_size, new_size as u64);
         Ok(())
     }
 

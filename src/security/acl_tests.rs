@@ -20,6 +20,7 @@ fn inode(kind: NodeKind, mode: u32, uid: u32, gid: u32) -> Inode {
         inline_sha256: String::new(),
         blocks: Vec::new(),
         xattrs: BTreeMap::new(),
+        quota_bytes: None,
         posix_acl_access: None,
         posix_acl_default: None,
         nfs4_acl: None,

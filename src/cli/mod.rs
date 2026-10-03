@@ -488,6 +488,35 @@ pub fn run() -> Result<()> {
         Command::Truncate { root, path, size } => {
             ArgosFs::open(root)?.truncate_path(&path, size)?;
         }
+        Command::Quota { root, path } => {
+            let (limit_bytes, used_bytes) = ArgosFs::open(root)?.directory_quota(&path)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "path": path,
+                    "limit_bytes": limit_bytes,
+                    "used_bytes": used_bytes,
+                    "available_bytes": limit_bytes.map(|limit| limit.saturating_sub(used_bytes)),
+                }))?
+            );
+        }
+        Command::SetQuota { root, path, size } => {
+            let fs = ArgosFs::open(root)?;
+            fs.set_directory_quota(&path, size)?;
+            let (_, used_bytes) = fs.directory_quota(&path)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "path": path,
+                    "limit_bytes": size,
+                    "used_bytes": used_bytes,
+                    "available_bytes": size.saturating_sub(used_bytes),
+                }))?
+            );
+        }
+        Command::ClearQuota { root, path } => {
+            ArgosFs::open(root)?.clear_directory_quota(&path)?;
+        }
         Command::ImportTree { storage, args } => {
             let storage = storage.resolve(BackendKind::Host)?;
             let backend = storage.backend;

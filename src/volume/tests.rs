@@ -1002,3 +1002,44 @@ fn rename_covers_same_inode_exchange_cycles_cross_parent_and_type_conflicts() {
     assert_eq!(fs.attr_inode(left).unwrap().nlink, left_links);
     assert_eq!(fs.attr_inode(right).unwrap().nlink, right_links + 1);
 }
+
+#[test]
+fn quota_rejected_rename_does_not_stage_deferred_reclaims() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = dir.path().join("quota-rename.img");
+    let fs = ArgosFs::create_loop(
+        std::slice::from_ref(&image),
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            compression: Compression::None,
+            defer_metadata_commit: true,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "quota-rename",
+        false,
+    )
+    .unwrap();
+
+    fs.mkdir("/src", 0o755).unwrap();
+    fs.mkdir("/q", 0o755).unwrap();
+    fs.write_file("/src/file", &vec![b's'; 800], 0o644).unwrap();
+    fs.write_file("/q/existing", &vec![b'd'; 600], 0o644)
+        .unwrap();
+    fs.set_directory_quota("/q", 700).unwrap();
+    fs.sync().unwrap();
+
+    assert!(fs.deferred_commit.lock().pending_reclaims.is_empty());
+    assert!(matches!(
+        fs.rename_path("/src/file", "/q/existing").unwrap_err(),
+        ArgosError::QuotaExceeded {
+            limit: 700,
+            used: 800,
+            ..
+        }
+    ));
+    assert!(fs.deferred_commit.lock().pending_reclaims.is_empty());
+    assert_eq!(fs.read_file("/q/existing", false).unwrap(), vec![b'd'; 600]);
+    assert_eq!(fs.read_file("/src/file", false).unwrap(), vec![b's'; 800]);
+}

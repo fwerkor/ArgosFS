@@ -20,6 +20,76 @@ impl ArgosFs {
         Ok(Self::attr_from_inode(inode, meta.config.chunk_size))
     }
 
+    pub fn directory_quota(&self, path: &str) -> Result<(Option<u64>, u64)> {
+        let meta = self.meta.read();
+        let ino = self.resolve_path_locked(&meta, path, true, 40)?;
+        let inode = self.dir_inode_locked(&meta, ino)?;
+        Ok((
+            Self::directory_quota_limit(inode)?,
+            Self::subtree_logical_usage_locked(&meta, ino)?,
+        ))
+    }
+
+    pub fn set_directory_quota(&self, path: &str, limit: u64) -> Result<()> {
+        let mut meta = self.meta.write();
+        self.ensure_block_backend_writable_locked(&meta)?;
+        let ino = self.resolve_path_locked(&meta, path, true, 40)?;
+        self.dir_inode_locked(&meta, ino)?;
+        let used = Self::subtree_logical_usage_locked(&meta, ino)?;
+        if used > limit {
+            return Err(ArgosError::QuotaExceeded {
+                inode: ino,
+                used,
+                limit,
+            });
+        }
+        let rollback = commit_previous_snapshot(&meta);
+        let inode = self.dir_inode_mut_locked(&mut meta, ino)?;
+        inode.quota_bytes = Some(limit);
+        inode.ctime = now_f64();
+        if let Err(err) = self.commit_locked_with_previous(
+            &mut meta,
+            rollback.as_ref(),
+            "set-directory-quota",
+            json!({"inode": ino, "path": path, "limit": limit, "used": used}),
+        ) {
+            if !Self::transaction_error_is_committed(&err) {
+                if let Some(rollback) = rollback {
+                    *meta = rollback;
+                }
+            }
+            return Err(err);
+        }
+        self.rebuild_quota_runtime_locked(&meta)?;
+        Ok(())
+    }
+
+    pub fn clear_directory_quota(&self, path: &str) -> Result<()> {
+        let mut meta = self.meta.write();
+        self.ensure_block_backend_writable_locked(&meta)?;
+        let ino = self.resolve_path_locked(&meta, path, true, 40)?;
+        self.dir_inode_locked(&meta, ino)?;
+        let rollback = commit_previous_snapshot(&meta);
+        let inode = self.dir_inode_mut_locked(&mut meta, ino)?;
+        inode.quota_bytes = None;
+        inode.ctime = now_f64();
+        if let Err(err) = self.commit_locked_with_previous(
+            &mut meta,
+            rollback.as_ref(),
+            "clear-directory-quota",
+            json!({"inode": ino, "path": path}),
+        ) {
+            if !Self::transaction_error_is_committed(&err) {
+                if let Some(rollback) = rollback {
+                    *meta = rollback;
+                }
+            }
+            return Err(err);
+        }
+        self.rebuild_quota_runtime_locked(&meta)?;
+        Ok(())
+    }
+
     pub fn lookup(&self, parent: InodeId, name: &OsStr) -> Result<NodeAttr> {
         let meta = self.meta.read();
         let parent_inode = self.dir_inode_locked(&meta, parent)?;
@@ -529,7 +599,7 @@ impl ArgosFs {
         clear_setid: bool,
     ) -> Result<()> {
         let rollback = commit_previous_snapshot(meta);
-        let (storage_class, boot_critical, existing_inline, had_blocks) = {
+        let (storage_class, boot_critical, old_size, existing_inline, had_blocks) = {
             let inode = meta
                 .inodes
                 .get(&ino)
@@ -542,10 +612,16 @@ impl ArgosFs {
             (
                 inode.storage_class,
                 inode.boot_critical,
+                inode.size,
                 decode_inline_data(inode)?,
                 !inode.blocks.is_empty(),
             )
         };
+        let target_size = offset
+            .checked_add(data.len())
+            .ok_or_else(|| ArgosError::Invalid("append size overflow".to_string()))?;
+        self.ensure_resize_within_quotas_locked(meta, ino, target_size as u64)?;
+
         let full_inline_data = if let Some(mut inline) = existing_inline {
             if offset != inline.len() {
                 return Err(ArgosError::Invalid(format!(
@@ -630,6 +706,7 @@ impl ArgosFs {
             }
             return Err(err);
         }
+        self.adjust_quota_usage_for_resize(ino, old_size, new_size as u64);
         Ok(())
     }
 
@@ -908,6 +985,7 @@ impl ArgosFs {
             inline_sha256: String::new(),
             blocks: Vec::new(),
             xattrs: BTreeMap::new(),
+            quota_bytes: None,
             posix_acl_access: inherited_acl,
             posix_acl_default: None,
             nfs4_acl: None,
@@ -985,6 +1063,7 @@ impl ArgosFs {
                 "cannot hard link a directory".to_string(),
             ));
         }
+        let quota_rollback = self.has_directory_quotas().then(|| meta.clone());
         self.dir_inode_mut_locked(&mut meta, new_parent)?
             .entries
             .insert(name.clone(), ino);
@@ -993,11 +1072,20 @@ impl ArgosFs {
             inode.ctime = now_f64();
         }
         self.touch_inode_locked(&mut meta, new_parent, true, true);
+        if quota_rollback.is_some() {
+            if let Err(err) = self.validate_all_directory_quotas_locked(&meta) {
+                if let Some(rollback) = quota_rollback {
+                    *meta = rollback;
+                }
+                return Err(err);
+            }
+        }
         self.commit_locked(
             &mut meta,
             "link",
             json!({"inode": ino, "new_parent": new_parent, "name": name}),
         )?;
+        self.rebuild_quota_runtime_locked(&meta)?;
         Ok(Self::attr_from_inode(
             meta.inodes
                 .get(&ino)

@@ -426,3 +426,185 @@ fn xattr_and_acl_lifecycle_covers_special_names_invalid_values_and_removal() {
     }
     assert!(fs.getxattr_inode(file, "user.badhex").is_err());
 }
+
+#[test]
+fn directory_quota_enforces_write_and_truncate_growth() {
+    let (_dir, fs) = volume();
+    fs.mkdir("/q", 0o755).unwrap();
+    let file = fs.create_file_path("/q/file", 0o644).unwrap();
+
+    fs.set_directory_quota("/q", 10).unwrap();
+    assert_eq!(fs.directory_quota("/q").unwrap(), (Some(10), 0));
+
+    fs.write_inode_range(file, 0, b"12345678").unwrap();
+    assert_eq!(fs.directory_quota("/q").unwrap(), (Some(10), 8));
+
+    let err = fs.write_inode_range(file, 8, b"abc").unwrap_err();
+    assert!(matches!(
+        err,
+        ArgosError::QuotaExceeded {
+            limit: 10,
+            used: 11,
+            ..
+        }
+    ));
+    assert_eq!(err.errno(), libc::EDQUOT);
+    assert_eq!(fs.attr_inode(file).unwrap().size, 8);
+
+    assert!(matches!(
+        fs.truncate_inode(file, 12).unwrap_err(),
+        ArgosError::QuotaExceeded {
+            limit: 10,
+            used: 12,
+            ..
+        }
+    ));
+    fs.truncate_inode(file, 5).unwrap();
+    assert_eq!(fs.directory_quota("/q").unwrap(), (Some(10), 5));
+
+    fs.clear_directory_quota("/q").unwrap();
+    assert_eq!(fs.directory_quota("/q").unwrap(), (None, 5));
+    fs.truncate_inode(file, 12).unwrap();
+    assert_eq!(fs.attr_inode(file).unwrap().size, 12);
+}
+
+#[test]
+fn nested_directory_quotas_apply_independently() {
+    let (_dir, fs) = volume();
+    fs.mkdir("/outer", 0o755).unwrap();
+    fs.mkdir("/outer/inner", 0o755).unwrap();
+    let file = fs.create_file_path("/outer/inner/file", 0o644).unwrap();
+
+    fs.set_directory_quota("/outer", 12).unwrap();
+    fs.set_directory_quota("/outer/inner", 6).unwrap();
+    fs.write_inode_range(file, 0, b"12345").unwrap();
+
+    let inner = fs.resolve_path("/outer/inner", true).unwrap();
+    assert!(matches!(
+        fs.write_inode_range(file, 5, b"67").unwrap_err(),
+        ArgosError::QuotaExceeded {
+            inode,
+            limit: 6,
+            used: 7,
+        } if inode == inner
+    ));
+    assert_eq!(fs.directory_quota("/outer").unwrap(), (Some(12), 5));
+    assert_eq!(fs.directory_quota("/outer/inner").unwrap(), (Some(6), 5));
+}
+
+#[test]
+fn quota_rejects_rename_and_hard_link_without_partial_namespace_changes() {
+    let (_dir, fs) = volume();
+    fs.mkdir("/src", 0o755).unwrap();
+    fs.mkdir("/q", 0o755).unwrap();
+    let file = fs.create_file_path("/src/file", 0o644).unwrap();
+    fs.write_inode_range(file, 0, b"12345678").unwrap();
+    fs.set_directory_quota("/q", 5).unwrap();
+
+    assert!(matches!(
+        fs.rename_path("/src/file", "/q/file").unwrap_err(),
+        ArgosError::QuotaExceeded { limit: 5, .. }
+    ));
+    assert!(fs.resolve_path("/src/file", true).is_ok());
+    assert!(fs.resolve_path("/q/file", true).is_err());
+
+    let q = fs.resolve_path("/q", true).unwrap();
+    let before_nlink = fs.attr_inode(file).unwrap().nlink;
+    assert!(matches!(
+        fs.link_at(file, q, OsStr::new("linked")).unwrap_err(),
+        ArgosError::QuotaExceeded { limit: 5, .. }
+    ));
+    assert_eq!(fs.attr_inode(file).unwrap().nlink, before_nlink);
+    assert!(fs.resolve_path("/q/linked", true).is_err());
+
+    fs.set_directory_quota("/q", 10).unwrap();
+    fs.rename_path("/src/file", "/q/file").unwrap();
+    assert_eq!(fs.directory_quota("/q").unwrap(), (Some(10), 8));
+
+    fs.link_at(file, q, OsStr::new("linked")).unwrap();
+    assert_eq!(fs.directory_quota("/q").unwrap(), (Some(10), 8));
+}
+
+#[test]
+fn setting_quota_below_existing_usage_is_rejected() {
+    let (_dir, fs) = volume();
+    fs.mkdir("/q", 0o755).unwrap();
+    let file = fs.create_file_path("/q/file", 0o644).unwrap();
+    fs.write_inode_range(file, 0, b"12345678").unwrap();
+
+    assert!(matches!(
+        fs.set_directory_quota("/q", 7).unwrap_err(),
+        ArgosError::QuotaExceeded {
+            limit: 7,
+            used: 8,
+            ..
+        }
+    ));
+    assert_eq!(fs.directory_quota("/q").unwrap(), (None, 8));
+}
+
+#[test]
+fn directory_quota_persists_across_reopen() {
+    let (dir, fs) = volume();
+    fs.mkdir("/q", 0o755).unwrap();
+    let file = fs.create_file_path("/q/file", 0o644).unwrap();
+    fs.write_inode_range(file, 0, b"1234").unwrap();
+    fs.set_directory_quota("/q", 9).unwrap();
+    fs.sync().unwrap();
+    drop(fs);
+
+    let reopened = ArgosFs::open(dir.path()).unwrap();
+    assert_eq!(reopened.directory_quota("/q").unwrap(), (Some(9), 4));
+    let reopened_file = reopened.resolve_path("/q/file", true).unwrap();
+    assert!(matches!(
+        reopened
+            .write_inode_range(reopened_file, 4, b"567890")
+            .unwrap_err(),
+        ArgosError::QuotaExceeded {
+            limit: 9,
+            used: 10,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn directory_quota_enforces_whole_file_replacements() {
+    let (_dir, fs) = volume();
+    fs.mkdir("/q", 0o755).unwrap();
+    fs.set_directory_quota("/q", 5).unwrap();
+
+    let err = fs.write_file("/q/file", b"123456", 0o644).unwrap_err();
+    assert!(matches!(
+        err,
+        ArgosError::QuotaExceeded {
+            limit: 5,
+            used: 6,
+            ..
+        }
+    ));
+    let file = fs.resolve_path("/q/file", true).unwrap();
+    assert_eq!(fs.attr_inode(file).unwrap().size, 0);
+    assert_eq!(fs.directory_quota("/q").unwrap(), (Some(5), 0));
+
+    fs.write_file("/q/file", b"12345", 0o644).unwrap();
+    assert_eq!(fs.directory_quota("/q").unwrap(), (Some(5), 5));
+    assert!(matches!(
+        fs.write_file("/q/file", b"1234567", 0o644).unwrap_err(),
+        ArgosError::QuotaExceeded {
+            limit: 5,
+            used: 7,
+            ..
+        }
+    ));
+    assert_eq!(fs.read_file("/q/file", false).unwrap(), b"12345");
+}
+
+#[test]
+fn symlinks_do_not_consume_regular_file_quota() {
+    let (_dir, fs) = volume();
+    fs.mkdir("/q", 0o755).unwrap();
+    fs.set_directory_quota("/q", 0).unwrap();
+    fs.symlink_path("a/long/symlink/target", "/q/link").unwrap();
+    assert_eq!(fs.directory_quota("/q").unwrap(), (Some(0), 0));
+}
