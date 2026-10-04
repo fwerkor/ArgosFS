@@ -535,6 +535,8 @@ pub struct Inode {
     pub inline_sha256: String,
     pub blocks: Vec<FileBlock>,
     pub xattrs: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_bytes: Option<u64>,
     #[serde(default)]
     pub posix_acl_access: Option<PosixAcl>,
     #[serde(default)]

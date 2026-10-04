@@ -109,6 +109,69 @@ impl DeferredCommitState {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct QuotaRuntime {
+    active: BTreeSet<InodeId>,
+    usage_bytes: BTreeMap<InodeId, u64>,
+    memberships: BTreeMap<InodeId, BTreeSet<InodeId>>,
+}
+
+impl QuotaRuntime {
+    fn from_metadata(meta: &Metadata) -> Result<Self> {
+        fn visit(
+            meta: &Metadata,
+            ino: InodeId,
+            quota_ino: InodeId,
+            seen: &mut BTreeSet<InodeId>,
+            runtime: &mut QuotaRuntime,
+        ) -> Result<u64> {
+            if !seen.insert(ino) {
+                return Ok(0);
+            }
+            let inode = meta
+                .inodes
+                .get(&ino)
+                .ok_or_else(|| ArgosError::NotFound(format!("inode {ino}")))?;
+            runtime
+                .memberships
+                .entry(ino)
+                .or_default()
+                .insert(quota_ino);
+            match inode.kind {
+                NodeKind::File => Ok(inode.size),
+                NodeKind::Directory => {
+                    let mut total = 0u64;
+                    for child in inode.entries.values() {
+                        total =
+                            total.saturating_add(visit(meta, *child, quota_ino, seen, runtime)?);
+                    }
+                    Ok(total)
+                }
+                NodeKind::Symlink | NodeKind::Special => Ok(0),
+            }
+        }
+
+        let mut runtime = Self::default();
+        let quota_inodes = meta
+            .inodes
+            .iter()
+            .filter_map(|(ino, inode)| inode.quota_bytes.map(|_| *ino))
+            .collect::<Vec<_>>();
+        for quota_ino in quota_inodes {
+            runtime.active.insert(quota_ino);
+            let used = visit(
+                meta,
+                quota_ino,
+                quota_ino,
+                &mut BTreeSet::new(),
+                &mut runtime,
+            )?;
+            runtime.usage_bytes.insert(quota_ino, used);
+        }
+        Ok(runtime)
+    }
+}
+
 #[derive(Clone)]
 pub struct ArgosFs {
     root: Arc<PathBuf>,
@@ -116,6 +179,7 @@ pub struct ArgosFs {
     backend_writable: bool,
     raw_superblocks: Arc<Vec<RawSuperblock>>,
     meta: Arc<RwLock<Metadata>>,
+    quota_runtime: Arc<RwLock<QuotaRuntime>>,
     deferred_commit: Arc<Mutex<DeferredCommitState>>,
     quarantined_devices: Arc<Mutex<BTreeSet<String>>>,
     write_fence: Arc<Mutex<Option<String>>>,
@@ -262,6 +326,7 @@ impl ArgosFs {
             inline_sha256: String::new(),
             blocks: Vec::new(),
             xattrs: BTreeMap::new(),
+            quota_bytes: None,
             posix_acl_access: None,
             posix_acl_default: None,
             nfs4_acl: None,
@@ -330,6 +395,7 @@ impl ArgosFs {
             deferred_commit: Arc::new(Mutex::new(DeferredCommitState::new(&meta))),
             quarantined_devices: Arc::new(Mutex::new(BTreeSet::new())),
             write_fence: Arc::new(Mutex::new(None)),
+            quota_runtime: Arc::new(RwLock::new(QuotaRuntime::from_metadata(&meta)?)),
             meta: Arc::new(RwLock::new(meta)),
             dirty_host_shards: Arc::new(Mutex::new(BTreeSet::new())),
             inode_locks: Arc::new(Mutex::new(BTreeMap::new())),
@@ -531,6 +597,7 @@ impl ArgosFs {
             ))),
             quarantined_devices: Arc::new(Mutex::new(BTreeSet::new())),
             write_fence: Arc::new(Mutex::new(None)),
+            quota_runtime: Arc::new(RwLock::new(QuotaRuntime::from_metadata(&meta)?)),
             meta: Arc::new(RwLock::new(meta)),
             dirty_host_shards: Arc::new(Mutex::new(BTreeSet::new())),
             inode_locks: Arc::new(Mutex::new(BTreeMap::new())),
@@ -919,6 +986,7 @@ impl ArgosFs {
             inline_sha256: String::new(),
             blocks: Vec::new(),
             xattrs: BTreeMap::new(),
+            quota_bytes: None,
             posix_acl_access: inherited_access_acl,
             posix_acl_default: inherited_default_acl,
             nfs4_acl: None,
@@ -945,6 +1013,7 @@ impl ArgosFs {
             "mkdir",
             json!({"parent": parent, "name": name, "inode": ino}),
         )?;
+        self.inherit_quota_memberships(parent, ino);
         Ok(ino)
     }
 
@@ -1032,6 +1101,7 @@ impl ArgosFs {
             inline_sha256: String::new(),
             blocks: Vec::new(),
             xattrs: BTreeMap::new(),
+            quota_bytes: None,
             posix_acl_access: inherited_acl,
             posix_acl_default: None,
             nfs4_acl: None,
@@ -1065,6 +1135,7 @@ impl ArgosFs {
             }
             return Err(err);
         }
+        self.inherit_quota_memberships(parent, ino);
         Ok(ino)
     }
 
@@ -1124,6 +1195,7 @@ impl ArgosFs {
             if dir { "rmdir" } else { "unlink" },
             json!({"parent": parent, "name": name, "inode": child}),
         )?;
+        self.rebuild_quota_runtime_locked(meta)?;
         self.finish_block_reclamation_locked(meta, &blocks_to_delete);
         Ok(())
     }
@@ -1209,6 +1281,16 @@ impl ArgosFs {
                     "cannot exchange a directory into itself".to_string(),
                 ));
             }
+            if self.has_directory_quotas() {
+                let mut quota_candidate = meta.clone();
+                self.dir_inode_mut_locked(&mut quota_candidate, old_parent)?
+                    .entries
+                    .insert(old_name.to_string(), existing);
+                self.dir_inode_mut_locked(&mut quota_candidate, new_parent)?
+                    .entries
+                    .insert(new_name.to_string(), child);
+                self.validate_all_directory_quotas_locked(&quota_candidate)?;
+            }
             self.dir_inode_mut_locked(meta, old_parent)?
                 .entries
                 .insert(old_name.to_string(), existing);
@@ -1242,6 +1324,7 @@ impl ArgosFs {
                 "rename-exchange",
                 json!({"old_parent": old_parent, "old_name": old_name, "new_parent": new_parent, "new_name": new_name, "inode": child, "exchanged_inode": existing}),
             )?;
+            self.rebuild_quota_runtime_locked(meta)?;
             return Ok(());
         }
         let existing_inode = if let Some(existing) = existing {
@@ -1268,6 +1351,21 @@ impl ArgosFs {
         } else {
             None
         };
+        if self.has_directory_quotas() {
+            let mut quota_candidate = meta.clone();
+            if existing.is_some() {
+                self.dir_inode_mut_locked(&mut quota_candidate, new_parent)?
+                    .entries
+                    .remove(new_name);
+            }
+            self.dir_inode_mut_locked(&mut quota_candidate, old_parent)?
+                .entries
+                .remove(old_name);
+            self.dir_inode_mut_locked(&mut quota_candidate, new_parent)?
+                .entries
+                .insert(new_name.to_string(), child);
+            self.validate_all_directory_quotas_locked(&quota_candidate)?;
+        }
         let mut blocks_to_delete = Vec::new();
         if let Some((existing, existing_inode)) = existing_inode {
             self.dir_inode_mut_locked(meta, new_parent)?
@@ -1310,6 +1408,7 @@ impl ArgosFs {
             "rename",
             json!({"old_parent": old_parent, "old_name": old_name, "new_parent": new_parent, "new_name": new_name, "inode": child}),
         )?;
+        self.rebuild_quota_runtime_locked(meta)?;
         self.finish_block_reclamation_locked(meta, &blocks_to_delete);
         Ok(())
     }
@@ -1433,6 +1532,138 @@ impl ArgosFs {
             .entries
             .values()
             .any(|child| Self::directory_contains_inode(meta, *child, needle))
+    }
+
+    fn directory_quota_limit(inode: &Inode) -> Result<Option<u64>> {
+        Ok(inode.quota_bytes)
+    }
+
+    fn subtree_logical_usage_locked(meta: &Metadata, root: InodeId) -> Result<u64> {
+        fn visit(meta: &Metadata, ino: InodeId, seen: &mut BTreeSet<InodeId>) -> Result<u64> {
+            if !seen.insert(ino) {
+                return Ok(0);
+            }
+            let inode = meta
+                .inodes
+                .get(&ino)
+                .ok_or_else(|| ArgosError::NotFound(format!("inode {ino}")))?;
+            match inode.kind {
+                NodeKind::File => Ok(inode.size),
+                NodeKind::Directory => {
+                    let mut total = 0u64;
+                    for child in inode.entries.values() {
+                        total = total.saturating_add(visit(meta, *child, seen)?);
+                    }
+                    Ok(total)
+                }
+                NodeKind::Symlink | NodeKind::Special => Ok(0),
+            }
+        }
+
+        let root_inode = meta
+            .inodes
+            .get(&root)
+            .ok_or_else(|| ArgosError::NotFound(format!("inode {root}")))?;
+        if root_inode.kind != NodeKind::Directory {
+            return Err(ArgosError::NotDirectory(format!("inode {root}")));
+        }
+        visit(meta, root, &mut BTreeSet::new())
+    }
+
+    fn validate_all_directory_quotas_locked(&self, meta: &Metadata) -> Result<()> {
+        let active = self.quota_runtime.read().active.clone();
+        for ino in active {
+            let Some(inode) = meta.inodes.get(&ino) else {
+                continue;
+            };
+            let Some(limit) = Self::directory_quota_limit(inode)? else {
+                continue;
+            };
+            let used = Self::subtree_logical_usage_locked(meta, ino)?;
+            if used > limit {
+                return Err(ArgosError::QuotaExceeded {
+                    inode: ino,
+                    used,
+                    limit,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn has_directory_quotas(&self) -> bool {
+        !self.quota_runtime.read().active.is_empty()
+    }
+
+    fn rebuild_quota_runtime_locked(&self, meta: &Metadata) -> Result<()> {
+        *self.quota_runtime.write() = QuotaRuntime::from_metadata(meta)?;
+        Ok(())
+    }
+
+    fn inherit_quota_memberships(&self, parent: InodeId, ino: InodeId) {
+        let mut runtime = self.quota_runtime.write();
+        let inherited = runtime
+            .memberships
+            .get(&parent)
+            .cloned()
+            .unwrap_or_default();
+        if inherited.is_empty() {
+            runtime.memberships.remove(&ino);
+        } else {
+            runtime.memberships.insert(ino, inherited);
+        }
+    }
+
+    fn adjust_quota_usage_for_resize(&self, ino: InodeId, old_size: u64, new_size: u64) {
+        if old_size == new_size {
+            return;
+        }
+        let mut runtime = self.quota_runtime.write();
+        let memberships = runtime.memberships.get(&ino).cloned().unwrap_or_default();
+        for quota_ino in memberships {
+            let used = runtime.usage_bytes.entry(quota_ino).or_default();
+            if new_size > old_size {
+                *used = used.saturating_add(new_size - old_size);
+            } else {
+                *used = used.saturating_sub(old_size - new_size);
+            }
+        }
+    }
+
+    fn ensure_resize_within_quotas_locked(
+        &self,
+        meta: &Metadata,
+        ino: InodeId,
+        new_size: u64,
+    ) -> Result<()> {
+        let inode = meta
+            .inodes
+            .get(&ino)
+            .ok_or_else(|| ArgosError::NotFound(format!("inode {ino}")))?;
+        if new_size <= inode.size {
+            return Ok(());
+        }
+        let growth = new_size - inode.size;
+        let runtime = self.quota_runtime.read();
+        let memberships = runtime.memberships.get(&ino).cloned().unwrap_or_default();
+        for quota_ino in memberships {
+            let Some(quota_inode) = meta.inodes.get(&quota_ino) else {
+                continue;
+            };
+            let Some(limit) = Self::directory_quota_limit(quota_inode)? else {
+                continue;
+            };
+            let used = runtime.usage_bytes.get(&quota_ino).copied().unwrap_or(0);
+            let projected = used.saturating_add(growth);
+            if projected > limit {
+                return Err(ArgosError::QuotaExceeded {
+                    inode: quota_ino,
+                    used: projected,
+                    limit,
+                });
+            }
+        }
+        Ok(())
     }
 
     fn check_sticky_locked(
@@ -1714,6 +1945,7 @@ impl ArgosFs {
             }
             Err(err) => {
                 *meta = before_commit;
+                self.rebuild_quota_runtime_locked(meta)?;
                 self.fence_on_quorum_loss(&err);
                 state.last_error = Some(err.to_string());
                 Err(err)
@@ -1823,6 +2055,8 @@ impl ArgosFs {
                         state.durable_metadata = Some(meta.clone());
                         state.raw_uncommitted_metadata_dirty = false;
                         state.last_error = Some(err.to_string());
+                        drop(state);
+                        self.rebuild_quota_runtime_locked(meta)?;
                         return Err(err);
                     }
                 }
@@ -1830,6 +2064,7 @@ impl ArgosFs {
                     self.fence_on_quorum_loss(&commit_err);
                     if Self::transaction_error_is_committed(&commit_err) {
                         self.deferred_commit.lock().raw_uncommitted_metadata_dirty = false;
+                        self.rebuild_quota_runtime_locked(meta)?;
                     }
                     let should_restore = !Self::transaction_error_is_committed(&commit_err)
                         && (previous_metadata.is_none()
@@ -1866,6 +2101,9 @@ impl ArgosFs {
                 })?;
                 *meta = recovered.metadata;
                 recompute_disk_usage_from_metadata(meta);
+                self.rebuild_quota_runtime_locked(meta)?;
+            } else {
+                self.rebuild_quota_runtime_locked(meta)?;
             }
         }
 
@@ -1885,6 +2123,7 @@ impl ArgosFs {
         };
         *meta = recovered;
         recompute_disk_usage_from_metadata(meta);
+        self.rebuild_quota_runtime_locked(meta)?;
         let mut state = self.deferred_commit.lock();
         state.durable_metadata = Some(meta.clone());
         // Recovery may normalize/recompute fields after validating the persisted hash.

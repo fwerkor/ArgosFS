@@ -30,6 +30,8 @@ pub enum ArgosError {
         required: u64,
         available: u64,
     },
+    #[error("directory quota exceeded for inode {inode}: used {used} bytes, limit {limit} bytes")]
+    QuotaExceeded { inode: u64, used: u64, limit: u64 },
     #[error("unrecoverable stripe {stripe_id}: {reason}")]
     UnrecoverableStripe { stripe_id: String, reason: String },
     #[error("invalid argument: {0}")]
@@ -102,6 +104,7 @@ impl ArgosError {
             ArgosError::DirectoryNotEmpty(_) => libc::ENOTEMPTY,
             ArgosError::NotEnoughDisks { .. } => libc::ENOSPC,
             ArgosError::DiskFull { .. } => libc::ENOSPC,
+            ArgosError::QuotaExceeded { .. } => libc::EDQUOT,
             ArgosError::UnrecoverableStripe { .. } => libc::EIO,
             ArgosError::Invalid(_) => libc::EINVAL,
             ArgosError::NameTooLong(_) => libc::ENAMETOOLONG,

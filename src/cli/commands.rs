@@ -430,6 +430,17 @@ pub(super) enum Command {
         path: String,
         size: u64,
     },
+    #[command(about = "Show a directory storage quota and current logical usage")]
+    Quota { root: PathBuf, path: String },
+    #[command(about = "Set a hard logical-byte quota on a directory")]
+    SetQuota {
+        root: PathBuf,
+        path: String,
+        #[arg(value_name = "SIZE", value_parser = parse_byte_size_u64)]
+        size: u64,
+    },
+    #[command(about = "Remove a directory storage quota")]
+    ClearQuota { root: PathBuf, path: String },
     #[command(about = "Import a host directory tree into a volume")]
     ImportTree {
         #[command(flatten)]
