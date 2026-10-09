@@ -82,7 +82,7 @@ dependencies = [
 
 [[package]]
 name = "argosfs"
-version = "1.0.1"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "argon2",
