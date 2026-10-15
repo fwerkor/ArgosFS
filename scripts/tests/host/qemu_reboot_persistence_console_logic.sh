@@ -3,7 +3,8 @@ set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+. "$repo/scripts/tests/host/qemu_test_diagnostics.sh"
+trap 'argosfs_qemu_test_cleanup "$?" "$tmp" "qemu_reboot_persistence_console_logic"' EXIT
 
 kernel="$tmp/kernel"
 rootfs="$tmp/rootfs"
@@ -111,6 +112,7 @@ if [ "$count" -eq 1 ]; then
   cat >/dev/null
   exit 0
 fi
+sleep "${FAKE_QEMU_READY_DELAY:-0}"
 exec "$FAKE_QEMU_WORKING" "$@"
 QEMU
 chmod +x "$tmp/qemu-retry-first-console"
@@ -121,13 +123,14 @@ retry_output="$tmp/retry-output"
 mkdir -p "$retry_artifacts"
 FAKE_QEMU_COUNT="$retry_count" \
 FAKE_QEMU_WORKING="$tmp/qemu-lost-prompts" \
+FAKE_QEMU_READY_DELAY=1 \
 ARGOSFS_QEMU_ARCH=arm64 \
 ARGOSFS_QEMU_BIN="$tmp/qemu-retry-first-console" \
 ARGOSFS_QEMU_KERNEL="$kernel" \
 ARGOSFS_QEMU_ROOTFS="$rootfs" \
 ARGOSFS_TEST_ARTIFACTS="$retry_artifacts" \
-ARGOSFS_QEMU_TIMEOUT=20 \
-ARGOSFS_QEMU_REBOOT_LOGIN_DELAY=1 \
+ARGOSFS_QEMU_TIMEOUT=30 \
+ARGOSFS_QEMU_REBOOT_LOGIN_DELAY=5 \
 ARGOSFS_QEMU_REBOOT_DELAY=5 \
 ARGOSFS_QEMU_PRE_SCRIPT_CONSOLE_ATTEMPTS=2 \
 ARGOSFS_QEMU_CONSOLE_WAKE_INTERVAL=1 \

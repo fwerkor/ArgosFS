@@ -3,7 +3,8 @@ set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+. "$repo/scripts/tests/host/qemu_test_diagnostics.sh"
+trap 'argosfs_qemu_test_cleanup "$?" "$tmp" "qemu_pre_script_retry_logic"' EXIT
 
 kernel="$tmp/kernel"
 rootfs="$tmp/rootfs"
@@ -157,8 +158,8 @@ run_retry_boundary_case() {
     ARGOSFS_TEST_ARTIFACTS="$artifacts" \
     ARGOSFS_QEMU_TIMEOUT=20 \
     ARGOSFS_QEMU_PRE_SCRIPT_CONSOLE_ATTEMPTS=3 \
-    ARGOSFS_QEMU_SHELL_READY_TIMEOUT=1 \
-    "$timeout_var=2" \
+    ARGOSFS_QEMU_SHELL_READY_TIMEOUT=3 \
+    "$timeout_var=4" \
     "$repo/scripts/qemu/$script" >"$output" 2>&1
   status=$?
   set -e

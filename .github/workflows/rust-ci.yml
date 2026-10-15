@@ -258,11 +258,21 @@ jobs:
           find scripts -name '*.sh' -print0 | xargs -0 bash -n
 
       - name: Test QEMU helper synchronization
+        env:
+          ARGOSFS_QEMU_TEST_DIAGNOSTICS_DIR: ${{ runner.temp }}/argosfs-qemu-test-diagnostics
         run: |
           scripts/tests/host/qemu_helper_logic.sh
           scripts/tests/host/qemu_reboot_persistence_console_logic.sh
           scripts/tests/host/qemu_phase1_retry_logic.sh
           scripts/tests/host/qemu_pre_script_retry_logic.sh
+
+      - name: Upload QEMU test failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: argosfs-qemu-test-diagnostics
+          path: ${{ runner.temp }}/argosfs-qemu-test-diagnostics
+          if-no-files-found: ignore
 
       - name: Run retained validation workflow
         run: python3 scripts/validation/run_full_validation.py --output "$RUNNER_TEMP/argosfs-validation"
