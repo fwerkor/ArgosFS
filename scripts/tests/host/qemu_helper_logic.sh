@@ -6,7 +6,8 @@ repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 . "$repo/scripts/qemu/lib/common.sh"
 
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+. "$repo/scripts/tests/host/qemu_test_diagnostics.sh"
+trap 'argosfs_qemu_test_cleanup "$?" "$tmp" "qemu_helper_logic"' EXIT
 log="$tmp/serial.log"
 
 cat >"$log" <<'EOF'
