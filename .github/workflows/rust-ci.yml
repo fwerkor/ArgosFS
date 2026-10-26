@@ -333,6 +333,44 @@ jobs:
           path: ${{ runner.temp }}/argosfs-capos-${{ matrix.capos_target }}
           if-no-files-found: ignore
 
+  fuzz-harness-smoke:
+    name: Coverage fuzz harness smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install system dependencies
+        run: scripts/ci/install-deps.sh
+
+      - name: Install nightly Rust
+        run: scripts/ci/install-rust.sh nightly
+
+      - name: Cache fuzz build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: fuzz-smoke
+          workspaces: |
+            fuzz -> target
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+
+      - name: Build all fuzz targets
+        run: cargo fuzz build
+
+      - name: Run bounded fuzz smoke
+        env:
+          ARGOSFS_FUZZ_MAX_LEN: "4096"
+          ARGOSFS_FUZZ_RSS_MB: "4096"
+        run: |
+          for target in raw_format journal_record metadata_delta paged_metadata journal_recovery erasure_codec; do
+            echo "::group::fuzz $target"
+            scripts/ci/run-fuzz.sh "$target" 10 1
+            echo "::endgroup::"
+          done
+
   security-validation:
     name: Security validation
     uses: ./.github/workflows/security.yml
@@ -360,6 +398,7 @@ jobs:
       - block-lifecycle-matrix
       - compatibility
       - retained-validation
+      - fuzz-harness-smoke
       - security-validation
       - coverage-validation
       - performance-validation
