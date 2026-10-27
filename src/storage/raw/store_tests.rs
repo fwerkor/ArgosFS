@@ -665,7 +665,11 @@ fn quorum_report_distinguishes_metadata_failure_from_device_unavailability() {
     );
     assert!(matches!(
         quorum_failure_before_write(&metadata_only, "metadata", 3, 2),
-        ArgosError::RetryableQuorumUnavailable { .. }
+        ArgosError::DiskFull {
+            disk_id,
+            required: 2,
+            available: 1,
+        } if disk_id == "metadata-full"
     ));
 }
 

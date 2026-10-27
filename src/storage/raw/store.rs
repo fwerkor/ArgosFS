@@ -41,6 +41,7 @@ pub struct RawOpen {
 pub(crate) struct QuorumWriteReport {
     pub failed_devices: BTreeMap<String, String>,
     pub unavailable_devices: BTreeSet<String>,
+    disk_full: Option<(String, u64, u64)>,
 }
 
 impl QuorumWriteReport {
@@ -49,6 +50,15 @@ impl QuorumWriteReport {
             .insert(disk_id.to_string(), err.to_string());
         if member_failure_makes_data_unavailable(err) {
             self.unavailable_devices.insert(disk_id.to_string());
+        }
+        if let ArgosError::DiskFull {
+            disk_id,
+            required,
+            available,
+        } = err
+        {
+            self.disk_full
+                .get_or_insert_with(|| (disk_id.clone(), *required, *available));
         }
     }
 }
@@ -370,7 +380,9 @@ pub fn write_metadata_copies(
     superblocks: &[RawSuperblock],
     metadata: &Metadata,
 ) -> Result<()> {
-    let bytes = serde_json::to_vec_pretty(metadata)?;
+    // Store compact JSON: the metadata checkpoint has half the fixed metadata
+    // region, and pretty-printing wastes about a third of that space.
+    let bytes = serde_json::to_vec(metadata)?;
     let hash = sha256_hex(&bytes);
     for sb in superblocks {
         write_metadata_member(backend, sb, metadata, &bytes, &hash)?;
@@ -391,7 +403,7 @@ pub(crate) fn write_metadata_copies_quorum(
             superblocks.len(),
         ));
     }
-    let bytes = serde_json::to_vec_pretty(metadata)?;
+    let bytes = serde_json::to_vec(metadata)?;
     let hash = sha256_hex(&bytes);
     let mut report = QuorumWriteReport::default();
     let mut durable = 0usize;
@@ -1299,11 +1311,20 @@ fn quorum_failure_before_write(
     need: usize,
     have: usize,
 ) -> ArgosError {
-    if report.unavailable_devices.is_empty() {
-        retryable_quorum_unavailable(operation, need, have)
-    } else {
-        quorum_unavailable(operation, need, have)
+    if !report.unavailable_devices.is_empty() {
+        return quorum_unavailable(operation, need, have);
     }
+    // A checkpoint that does not fit is not a transient quorum failure.
+    // Reporting EAGAIN here makes callers retry forever (for example, rsync
+    // retrying setattr) instead of reporting the real out-of-space condition.
+    if let Some((disk_id, required, available)) = &report.disk_full {
+        return ArgosError::DiskFull {
+            disk_id: disk_id.clone(),
+            required: *required,
+            available: *available,
+        };
+    }
+    retryable_quorum_unavailable(operation, need, have)
 }
 
 fn indeterminate_commit(operation: &str, need: usize, durable: usize) -> ArgosError {

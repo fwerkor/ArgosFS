@@ -27,6 +27,13 @@ All multi-byte fields are explicitly little-endian. The current v1 layout is
 end - 1 MiB       backup superblock and backup label
 ```
 
+Devices of at least 128 MiB use a larger layout: an 8 MiB journal and a
+metadata region of `clamp(capacity / 64, 64 MiB, 1 GiB)`.  The metadata region
+is split into two checkpoint slots, so the larger layout reserves between
+32 MiB and 512 MiB for the live inode table.  The metadata is JSON, so a pool
+with a very large number of small files can still exhaust the checkpoint slot;
+when that happens writes fail with `ENOSPC` rather than retrying forever.
+
 The superblock records magic, format version, minimum compatible version,
 endianness marker, pool UUID, device UUID, logical disk id, `k/m`, chunk size,
 generation, clean state, feature flags, region descriptors, checksum algorithm,
