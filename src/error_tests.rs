@@ -45,6 +45,20 @@ fn every_error_variant_has_the_expected_errno() {
         (ArgosError::CorruptedMetadata("x".into()), libc::EIO),
         (ArgosError::IncompatibleFormat("x".into()), libc::EINVAL),
         (ArgosError::MissingDevice("x".into()), libc::ENODEV),
+        (
+            ArgosError::DeviceTimeout {
+                disk_id: "d".into(),
+                timeout_ms: 10,
+            },
+            libc::EIO,
+        ),
+        (
+            ArgosError::DeviceFailed {
+                disk_id: "d".into(),
+                reason: "x".into(),
+            },
+            libc::EIO,
+        ),
         (ArgosError::DegradedPool("x".into()), libc::EIO),
         (
             ArgosError::QuorumUnavailable {
@@ -87,6 +101,16 @@ fn fatal_device_error_classification_excludes_capacity_and_transient_io() {
         assert!(ArgosError::Io(std::io::Error::from_raw_os_error(errno)).is_fatal_device_error());
     }
     assert!(ArgosError::MissingDevice("disk-0001".to_string()).is_fatal_device_error());
+    assert!(ArgosError::DeviceTimeout {
+        disk_id: "disk-0001".to_string(),
+        timeout_ms: 10,
+    }
+    .is_fatal_device_error());
+    assert!(ArgosError::DeviceFailed {
+        disk_id: "disk-0001".to_string(),
+        reason: "x".to_string(),
+    }
+    .is_fatal_device_error());
 
     for errno in [libc::ENOSPC, libc::EDQUOT, libc::EAGAIN, libc::EINTR] {
         assert!(!ArgosError::Io(std::io::Error::from_raw_os_error(errno)).is_fatal_device_error());

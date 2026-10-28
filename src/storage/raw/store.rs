@@ -5,6 +5,7 @@ use crate::raw_format::{
     align_down, align_up, RawDeviceLabel, RawSuperblock, BACKUP_REGION_SIZE, DEVICE_LABEL_OFFSET,
     DEVICE_LABEL_SIZE, PRIMARY_SUPERBLOCK_OFFSET, PROTECTIVE_HEADER_OFFSET, SUPERBLOCK_SIZE,
 };
+use crate::storage::guard::GuardedBackend;
 use crate::types::{
     BackendKind, DiskStatus, FaultPoint, Metadata, MetadataCandidateReport, RawJournalMemberReport,
     TransactionReport,
@@ -185,7 +186,16 @@ pub fn open_pool(kind: BackendKind, paths: &[PathBuf], write: bool) -> Result<Ra
             ));
             continue;
         }
-        let (sb, _) = superblock_from_path(kind, &item.path)?;
+        let (sb, _) = match superblock_from_path(kind, &item.path) {
+            Ok(superblock) => superblock,
+            Err(err) => {
+                // A card that has gone bad between the scan and this read must
+                // not make the whole pool unopenable.  Record it and continue;
+                // quorum decides whether the remaining members are enough.
+                scan_errors.push(format!("{}: {err}", item.path.display()));
+                continue;
+            }
+        };
         if let Some(pool) = pool_uuid {
             if pool != sb.pool_uuid {
                 return Err(ArgosError::IncompatibleFormat(
@@ -233,7 +243,9 @@ pub fn open_pool(kind: BackendKind, paths: &[PathBuf], write: bool) -> Result<Ra
         .iter()
         .cloned()
         .collect::<std::collections::BTreeMap<_, _>>();
-    let backend = Arc::new(FileBlockBackend::open_with_ids(kind, devices, write)?);
+    let backend: Arc<dyn StorageBackend> = Arc::new(GuardedBackend::new(Arc::new(
+        FileBlockBackend::open_with_ids(kind, devices, write)?,
+    )));
     let (mut metadata, mut report) = load_or_recover(&*backend, &superblocks, write)?;
     if metadata.backend != kind {
         return Err(ArgosError::IncompatibleFormat(format!(
@@ -2040,16 +2052,35 @@ pub fn superblock_for_device(
     )
 }
 
-pub fn inspect_device(kind: BackendKind, path: PathBuf) -> Result<(RawSuperblock, RawDeviceLabel)> {
-    let backend = match kind {
-        BackendKind::LoopBlock => FileBlockBackend::open_loop(std::slice::from_ref(&path), false)?,
-        BackendKind::RawBlock => FileBlockBackend::open_raw(std::slice::from_ref(&path), false)?,
+fn guarded_single_device(
+    kind: BackendKind,
+    path: &PathBuf,
+    write: bool,
+    host_error: &str,
+) -> Result<Arc<dyn StorageBackend>> {
+    let inner: Arc<dyn StorageBackend> = match kind {
+        BackendKind::LoopBlock => Arc::new(FileBlockBackend::open_loop(
+            std::slice::from_ref(path),
+            write,
+        )?),
+        BackendKind::RawBlock => Arc::new(FileBlockBackend::open_raw(
+            std::slice::from_ref(path),
+            write,
+        )?),
         BackendKind::Host => {
-            return Err(ArgosError::Unsupported(
-                "inspect-device is for loop/raw block backends".to_string(),
-            ))
+            return Err(ArgosError::Unsupported(host_error.to_string()));
         }
     };
+    Ok(Arc::new(GuardedBackend::new(inner)))
+}
+
+pub fn inspect_device(kind: BackendKind, path: PathBuf) -> Result<(RawSuperblock, RawDeviceLabel)> {
+    let backend = guarded_single_device(
+        kind,
+        &path,
+        false,
+        "inspect-device is for loop/raw block backends",
+    )?;
     let id = "disk-0000".to_string();
     let capacity = backend.capacity(&id)?;
     let mut sb = vec![0u8; SUPERBLOCK_SIZE];
@@ -2080,11 +2111,7 @@ pub fn inspect_device(kind: BackendKind, path: PathBuf) -> Result<(RawSuperblock
 }
 
 fn scan_one_path(kind: BackendKind, path: &PathBuf) -> ScannedDevice {
-    let backend = match kind {
-        BackendKind::LoopBlock => FileBlockBackend::open_loop(std::slice::from_ref(path), false),
-        BackendKind::RawBlock => FileBlockBackend::open_raw(std::slice::from_ref(path), false),
-        BackendKind::Host => unreachable!(),
-    };
+    let backend = guarded_single_device(kind, path, false, "scan is for loop/raw block backends");
     let Ok(backend) = backend else {
         return ScannedDevice {
             path: path.clone(),
@@ -2103,7 +2130,7 @@ fn scan_one_path(kind: BackendKind, path: &PathBuf) -> ScannedDevice {
     };
     let id = "disk-0000".to_string();
     let capacity = backend.capacity(&id).unwrap_or(0);
-    match read_superblock_with_backup(&backend, &id, capacity) {
+    match read_superblock_with_backup(&*backend, &id, capacity) {
         Ok((sb, source)) => {
             let label_result = (|| {
                 let mut label = vec![0u8; DEVICE_LABEL_SIZE];
@@ -2163,18 +2190,10 @@ fn superblock_from_path(
     kind: BackendKind,
     path: &PathBuf,
 ) -> Result<(RawSuperblock, &'static str)> {
-    let backend = match kind {
-        BackendKind::LoopBlock => FileBlockBackend::open_loop(std::slice::from_ref(path), false)?,
-        BackendKind::RawBlock => FileBlockBackend::open_raw(std::slice::from_ref(path), false)?,
-        BackendKind::Host => {
-            return Err(ArgosError::Unsupported(
-                "host backend has no raw superblock".to_string(),
-            ))
-        }
-    };
+    let backend = guarded_single_device(kind, path, false, "host backend has no raw superblock")?;
     let id = "disk-0000".to_string();
     let capacity = backend.capacity(&id)?;
-    read_superblock_with_backup(&backend, &id, capacity)
+    read_superblock_with_backup(&*backend, &id, capacity)
 }
 
 fn read_superblock_with_backup(

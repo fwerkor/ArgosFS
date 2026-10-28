@@ -91,6 +91,25 @@ group window, while recovery continues to use checksum-valid, quorum-supported
 metadata and journal records. Strict mode remains available as an explicit
 compatibility and diagnostic mode.
 
+## Device I/O deadline
+
+A failing USB card can leave a `pwrite` or `fsync` blocked for tens of
+seconds per command.  Raw and loop I/O is therefore guarded per device: every
+read, write and flush runs on a worker with a deadline (default **10 000 ms**,
+override with `ARGOSFS_IO_TIMEOUT_MS`, clamped to 100–120 000 ms).  A device
+that misses the deadline is marked failed for the rest of the mount, later
+operations fail immediately with `DeviceFailed`, and the quorum code records
+the member as unavailable.  The pool keeps running on its remaining members
+when the `k+m` layout still has redundancy; if it does not, writes are fenced
+but reads remain available.  This keeps a sick card from holding the metadata
+lock and freezing FUSE `lookup`/`statfs` while the block layer retries it.
+
+The deadline is a per-operation upper bound, not a throughput target.  A very
+slow but healthy card can be fenced if it cannot finish one read/write/flush
+inside the deadline; raise `ARGOSFS_IO_TIMEOUT_MS` for such hardware.  The
+default is deliberately much shorter than the Linux SCSI timeout so a failed
+member is isolated quickly, and much longer than a normal SD-card operation.
+
 ## Data Extents
 
 Host shards use `ShardLocation::HostPath`. Loop/raw shards use
