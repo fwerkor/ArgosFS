@@ -51,6 +51,23 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --all-features --no-deps
 
+  capos-rust-toolchain:
+    name: CapOS Rust 1.94 compatibility
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install system dependencies
+        run: scripts/ci/install-deps.sh
+
+      - name: Install CapOS-compatible Rust toolchain
+        run: scripts/ci/install-rust.sh 1.94.0
+
+      - name: Check locked dependency compilation
+        run: cargo check --locked --bin argosfs
+
   rust-unit:
     name: Rust tests (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
@@ -384,6 +401,7 @@ jobs:
     runs-on: ubuntu-24.04
     needs:
       - capos-target-compile
+      - capos-rust-toolchain
     if: always()
     steps:
       - name: Verify required CapOS compile gates
