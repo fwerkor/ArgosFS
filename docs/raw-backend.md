@@ -125,29 +125,32 @@ member is isolated quickly, and much longer than a normal SD-card operation.
 
 ## Read-after-write verification
 
-This is **off by default**.  Set `ARGOSFS_VERIFY_WRITE_AFTER_MS` (for example
-`60000` for one minute, clamped to 10 ms–1 h) before opening or mounting a
-raw/loop pool to enable it.  Every file-data shard write is put on a bounded
-queue.  After the delay the verifier drops the operating-system page cache for
-that range (`POSIX_FADV_DONTNEED`), reads the shard back through the guarded
-backend, and compares its content hash.  The delay is meant to be long enough
-that the microSD card's own write cache is no longer likely to answer the
-read.  A failed check is put back in the queue for another delay instead of
-being reported immediately: USB errors are much more common than lost data.
+**Disabled by default**; enable on writable raw/loop mounts with
+`ARGOSFS_VERIFY_WRITE_AFTER_MS` (10 ms–1 h; e.g. `60000`). The verifier records
+each shard's physical extent and generation and schedules a delayed read. A
+background worker flushes the member (also for deferred/bulk writes), requests
+`POSIX_FADV_DONTNEED` for the aligned range, and checks its checksum. This
+extra `fsync` can reduce throughput when the option is enabled. Cache eviction
+is advisory, and removable media can still answer reads from internal cache:
+a successful check is **not** a guarantee of power-loss durability.
+
+Failed reads or mismatched checksums are retried after another delay. Set
 `ARGOS_VERIFY_WRITE_RETRIES` (or `ARGOSFS_VERIFY_WRITE_RETRIES`, default 3,
-clamped to 0–10) is the number of retries after the first failure.  Only when
-all retries fail does the verifier count a final failure, log it, and mark the
-member failed for the rest of the mount (the same runtime quarantine the I/O
-guard uses).  A failure is logged as
+range 0–10) for additional attempts. Before a failed member is quarantined,
+ArgosFS checks that the original extent is still referenced by current
+metadata. Deleting or rewriting a shard invalidates old checks so recycled
+space cannot cause a false alarm. Once confirmed, a member is quarantined and
+remaining data durability is validated; writes are fenced when required shards
+would become unavailable. Scrub remains the recovery and repair path.
 
-```text
-argosfs: read-after-write check failed for disk-0003 stripe s... at offset ...
-```
-
-The filesystem is not modified: the normal read path can still reconstruct the
-shard from parity, and a scrub remains the full repair pass.  This option is
-intended for bringing up and soak-testing removable media, not as a substitute
-for scrubbing.
+The queue holds up to 8192 pending verifications and drops oldest entries
+under pressure. Unfinished entries are also discarded at unmount rather than
+blocking indefinitely for their configured delay. `verify_written_skipped()`
+reports such unverified work; `verify_written_failures()` counts confirmed
+final failures. Unsupported cache eviction counts as skipped, not a device
+failure. All counters are runtime-only; the process log reports confirmed
+failures. Long-running soak tests should monitor skipped counts and run scrub
+periodically, particularly after unmount or heavy write bursts.
 
 ## Data Extents
 
