@@ -165,6 +165,77 @@ fn constructor_and_large_layout_cover_capacity_and_overflow_edges() {
 }
 
 #[test]
+fn metadata_region_scales_with_device_capacity() {
+    let create = |capacity| {
+        RawSuperblock::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            "disk".to_string(),
+            0,
+            1,
+            0,
+            4096,
+            capacity,
+            "pool".to_string(),
+        )
+        .unwrap()
+    };
+
+    assert_eq!(
+        create(LARGE_LAYOUT_MIN_DEVICE_BYTES).metadata.length,
+        LARGE_METADATA_REGION_SIZE
+    );
+    assert_eq!(
+        create(32 * 1024 * 1024 * 1024).metadata.length,
+        512 * 1024 * 1024
+    );
+    assert_eq!(
+        create(2 * 1024 * 1024 * 1024 * 1024).metadata.length,
+        LARGE_METADATA_REGION_MAX_SIZE
+    );
+
+    // Real partitions are not always an exact number of MiB.  The scaled
+    // region must still stay block aligned so the superblock decodes again.
+    let physical = create(31_267_995_136);
+    assert!(physical.metadata.length.is_multiple_of(RAW_BLOCK_SIZE));
+    assert_eq!(RawSuperblock::decode(&physical.encode()).unwrap(), physical);
+}
+
+#[test]
+fn previously_formatted_large_devices_keep_their_original_regions() {
+    let capacity = 32 * 1024 * 1024 * 1024u64;
+    let mut original = RawSuperblock::new(
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        "disk".to_string(),
+        0,
+        1,
+        0,
+        4096,
+        capacity,
+        "old-pool".to_string(),
+    )
+    .unwrap();
+    let new_metadata_size = original.metadata.length;
+    let old_metadata_size = LARGE_METADATA_REGION_SIZE;
+    assert!(new_metadata_size > old_metadata_size);
+    let size_difference = new_metadata_size - old_metadata_size;
+
+    // Old superblocks record the 64 MiB region explicitly. Decoding and
+    // validating them must never recompute the newer capacity-based layout.
+    original.metadata.length = old_metadata_size;
+    original.allocator.offset -= size_difference;
+    original.data.offset -= size_difference;
+    original.data.length += size_difference;
+    let decoded = RawSuperblock::decode(&original.encode()).unwrap();
+    decoded.validate_device_capacity(capacity).unwrap();
+    assert_eq!(decoded, original);
+    assert_eq!(decoded.metadata.length, old_metadata_size);
+    assert_eq!(decoded.data.offset, original.data.offset);
+    assert_eq!(decoded.encode(), original.encode());
+}
+
+#[test]
 fn superblock_decode_rejects_header_and_geometry_variants() {
     let original = sample_superblock().encode();
     assert!(RawSuperblock::decode(&original[..SUPERBLOCK_SIZE - 1]).is_err());

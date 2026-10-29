@@ -56,6 +56,12 @@ pub enum ArgosError {
     IncompatibleFormat(String),
     #[error("missing device: {0}")]
     MissingDevice(String),
+    #[error("device {disk_id} did not respond within {timeout_ms} ms; marked unavailable")]
+    DeviceTimeout { disk_id: String, timeout_ms: u64 },
+    #[error("device {disk_id} is unavailable: {reason}")]
+    DeviceFailed { disk_id: String, reason: String },
+    #[error("device {disk_id} I/O is busy: {reason}")]
+    DeviceBusy { disk_id: String, reason: String },
     #[error("degraded pool: {0}")]
     DegradedPool(String),
     #[error("{operation} quorum unavailable: need {need}, have {have}")]
@@ -86,6 +92,7 @@ impl ArgosError {
     pub(crate) fn is_fatal_device_error(&self) -> bool {
         match self {
             ArgosError::MissingDevice(_) => true,
+            ArgosError::DeviceTimeout { .. } | ArgosError::DeviceFailed { .. } => true,
             ArgosError::Io(err) => matches!(
                 err.raw_os_error(),
                 Some(libc::EIO | libc::ENODEV | libc::ENXIO | libc::EREMOTEIO)
@@ -117,6 +124,8 @@ impl ArgosError {
             ArgosError::CorruptedMetadata(_) => libc::EIO,
             ArgosError::IncompatibleFormat(_) => libc::EINVAL,
             ArgosError::MissingDevice(_) => libc::ENODEV,
+            ArgosError::DeviceTimeout { .. } | ArgosError::DeviceFailed { .. } => libc::EIO,
+            ArgosError::DeviceBusy { .. } => libc::EAGAIN,
             ArgosError::DegradedPool(_) => libc::EIO,
             ArgosError::QuorumUnavailable { .. } => libc::EROFS,
             ArgosError::RetryableQuorumUnavailable { .. } => libc::EAGAIN,
