@@ -17,6 +17,13 @@ pub const BACKUP_REGION_SIZE: u64 = 1024 * 1024;
 const LARGE_LAYOUT_MIN_DEVICE_BYTES: u64 = 128 * 1024 * 1024;
 const LARGE_JOURNAL_REGION_SIZE: u64 = 8 * 1024 * 1024;
 const LARGE_METADATA_REGION_SIZE: u64 = 64 * 1024 * 1024;
+const LARGE_METADATA_REGION_MAX_SIZE: u64 = 1024 * 1024 * 1024;
+// The metadata region holds the JSON inode table twice (current checkpoint and
+// mirror).  A fixed 64 MiB region only leaves about 32 MiB for the inode table,
+// which a normal home directory can exhaust after roughly 40,000 small files.
+// Scale the region with the device so larger cards do not run out of metadata
+// long before they run out of data space.
+const METADATA_CAPACITY_DIVISOR: u64 = 64;
 pub const SUPERBLOCK_SIZE: usize = 4096;
 pub const DEVICE_LABEL_SIZE: usize = 4096;
 pub const MIN_DEVICE_BYTES: u64 = 20 * 1024 * 1024;
@@ -343,6 +350,11 @@ struct RawLayoutRegions {
     data: RawRegion,
 }
 
+fn large_metadata_region_size(capacity: u64) -> u64 {
+    let scaled = align_down(capacity / METADATA_CAPACITY_DIVISOR, RAW_BLOCK_SIZE);
+    scaled.clamp(LARGE_METADATA_REGION_SIZE, LARGE_METADATA_REGION_MAX_SIZE)
+}
+
 fn raw_regions_for_capacity(capacity: u64) -> RawLayoutRegions {
     if capacity >= LARGE_LAYOUT_MIN_DEVICE_BYTES {
         let journal = RawRegion {
@@ -351,7 +363,7 @@ fn raw_regions_for_capacity(capacity: u64) -> RawLayoutRegions {
         };
         let metadata = RawRegion {
             offset: journal.offset + journal.length,
-            length: LARGE_METADATA_REGION_SIZE,
+            length: large_metadata_region_size(capacity),
         };
         let allocator = RawRegion {
             offset: metadata.offset + metadata.length,
