@@ -273,6 +273,10 @@ impl StorageBackend for GuardedBackend {
         self.run(device_id, "flush", move || inner.flush_device(&id))
     }
 
+    fn drop_cache(&self, device_id: &String, offset: u64, length: u64) -> Result<()> {
+        self.inner.drop_cache(device_id, offset, length)
+    }
+
     fn flush_all(&self) -> Result<()> {
         let mut first_error = None;
         for device in self.inner.list_devices()? {

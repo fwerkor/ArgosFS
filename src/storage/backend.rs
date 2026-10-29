@@ -32,6 +32,12 @@ pub trait StorageBackend: Send + Sync {
     fn write_at(&self, device_id: &DeviceId, offset: u64, data: &[u8]) -> Result<()>;
     fn flush_device(&self, device_id: &DeviceId) -> Result<()>;
     fn flush_all(&self) -> Result<()>;
+    /// Drop cached pages for a range before a verification read.  The default
+    /// is a no-op; block backends override it so a read-after-write check does
+    /// not compare against the operating system's page cache.
+    fn drop_cache(&self, _device_id: &DeviceId, _offset: u64, _length: u64) -> Result<()> {
+        Ok(())
+    }
     fn capacity(&self, device_id: &DeviceId) -> Result<u64>;
     fn device_status(&self, device_id: &DeviceId) -> Result<DiskStatus>;
     fn capabilities(&self) -> BackendCapabilities;
@@ -255,6 +261,25 @@ impl StorageBackend for FileBlockBackend {
             fallocate: true,
             discard: self.kind == BackendKind::RawBlock,
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn drop_cache(&self, device_id: &DeviceId, offset: u64, length: u64) -> Result<()> {
+        use std::os::unix::io::AsRawFd;
+        let device = self.device(device_id)?;
+        // POSIX_FADV_DONTNEED only works on clean pages; the shard write has
+        // been flushed (fsync) before the verifier reads it.  Some kernels or
+        // devices reject the advice, which is harmless: the delayed read still
+        // happens, we just cannot guarantee the page cache was dropped.
+        let _ = unsafe {
+            libc::posix_fadvise(
+                device.file.as_raw_fd(),
+                offset as libc::off_t,
+                length as libc::off_t,
+                libc::POSIX_FADV_DONTNEED,
+            )
+        };
+        Ok(())
     }
 }
 

@@ -18,6 +18,9 @@ use crate::raw_format::{self, RawSuperblock};
 use crate::raw_store;
 use crate::storage::guard::GuardedBackend;
 use crate::types::*;
+use verify_after_write::VerifyAfterWrite;
+
+mod verify_after_write;
 use crate::util::{
     append_json_line, atomic_write, clean_path, content_hash_hex, content_hash_matches, ensure_dir,
     ensure_private_dir, now_f64, parent_name, relative_or_absolute, split_path, stable_u01,
@@ -187,10 +190,14 @@ pub struct ArgosFs {
     dirty_host_shards: Arc<Mutex<BTreeSet<PathBuf>>>,
     inode_locks: Arc<Mutex<BTreeMap<InodeId, Arc<Mutex<()>>>>>,
     cache: Arc<BlockCache>,
+    verify_written: Option<Arc<VerifyAfterWrite>>,
 }
 
 impl Drop for ArgosFs {
     fn drop(&mut self) {
+        if let Some(verify) = &self.verify_written {
+            verify.stop();
+        }
         if !self.backend_writable || Arc::strong_count(&self.meta) != 1 {
             return;
         }
@@ -401,6 +408,7 @@ impl ArgosFs {
             dirty_host_shards: Arc::new(Mutex::new(BTreeSet::new())),
             inode_locks: Arc::new(Mutex::new(BTreeMap::new())),
             cache: Arc::new(cache),
+            verify_written: None,
         })
     }
 
@@ -588,6 +596,12 @@ impl ArgosFs {
         let raw_uncommitted_metadata_dirty = meta.backend != BackendKind::Host
             && (meta.integrity.meta_hash.is_empty()
                 || journal::canonical_metadata_hash(&meta)? != meta.integrity.meta_hash);
+        let verify_written = if meta.backend != BackendKind::Host {
+            VerifyAfterWrite::configured_delay()
+                .map(|delay| VerifyAfterWrite::start(backend.clone(), delay))
+        } else {
+            None
+        };
         Ok(Self {
             root: Arc::new(root),
             backend,
@@ -604,7 +618,15 @@ impl ArgosFs {
             dirty_host_shards: Arc::new(Mutex::new(BTreeSet::new())),
             inode_locks: Arc::new(Mutex::new(BTreeMap::new())),
             cache: Arc::new(cache),
+            verify_written,
         })
+    }
+
+    pub fn verify_written_failures(&self) -> u64 {
+        self.verify_written
+            .as_ref()
+            .map(|verify| verify.failures())
+            .unwrap_or(0)
     }
 
     pub fn root(&self) -> &Path {

@@ -917,6 +917,9 @@ impl ArgosFs {
                 data.len() as u64,
                 start.elapsed().as_secs_f64(),
             );
+            if let Some(verify) = &self.verify_written {
+                verify.enqueue(disk_id, extent.offset, data.len(), &sha256, stripe_id);
+            }
             return Ok(Shard {
                 slot,
                 disk_id: disk_id.to_string(),

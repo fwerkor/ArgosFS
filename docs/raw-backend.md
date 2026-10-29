@@ -123,6 +123,26 @@ inside the deadline; raise `ARGOSFS_IO_TIMEOUT_MS` for such hardware.  The
 default is deliberately much shorter than the Linux SCSI timeout so a failed
 member is isolated quickly, and much longer than a normal SD-card operation.
 
+## Read-after-write verification
+
+This is **off by default**.  Set `ARGOSFS_VERIFY_WRITE_AFTER_MS` (for example
+`60000` for one minute, clamped to 10 ms–1 h) before opening or mounting a
+raw/loop pool to enable it.  Every file-data shard write is put on a bounded
+queue.  After the delay the verifier drops the operating-system page cache for
+that range (`POSIX_FADV_DONTNEED`), reads the shard back through the guarded
+backend, and compares its content hash.  The delay is meant to be long enough
+that the microSD card's own write cache is no longer likely to answer the
+read.  A failure is logged as
+
+```text
+argosfs: read-after-write check failed for disk-0003 stripe s... at offset ...
+```
+
+The filesystem is not modified: the normal read path can still reconstruct the
+shard from parity, and a scrub remains the full repair pass.  This option is
+intended for bringing up and soak-testing removable media, not as a substitute
+for scrubbing.
+
 ## Data Extents
 
 Host shards use `ShardLocation::HostPath`. Loop/raw shards use
