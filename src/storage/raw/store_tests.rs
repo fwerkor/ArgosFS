@@ -1,10 +1,13 @@
 use super::*;
 use crate::raw_format::MIN_DEVICE_BYTES;
+use crate::storage::guard::GuardedBackend;
 use crate::types::{Disk, MetadataIntegrity, VolumeConfig};
 use crate::volume::ArgosFs;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
 struct FailingBackend {
@@ -53,6 +56,53 @@ impl StorageBackend for FlushFailBackend {
             self.flush_device(&device.device_id)?;
         }
         Ok(())
+    }
+
+    fn capacity(&self, device_id: &String) -> Result<u64> {
+        self.inner.capacity(device_id)
+    }
+
+    fn device_status(&self, device_id: &String) -> Result<DiskStatus> {
+        self.inner.device_status(device_id)
+    }
+
+    fn capabilities(&self) -> crate::backend::BackendCapabilities {
+        self.inner.capabilities()
+    }
+}
+
+struct SlowFlushBackend {
+    inner: FileBlockBackend,
+    slow_device: String,
+    delay: Duration,
+}
+
+impl StorageBackend for SlowFlushBackend {
+    fn backend_kind(&self) -> BackendKind {
+        self.inner.backend_kind()
+    }
+
+    fn list_devices(&self) -> Result<Vec<crate::backend::BackendDeviceInfo>> {
+        self.inner.list_devices()
+    }
+
+    fn read_at(&self, device_id: &String, offset: u64, buf: &mut [u8]) -> Result<()> {
+        self.inner.read_at(device_id, offset, buf)
+    }
+
+    fn write_at(&self, device_id: &String, offset: u64, data: &[u8]) -> Result<()> {
+        self.inner.write_at(device_id, offset, data)
+    }
+
+    fn flush_device(&self, device_id: &String) -> Result<()> {
+        if device_id == &self.slow_device {
+            std::thread::sleep(self.delay);
+        }
+        self.inner.flush_device(device_id)
+    }
+
+    fn flush_all(&self) -> Result<()> {
+        self.inner.flush_all()
     }
 
     fn capacity(&self, device_id: &String) -> Result<u64> {
@@ -440,6 +490,40 @@ fn quorum_journal_commit_survives_one_member_eio() {
 }
 
 #[test]
+fn guarded_quorum_commit_continues_when_one_member_stalls() {
+    let (_dir, images, previous, superblocks) = quorum_fixture();
+    let next = next_metadata(&previous, "guarded-stall");
+    let backend = GuardedBackend::with_timeout(
+        Arc::new(SlowFlushBackend {
+            inner: block_backend_for(&images),
+            slow_device: "disk-0002".to_string(),
+            delay: Duration::from_millis(500),
+        }),
+        Duration::from_millis(50),
+    );
+
+    let started = Instant::now();
+    let report = append_transaction_with_trusted_integrity_quorum(
+        &backend,
+        &superblocks,
+        &next,
+        Some(&previous),
+        "guarded-stall-test",
+        serde_json::json!({}),
+    )
+    .unwrap();
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(report.failed_devices.contains_key("disk-0002"));
+    assert_eq!(report.failed_devices.len(), 1);
+    drop(backend);
+
+    let reopened = ArgosFs::open_loop(&images, false).unwrap();
+    let recovered = reopened.metadata_snapshot();
+    assert_eq!(recovered.txid, next.txid);
+    assert_eq!(recovered.raw_pool.pool_name, "guarded-stall");
+}
+
+#[test]
 fn quorum_certificate_preserves_commit_across_changing_member_failures() {
     let (_dir, images, previous, superblocks) = quorum_fixture();
     let next = next_metadata(&previous, "certified-changing-failure");
@@ -665,7 +749,11 @@ fn quorum_report_distinguishes_metadata_failure_from_device_unavailability() {
     );
     assert!(matches!(
         quorum_failure_before_write(&metadata_only, "metadata", 3, 2),
-        ArgosError::RetryableQuorumUnavailable { .. }
+        ArgosError::DiskFull {
+            disk_id,
+            required: 2,
+            available: 1,
+        } if disk_id == "metadata-full"
     ));
 }
 

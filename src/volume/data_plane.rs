@@ -1,4 +1,7 @@
 use super::*;
+use crate::backend::StorageBackend;
+use crate::storage::guard::GuardedBackend;
+use std::sync::Arc;
 
 impl ArgosFs {
     pub(super) fn replace_inode_data(
@@ -1433,16 +1436,17 @@ impl ArgosFs {
         meta: &Metadata,
         disk_id: &str,
         write: bool,
-    ) -> Result<FileBlockBackend> {
+    ) -> Result<Arc<dyn StorageBackend>> {
         let disk = meta
             .disks
             .get(disk_id)
             .ok_or_else(|| ArgosError::MissingDevice(disk_id.to_string()))?;
-        FileBlockBackend::open_with_ids(
+        let inner: Arc<dyn StorageBackend> = Arc::new(FileBlockBackend::open_with_ids(
             meta.backend,
             vec![(disk_id.to_string(), disk.path.clone())],
             write,
-        )
+        )?);
+        Ok(Arc::new(GuardedBackend::new(inner)))
     }
 
     pub(super) fn account_blocks_locked(

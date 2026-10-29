@@ -16,6 +16,7 @@ pub use crate::inode_ops::{DirEntry, NodeAttr, RenamePolicy};
 use crate::journal;
 use crate::raw_format::{self, RawSuperblock};
 use crate::raw_store;
+use crate::storage::guard::GuardedBackend;
 use crate::types::*;
 use crate::util::{
     append_json_line, atomic_write, clean_path, content_hash_hex, content_hash_matches, ensure_dir,
@@ -548,7 +549,8 @@ impl ArgosFs {
         };
         normalize_metadata_layouts(&mut meta);
         journal::prepare_metadata_integrity_for_external_store(&mut meta)?;
-        let backend: Arc<dyn StorageBackend> = Arc::new(backend_file);
+        let backend: Arc<dyn StorageBackend> =
+            Arc::new(GuardedBackend::new(Arc::new(backend_file)));
         raw_store::initialize_pool(backend.clone(), &superblocks, &mut meta, force)?;
         raw_store::write_superblock_clean_state(&*backend, &superblocks, false)?;
         Self::from_block_parts(paths, backend, true, superblocks, meta)
@@ -621,7 +623,7 @@ impl ArgosFs {
                 return raw_store::audit(&*self.backend, &superblocks);
             }
             let backend = self.metadata_block_backend_locked(&meta, &superblocks, false)?;
-            return raw_store::audit(&backend, &superblocks);
+            return raw_store::audit(&*backend, &superblocks);
         }
         journal::scan(&self.root)
     }
@@ -718,7 +720,7 @@ impl ArgosFs {
                 raw_store::write_metadata_copies_quorum(&*self.backend, &superblocks, &meta)
             } else {
                 let backend = self.metadata_block_backend_locked(&meta, &superblocks, true)?;
-                raw_store::write_metadata_copies_quorum(&backend, &superblocks, &meta)
+                raw_store::write_metadata_copies_quorum(&*backend, &superblocks, &meta)
             };
             let durability = match result {
                 Ok(report) => self.apply_quorum_write_report(&meta, report),
@@ -768,13 +770,18 @@ impl ArgosFs {
                 let report = raw_store::write_metadata_copies_quorum(backend, &superblocks, &meta)?;
                 self.apply_quorum_write_report(&meta, report)?;
             }
-            raw_store::write_superblock_clean_state(backend, &superblocks, true)
+            // Mark clean on a quorum of members.  A card that failed during
+            // the sync must not make unmount hang or abort; its clean flag is
+            // not needed while it is unavailable.
+            let report =
+                raw_store::write_superblock_clean_state_quorum(backend, &superblocks, &meta, true)?;
+            self.apply_quorum_write_report(&meta, report)
         };
         if self.open_backend_covers_superblocks(&superblocks) {
             mark_clean(&*self.backend)
         } else {
             let backend = self.metadata_block_backend_locked(&meta, &superblocks, true)?;
-            mark_clean(&backend)
+            mark_clean(&*backend)
         }
     }
 
@@ -1911,7 +1918,7 @@ impl ArgosFs {
                 commit(&*self.backend)
             } else {
                 let backend = self.metadata_block_backend_locked(meta, &superblocks, true)?;
-                commit(&backend)
+                commit(&*backend)
             }
         })();
 
@@ -2042,7 +2049,7 @@ impl ArgosFs {
                 commit(&*self.backend)
             } else {
                 let backend = self.metadata_block_backend_locked(meta, &superblocks, true)?;
-                commit(&backend)
+                commit(&*backend)
             };
             match result {
                 Ok(report) => {
@@ -2119,7 +2126,7 @@ impl ArgosFs {
             raw_store::recover_metadata(&*self.backend, superblocks)?
         } else {
             let backend = self.metadata_block_backend_locked(meta, superblocks, false)?;
-            raw_store::recover_metadata(&backend, superblocks)?
+            raw_store::recover_metadata(&*backend, superblocks)?
         };
         *meta = recovered;
         recompute_disk_usage_from_metadata(meta);
@@ -2168,7 +2175,7 @@ impl ArgosFs {
                 let backend =
                     self.metadata_block_backend_locked(&journal_meta, &superblocks, true)?;
                 raw_store::append_event_quorum(
-                    &backend,
+                    &*backend,
                     &superblocks,
                     &journal_meta,
                     action,
@@ -2261,7 +2268,7 @@ impl ArgosFs {
         meta: &Metadata,
         superblocks: &[RawSuperblock],
         write: bool,
-    ) -> Result<FileBlockBackend> {
+    ) -> Result<Arc<dyn StorageBackend>> {
         if meta.backend == BackendKind::Host {
             return Err(ArgosError::Unsupported(
                 "host backend has no block device set".to_string(),
@@ -2277,7 +2284,12 @@ impl ArgosFs {
                 Ok((sb.disk_id.clone(), disk.path.clone()))
             })
             .collect::<Result<Vec<_>>>()?;
-        FileBlockBackend::open_with_ids(meta.backend, devices, write)
+        let inner: Arc<dyn StorageBackend> = Arc::new(FileBlockBackend::open_with_ids(
+            meta.backend,
+            devices,
+            write,
+        )?);
+        Ok(Arc::new(GuardedBackend::new(inner)))
     }
 
     fn attr_from_inode(inode: &Inode, chunk_size: usize) -> NodeAttr {
