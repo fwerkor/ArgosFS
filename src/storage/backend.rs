@@ -36,7 +36,9 @@ pub trait StorageBackend: Send + Sync {
     /// is a no-op; block backends override it so a read-after-write check does
     /// not compare against the operating system's page cache.
     fn drop_cache(&self, _device_id: &DeviceId, _offset: u64, _length: u64) -> Result<()> {
-        Ok(())
+        Err(ArgosError::Unsupported(
+            "cache eviction is unavailable".to_string(),
+        ))
     }
     fn capacity(&self, device_id: &DeviceId) -> Result<u64>;
     fn device_status(&self, device_id: &DeviceId) -> Result<DiskStatus>;
@@ -267,11 +269,10 @@ impl StorageBackend for FileBlockBackend {
     fn drop_cache(&self, device_id: &DeviceId, offset: u64, length: u64) -> Result<()> {
         use std::os::unix::io::AsRawFd;
         let device = self.device(device_id)?;
-        // POSIX_FADV_DONTNEED only works on clean pages; the shard write has
-        // been flushed (fsync) before the verifier reads it.  Some kernels or
-        // devices reject the advice, which is harmless: the delayed read still
-        // happens, we just cannot guarantee the page cache was dropped.
-        let _ = unsafe {
+        // DONTNEED only discards clean, full pages; shard payloads may have
+        // a short final block. The verifier explicitly flushes before this.
+        let length = length.saturating_add(4095) & !4095;
+        let status = unsafe {
             libc::posix_fadvise(
                 device.file.as_raw_fd(),
                 offset as libc::off_t,
@@ -279,6 +280,12 @@ impl StorageBackend for FileBlockBackend {
                 libc::POSIX_FADV_DONTNEED,
             )
         };
+        if status != 0 {
+            return Err(ArgosError::Unsupported(format!(
+                "page-cache eviction failed on {device_id}: {}",
+                std::io::Error::from_raw_os_error(status)
+            )));
+        }
         Ok(())
     }
 }

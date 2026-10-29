@@ -918,7 +918,14 @@ impl ArgosFs {
                 start.elapsed().as_secs_f64(),
             );
             if let Some(verify) = &self.verify_written {
-                verify.enqueue(disk_id, extent.offset, data.len(), &sha256, stripe_id);
+                verify.enqueue(
+                    disk_id,
+                    extent.offset,
+                    extent.generation,
+                    data.len(),
+                    &sha256,
+                    stripe_id,
+                );
             }
             return Ok(Shard {
                 slot,
@@ -1343,6 +1350,9 @@ impl ArgosFs {
     pub(super) fn delete_shard_locked(&self, meta: &mut Metadata, shard: &Shard) -> Result<()> {
         match shard.location.as_ref() {
             Some(ShardLocation::RawExtent(extent)) => {
+                if let Some(verify) = &self.verify_written {
+                    verify.invalidate(&extent.disk_id, extent.offset);
+                }
                 if let Some(allocator) = meta.raw_pool.allocators.get_mut(&extent.disk_id) {
                     allocator::free(allocator, extent)?;
                 }
