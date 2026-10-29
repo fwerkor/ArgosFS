@@ -202,6 +202,40 @@ fn metadata_region_scales_with_device_capacity() {
 }
 
 #[test]
+fn previously_formatted_large_devices_keep_their_original_regions() {
+    let capacity = 32 * 1024 * 1024 * 1024u64;
+    let mut original = RawSuperblock::new(
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        "disk".to_string(),
+        0,
+        1,
+        0,
+        4096,
+        capacity,
+        "old-pool".to_string(),
+    )
+    .unwrap();
+    let new_metadata_size = original.metadata.length;
+    let old_metadata_size = LARGE_METADATA_REGION_SIZE;
+    assert!(new_metadata_size > old_metadata_size);
+    let size_difference = new_metadata_size - old_metadata_size;
+
+    // Old superblocks record the 64 MiB region explicitly. Decoding and
+    // validating them must never recompute the newer capacity-based layout.
+    original.metadata.length = old_metadata_size;
+    original.allocator.offset -= size_difference;
+    original.data.offset -= size_difference;
+    original.data.length += size_difference;
+    let decoded = RawSuperblock::decode(&original.encode()).unwrap();
+    decoded.validate_device_capacity(capacity).unwrap();
+    assert_eq!(decoded, original);
+    assert_eq!(decoded.metadata.length, old_metadata_size);
+    assert_eq!(decoded.data.offset, original.data.offset);
+    assert_eq!(decoded.encode(), original.encode());
+}
+
+#[test]
 fn superblock_decode_rejects_header_and_geometry_variants() {
     let original = sample_superblock().encode();
     assert!(RawSuperblock::decode(&original[..SUPERBLOCK_SIZE - 1]).is_err());

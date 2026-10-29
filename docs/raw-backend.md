@@ -33,6 +33,12 @@ is split into two checkpoint slots, so the larger layout reserves between
 32 MiB and 512 MiB for the live inode table.  The metadata is JSON, so a pool
 with a very large number of small files can still exhaust the checkpoint slot;
 when that happens writes fail with `ENOSPC` rather than retrying forever.
+This capacity-based allocation applies only when formatting a **new** pool.
+Existing devices retain the region descriptors stored in their superblocks;
+mounting with a newer binary does not resize or move their metadata, journal,
+or data regions. Existing pools with full checkpoints need an offline backup and
+reformat to gain a larger metadata area. Do not rewrite superblock offsets in
+place on a pool containing data.
 
 The superblock records magic, format version, minimum compatible version,
 endianness marker, pool UUID, device UUID, logical disk id, `k/m`, chunk size,
@@ -95,7 +101,7 @@ compatibility and diagnostic mode.
 
 A failing USB card can leave a `pwrite` or `fsync` blocked for tens of
 seconds per command.  Raw and loop I/O is therefore guarded per device: every
-read, write and flush runs on a worker with a deadline (default **10 000 ms**,
+read, write and flush runs on a device worker with a deadline (default **10 000 ms**,
 override with `ARGOSFS_IO_TIMEOUT_MS`, clamped to 100–120 000 ms).  A device
 that misses the deadline is marked failed for the rest of the mount, later
 operations fail immediately with `DeviceFailed`, and the quorum code records
@@ -103,6 +109,13 @@ the member as unavailable.  The pool keeps running on its remaining members
 when the `k+m` layout still has redundancy; if it does not, writes are fenced
 but reads remain available.  This keeps a sick card from holding the metadata
 lock and freezing FUSE `lookup`/`statfs` while the block layer retries it.
+
+A worker thread is reused per device and pending operations are bounded. A
+request waiting too long to start, or exceeding the queue capacity, fails
+transiently without marking a healthy member failed. A running I/O that times
+out cannot safely be interrupted in the kernel: the member remains fenced,
+but its outstanding write may finish later. Do not reintroduce a timed-out
+member without verifying and recovering it against a valid metadata quorum.
 
 The deadline is a per-operation upper bound, not a throughput target.  A very
 slow but healthy card can be fenced if it cannot finish one read/write/flush
