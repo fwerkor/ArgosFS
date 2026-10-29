@@ -596,9 +596,16 @@ impl ArgosFs {
         let raw_uncommitted_metadata_dirty = meta.backend != BackendKind::Host
             && (meta.integrity.meta_hash.is_empty()
                 || journal::canonical_metadata_hash(&meta)? != meta.integrity.meta_hash);
+        let quarantined_devices = Arc::new(Mutex::new(BTreeSet::new()));
         let verify_written = if meta.backend != BackendKind::Host {
-            VerifyAfterWrite::configured_delay()
-                .map(|delay| VerifyAfterWrite::start(backend.clone(), delay))
+            VerifyAfterWrite::configured_delay().map(|delay| {
+                VerifyAfterWrite::start(
+                    backend.clone(),
+                    delay,
+                    VerifyAfterWrite::configured_retries(),
+                    Some(quarantined_devices.clone()),
+                )
+            })
         } else {
             None
         };
@@ -611,7 +618,7 @@ impl ArgosFs {
                 &meta,
                 raw_uncommitted_metadata_dirty,
             ))),
-            quarantined_devices: Arc::new(Mutex::new(BTreeSet::new())),
+            quarantined_devices,
             write_fence: Arc::new(Mutex::new(None)),
             quota_runtime: Arc::new(RwLock::new(QuotaRuntime::from_metadata(&meta)?)),
             meta: Arc::new(RwLock::new(meta)),

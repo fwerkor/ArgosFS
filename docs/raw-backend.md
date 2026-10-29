@@ -132,7 +132,13 @@ queue.  After the delay the verifier drops the operating-system page cache for
 that range (`POSIX_FADV_DONTNEED`), reads the shard back through the guarded
 backend, and compares its content hash.  The delay is meant to be long enough
 that the microSD card's own write cache is no longer likely to answer the
-read.  A failure is logged as
+read.  A failed check is put back in the queue for another delay instead of
+being reported immediately: USB errors are much more common than lost data.
+`ARGOS_VERIFY_WRITE_RETRIES` (or `ARGOSFS_VERIFY_WRITE_RETRIES`, default 3,
+clamped to 0–10) is the number of retries after the first failure.  Only when
+all retries fail does the verifier count a final failure, log it, and mark the
+member failed for the rest of the mount (the same runtime quarantine the I/O
+guard uses).  A failure is logged as
 
 ```text
 argosfs: read-after-write check failed for disk-0003 stripe s... at offset ...

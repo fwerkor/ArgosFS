@@ -8,13 +8,16 @@
 //!
 //! It is **off by default**.  Set `ARGOSFS_VERIFY_WRITE_AFTER_MS` (for example
 //! `60000` for one minute) before mounting to turn it on.  A failure is logged
-//! to stderr as `argosfs: read-after-write check failed ...`; the filesystem
-//! itself is untouched, so the normal read path can still repair the shard
-//! from parity.
+//! to stderr as `argosfs: read-after-write check failed ...`; a failed check
+//! is retried after another delay (USB errors are more common than lost
+//! data) and only after `ARGOS_VERIFY_WRITE_RETRIES` failures (default 3) is
+//! the device marked failed.  The shard itself is left to the normal read
+//! path, which can repair it from parity.
 
 use crate::backend::StorageBackend;
 use crate::util::content_hash_hex;
-use std::collections::VecDeque;
+use parking_lot::Mutex as DeviceMutex;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -27,6 +30,7 @@ const MAX_DELAY_MS: u64 = 60 * 60 * 1000;
 #[derive(Clone, Debug)]
 struct VerifyOp {
     due: Instant,
+    retries: u32,
     disk_id: String,
     offset: u64,
     length: usize,
@@ -39,7 +43,10 @@ pub struct VerifyAfterWrite {
     work: Condvar,
     stop: AtomicBool,
     delay: Duration,
+    max_retries: u32,
+    quarantined: Option<Arc<DeviceMutex<BTreeSet<String>>>>,
     checks: AtomicU64,
+    retries: AtomicU64,
     failures: AtomicU64,
     handle: Mutex<Option<JoinHandle<()>>>,
 }
@@ -61,13 +68,35 @@ impl VerifyAfterWrite {
         }
     }
 
-    pub fn start(backend: Arc<dyn StorageBackend>, delay: Duration) -> Arc<Self> {
+    /// Number of retries after the first failed check.  `ARGOS_VERIFY_WRITE_RETRIES`
+    /// (or `ARGOSFS_VERIFY_WRITE_RETRIES`) overrides the default of 3; it is
+    /// clamped to 0..10.
+    pub fn configured_retries() -> u32 {
+        for name in ["ARGOS_VERIFY_WRITE_RETRIES", "ARGOSFS_VERIFY_WRITE_RETRIES"] {
+            if let Some(value) = std::env::var(name).ok() {
+                if let Ok(retries) = value.trim().parse::<u32>() {
+                    return retries.min(10);
+                }
+            }
+        }
+        3
+    }
+
+    pub fn start(
+        backend: Arc<dyn StorageBackend>,
+        delay: Duration,
+        max_retries: u32,
+        quarantined: Option<Arc<DeviceMutex<BTreeSet<String>>>>,
+    ) -> Arc<Self> {
         let state = Arc::new(Self {
             queue: Mutex::new(VecDeque::new()),
             work: Condvar::new(),
             stop: AtomicBool::new(false),
             delay,
+            max_retries: max_retries.min(10),
+            quarantined,
             checks: AtomicU64::new(0),
+            retries: AtomicU64::new(0),
             failures: AtomicU64::new(0),
             handle: Mutex::new(None),
         });
@@ -93,6 +122,7 @@ impl VerifyAfterWrite {
         }
         queue.push_back(VerifyOp {
             due: Instant::now() + self.delay,
+            retries: 0,
             disk_id: disk_id.to_string(),
             offset,
             length,
@@ -109,6 +139,10 @@ impl VerifyAfterWrite {
 
     pub fn failures(&self) -> u64 {
         self.failures.load(Ordering::Relaxed)
+    }
+
+    pub fn retries(&self) -> u64 {
+        self.retries.load(Ordering::Relaxed)
     }
 
     fn run(self: Arc<Self>, backend: Arc<dyn StorageBackend>) {
@@ -137,34 +171,61 @@ impl VerifyAfterWrite {
                     queue = guard;
                 }
             };
-            self.verify(&*backend, &op);
+            self.verify(&*backend, op);
         }
     }
 
-    fn verify(&self, backend: &dyn StorageBackend, op: &VerifyOp) {
+    fn verify(&self, backend: &dyn StorageBackend, mut op: VerifyOp) {
         let mut data = vec![0u8; op.length];
         self.checks.fetch_add(1, Ordering::Relaxed);
         // Drop cached pages first so this compares the card, not RAM.
         let _ = backend.drop_cache(&op.disk_id, op.offset, op.length as u64);
-        match backend.read_at(&op.disk_id, op.offset, &mut data) {
+        let problem = match backend.read_at(&op.disk_id, op.offset, &mut data) {
             Ok(()) => {
                 let actual = content_hash_hex(&data);
-                if actual != op.hash {
-                    self.failures.fetch_add(1, Ordering::Relaxed);
-                    eprintln!(
-                        "argosfs: read-after-write check failed for {} stripe {} at offset {} \
-                         (expected {}, read {})",
-                        op.disk_id, op.stripe_id, op.offset, op.hash, actual
-                    );
-                }
+                (actual != op.hash)
+                    .then(|| format!("hash {} does not match expected {}", actual, op.hash))
             }
-            Err(err) => {
-                self.failures.fetch_add(1, Ordering::Relaxed);
-                eprintln!(
-                    "argosfs: read-after-write check could not read {} stripe {} at offset {}: {}",
-                    op.disk_id, op.stripe_id, op.offset, err
-                );
+            Err(err) => Some(format!("read failed: {err}")),
+        };
+        let Some(problem) = problem else {
+            return;
+        };
+        if op.retries < self.max_retries {
+            op.retries += 1;
+            op.due = Instant::now() + self.delay;
+            self.retries.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "argosfs: read-after-write check for {} stripe {} at offset {} failed \
+                 ({}); retry {}/{} after {:?}",
+                op.disk_id,
+                op.stripe_id,
+                op.offset,
+                problem,
+                op.retries,
+                self.max_retries,
+                self.delay
+            );
+            let mut queue = self.queue.lock().expect("verify queue");
+            if queue.len() >= MAX_QUEUE {
+                queue.pop_front();
             }
+            queue.push_back(op);
+            self.work.notify_one();
+            return;
+        }
+        self.failures.fetch_add(1, Ordering::Relaxed);
+        eprintln!(
+            "argosfs: read-after-write check failed for {} stripe {} at offset {} after \
+             {} attempt(s): {}; marking the device failed",
+            op.disk_id,
+            op.stripe_id,
+            op.offset,
+            op.retries + 1,
+            problem
+        );
+        if let Some(quarantined) = &self.quarantined {
+            quarantined.lock().insert(op.disk_id.clone());
         }
     }
 
@@ -216,7 +277,7 @@ mod tests {
             .write_at(&"disk-0000".to_string(), 0, &data)
             .unwrap();
         backend.flush_device(&"disk-0000".to_string()).unwrap();
-        let verifier = VerifyAfterWrite::start(backend.clone(), Duration::from_millis(20));
+        let verifier = VerifyAfterWrite::start(backend.clone(), Duration::from_millis(20), 0, None);
         verifier.enqueue(
             "disk-0000",
             0,
@@ -242,6 +303,45 @@ mod tests {
         wait_for_checks(&verifier, 2);
         assert_eq!(verifier.checks(), 2);
         assert_eq!(verifier.failures(), 1);
+        verifier.stop();
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn retries_a_transient_failure_before_marking_the_device_failed() {
+        let path = temp_file("retry");
+        let backend: Arc<dyn StorageBackend> =
+            Arc::new(FileBlockBackend::open_raw(&[path.clone()], true).unwrap());
+        let data = vec![3u8; 4096];
+        backend
+            .write_at(&"disk-0000".to_string(), 0, &data)
+            .unwrap();
+        backend.flush_device(&"disk-0000".to_string()).unwrap();
+        let quarantined = Arc::new(DeviceMutex::new(BTreeSet::new()));
+        let verifier = VerifyAfterWrite::start(
+            backend.clone(),
+            Duration::from_millis(10),
+            1,
+            Some(quarantined.clone()),
+        );
+        // Corrupt the shard immediately so every check fails.
+        backend
+            .write_at(&"disk-0000".to_string(), 0, &vec![4u8; 4096])
+            .unwrap();
+        backend.flush_device(&"disk-0000".to_string()).unwrap();
+        verifier.enqueue(
+            "disk-0000",
+            0,
+            data.len(),
+            &content_hash_hex(&data),
+            "s-retry",
+        );
+        wait_for_checks(&verifier, 2);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(verifier.checks(), 2);
+        assert_eq!(verifier.retries(), 1);
+        assert_eq!(verifier.failures(), 1);
+        assert!(quarantined.lock().contains("disk-0000"));
         verifier.stop();
         let _ = std::fs::remove_file(path);
     }
