@@ -195,7 +195,9 @@ pub struct ArgosFs {
 
 impl Drop for ArgosFs {
     fn drop(&mut self) {
-        if let Some(verify) = &self.verify_written {
+        // The verifier retains a metadata Arc while it runs. Release that
+        // reference before checking whether this is the final mount owner.
+        if let Some(verify) = self.verify_written.take() {
             verify.stop();
         }
         if !self.backend_writable || Arc::strong_count(&self.meta) != 1 {

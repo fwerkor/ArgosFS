@@ -279,3 +279,16 @@ fn redundant_pool_can_quarantine_one_corrupted_member_without_write_fence() {
     assert!(fs.write_fence.lock().is_none());
     verifier.stop();
 }
+
+#[test]
+fn shutting_down_verifier_does_not_skip_clean_unmount() {
+    let (dir, mut fs, _stripe, _offset, _generation, _data) = fixture();
+    let verifier = start(&fs, 10_000, 0);
+    fs.verify_written = Some(verifier.clone());
+    drop(verifier);
+    drop(fs);
+    let image = dir.path().join("verifier.img");
+    let (sb, _) =
+        crate::raw_store::inspect_device(crate::types::BackendKind::LoopBlock, image).unwrap();
+    assert!(sb.clean);
+}
