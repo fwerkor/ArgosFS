@@ -30,7 +30,7 @@ io-uring = "0.7"
 libc = "0.2"
 lz4_flex = "0.14"
 memmap2 = "0.9.11"
-parking_lot = "0.13"
+parking_lot = "0.12.5"
 rand = "0.10"
 erase = "4.0"
 serde = { version = "1.0", features = ["derive"] }
