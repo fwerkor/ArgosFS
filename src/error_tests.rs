@@ -59,6 +59,13 @@ fn every_error_variant_has_the_expected_errno() {
             },
             libc::EIO,
         ),
+        (
+            ArgosError::DeviceBusy {
+                disk_id: "d".into(),
+                reason: "busy".into(),
+            },
+            libc::EAGAIN,
+        ),
         (ArgosError::DegradedPool("x".into()), libc::EIO),
         (
             ArgosError::QuorumUnavailable {

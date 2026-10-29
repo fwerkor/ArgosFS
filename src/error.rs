@@ -60,6 +60,8 @@ pub enum ArgosError {
     DeviceTimeout { disk_id: String, timeout_ms: u64 },
     #[error("device {disk_id} is unavailable: {reason}")]
     DeviceFailed { disk_id: String, reason: String },
+    #[error("device {disk_id} I/O is busy: {reason}")]
+    DeviceBusy { disk_id: String, reason: String },
     #[error("degraded pool: {0}")]
     DegradedPool(String),
     #[error("{operation} quorum unavailable: need {need}, have {have}")]
@@ -123,6 +125,7 @@ impl ArgosError {
             ArgosError::IncompatibleFormat(_) => libc::EINVAL,
             ArgosError::MissingDevice(_) => libc::ENODEV,
             ArgosError::DeviceTimeout { .. } | ArgosError::DeviceFailed { .. } => libc::EIO,
+            ArgosError::DeviceBusy { .. } => libc::EAGAIN,
             ArgosError::DegradedPool(_) => libc::EIO,
             ArgosError::QuorumUnavailable { .. } => libc::EROFS,
             ArgosError::RetryableQuorumUnavailable { .. } => libc::EAGAIN,

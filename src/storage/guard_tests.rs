@@ -1,6 +1,7 @@
 use super::*;
 use std::io;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 #[derive(Clone)]
@@ -10,6 +11,7 @@ struct MemoryBackend {
     write_delay: Duration,
     flush_delay: Duration,
     write_error: Option<i32>,
+    write_attempts: Arc<AtomicUsize>,
 }
 
 impl MemoryBackend {
@@ -20,6 +22,7 @@ impl MemoryBackend {
             write_delay: Duration::ZERO,
             flush_delay: Duration::ZERO,
             write_error: None,
+            write_attempts: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -66,6 +69,7 @@ impl StorageBackend for MemoryBackend {
     }
 
     fn write_at(&self, device_id: &String, offset: u64, data: &[u8]) -> Result<()> {
+        self.write_attempts.fetch_add(1, Ordering::SeqCst);
         if device_id != "disk-0000" {
             return Err(ArgosError::MissingDevice(device_id.clone()));
         }
@@ -220,4 +224,52 @@ fn missing_device_is_passed_through_without_fencing() {
         assert!(matches!(error, ArgosError::MissingDevice(_)), "{error}");
         assert!(backend.failure(&missing).is_none());
     }
+}
+
+#[test]
+fn one_worker_is_reused_for_repeated_device_io() {
+    let backend =
+        GuardedBackend::with_timeout(Arc::new(MemoryBackend::new(4096)), Duration::from_secs(1));
+    for index in 0..100u8 {
+        backend.write_at(&id(), 0, &[index]).unwrap();
+    }
+    backend.flush_device(&id()).unwrap();
+    assert_eq!(backend.worker_seq.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn queued_write_does_not_run_after_first_write_times_out() {
+    let mut memory = MemoryBackend::new(4096);
+    memory.write_delay = Duration::from_millis(250);
+    let attempts = memory.write_attempts.clone();
+    let backend = Arc::new(GuardedBackend::with_timeout(
+        Arc::new(memory),
+        Duration::from_millis(70),
+    ));
+    let first = backend.clone();
+    let first_write = std::thread::spawn(move || first.write_at(&id(), 0, b"first"));
+
+    let start = Instant::now();
+    while attempts.load(Ordering::SeqCst) == 0 {
+        assert!(start.elapsed() < Duration::from_secs(2));
+        std::thread::yield_now();
+    }
+    let second_error = backend.write_at(&id(), 0, b"second").unwrap_err();
+    assert!(matches!(
+        second_error,
+        ArgosError::DeviceFailed { .. } | ArgosError::DeviceBusy { .. }
+    ));
+    assert!(matches!(
+        first_write.join().unwrap().unwrap_err(),
+        ArgosError::DeviceTimeout { .. }
+    ));
+
+    // The blocked kernel write may still complete. No subsequent write is
+    // permitted to run on the fenced member, including already queued jobs.
+    std::thread::sleep(Duration::from_millis(270));
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        backend.write_at(&id(), 0, b"third"),
+        Err(ArgosError::DeviceFailed { .. })
+    ));
 }
