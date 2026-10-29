@@ -497,9 +497,10 @@ fn guarded_quorum_commit_continues_when_one_member_stalls() {
         Arc::new(SlowFlushBackend {
             inner: block_backend_for(&images),
             slow_device: "disk-0002".to_string(),
-            delay: Duration::from_millis(500),
+            delay: Duration::from_secs(10),
         }),
-        Duration::from_millis(50),
+        // Instrumented coverage runs can exceed 50 ms on healthy members.
+        Duration::from_secs(2),
     );
 
     let started = Instant::now();
@@ -512,7 +513,7 @@ fn guarded_quorum_commit_continues_when_one_member_stalls() {
         serde_json::json!({}),
     )
     .unwrap();
-    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(started.elapsed() < Duration::from_secs(8));
     assert!(report.failed_devices.contains_key("disk-0002"));
     assert_eq!(report.failed_devices.len(), 1);
     drop(backend);
