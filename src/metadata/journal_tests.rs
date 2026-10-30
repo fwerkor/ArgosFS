@@ -606,3 +606,103 @@ fn metadata_snapshot_with_fractional_scores_survives_journal_scan() {
     assert_eq!(report.valid_entries, 1, "{:?}", report.errors);
     assert_eq!(report.invalid_entries, 0);
 }
+
+#[test]
+fn journal_scan_accepts_non_idempotent_json_float() {
+    let (_volume_dir, fs) = volume();
+    let mut metadata = fs.metadata_snapshot();
+    metadata.created_at = -7.138720035721163e-76;
+    for inode in metadata.inodes.values_mut() {
+        inode.workload_score = -7.138720035721163e-76;
+    }
+    prepare_metadata_integrity_for_external_store(&mut metadata).unwrap();
+    let record = build_record(
+        &metadata,
+        BuildRecordOptions {
+            record_type: JournalRecordKind::Checkpoint,
+            action: "float-scan".into(),
+            details: json!({}),
+            previous_record_hash: String::new(),
+            time: -7.138720035721163e-76,
+            metadata: Some(metadata.clone()),
+            metadata_delta: None,
+        },
+    )
+    .unwrap();
+    assert!(!record.record_hash.is_empty());
+    let dir = tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".argosfs")).unwrap();
+    append_record(dir.path(), &record).unwrap();
+    let report = scan(dir.path()).unwrap();
+    assert_eq!(report.valid_entries, 1, "{:?}", report.errors);
+    assert_eq!(report.invalid_entries, 0);
+    let original = fs::read(journal_path(dir.path())).unwrap();
+    compact_journal_unlocked(dir.path()).unwrap();
+    assert_eq!(fs::read(journal_path(dir.path())).unwrap(), original);
+    let compacted = scan(dir.path()).unwrap();
+    assert_eq!(compacted.valid_entries, 1, "{:?}", compacted.errors);
+    assert_eq!(compacted.invalid_entries, 0);
+}
+
+#[test]
+fn metadata_copies_accept_non_idempotent_json_float() {
+    let (_volume_dir, fs) = volume();
+    let mut metadata = fs.metadata_snapshot();
+    metadata.created_at = -7.138720035721163e-76;
+    prepare_metadata_integrity_for_external_store(&mut metadata).unwrap();
+    let dir = tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".argosfs")).unwrap();
+    write_metadata_copies(dir.path(), &metadata).unwrap();
+    for (source, path) in metadata_paths(dir.path()) {
+        let candidate = read_candidate(source, path);
+        assert!(candidate.report.valid, "{:?}", candidate.report.error);
+    }
+}
+
+#[test]
+fn recovery_replays_delta_with_non_idempotent_json_float() {
+    let (_volume_dir, fs) = volume();
+    let mut base = fs.metadata_snapshot();
+    base.created_at = -7.138720035721163e-76;
+    prepare_metadata_integrity_for_external_store(&mut base).unwrap();
+    let mut next = base.clone();
+    next.txid += 1;
+    next.config.fsname = "after-delta".into();
+    prepare_metadata_integrity_with_previous(&mut next, base.integrity.meta_hash.clone()).unwrap();
+    let checkpoint = build_record(
+        &base,
+        BuildRecordOptions {
+            record_type: JournalRecordKind::Checkpoint,
+            action: "checkpoint".into(),
+            details: json!({}),
+            previous_record_hash: String::new(),
+            time: 0.0,
+            metadata: Some(base.clone()),
+            metadata_delta: None,
+        },
+    )
+    .unwrap();
+    let transaction = build_record(
+        &next,
+        BuildRecordOptions {
+            record_type: JournalRecordKind::Transaction,
+            action: "delta".into(),
+            details: json!({}),
+            previous_record_hash: checkpoint.record_hash.clone(),
+            time: 0.0,
+            metadata: None,
+            metadata_delta: Some(metadata_delta(&base, &next).unwrap()),
+        },
+    )
+    .unwrap();
+    let dir = tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".argosfs")).unwrap();
+    append_record(dir.path(), &checkpoint).unwrap();
+    append_record(dir.path(), &transaction).unwrap();
+    assert_eq!(scan(dir.path()).unwrap().valid_entries, 2);
+    let recovered = report_latest_recoverable_metadata(dir.path())
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.txid, next.txid);
+    assert_eq!(recovered.config.fsname, "after-delta");
+}
