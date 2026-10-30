@@ -274,7 +274,11 @@ impl StorageBackend for GuardedBackend {
     }
 
     fn drop_cache(&self, device_id: &String, offset: u64, length: u64) -> Result<()> {
-        self.inner.drop_cache(device_id, offset, length)
+        let inner = self.inner.clone();
+        let id = device_id.clone();
+        self.run(device_id, "drop cache", move || {
+            inner.drop_cache(&id, offset, length)
+        })
     }
 
     fn flush_all(&self) -> Result<()> {

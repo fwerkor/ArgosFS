@@ -10,6 +10,8 @@ struct MemoryBackend {
     read_delay: Duration,
     write_delay: Duration,
     flush_delay: Duration,
+    cache_delay: Duration,
+    cache_unsupported: bool,
     write_error: Option<i32>,
     write_attempts: Arc<AtomicUsize>,
 }
@@ -21,6 +23,8 @@ impl MemoryBackend {
             read_delay: Duration::ZERO,
             write_delay: Duration::ZERO,
             flush_delay: Duration::ZERO,
+            cache_delay: Duration::ZERO,
+            cache_unsupported: false,
             write_error: None,
             write_attempts: Arc::new(AtomicUsize::new(0)),
         }
@@ -111,6 +115,19 @@ impl StorageBackend for MemoryBackend {
         self.flush_device(&"disk-0000".to_string())
     }
 
+    fn drop_cache(&self, device_id: &String, _offset: u64, _length: u64) -> Result<()> {
+        if device_id != "disk-0000" {
+            return Err(ArgosError::MissingDevice(device_id.clone()));
+        }
+        if !self.cache_delay.is_zero() {
+            std::thread::sleep(self.cache_delay);
+        }
+        if self.cache_unsupported {
+            return Err(ArgosError::Unsupported("cache eviction unavailable".into()));
+        }
+        Ok(())
+    }
+
     fn capacity(&self, device_id: &String) -> Result<u64> {
         self.device()?;
         if device_id != "disk-0000" {
@@ -147,6 +164,7 @@ fn fast_operations_pass_through() {
     let disk = id();
     backend.write_at(&disk, 0, b"hello").unwrap();
     backend.flush_device(&disk).unwrap();
+    backend.drop_cache(&disk, 0, 4096).unwrap();
     backend.flush_all().unwrap();
     let mut data = [0u8; 5];
     backend.read_at(&disk, 0, &mut data).unwrap();
@@ -272,4 +290,33 @@ fn queued_write_does_not_run_after_first_write_times_out() {
         backend.write_at(&id(), 0, b"third"),
         Err(ArgosError::DeviceFailed { .. })
     ));
+}
+
+#[test]
+fn slow_cache_eviction_is_fenced_after_deadline() {
+    let mut memory = MemoryBackend::new(4096);
+    memory.cache_delay = Duration::from_millis(500);
+    let backend = GuardedBackend::with_timeout(Arc::new(memory), Duration::from_millis(50));
+    let disk = id();
+    let started = Instant::now();
+    let err = backend.drop_cache(&disk, 0, 4096).unwrap_err();
+    assert!(matches!(err, ArgosError::DeviceTimeout { .. }), "{err}");
+    assert!(started.elapsed() < Duration::from_millis(300));
+    assert_eq!(backend.device_status(&disk).unwrap(), DiskStatus::Failed);
+    let started = Instant::now();
+    let err = backend.drop_cache(&disk, 0, 4096).unwrap_err();
+    assert!(matches!(err, ArgosError::DeviceFailed { .. }), "{err}");
+    assert!(started.elapsed() < Duration::from_millis(50));
+}
+
+#[test]
+fn unsupported_cache_eviction_does_not_quarantine_member() {
+    let mut memory = MemoryBackend::new(4096);
+    memory.cache_unsupported = true;
+    let backend = GuardedBackend::with_timeout(Arc::new(memory), Duration::from_secs(1));
+    let disk = id();
+    let err = backend.drop_cache(&disk, 0, 4096).unwrap_err();
+    assert!(matches!(err, ArgosError::Unsupported(_)), "{err}");
+    assert!(backend.failure(&disk).is_none());
+    backend.flush_device(&disk).unwrap();
 }
