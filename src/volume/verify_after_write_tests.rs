@@ -292,3 +292,37 @@ fn shutting_down_verifier_does_not_skip_clean_unmount() {
         crate::raw_store::inspect_device(crate::types::BackendKind::LoopBlock, image).unwrap();
     assert!(sb.clean);
 }
+
+#[test]
+fn dropping_clone_does_not_disable_verification() {
+    let (_dir, mut fs, _stripe, _offset, _generation, _data) = fixture();
+    let verifier = start(&fs, 30, 0);
+    fs.verify_written = Some(verifier.clone());
+    let clone = fs.clone();
+    drop(clone);
+    assert!(!verifier.stop.load(Ordering::SeqCst));
+
+    fs.write_file("/data", &vec![8u8; 4096], 0o600).unwrap();
+    wait_for(&verifier, 1);
+    assert_eq!(verifier.failures(), 0);
+    assert!(!verifier.stop.load(Ordering::SeqCst));
+    drop(fs);
+    assert!(verifier.stop.load(Ordering::SeqCst));
+}
+
+#[test]
+fn final_clone_stops_verifier_and_marks_clean() {
+    let (dir, mut fs, _stripe, _offset, _generation, _data) = fixture();
+    let verifier = start(&fs, 10_000, 0);
+    fs.verify_written = Some(verifier.clone());
+    let clone = fs.clone();
+    drop(fs);
+    assert!(!verifier.stop.load(Ordering::SeqCst));
+    clone.write_file("/data", &vec![8u8; 4096], 0o600).unwrap();
+    drop(clone);
+    assert!(verifier.stop.load(Ordering::SeqCst));
+    let image = dir.path().join("verifier.img");
+    let (sb, _) =
+        crate::raw_store::inspect_device(crate::types::BackendKind::LoopBlock, image).unwrap();
+    assert!(sb.clean);
+}

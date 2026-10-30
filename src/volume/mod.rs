@@ -34,6 +34,7 @@ use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -176,7 +177,6 @@ impl QuotaRuntime {
     }
 }
 
-#[derive(Clone)]
 pub struct ArgosFs {
     root: Arc<PathBuf>,
     backend: Arc<dyn StorageBackend>,
@@ -191,16 +191,43 @@ pub struct ArgosFs {
     inode_locks: Arc<Mutex<BTreeMap<InodeId, Arc<Mutex<()>>>>>,
     cache: Arc<BlockCache>,
     verify_written: Option<Arc<VerifyAfterWrite>>,
+    mount_owners: Arc<AtomicUsize>,
+}
+
+impl Clone for ArgosFs {
+    fn clone(&self) -> Self {
+        self.mount_owners.fetch_add(1, Ordering::Relaxed);
+        Self {
+            root: self.root.clone(),
+            backend: self.backend.clone(),
+            backend_writable: self.backend_writable,
+            raw_superblocks: self.raw_superblocks.clone(),
+            meta: self.meta.clone(),
+            quota_runtime: self.quota_runtime.clone(),
+            deferred_commit: self.deferred_commit.clone(),
+            quarantined_devices: self.quarantined_devices.clone(),
+            write_fence: self.write_fence.clone(),
+            dirty_host_shards: self.dirty_host_shards.clone(),
+            inode_locks: self.inode_locks.clone(),
+            cache: self.cache.clone(),
+            verify_written: self.verify_written.clone(),
+            mount_owners: self.mount_owners.clone(),
+        }
+    }
 }
 
 impl Drop for ArgosFs {
     fn drop(&mut self) {
-        // The verifier retains a metadata Arc while it runs. Release that
-        // reference before checking whether this is the final mount owner.
+        // A clone can outlive another mount handle (for example a metrics
+        // request). Only the final handle may stop the shared verifier.
+        if self.mount_owners.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
+        // The worker owns a metadata Arc, so stop it before clean-unmount.
         if let Some(verify) = self.verify_written.take() {
             verify.stop();
         }
-        if !self.backend_writable || Arc::strong_count(&self.meta) != 1 {
+        if !self.backend_writable {
             return;
         }
         if self.meta.read().backend != BackendKind::Host {
@@ -411,6 +438,7 @@ impl ArgosFs {
             inode_locks: Arc::new(Mutex::new(BTreeMap::new())),
             cache: Arc::new(cache),
             verify_written: None,
+            mount_owners: Arc::new(AtomicUsize::new(1)),
         })
     }
 
@@ -634,6 +662,7 @@ impl ArgosFs {
             inode_locks: Arc::new(Mutex::new(BTreeMap::new())),
             cache: Arc::new(cache),
             verify_written,
+            mount_owners: Arc::new(AtomicUsize::new(1)),
         })
     }
 
