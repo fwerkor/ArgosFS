@@ -547,3 +547,62 @@ fn valid_chain_filter_skips_blank_malformed_legacy_bad_hash_and_bad_links() {
     assert_eq!(records[0].action, "first");
     assert_eq!(records[1].action, "second");
 }
+
+#[test]
+fn legacy_journal_hash_with_rounded_float_remains_valid() {
+    let dir = tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".argosfs")).unwrap();
+    let record = JournalRecord {
+        version: 1,
+        record_type: JournalRecordKind::Event,
+        time: 1.6666666666666665,
+        volume_uuid: "fuzz-stable".into(),
+        txid: 1,
+        generation: 1,
+        action: "write".into(),
+        details: json!({"note": "test"}),
+        previous_record_hash: String::new(),
+        previous_meta_hash: String::new(),
+        meta_hash: String::new(),
+        metadata: None,
+        metadata_delta: None,
+        record_hash: "e3ef0e4461be8c8de869141cb817e93171a55189396543b3c9eb7a28c9144353".into(),
+    };
+    assert_eq!(record_hash(&record).unwrap(), record.record_hash);
+    append_record(dir.path(), &record).unwrap();
+    let report = scan(dir.path()).unwrap();
+    assert_eq!(report.valid_entries, 1);
+    assert_eq!(report.invalid_entries, 0, "{:?}", report.errors);
+}
+
+#[test]
+fn metadata_snapshot_with_fractional_scores_survives_journal_scan() {
+    let (_volume_dir, fs) = volume();
+    let mut metadata = fs.metadata_snapshot();
+    metadata.created_at = 1.6666666666666665;
+    metadata.updated_at = 1.8888888888888886e93;
+    for inode in metadata.inodes.values_mut() {
+        inode.workload_score = 109.0 / 255.0;
+        inode.last_accessed_at = metadata.created_at;
+    }
+    prepare_metadata_integrity_for_external_store(&mut metadata).unwrap();
+    let record = build_record(
+        &metadata,
+        BuildRecordOptions {
+            record_type: JournalRecordKind::Checkpoint,
+            action: "fractional-metadata".into(),
+            details: json!({"score": 109.0 / 255.0}),
+            previous_record_hash: String::new(),
+            time: 1.6666666666666665,
+            metadata: Some(metadata.clone()),
+            metadata_delta: None,
+        },
+    )
+    .unwrap();
+    let dir = tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".argosfs")).unwrap();
+    append_record(dir.path(), &record).unwrap();
+    let report = scan(dir.path()).unwrap();
+    assert_eq!(report.valid_entries, 1, "{:?}", report.errors);
+    assert_eq!(report.invalid_entries, 0);
+}
