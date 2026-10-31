@@ -264,6 +264,14 @@ pub fn open_pool(kind: BackendKind, paths: &[PathBuf], write: bool) -> Result<Ra
     for (disk_id, disk) in &mut metadata.disks {
         if let Some(path) = present_paths.get(disk_id) {
             disk.path = path.clone();
+            // Raw pools have no administrative mark-offline command: Offline
+            // is set here when a member is missing from an open.  If that
+            // member is back (for example after its USB reader was
+            // power-cycled), it must be online again or every later open
+            // counts it missing forever.
+            if disk.status == DiskStatus::Offline {
+                disk.status = DiskStatus::Online;
+            }
         } else if !present.contains(disk_id)
             && !matches!(disk.status, DiskStatus::Removed | DiskStatus::Failed)
         {

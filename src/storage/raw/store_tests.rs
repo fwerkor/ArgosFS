@@ -649,6 +649,40 @@ fn open_still_reports_an_unclean_pool_below_clean_quorum() {
 }
 
 #[test]
+fn a_member_that_returns_is_online_again() {
+    let (_dir, images, metadata, superblocks) = quorum_fixture();
+    let mut offline = metadata.clone();
+    offline.disks.get_mut("disk-0002").unwrap().status = DiskStatus::Offline;
+    offline.txid += 1;
+    offline.updated_at = crate::util::now_f64();
+    journal::prepare_metadata_integrity_with_previous(
+        &mut offline,
+        metadata.integrity.meta_hash.clone(),
+    )
+    .unwrap();
+    let backend = block_backend_for(&images);
+    append_transaction_with_previous(
+        &backend,
+        &superblocks,
+        &offline,
+        Some(&metadata),
+        "member-offline",
+        serde_json::json!({}),
+    )
+    .unwrap();
+    drop(backend);
+
+    // The device did not stay missing: a power-cycled reader brought it back.
+    // Offline is only ever set automatically for a raw member that was absent,
+    // so a present member must not stay offline for the rest of the pool's life.
+    let opened = open_pool(BackendKind::LoopBlock, &images, false).unwrap();
+    assert_eq!(
+        opened.metadata.disks.get("disk-0002").unwrap().status,
+        DiskStatus::Online
+    );
+}
+
+#[test]
 fn journal_flush_shortfall_is_indeterminate_after_quorum_exposure() {
     let (_dir, images, previous, superblocks) = quorum_fixture();
     let next = next_metadata(&previous, "indeterminate-flush");
