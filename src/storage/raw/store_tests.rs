@@ -118,6 +118,54 @@ impl StorageBackend for SlowFlushBackend {
     }
 }
 
+struct FlakyReadBackend {
+    inner: FileBlockBackend,
+    failures_left: std::sync::atomic::AtomicUsize,
+}
+
+impl StorageBackend for FlakyReadBackend {
+    fn backend_kind(&self) -> BackendKind {
+        self.inner.backend_kind()
+    }
+
+    fn list_devices(&self) -> Result<Vec<crate::backend::BackendDeviceInfo>> {
+        self.inner.list_devices()
+    }
+
+    fn read_at(&self, device_id: &String, offset: u64, buf: &mut [u8]) -> Result<()> {
+        if self.failures_left.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            self.failures_left
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(ArgosError::Io(std::io::Error::from_raw_os_error(libc::EIO)));
+        }
+        self.inner.read_at(device_id, offset, buf)
+    }
+
+    fn write_at(&self, device_id: &String, offset: u64, data: &[u8]) -> Result<()> {
+        self.inner.write_at(device_id, offset, data)
+    }
+
+    fn flush_device(&self, device_id: &String) -> Result<()> {
+        self.inner.flush_device(device_id)
+    }
+
+    fn flush_all(&self) -> Result<()> {
+        self.inner.flush_all()
+    }
+
+    fn capacity(&self, device_id: &String) -> Result<u64> {
+        self.inner.capacity(device_id)
+    }
+
+    fn device_status(&self, device_id: &String) -> Result<DiskStatus> {
+        self.inner.device_status(device_id)
+    }
+
+    fn capabilities(&self) -> crate::backend::BackendCapabilities {
+        self.inner.capabilities()
+    }
+}
+
 struct WriteFailBackend {
     inner: FileBlockBackend,
     failed: BTreeSet<String>,
@@ -680,6 +728,24 @@ fn a_member_that_returns_is_online_again() {
         opened.metadata.disks.get("disk-0002").unwrap().status,
         DiskStatus::Online
     );
+}
+
+#[test]
+fn superblock_read_retries_a_transient_io_error() {
+    let dir = tempdir().unwrap();
+    let (image, fs) = create_loop_pool(dir.path(), "flaky-scan");
+    fs.mark_clean_unmount().unwrap();
+    drop(fs);
+    let backend = FlakyReadBackend {
+        inner: FileBlockBackend::open_loop(std::slice::from_ref(&image), false).unwrap(),
+        // Fail the primary read and the backup fallback, so this needs the
+        // retry rather than succeeding from the backup on the first attempt.
+        failures_left: std::sync::atomic::AtomicUsize::new(2),
+    };
+    let (superblock, source) =
+        read_superblock_with_backup(&backend, "disk-0000", MIN_DEVICE_BYTES).unwrap();
+    assert_eq!(source, "primary");
+    assert_eq!(superblock.disk_id, "disk-0000");
 }
 
 #[test]

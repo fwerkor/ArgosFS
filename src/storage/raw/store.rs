@@ -29,6 +29,11 @@ const METADATA_PAGE_SIZE: usize = 4096;
 const METADATA_INDEX_ENTRY_SIZE: usize = 48;
 const HASH_HEX_LEN: usize = 64;
 const HASH_BYTES_LEN: usize = 32;
+// A USB card can answer a scan with a transient I/O error or a short/zero
+// read while it wakes up.  Retry before deciding that the member is gone:
+// a false "missing" marks the member Offline in the pool metadata.
+const RAW_SCAN_ATTEMPTS: usize = 3;
+const RAW_SCAN_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
 #[derive(Clone)]
 pub struct RawOpen {
@@ -2130,6 +2135,21 @@ pub fn inspect_device(kind: BackendKind, path: PathBuf) -> Result<(RawSuperblock
 }
 
 fn scan_one_path(kind: BackendKind, path: &PathBuf) -> ScannedDevice {
+    let mut last = None;
+    for attempt in 0..RAW_SCAN_ATTEMPTS {
+        let scanned = scan_one_path_once(kind, path);
+        if scanned.valid {
+            return scanned;
+        }
+        last = Some(scanned);
+        if attempt + 1 < RAW_SCAN_ATTEMPTS {
+            std::thread::sleep(RAW_SCAN_RETRY_DELAY);
+        }
+    }
+    last.expect("scan makes at least one attempt")
+}
+
+fn scan_one_path_once(kind: BackendKind, path: &PathBuf) -> ScannedDevice {
     let backend = guarded_single_device(kind, path, false, "scan is for loop/raw block backends");
     let Ok(backend) = backend else {
         return ScannedDevice {
@@ -2216,6 +2236,24 @@ fn superblock_from_path(
 }
 
 fn read_superblock_with_backup(
+    backend: &dyn StorageBackend,
+    device_id: &str,
+    capacity: u64,
+) -> Result<(RawSuperblock, &'static str)> {
+    let mut last = None;
+    for attempt in 0..RAW_SCAN_ATTEMPTS {
+        match read_superblock_with_backup_once(backend, device_id, capacity) {
+            Ok(found) => return Ok(found),
+            Err(err) => last = Some(err),
+        }
+        if attempt + 1 < RAW_SCAN_ATTEMPTS {
+            std::thread::sleep(RAW_SCAN_RETRY_DELAY);
+        }
+    }
+    Err(last.expect("superblock read makes at least one attempt"))
+}
+
+fn read_superblock_with_backup_once(
     backend: &dyn StorageBackend,
     device_id: &str,
     capacity: u64,
