@@ -123,6 +123,75 @@ inside the deadline; raise `ARGOSFS_IO_TIMEOUT_MS` for such hardware.  The
 default is deliberately much shorter than the Linux SCSI timeout so a failed
 member is isolated quickly, and much longer than a normal SD-card operation.
 
+## Read-after-write verification
+
+**Disabled by default**; enable on writable raw/loop mounts with
+`ARGOSFS_VERIFY_WRITE_AFTER_MS` (10 ms–1 h; e.g. `60000`). The verifier records
+each shard's physical extent and generation and schedules a delayed read. A
+background worker flushes the member (also for deferred/bulk writes), requests
+`POSIX_FADV_DONTNEED` for the aligned range, and checks its checksum. This
+extra `fsync` can reduce throughput when the option is enabled. Cache eviction
+is advisory, and removable media can still answer reads from internal cache:
+a successful check is **not** a guarantee of power-loss durability.
+
+Failed reads or mismatched checksums are retried after another delay. Set
+`ARGOS_VERIFY_WRITE_RETRIES` (or `ARGOSFS_VERIFY_WRITE_RETRIES`, default 3,
+range 0–10) for additional attempts. Before a failed member is quarantined,
+ArgosFS checks that the original extent is still referenced by current
+metadata. Deleting or rewriting a shard invalidates old checks so recycled
+space cannot cause a false alarm. Once confirmed, a member is quarantined and
+remaining data durability is validated; writes are fenced when required shards
+would become unavailable. Scrub remains the recovery and repair path.
+
+The queue holds up to 8192 pending verifications and drops oldest entries
+under pressure. Unfinished entries are also discarded at unmount rather than
+blocking indefinitely for their configured delay. `verify_written_skipped()`
+reports such unverified work; `verify_written_failures()` counts confirmed
+final failures. Unsupported cache eviction counts as skipped, not a device
+failure. All counters are runtime-only; the process log reports confirmed
+failures. Long-running soak tests should monitor skipped counts and run scrub
+periodically, particularly after unmount or heavy write bursts.
+
+## USB mode and shard-read retries
+
+A USB card or its bridge can occasionally return a corrupt block once and the
+correct data on the next read.  ArgosFS can retry a shard whose length or
+checksum does not match before treating it as damaged:
+
+- `ARGOSFS_READ_RETRIES` (0–10, default 0) is the number of extra reads.
+  A final mismatch is still reported as a checksum error, so scrub can repair
+  it.  I/O errors are not retried here; the guarded backend has already
+  fenced that device.
+- The retry applies to full-shard reads, which is what scrub and normal
+  whole-block reads use.  It does not hide persistent corruption.
+- Scrub's report (JSON and the human summary) includes
+  `shard_read_retries` (extra reads after a mismatch) and
+  `shard_read_recovered` (shards that read correctly on a retry).  A
+  non-zero `shard_read_retries` with `shard_read_recovered` equal to it means
+  every retry was a transient USB/controller error rather than bad media.
+
+`ARGOSFS_USB=1` is a convenience profile for USB card jukeboxes.  It changes
+the defaults of several options at once (an explicitly set option always
+wins):
+
+| option | normal default | `ARGOSFS_USB=1` |
+|--------|----------------|-----------------|
+| `ARGOSFS_IO_TIMEOUT_MS` | 10 000 | 120 000 |
+| `ARGOSFS_READ_RETRIES` | 0 | 1 |
+| `ARGOSFS_VERIFY_WRITE_AFTER_MS` | 0 (off) | 60 000 |
+| `ARGOS_VERIFY_WRITE_RETRIES` | 3 | 3 |
+
+For example, to mount a raw pool with all USB-friendly defaults:
+
+```sh
+ARGOSFS_USB=1 argosfs mount-root --devices /dev/... --target /mnt --mode rw
+```
+
+The read-after-write verifier costs an extra flush per checked shard, so USB
+mode is not a free speed-up; it trades some throughput for more tolerance of
+transient card/controller errors.  Scrub still performs the full check and
+repair.
+
 ## Data Extents
 
 Host shards use `ShardLocation::HostPath`. Loop/raw shards use

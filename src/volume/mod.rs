@@ -18,9 +18,13 @@ use crate::raw_format::{self, RawSuperblock};
 use crate::raw_store;
 use crate::storage::guard::GuardedBackend;
 use crate::types::*;
+use verify_after_write::VerifyAfterWrite;
+
+mod verify_after_write;
 use crate::util::{
-    append_json_line, atomic_write, clean_path, content_hash_hex, content_hash_matches, ensure_dir,
-    ensure_private_dir, now_f64, parent_name, relative_or_absolute, split_path, stable_u01,
+    append_json_line, atomic_write, clean_path, configured_read_retries, content_hash_hex,
+    content_hash_matches, ensure_dir, ensure_private_dir, now_f64, parent_name,
+    relative_or_absolute, retry_verified, split_path, stable_u01,
 };
 use parking_lot::{Mutex, RwLock};
 use serde_json::json;
@@ -31,6 +35,7 @@ use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -173,7 +178,6 @@ impl QuotaRuntime {
     }
 }
 
-#[derive(Clone)]
 pub struct ArgosFs {
     root: Arc<PathBuf>,
     backend: Arc<dyn StorageBackend>,
@@ -187,11 +191,50 @@ pub struct ArgosFs {
     dirty_host_shards: Arc<Mutex<BTreeSet<PathBuf>>>,
     inode_locks: Arc<Mutex<BTreeMap<InodeId, Arc<Mutex<()>>>>>,
     cache: Arc<BlockCache>,
+    verify_written: Option<Arc<VerifyAfterWrite>>,
+    read_retries: usize,
+    read_retries_seen: Arc<AtomicU64>,
+    read_recovered: Arc<AtomicU64>,
+    mount_owners: Arc<AtomicUsize>,
+}
+
+impl Clone for ArgosFs {
+    fn clone(&self) -> Self {
+        self.mount_owners.fetch_add(1, Ordering::Relaxed);
+        Self {
+            root: self.root.clone(),
+            backend: self.backend.clone(),
+            backend_writable: self.backend_writable,
+            raw_superblocks: self.raw_superblocks.clone(),
+            meta: self.meta.clone(),
+            quota_runtime: self.quota_runtime.clone(),
+            deferred_commit: self.deferred_commit.clone(),
+            quarantined_devices: self.quarantined_devices.clone(),
+            write_fence: self.write_fence.clone(),
+            dirty_host_shards: self.dirty_host_shards.clone(),
+            inode_locks: self.inode_locks.clone(),
+            cache: self.cache.clone(),
+            verify_written: self.verify_written.clone(),
+            read_retries: self.read_retries,
+            read_retries_seen: self.read_retries_seen.clone(),
+            read_recovered: self.read_recovered.clone(),
+            mount_owners: self.mount_owners.clone(),
+        }
+    }
 }
 
 impl Drop for ArgosFs {
     fn drop(&mut self) {
-        if !self.backend_writable || Arc::strong_count(&self.meta) != 1 {
+        // A clone can outlive another mount handle (for example a metrics
+        // request). Only the final handle may stop the shared verifier.
+        if self.mount_owners.fetch_sub(1, Ordering::AcqRel) != 1 {
+            return;
+        }
+        // The worker owns a metadata Arc, so stop it before clean-unmount.
+        if let Some(verify) = self.verify_written.take() {
+            verify.stop();
+        }
+        if !self.backend_writable {
             return;
         }
         if self.meta.read().backend != BackendKind::Host {
@@ -401,6 +444,11 @@ impl ArgosFs {
             dirty_host_shards: Arc::new(Mutex::new(BTreeSet::new())),
             inode_locks: Arc::new(Mutex::new(BTreeMap::new())),
             cache: Arc::new(cache),
+            verify_written: None,
+            read_retries: configured_read_retries(),
+            read_retries_seen: Arc::new(AtomicU64::new(0)),
+            read_recovered: Arc::new(AtomicU64::new(0)),
+            mount_owners: Arc::new(AtomicUsize::new(1)),
         })
     }
 
@@ -588,23 +636,61 @@ impl ArgosFs {
         let raw_uncommitted_metadata_dirty = meta.backend != BackendKind::Host
             && (meta.integrity.meta_hash.is_empty()
                 || journal::canonical_metadata_hash(&meta)? != meta.integrity.meta_hash);
+        let quarantined_devices = Arc::new(Mutex::new(BTreeSet::new()));
+        let write_fence = Arc::new(Mutex::new(None));
+        let meta = Arc::new(RwLock::new(meta));
+        let deferred_commit = Arc::new(Mutex::new(DeferredCommitState::new_with_raw_dirty(
+            &meta.read(),
+            raw_uncommitted_metadata_dirty,
+        )));
+        let quota_runtime = Arc::new(RwLock::new(QuotaRuntime::from_metadata(&meta.read())?));
+        let verify_written = if backend_writable && meta.read().backend != BackendKind::Host {
+            VerifyAfterWrite::configured_delay().map(|delay| {
+                VerifyAfterWrite::start(
+                    backend.clone(),
+                    delay,
+                    VerifyAfterWrite::configured_retries(),
+                    meta.clone(),
+                    quarantined_devices.clone(),
+                    write_fence.clone(),
+                )
+            })
+        } else {
+            None
+        };
         Ok(Self {
             root: Arc::new(root),
             backend,
             backend_writable,
             raw_superblocks: Arc::new(superblocks),
-            deferred_commit: Arc::new(Mutex::new(DeferredCommitState::new_with_raw_dirty(
-                &meta,
-                raw_uncommitted_metadata_dirty,
-            ))),
-            quarantined_devices: Arc::new(Mutex::new(BTreeSet::new())),
-            write_fence: Arc::new(Mutex::new(None)),
-            quota_runtime: Arc::new(RwLock::new(QuotaRuntime::from_metadata(&meta)?)),
-            meta: Arc::new(RwLock::new(meta)),
+            deferred_commit,
+            quarantined_devices,
+            write_fence,
+            quota_runtime,
+            meta,
             dirty_host_shards: Arc::new(Mutex::new(BTreeSet::new())),
             inode_locks: Arc::new(Mutex::new(BTreeMap::new())),
             cache: Arc::new(cache),
+            verify_written,
+            read_retries: configured_read_retries(),
+            read_retries_seen: Arc::new(AtomicU64::new(0)),
+            read_recovered: Arc::new(AtomicU64::new(0)),
+            mount_owners: Arc::new(AtomicUsize::new(1)),
         })
+    }
+
+    pub fn verify_written_failures(&self) -> u64 {
+        self.verify_written
+            .as_ref()
+            .map(|verify| verify.failures())
+            .unwrap_or(0)
+    }
+
+    pub fn verify_written_skipped(&self) -> u64 {
+        self.verify_written
+            .as_ref()
+            .map(|verify| verify.skipped())
+            .unwrap_or(0)
     }
 
     pub fn root(&self) -> &Path {
@@ -1808,6 +1894,13 @@ impl ArgosFs {
 
     fn validate_data_durability_locked(
         &self,
+        meta: &Metadata,
+        unavailable: &BTreeSet<String>,
+    ) -> Result<()> {
+        Self::validate_data_durability_snapshot(meta, unavailable)
+    }
+
+    fn validate_data_durability_snapshot(
         meta: &Metadata,
         unavailable: &BTreeSet<String>,
     ) -> Result<()> {
