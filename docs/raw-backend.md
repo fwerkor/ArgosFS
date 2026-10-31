@@ -67,7 +67,19 @@ entry checksum and an internal record hash. Records normally carry metadata
 deltas and periodic full snapshots, so open can replay a newer committed state
 when checkpoint copies are stale. Rw open marks member superblocks dirty. A
 clean unmount writes fresh metadata checkpoint copies before marking the member
-superblocks clean.
+superblocks clean. A pool counts as cleanly unmounted when at least a metadata
+quorum of its members is clean, not only when every member is clean: a card
+that failed during the unmount (or missed a later cleanup) can stay dirty
+without forcing every future writable mount to replay or refuse the pool.
+
+A member that is absent from an open scan is recorded as `Offline`. Raw pools
+have no administrative mark-offline command, so that state only means "this
+member was missing the last time the pool was opened". Opening the pool again
+marks every member that is now visible as `Online`, even if its reader was
+only away for a moment and has since been power-cycled. Without that
+reconciliation a USB reader that dropped off the bus once would stay offline
+forever, and every later scrub, mount or layout change would report too few
+online disks even after the card was back.
 
 New loop/raw volumes created by the CLI use bounded group commit by default.
 Ordinary buffered updates are accumulated in memory and persisted as one journal

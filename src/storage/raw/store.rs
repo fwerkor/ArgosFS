@@ -29,6 +29,11 @@ const METADATA_PAGE_SIZE: usize = 4096;
 const METADATA_INDEX_ENTRY_SIZE: usize = 48;
 const HASH_HEX_LEN: usize = 64;
 const HASH_BYTES_LEN: usize = 32;
+// A USB card can answer a scan with a transient I/O error or a short/zero
+// read while it wakes up.  Retry before deciding that the member is gone:
+// a false "missing" marks the member Offline in the pool metadata.
+const RAW_SCAN_ATTEMPTS: usize = 3;
+const RAW_SCAN_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
 #[derive(Clone)]
 pub struct RawOpen {
@@ -264,6 +269,14 @@ pub fn open_pool(kind: BackendKind, paths: &[PathBuf], write: bool) -> Result<Ra
     for (disk_id, disk) in &mut metadata.disks {
         if let Some(path) = present_paths.get(disk_id) {
             disk.path = path.clone();
+            // Raw pools have no administrative mark-offline command: Offline
+            // is set here when a member is missing from an open.  If that
+            // member is back (for example after its USB reader was
+            // power-cycled), it must be online again or every later open
+            // counts it missing forever.
+            if disk.status == DiskStatus::Offline {
+                disk.status = DiskStatus::Online;
+            }
         } else if !present.contains(disk_id)
             && !matches!(disk.status, DiskStatus::Removed | DiskStatus::Failed)
         {
@@ -273,7 +286,7 @@ pub fn open_pool(kind: BackendKind, paths: &[PathBuf], write: bool) -> Result<Ra
     if !scan_errors.is_empty() {
         report.errors.extend(scan_errors);
     }
-    if superblocks.iter().any(|sb| !sb.clean) {
+    if !clean_unmount_quorum(&superblocks, &metadata) {
         report
             .errors
             .push("pool was not cleanly unmounted".to_string());
@@ -495,8 +508,8 @@ pub fn audit(
     backend: &dyn StorageBackend,
     superblocks: &[RawSuperblock],
 ) -> Result<TransactionReport> {
-    let (_, mut report) = load_or_recover(backend, superblocks, false)?;
-    if superblocks.iter().any(|sb| !sb.clean) {
+    let (metadata, mut report) = load_or_recover(backend, superblocks, false)?;
+    if !clean_unmount_quorum(superblocks, &metadata) {
         report
             .errors
             .push("pool was not cleanly unmounted".to_string());
@@ -1299,6 +1312,17 @@ pub(crate) fn metadata_quorum_requirement(metadata: &Metadata) -> usize {
         .max(1)
         / 2
         + 1
+}
+
+fn clean_unmount_quorum(superblocks: &[RawSuperblock], metadata: &Metadata) -> bool {
+    // A clean unmount marks the members clean only after a metadata
+    // checkpoint has reached its quorum.  If a card failed during the
+    // unmount, or missed a later cleanup, its superblock stays dirty while
+    // every other member is clean.  Requiring every member to be clean makes
+    // that one stale card block every writable mount, even though the clean
+    // members are a full quorum.  The remaining clean members are enough.
+    let clean = superblocks.iter().filter(|sb| sb.clean).count();
+    clean >= metadata_quorum_requirement(metadata)
 }
 
 fn quorum_unavailable(operation: &str, need: usize, have: usize) -> ArgosError {
@@ -2111,6 +2135,21 @@ pub fn inspect_device(kind: BackendKind, path: PathBuf) -> Result<(RawSuperblock
 }
 
 fn scan_one_path(kind: BackendKind, path: &PathBuf) -> ScannedDevice {
+    let mut last = None;
+    for attempt in 0..RAW_SCAN_ATTEMPTS {
+        let scanned = scan_one_path_once(kind, path);
+        if scanned.valid {
+            return scanned;
+        }
+        last = Some(scanned);
+        if attempt + 1 < RAW_SCAN_ATTEMPTS {
+            std::thread::sleep(RAW_SCAN_RETRY_DELAY);
+        }
+    }
+    last.expect("scan makes at least one attempt")
+}
+
+fn scan_one_path_once(kind: BackendKind, path: &PathBuf) -> ScannedDevice {
     let backend = guarded_single_device(kind, path, false, "scan is for loop/raw block backends");
     let Ok(backend) = backend else {
         return ScannedDevice {
@@ -2197,6 +2236,24 @@ fn superblock_from_path(
 }
 
 fn read_superblock_with_backup(
+    backend: &dyn StorageBackend,
+    device_id: &str,
+    capacity: u64,
+) -> Result<(RawSuperblock, &'static str)> {
+    let mut last = None;
+    for attempt in 0..RAW_SCAN_ATTEMPTS {
+        match read_superblock_with_backup_once(backend, device_id, capacity) {
+            Ok(found) => return Ok(found),
+            Err(err) => last = Some(err),
+        }
+        if attempt + 1 < RAW_SCAN_ATTEMPTS {
+            std::thread::sleep(RAW_SCAN_RETRY_DELAY);
+        }
+    }
+    Err(last.expect("superblock read makes at least one attempt"))
+}
+
+fn read_superblock_with_backup_once(
     backend: &dyn StorageBackend,
     device_id: &str,
     capacity: u64,

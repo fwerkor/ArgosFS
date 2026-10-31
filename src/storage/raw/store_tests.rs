@@ -118,6 +118,54 @@ impl StorageBackend for SlowFlushBackend {
     }
 }
 
+struct FlakyReadBackend {
+    inner: FileBlockBackend,
+    failures_left: std::sync::atomic::AtomicUsize,
+}
+
+impl StorageBackend for FlakyReadBackend {
+    fn backend_kind(&self) -> BackendKind {
+        self.inner.backend_kind()
+    }
+
+    fn list_devices(&self) -> Result<Vec<crate::backend::BackendDeviceInfo>> {
+        self.inner.list_devices()
+    }
+
+    fn read_at(&self, device_id: &String, offset: u64, buf: &mut [u8]) -> Result<()> {
+        if self.failures_left.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            self.failures_left
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            return Err(ArgosError::Io(std::io::Error::from_raw_os_error(libc::EIO)));
+        }
+        self.inner.read_at(device_id, offset, buf)
+    }
+
+    fn write_at(&self, device_id: &String, offset: u64, data: &[u8]) -> Result<()> {
+        self.inner.write_at(device_id, offset, data)
+    }
+
+    fn flush_device(&self, device_id: &String) -> Result<()> {
+        self.inner.flush_device(device_id)
+    }
+
+    fn flush_all(&self) -> Result<()> {
+        self.inner.flush_all()
+    }
+
+    fn capacity(&self, device_id: &String) -> Result<u64> {
+        self.inner.capacity(device_id)
+    }
+
+    fn device_status(&self, device_id: &String) -> Result<DiskStatus> {
+        self.inner.device_status(device_id)
+    }
+
+    fn capabilities(&self) -> crate::backend::BackendCapabilities {
+        self.inner.capabilities()
+    }
+}
+
 struct WriteFailBackend {
     inner: FileBlockBackend,
     failed: BTreeSet<String>,
@@ -608,6 +656,96 @@ fn dirty_superblock_marking_succeeds_with_one_write_rejecting_member() {
     let report =
         write_superblock_clean_state_quorum(&backend, &superblocks, &metadata, false).unwrap();
     assert!(report.failed_devices.contains_key("disk-0002"));
+}
+
+#[test]
+fn one_dirty_member_does_not_block_open_when_a_clean_quorum_exists() {
+    let (_dir, images, _metadata, superblocks) = quorum_fixture();
+    let backend = block_backend_for(&images);
+    write_superblock_clean_state(&backend, &superblocks[..1], false).unwrap();
+    drop(backend);
+
+    let opened = open_pool(BackendKind::LoopBlock, &images, false).unwrap();
+    assert!(
+        !opened
+            .report
+            .errors
+            .iter()
+            .any(|error| error.contains("not cleanly unmounted")),
+        "{:?}",
+        opened.report.errors
+    );
+}
+
+#[test]
+fn open_still_reports_an_unclean_pool_below_clean_quorum() {
+    let (_dir, images, _metadata, superblocks) = quorum_fixture();
+    let backend = block_backend_for(&images);
+    write_superblock_clean_state(&backend, &superblocks[..2], false).unwrap();
+    drop(backend);
+
+    let opened = open_pool(BackendKind::LoopBlock, &images, false).unwrap();
+    assert!(
+        opened
+            .report
+            .errors
+            .iter()
+            .any(|error| error.contains("not cleanly unmounted")),
+        "{:?}",
+        opened.report.errors
+    );
+}
+
+#[test]
+fn a_member_that_returns_is_online_again() {
+    let (_dir, images, metadata, superblocks) = quorum_fixture();
+    let mut offline = metadata.clone();
+    offline.disks.get_mut("disk-0002").unwrap().status = DiskStatus::Offline;
+    offline.txid += 1;
+    offline.updated_at = crate::util::now_f64();
+    journal::prepare_metadata_integrity_with_previous(
+        &mut offline,
+        metadata.integrity.meta_hash.clone(),
+    )
+    .unwrap();
+    let backend = block_backend_for(&images);
+    append_transaction_with_previous(
+        &backend,
+        &superblocks,
+        &offline,
+        Some(&metadata),
+        "member-offline",
+        serde_json::json!({}),
+    )
+    .unwrap();
+    drop(backend);
+
+    // The device did not stay missing: a power-cycled reader brought it back.
+    // Offline is only ever set automatically for a raw member that was absent,
+    // so a present member must not stay offline for the rest of the pool's life.
+    let opened = open_pool(BackendKind::LoopBlock, &images, false).unwrap();
+    assert_eq!(
+        opened.metadata.disks.get("disk-0002").unwrap().status,
+        DiskStatus::Online
+    );
+}
+
+#[test]
+fn superblock_read_retries_a_transient_io_error() {
+    let dir = tempdir().unwrap();
+    let (image, fs) = create_loop_pool(dir.path(), "flaky-scan");
+    fs.mark_clean_unmount().unwrap();
+    drop(fs);
+    let backend = FlakyReadBackend {
+        inner: FileBlockBackend::open_loop(std::slice::from_ref(&image), false).unwrap(),
+        // Fail the primary read and the backup fallback, so this needs the
+        // retry rather than succeeding from the backup on the first attempt.
+        failures_left: std::sync::atomic::AtomicUsize::new(2),
+    };
+    let (superblock, source) =
+        read_superblock_with_backup(&backend, "disk-0000", MIN_DEVICE_BYTES).unwrap();
+    assert_eq!(source, "primary");
+    assert_eq!(superblock.disk_id, "disk-0000");
 }
 
 #[test]
