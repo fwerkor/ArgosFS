@@ -70,20 +70,22 @@ pub fn configured_read_retries() -> usize {
 
 /// Read a value up to `attempts` times.  An error is returned immediately;
 /// a successful value that does not validate is retried, and `None` means
-/// every attempt produced an invalid value.
+/// every attempt produced an invalid value.  The second value is the number
+/// of reads actually made, so the caller can report how many retries were
+/// needed.
 pub fn retry_verified<T, E>(
     attempts: usize,
     mut read: impl FnMut(usize) -> std::result::Result<T, E>,
     mut valid: impl FnMut(&T) -> bool,
-) -> std::result::Result<Option<T>, E> {
+) -> std::result::Result<(Option<T>, usize), E> {
     let attempts = attempts.max(1);
     for attempt in 0..attempts {
         let value = read(attempt)?;
         if valid(&value) {
-            return Ok(Some(value));
+            return Ok((Some(value), attempt + 1));
         }
     }
-    Ok(None)
+    Ok((None, attempts))
 }
 
 pub fn ensure_dir(path: &Path) -> Result<()> {
@@ -308,7 +310,7 @@ mod tests {
             },
             |value| value == b"good",
         );
-        assert_eq!(result, Ok(Some(b"good".to_vec())));
+        assert_eq!(result, Ok((Some(b"good".to_vec()), 2)));
         assert_eq!(reads, 2);
 
         let mut reads = 0;
@@ -320,7 +322,7 @@ mod tests {
             },
             |value| value == b"good",
         );
-        assert_eq!(result, Ok(None));
+        assert_eq!(result, Ok((None, 1)));
         assert_eq!(reads, 1);
 
         let mut reads = 0;

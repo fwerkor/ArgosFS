@@ -1203,7 +1203,7 @@ fn print_fsck_report(report: &FsckReport, explicit_json: bool) -> Result<()> {
         return Ok(());
     }
     println!(
-        "checked files={} directories={} damaged={} repaired={} unrecoverable={} missing_shards={} checksum_errors={} orphans={}",
+        "checked files={} directories={} damaged={} repaired={} unrecoverable={} missing_shards={} checksum_errors={} shard_read_retries={} shard_read_recovered={} orphans={}",
         report.files_checked,
         report.directories_checked,
         report.damaged_files,
@@ -1211,6 +1211,8 @@ fn print_fsck_report(report: &FsckReport, explicit_json: bool) -> Result<()> {
         report.unrecoverable_files,
         report.missing_shards,
         report.checksum_errors,
+        report.shard_read_retries,
+        report.shard_read_recovered,
         report.orphan_shards
     );
     for error in &report.errors {

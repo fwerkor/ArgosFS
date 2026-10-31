@@ -35,7 +35,7 @@ use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -193,6 +193,8 @@ pub struct ArgosFs {
     cache: Arc<BlockCache>,
     verify_written: Option<Arc<VerifyAfterWrite>>,
     read_retries: usize,
+    read_retries_seen: Arc<AtomicU64>,
+    read_recovered: Arc<AtomicU64>,
     mount_owners: Arc<AtomicUsize>,
 }
 
@@ -214,6 +216,8 @@ impl Clone for ArgosFs {
             cache: self.cache.clone(),
             verify_written: self.verify_written.clone(),
             read_retries: self.read_retries,
+            read_retries_seen: self.read_retries_seen.clone(),
+            read_recovered: self.read_recovered.clone(),
             mount_owners: self.mount_owners.clone(),
         }
     }
@@ -442,6 +446,8 @@ impl ArgosFs {
             cache: Arc::new(cache),
             verify_written: None,
             read_retries: configured_read_retries(),
+            read_retries_seen: Arc::new(AtomicU64::new(0)),
+            read_recovered: Arc::new(AtomicU64::new(0)),
             mount_owners: Arc::new(AtomicUsize::new(1)),
         })
     }
@@ -667,6 +673,8 @@ impl ArgosFs {
             cache: Arc::new(cache),
             verify_written,
             read_retries: configured_read_retries(),
+            read_retries_seen: Arc::new(AtomicU64::new(0)),
+            read_recovered: Arc::new(AtomicU64::new(0)),
             mount_owners: Arc::new(AtomicUsize::new(1)),
         })
     }

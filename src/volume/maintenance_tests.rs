@@ -309,6 +309,31 @@ fn fsck_reports_missing_directory_children_orphans_and_repairs_usage() {
 }
 
 #[test]
+fn scrub_reports_shard_read_retries() {
+    let _guard = env_lock();
+    std::env::set_var("ARGOSFS_READ_RETRIES", "1");
+    let (_dir, fs) = host_volume(1);
+    fs.write_file("/file", &vec![9u8; 8192], 0o600).unwrap();
+    let (disk_id, relpath) = {
+        let meta = fs.metadata_snapshot();
+        let ino = fs.resolve_path("/file", true).unwrap();
+        let shard = &meta.inodes[&ino].blocks[0].shards[0];
+        (shard.disk_id.clone(), shard.relpath.clone())
+    };
+    let path = fs.shard_path_locked(&fs.metadata_snapshot(), &disk_id, &relpath);
+    let mut data = std::fs::read(&path).unwrap();
+    data[0] ^= 0xff;
+    std::fs::write(&path, &data).unwrap();
+
+    let report = fs.scrub().unwrap();
+    std::env::remove_var("ARGOSFS_READ_RETRIES");
+
+    assert!(report.checksum_errors >= 1);
+    assert!(report.shard_read_retries >= 1);
+    assert_eq!(report.shard_read_recovered, 0);
+}
+
+#[test]
 fn health_report_counts_all_inode_kinds_and_delay_parser_is_best_effort() {
     let _guard = env_lock();
     let (_dir, fs) = host_volume(1);

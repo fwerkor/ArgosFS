@@ -1292,7 +1292,7 @@ impl ArgosFs {
         meta: &mut Metadata,
         shard: &Shard,
     ) -> Result<Option<Vec<u8>>> {
-        retry_verified(
+        let (result, attempts) = retry_verified(
             1 + self.read_retries,
             |_| {
                 let start = std::time::Instant::now();
@@ -1318,7 +1318,16 @@ impl ArgosFs {
                 }
             },
             |data| data.len() == shard.size && content_hash_matches(data, &shard.sha256),
-        )
+        )?;
+        if attempts > 1 {
+            self.read_retries_seen
+                .fetch_add((attempts - 1) as u64, std::sync::atomic::Ordering::Relaxed);
+            if result.is_some() {
+                self.read_recovered
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        Ok(result)
     }
 
     pub(super) fn read_shard_range_locked(
