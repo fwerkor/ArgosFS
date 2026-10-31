@@ -746,6 +746,10 @@ pub struct FsckReport {
     pub unrecoverable_files: u64,
     pub missing_shards: u64,
     pub checksum_errors: u64,
+    /// Extra shard reads after a checksum/size mismatch.
+    pub shard_read_retries: u64,
+    /// Shards that a retry read successfully after a mismatch.
+    pub shard_read_recovered: u64,
     pub orphan_shards: u64,
     pub removed_orphans: u64,
     pub errors: Vec<String>,

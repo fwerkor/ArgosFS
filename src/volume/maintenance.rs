@@ -794,6 +794,12 @@ impl ArgosFs {
         if max_files == 0 {
             return (report, cursor);
         }
+        let retries_before = self
+            .read_retries_seen
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let recovered_before = self
+            .read_recovered
+            .load(std::sync::atomic::Ordering::Relaxed);
         let mut next_cursor = cursor;
         for (ino, _) in self.file_window(cursor, max_files) {
             let inode_lock = self.inode_lock(ino);
@@ -827,6 +833,14 @@ impl ArgosFs {
             }
             next_cursor = Some(ino);
         }
+        report.shard_read_retries = self
+            .read_retries_seen
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(retries_before);
+        report.shard_read_recovered = self
+            .read_recovered
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(recovered_before);
         (report, next_cursor)
     }
 
@@ -869,6 +883,12 @@ impl ArgosFs {
 
     pub fn fsck(&self, repair: bool, remove_orphans: bool) -> Result<FsckReport> {
         let mut report = FsckReport::default();
+        let retries_before = self
+            .read_retries_seen
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let recovered_before = self
+            .read_recovered
+            .load(std::sync::atomic::Ordering::Relaxed);
         let inodes = self.metadata_snapshot().inodes;
         for (ino, inode) in inodes {
             match inode.kind {
@@ -887,15 +907,14 @@ impl ArgosFs {
                     let _inode_guard = inode_lock.lock();
                     report.files_checked += 1;
                     let mut damaged = false;
+                    let mut meta = self.meta.write();
                     for block in &inode.blocks {
                         for shard in &block.shards {
-                            let meta = self.meta.read();
-                            match self.read_shard_locked(&meta, shard) {
-                                Ok(data) => {
-                                    if !content_hash_matches(&data, &shard.sha256) {
-                                        report.checksum_errors += 1;
-                                        damaged = true;
-                                    }
+                            match self.read_shard_verified_locked(&mut meta, shard) {
+                                Ok(Some(_)) => {}
+                                Ok(None) => {
+                                    report.checksum_errors += 1;
+                                    damaged = true;
                                 }
                                 Err(_) => {
                                     report.missing_shards += 1;
@@ -904,6 +923,7 @@ impl ArgosFs {
                             }
                         }
                     }
+                    drop(meta);
                     match self.read_inode(ino, 0, u64::MAX as usize, false) {
                         Ok(data) => {
                             if damaged {
@@ -1016,6 +1036,14 @@ impl ArgosFs {
                 self.commit_locked(&mut meta, "fsck", json!({"report": report}))?;
             }
         }
+        report.shard_read_retries = self
+            .read_retries_seen
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(retries_before);
+        report.shard_read_recovered = self
+            .read_recovered
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(recovered_before);
         Ok(report)
     }
 

@@ -403,28 +403,14 @@ impl ArgosFs {
                 damaged.push(format!("{}:unavailable", shard.disk_id));
                 continue;
             }
-            let start = std::time::Instant::now();
-            match self.read_shard_locked(meta, shard) {
-                Ok(data) => {
-                    self.update_read_latency_locked(
-                        meta,
-                        &shard.disk_id,
-                        data.len() as u64,
-                        start.elapsed().as_secs_f64(),
-                    );
-                    if data.len() == shard.size && content_hash_matches(&data, &shard.sha256) {
-                        shards[shard.slot] = Some(data);
-                    } else {
-                        damaged.push(format!("{}:checksum:{}", shard.disk_id, shard.slot));
-                    }
+            match self.read_shard_verified_locked(meta, shard) {
+                Ok(Some(data)) => {
+                    shards[shard.slot] = Some(data);
+                }
+                Ok(None) => {
+                    damaged.push(format!("{}:checksum:{}", shard.disk_id, shard.slot));
                 }
                 Err(_) => {
-                    self.update_read_latency_locked(
-                        meta,
-                        &shard.disk_id,
-                        0,
-                        start.elapsed().as_secs_f64(),
-                    );
                     damaged.push(format!("{}:missing:{}", shard.disk_id, shard.slot));
                 }
             }
@@ -618,31 +604,21 @@ impl ArgosFs {
                 reason: "single-device shard is unavailable".to_string(),
             });
         }
-        let start = std::time::Instant::now();
-        let data = match self.read_shard_locked(meta, shard) {
-            Ok(data) => data,
+        let data = match self.read_shard_verified_locked(meta, shard) {
+            Ok(Some(data)) => data,
+            Ok(None) => {
+                damaged.push(format!("{}:checksum:{}", shard.disk_id, shard.slot));
+                return Err(ArgosError::UnrecoverableStripe {
+                    stripe_id: block.stripe_id.clone(),
+                    reason: "single-device raw checksum mismatch".to_string(),
+                });
+            }
             Err(err) => {
-                self.update_read_latency_locked(
-                    meta,
-                    &shard.disk_id,
-                    0,
-                    start.elapsed().as_secs_f64(),
-                );
                 damaged.push(format!("{}:missing:{}", shard.disk_id, shard.slot));
                 return Err(err);
             }
         };
-        self.update_read_latency_locked(
-            meta,
-            &shard.disk_id,
-            data.len() as u64,
-            start.elapsed().as_secs_f64(),
-        );
-        if data.len() != shard.size
-            || data.len() != block.raw_size
-            || !content_hash_matches(&data, &shard.sha256)
-            || !content_hash_matches(&data, &block.raw_sha256)
-        {
+        if data.len() != block.raw_size || !content_hash_matches(&data, &block.raw_sha256) {
             damaged.push(format!("{}:checksum:{}", shard.disk_id, shard.slot));
             return Err(ArgosError::UnrecoverableStripe {
                 stripe_id: block.stripe_id.clone(),
@@ -917,6 +893,16 @@ impl ArgosFs {
                 data.len() as u64,
                 start.elapsed().as_secs_f64(),
             );
+            if let Some(verify) = &self.verify_written {
+                verify.enqueue(
+                    disk_id,
+                    extent.offset,
+                    extent.generation,
+                    data.len(),
+                    &sha256,
+                    stripe_id,
+                );
+            }
             return Ok(Shard {
                 slot,
                 disk_id: disk_id.to_string(),
@@ -1294,6 +1280,56 @@ impl ArgosFs {
         }
     }
 
+    /// Read one shard, retrying a checksum or size mismatch.
+    ///
+    /// A USB card or its controller can occasionally return a bad block once
+    /// and the correct data on the next read.  Retrying before declaring the
+    /// shard damaged keeps scrub from rewriting a file for a transmission
+    /// glitch.  I/O errors are returned immediately: the guarded backend has
+    /// already fenced the device for those.
+    pub(super) fn read_shard_verified_locked(
+        &self,
+        meta: &mut Metadata,
+        shard: &Shard,
+    ) -> Result<Option<Vec<u8>>> {
+        let (result, attempts) = retry_verified(
+            1 + self.read_retries,
+            |_| {
+                let start = std::time::Instant::now();
+                match self.read_shard_locked(meta, shard) {
+                    Ok(data) => {
+                        self.update_read_latency_locked(
+                            meta,
+                            &shard.disk_id,
+                            data.len() as u64,
+                            start.elapsed().as_secs_f64(),
+                        );
+                        Ok(data)
+                    }
+                    Err(err) => {
+                        self.update_read_latency_locked(
+                            meta,
+                            &shard.disk_id,
+                            0,
+                            start.elapsed().as_secs_f64(),
+                        );
+                        Err(err)
+                    }
+                }
+            },
+            |data| data.len() == shard.size && content_hash_matches(data, &shard.sha256),
+        )?;
+        if attempts > 1 {
+            self.read_retries_seen
+                .fetch_add((attempts - 1) as u64, std::sync::atomic::Ordering::Relaxed);
+            if result.is_some() {
+                self.read_recovered
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        Ok(result)
+    }
+
     pub(super) fn read_shard_range_locked(
         &self,
         meta: &Metadata,
@@ -1340,6 +1376,9 @@ impl ArgosFs {
     pub(super) fn delete_shard_locked(&self, meta: &mut Metadata, shard: &Shard) -> Result<()> {
         match shard.location.as_ref() {
             Some(ShardLocation::RawExtent(extent)) => {
+                if let Some(verify) = &self.verify_written {
+                    verify.invalidate(&extent.disk_id, extent.offset);
+                }
                 if let Some(allocator) = meta.raw_pool.allocators.get_mut(&extent.disk_id) {
                     allocator::free(allocator, extent)?;
                 }
