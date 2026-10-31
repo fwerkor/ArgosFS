@@ -152,6 +152,41 @@ failure. All counters are runtime-only; the process log reports confirmed
 failures. Long-running soak tests should monitor skipped counts and run scrub
 periodically, particularly after unmount or heavy write bursts.
 
+## USB mode and shard-read retries
+
+A USB card or its bridge can occasionally return a corrupt block once and the
+correct data on the next read.  ArgosFS can retry a shard whose length or
+checksum does not match before treating it as damaged:
+
+- `ARGOSFS_READ_RETRIES` (0–10, default 0) is the number of extra reads.
+  A final mismatch is still reported as a checksum error, so scrub can repair
+  it.  I/O errors are not retried here; the guarded backend has already
+  fenced that device.
+- The retry applies to full-shard reads, which is what scrub and normal
+  whole-block reads use.  It does not hide persistent corruption.
+
+`ARGOSFS_USB=1` is a convenience profile for USB card jukeboxes.  It changes
+the defaults of several options at once (an explicitly set option always
+wins):
+
+| option | normal default | `ARGOSFS_USB=1` |
+|--------|----------------|-----------------|
+| `ARGOSFS_IO_TIMEOUT_MS` | 10 000 | 120 000 |
+| `ARGOSFS_READ_RETRIES` | 0 | 1 |
+| `ARGOSFS_VERIFY_WRITE_AFTER_MS` | 0 (off) | 60 000 |
+| `ARGOS_VERIFY_WRITE_RETRIES` | 3 | 3 |
+
+For example, to mount a raw pool with all USB-friendly defaults:
+
+```sh
+ARGOSFS_USB=1 argosfs mount-root --devices /dev/... --target /mnt --mode rw
+```
+
+The read-after-write verifier costs an extra flush per checked shard, so USB
+mode is not a free speed-up; it trades some throughput for more tolerance of
+transient card/controller errors.  Scrub still performs the full check and
+repair.
+
 ## Data Extents
 
 Host shards use `ShardLocation::HostPath`. Loop/raw shards use

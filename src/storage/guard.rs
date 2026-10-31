@@ -9,6 +9,7 @@
 use crate::backend::{BackendCapabilities, BackendDeviceInfo, StorageBackend};
 use crate::error::{ArgosError, Result};
 use crate::types::{BackendKind, DiskStatus};
+use crate::util::usb_mode;
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
 use std::io;
@@ -33,7 +34,13 @@ pub fn configured_io_timeout() -> Duration {
     let millis = std::env::var("ARGOSFS_IO_TIMEOUT_MS")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
-        .unwrap_or(DEFAULT_IO_TIMEOUT_MS)
+        .unwrap_or_else(|| {
+            if usb_mode() {
+                MAX_IO_TIMEOUT_MS
+            } else {
+                DEFAULT_IO_TIMEOUT_MS
+            }
+        })
         .clamp(MIN_IO_TIMEOUT_MS, MAX_IO_TIMEOUT_MS);
     Duration::from_millis(millis)
 }

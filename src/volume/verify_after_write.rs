@@ -10,6 +10,7 @@ use crate::error::{ArgosError, Result};
 use crate::storage::guard::GuardedBackend;
 use crate::types::{DiskStatus, ShardLocation};
 use crate::util::content_hash_matches;
+use crate::util::usb_mode;
 use parking_lot::{Mutex as DeviceMutex, RwLock};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
@@ -66,7 +67,7 @@ impl VerifyAfterWrite {
         let millis = std::env::var("ARGOSFS_VERIFY_WRITE_AFTER_MS")
             .ok()
             .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(0);
+            .unwrap_or_else(|| if usb_mode() { 60_000 } else { 0 });
         (millis != 0).then(|| Duration::from_millis(millis.clamp(MIN_DELAY_MS, MAX_DELAY_MS)))
     }
 

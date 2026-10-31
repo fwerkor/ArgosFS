@@ -22,8 +22,9 @@ use verify_after_write::VerifyAfterWrite;
 
 mod verify_after_write;
 use crate::util::{
-    append_json_line, atomic_write, clean_path, content_hash_hex, content_hash_matches, ensure_dir,
-    ensure_private_dir, now_f64, parent_name, relative_or_absolute, split_path, stable_u01,
+    append_json_line, atomic_write, clean_path, configured_read_retries, content_hash_hex,
+    content_hash_matches, ensure_dir, ensure_private_dir, now_f64, parent_name,
+    relative_or_absolute, retry_verified, split_path, stable_u01,
 };
 use parking_lot::{Mutex, RwLock};
 use serde_json::json;
@@ -191,6 +192,7 @@ pub struct ArgosFs {
     inode_locks: Arc<Mutex<BTreeMap<InodeId, Arc<Mutex<()>>>>>,
     cache: Arc<BlockCache>,
     verify_written: Option<Arc<VerifyAfterWrite>>,
+    read_retries: usize,
     mount_owners: Arc<AtomicUsize>,
 }
 
@@ -211,6 +213,7 @@ impl Clone for ArgosFs {
             inode_locks: self.inode_locks.clone(),
             cache: self.cache.clone(),
             verify_written: self.verify_written.clone(),
+            read_retries: self.read_retries,
             mount_owners: self.mount_owners.clone(),
         }
     }
@@ -438,6 +441,7 @@ impl ArgosFs {
             inode_locks: Arc::new(Mutex::new(BTreeMap::new())),
             cache: Arc::new(cache),
             verify_written: None,
+            read_retries: configured_read_retries(),
             mount_owners: Arc::new(AtomicUsize::new(1)),
         })
     }
@@ -662,6 +666,7 @@ impl ArgosFs {
             inode_locks: Arc::new(Mutex::new(BTreeMap::new())),
             cache: Arc::new(cache),
             verify_written,
+            read_retries: configured_read_retries(),
             mount_owners: Arc::new(AtomicUsize::new(1)),
         })
     }
