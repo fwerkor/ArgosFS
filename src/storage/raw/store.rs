@@ -273,7 +273,7 @@ pub fn open_pool(kind: BackendKind, paths: &[PathBuf], write: bool) -> Result<Ra
     if !scan_errors.is_empty() {
         report.errors.extend(scan_errors);
     }
-    if superblocks.iter().any(|sb| !sb.clean) {
+    if !clean_unmount_quorum(&superblocks, &metadata) {
         report
             .errors
             .push("pool was not cleanly unmounted".to_string());
@@ -495,8 +495,8 @@ pub fn audit(
     backend: &dyn StorageBackend,
     superblocks: &[RawSuperblock],
 ) -> Result<TransactionReport> {
-    let (_, mut report) = load_or_recover(backend, superblocks, false)?;
-    if superblocks.iter().any(|sb| !sb.clean) {
+    let (metadata, mut report) = load_or_recover(backend, superblocks, false)?;
+    if !clean_unmount_quorum(superblocks, &metadata) {
         report
             .errors
             .push("pool was not cleanly unmounted".to_string());
@@ -1299,6 +1299,17 @@ pub(crate) fn metadata_quorum_requirement(metadata: &Metadata) -> usize {
         .max(1)
         / 2
         + 1
+}
+
+fn clean_unmount_quorum(superblocks: &[RawSuperblock], metadata: &Metadata) -> bool {
+    // A clean unmount marks the members clean only after a metadata
+    // checkpoint has reached its quorum.  If a card failed during the
+    // unmount, or missed a later cleanup, its superblock stays dirty while
+    // every other member is clean.  Requiring every member to be clean makes
+    // that one stale card block every writable mount, even though the clean
+    // members are a full quorum.  The remaining clean members are enough.
+    let clean = superblocks.iter().filter(|sb| sb.clean).count();
+    clean >= metadata_quorum_requirement(metadata)
 }
 
 fn quorum_unavailable(operation: &str, need: usize, have: usize) -> ArgosError {

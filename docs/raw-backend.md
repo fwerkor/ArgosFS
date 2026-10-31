@@ -67,7 +67,10 @@ entry checksum and an internal record hash. Records normally carry metadata
 deltas and periodic full snapshots, so open can replay a newer committed state
 when checkpoint copies are stale. Rw open marks member superblocks dirty. A
 clean unmount writes fresh metadata checkpoint copies before marking the member
-superblocks clean.
+superblocks clean. A pool counts as cleanly unmounted when at least a metadata
+quorum of its members is clean, not only when every member is clean: a card
+that failed during the unmount (or missed a later cleanup) can stay dirty
+without forcing every future writable mount to replay or refuse the pool.
 
 New loop/raw volumes created by the CLI use bounded group commit by default.
 Ordinary buffered updates are accumulated in memory and persisted as one journal

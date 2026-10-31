@@ -611,6 +611,44 @@ fn dirty_superblock_marking_succeeds_with_one_write_rejecting_member() {
 }
 
 #[test]
+fn one_dirty_member_does_not_block_open_when_a_clean_quorum_exists() {
+    let (_dir, images, _metadata, superblocks) = quorum_fixture();
+    let backend = block_backend_for(&images);
+    write_superblock_clean_state(&backend, &superblocks[..1], false).unwrap();
+    drop(backend);
+
+    let opened = open_pool(BackendKind::LoopBlock, &images, false).unwrap();
+    assert!(
+        !opened
+            .report
+            .errors
+            .iter()
+            .any(|error| error.contains("not cleanly unmounted")),
+        "{:?}",
+        opened.report.errors
+    );
+}
+
+#[test]
+fn open_still_reports_an_unclean_pool_below_clean_quorum() {
+    let (_dir, images, _metadata, superblocks) = quorum_fixture();
+    let backend = block_backend_for(&images);
+    write_superblock_clean_state(&backend, &superblocks[..2], false).unwrap();
+    drop(backend);
+
+    let opened = open_pool(BackendKind::LoopBlock, &images, false).unwrap();
+    assert!(
+        opened
+            .report
+            .errors
+            .iter()
+            .any(|error| error.contains("not cleanly unmounted")),
+        "{:?}",
+        opened.report.errors
+    );
+}
+
+#[test]
 fn journal_flush_shortfall_is_indeterminate_after_quorum_exposure() {
     let (_dir, images, previous, superblocks) = quorum_fixture();
     let next = next_metadata(&previous, "indeterminate-flush");
