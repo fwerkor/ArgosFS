@@ -164,6 +164,11 @@ checksum does not match before treating it as damaged:
   fenced that device.
 - The retry applies to full-shard reads, which is what scrub and normal
   whole-block reads use.  It does not hide persistent corruption.
+- Scrub's report (JSON and the human summary) includes
+  `shard_read_retries` (extra reads after a mismatch) and
+  `shard_read_recovered` (shards that read correctly on a retry).  A
+  non-zero `shard_read_retries` with `shard_read_recovered` equal to it means
+  every retry was a transient USB/controller error rather than bad media.
 
 `ARGOSFS_USB=1` is a convenience profile for USB card jukeboxes.  It changes
 the defaults of several options at once (an explicitly set option always
