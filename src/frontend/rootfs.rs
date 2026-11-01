@@ -103,17 +103,24 @@ pub fn preflight_volume(fs: &ArgosFs, mode: RootMountMode) -> Result<RootPreflig
 pub fn preflight_report(fs: &ArgosFs, mode: RootMountMode) -> RootPreflightReport {
     let meta = fs.metadata_snapshot();
     let backend = meta.backend;
-    let total_devices = meta.disks.len();
-    let available_devices = meta
+    // A member marked Removed has already been rewritten out of the pool by
+    // replace/remove-device.  It is not missing capacity and must not make
+    // every later rootfs mount use degraded-rw just because it is still in
+    // the metadata history.
+    let active_disks = meta
         .disks
         .values()
+        .filter(|disk| disk.status != DiskStatus::Removed)
+        .collect::<Vec<_>>();
+    let total_devices = active_disks.len();
+    let available_devices = active_disks
+        .iter()
         .filter(|disk| matches!(disk.status, DiskStatus::Online | DiskStatus::Degraded))
         .count();
     let missing_devices = total_devices.saturating_sub(available_devices);
     let degraded = missing_devices > 0
-        || meta
-            .disks
-            .values()
+        || active_disks
+            .iter()
             .any(|disk| disk.status != DiskStatus::Online);
     let redundancy = minimum_active_redundancy(&meta);
     let mut issues = Vec::new();
