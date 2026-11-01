@@ -107,6 +107,7 @@ impl ArgosFs {
                 tier: final_tier,
                 weight: final_weight,
                 status: DiskStatus::Online,
+                manually_offline: false,
                 capacity_bytes: final_capacity,
                 capacity_source,
                 used_bytes: 0,
@@ -204,6 +205,7 @@ impl ArgosFs {
                 tier: StorageTier::Warm,
                 weight: 1.0,
                 status: DiskStatus::Online,
+                manually_offline: false,
                 capacity_bytes: info.capacity,
                 capacity_source: CapacitySource::UserOverride,
                 used_bytes: 0,
@@ -252,6 +254,7 @@ impl ArgosFs {
             .get_mut(disk_id)
             .ok_or_else(|| ArgosError::NotFound(disk_id.to_string()))?;
         disk.status = status;
+        disk.manually_offline = status == DiskStatus::Offline;
         self.commit_locked(
             &mut meta,
             "mark-disk",

@@ -731,6 +731,54 @@ fn a_member_that_returns_is_online_again() {
 }
 
 #[test]
+fn manually_offline_member_stays_offline_after_reopen() {
+    let dir = tempdir().unwrap();
+    let images = (0..3)
+        .map(|index| dir.path().join(format!("manual-offline-{index}.img")))
+        .collect::<Vec<_>>();
+    let fs = crate::volume::ArgosFs::create_loop(
+        &images,
+        crate::types::VolumeConfig {
+            k: 2,
+            m: 1,
+            ..crate::types::VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "manual-offline",
+        false,
+    )
+    .unwrap();
+    fs.mark_disk("disk-0002", DiskStatus::Offline).unwrap();
+    fs.mark_clean_unmount().unwrap();
+    drop(fs);
+
+    // A missing manually disabled member must keep its isolation flag, too.
+    let missing = open_pool(BackendKind::LoopBlock, &images[..2], false).unwrap();
+    assert!(missing.metadata.disks["disk-0002"].manually_offline);
+    assert_eq!(
+        missing.metadata.disks["disk-0002"].status,
+        DiskStatus::Offline
+    );
+
+    let reopened = open_pool(BackendKind::LoopBlock, &images, false).unwrap();
+    let disk = &reopened.metadata.disks["disk-0002"];
+    assert_eq!(disk.status, DiskStatus::Offline);
+    assert!(disk.manually_offline);
+
+    // Explicitly bringing the disk online clears the persistent override.
+    let fs = crate::volume::ArgosFs::open_loop(&images, true).unwrap();
+    fs.mark_disk("disk-0002", DiskStatus::Online).unwrap();
+    fs.mark_clean_unmount().unwrap();
+    drop(fs);
+    let online = open_pool(BackendKind::LoopBlock, &images, false).unwrap();
+    assert_eq!(
+        online.metadata.disks["disk-0002"].status,
+        DiskStatus::Online
+    );
+    assert!(!online.metadata.disks["disk-0002"].manually_offline);
+}
+
+#[test]
 fn superblock_read_retries_a_transient_io_error() {
     let dir = tempdir().unwrap();
     let (image, fs) = create_loop_pool(dir.path(), "flaky-scan");
@@ -746,6 +794,40 @@ fn superblock_read_retries_a_transient_io_error() {
         read_superblock_with_backup(&backend, "disk-0000", MIN_DEVICE_BYTES).unwrap();
     assert_eq!(source, "primary");
     assert_eq!(superblock.disk_id, "disk-0000");
+}
+
+#[test]
+fn guarded_scan_reopens_after_a_fenced_read() {
+    let dir = tempdir().unwrap();
+    let (image, fs) = create_loop_pool(dir.path(), "fenced-scan");
+    fs.mark_clean_unmount().unwrap();
+    drop(fs);
+
+    let good = scan_one_path_once(BackendKind::LoopBlock, &image);
+    assert!(good.valid);
+    let mut attempts = 0;
+    let result = scan_one_path_with_retry(|| {
+        attempts += 1;
+        // First attempt simulates a controller I/O error, which fences this
+        // guarded backend. The next attempt opens a new guarded backend.
+        let inner = FlakyReadBackend {
+            inner: FileBlockBackend::open_loop(std::slice::from_ref(&image), false).unwrap(),
+            failures_left: std::sync::atomic::AtomicUsize::new(usize::from(attempts == 1)),
+        };
+        let guarded = GuardedBackend::new(Arc::new(inner));
+        let mut scanned = good.clone();
+        match read_superblock_with_backup(&guarded, "disk-0000", MIN_DEVICE_BYTES) {
+            Ok(_) => scanned,
+            Err(err) => {
+                assert!(matches!(err, ArgosError::DeviceFailed { .. }));
+                scanned.valid = false;
+                scanned.error = Some(err.to_string());
+                scanned
+            }
+        }
+    });
+    assert!(result.valid);
+    assert_eq!(attempts, 2);
 }
 
 #[test]

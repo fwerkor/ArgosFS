@@ -72,14 +72,18 @@ quorum of its members is clean, not only when every member is clean: a card
 that failed during the unmount (or missed a later cleanup) can stay dirty
 without forcing every future writable mount to replay or refuse the pool.
 
-A member that is absent from an open scan is recorded as `Offline`. Raw pools
-have no administrative mark-offline command, so that state only means "this
-member was missing the last time the pool was opened". Opening the pool again
-marks every member that is now visible as `Online`, even if its reader was
-only away for a moment and has since been power-cycled. Without that
-reconciliation a USB reader that dropped off the bus once would stay offline
-forever, and every later scrub, mount or layout change would report too few
-online disks even after the card was back.
+A member that is absent from an open scan is recorded as `Offline`. The
+raw/loop CLI has no administrative mark-offline command, but callers of the
+Rust API can explicitly isolate a member with `ArgosFs::mark_disk()`. Scan-
+derived `Offline` members return to `Online` when their devices are visible
+again, while explicitly isolated members remain `Offline` until marked
+otherwise. This allows a USB reader that briefly dropped off the bus to
+recover without silently undoing an administrator's isolation decision.
+
+The explicit-isolation marker is backward-compatible with older metadata:
+members without the marker are treated as scan-offline. An intentionally
+isolated member marked by an older binary has no provenance recorded and
+may therefore need to be re-isolated when upgrading.
 
 New loop/raw volumes created by the CLI use bounded group commit by default.
 Ordinary buffered updates are accumulated in memory and persisted as one journal

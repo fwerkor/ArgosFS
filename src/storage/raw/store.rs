@@ -269,12 +269,9 @@ pub fn open_pool(kind: BackendKind, paths: &[PathBuf], write: bool) -> Result<Ra
     for (disk_id, disk) in &mut metadata.disks {
         if let Some(path) = present_paths.get(disk_id) {
             disk.path = path.clone();
-            // Raw pools have no administrative mark-offline command: Offline
-            // is set here when a member is missing from an open.  If that
-            // member is back (for example after its USB reader was
-            // power-cycled), it must be online again or every later open
-            // counts it missing forever.
-            if disk.status == DiskStatus::Offline {
+            // Restore only scan-offline members: a caller can explicitly
+            // isolate a raw member through ArgosFs::mark_disk().
+            if disk.status == DiskStatus::Offline && !disk.manually_offline {
                 disk.status = DiskStatus::Online;
             }
         } else if !present.contains(disk_id)
@@ -2135,9 +2132,15 @@ pub fn inspect_device(kind: BackendKind, path: PathBuf) -> Result<(RawSuperblock
 }
 
 fn scan_one_path(kind: BackendKind, path: &PathBuf) -> ScannedDevice {
+    // Each attempt opens a fresh guarded device, since a fatal I/O error
+    // fences the previous backend for its entire lifetime.
+    scan_one_path_with_retry(|| scan_one_path_once(kind, path))
+}
+
+fn scan_one_path_with_retry(mut scan_once: impl FnMut() -> ScannedDevice) -> ScannedDevice {
     let mut last = None;
     for attempt in 0..RAW_SCAN_ATTEMPTS {
-        let scanned = scan_one_path_once(kind, path);
+        let scanned = scan_once();
         if scanned.valid {
             return scanned;
         }
@@ -2244,6 +2247,11 @@ fn read_superblock_with_backup(
     for attempt in 0..RAW_SCAN_ATTEMPTS {
         match read_superblock_with_backup_once(backend, device_id, capacity) {
             Ok(found) => return Ok(found),
+            Err(err @ (ArgosError::DeviceFailed { .. } | ArgosError::DeviceTimeout { .. })) => {
+                // A fenced device cannot recover inside the same backend.
+                // Leave recovery to the outer scan, which reopens it.
+                return Err(err);
+            }
             Err(err) => last = Some(err),
         }
         if attempt + 1 < RAW_SCAN_ATTEMPTS {
@@ -2284,6 +2292,12 @@ fn read_superblock_with_backup_once(
                 })
                 .map(|sb| (sb, "backup"))
                 .map_err(|backup_err| {
+                    if matches!(
+                        backup_err,
+                        ArgosError::DeviceFailed { .. } | ArgosError::DeviceTimeout { .. }
+                    ) {
+                        return backup_err;
+                    }
                     ArgosError::IncompatibleFormat(format!(
                         "primary superblock failed ({primary_err}); backup superblock failed ({backup_err})"
                     ))

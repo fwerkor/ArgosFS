@@ -408,6 +408,10 @@ pub struct DiskProbe {
     pub recommended_tier: StorageTier,
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Disk {
     pub id: String,
@@ -415,6 +419,10 @@ pub struct Disk {
     pub tier: StorageTier,
     pub weight: f64,
     pub status: DiskStatus,
+    // Preserve an explicit offline decision when raw devices reappear.
+    // Older metadata cannot distinguish scan- and manually-offline states.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub manually_offline: bool,
     pub capacity_bytes: u64,
     #[serde(default)]
     pub capacity_source: CapacitySource,
