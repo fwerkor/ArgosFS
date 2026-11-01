@@ -716,6 +716,43 @@ impl ArgosFs {
         journal::scan(&self.root)
     }
 
+    /// Reset journal regions that only contain a stale invalid tail.
+    ///
+    /// Recovery selects the newest durable metadata checkpoint and replays a
+    /// newer journal snapshot when one exists.  If no replay was needed, every
+    /// valid journal record is at or below that checkpoint; an invalid tail
+    /// then cannot describe committed state.  Clearing it lets `fsck --repair`
+    /// or `replay-journal` leave a raw pool mountable writable instead of
+    /// tripping the preflight "invalid journal entries" check forever.
+    ///
+    /// Returns the number of journal regions reset.  A pool with no invalid
+    /// entries, a host backend, or a journal that still needs replay is left
+    /// untouched.  The caller must have written its metadata checkpoint first
+    /// (`ArgosFs::sync`), so the journal reset cannot roll back a repair.
+    pub fn reset_stale_journals(&self) -> Result<u64> {
+        let report = self.transaction_report()?;
+        if report.invalid_entries == 0 || report.replayed {
+            return Ok(0);
+        }
+        if !self.backend_writable {
+            return Err(ArgosError::PermissionDenied(
+                "volume is read-only; cannot reset stale journals".to_string(),
+            ));
+        }
+        let meta = self.meta.read();
+        if meta.backend == BackendKind::Host {
+            return Ok(0);
+        }
+        let superblocks = self.metadata_superblocks_locked(&meta)?;
+        if self.open_backend_covers_superblocks(&superblocks) {
+            raw_store::reset_journals(&*self.backend, &superblocks)?;
+        } else {
+            let backend = self.metadata_block_backend_locked(&meta, &superblocks, true)?;
+            raw_store::reset_journals(&*backend, &superblocks)?;
+        }
+        Ok(superblocks.len() as u64)
+    }
+
     pub fn deferred_commit_interval(&self) -> Option<Duration> {
         let meta = self.meta.read();
         (self.backend_writable

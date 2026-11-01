@@ -230,6 +230,13 @@ quorum flag. This makes partial fanout, unreadable member journals, and member
 tail corruption visible to preflight tooling instead of hiding them behind only
 the aggregate invalid-entry count.
 
+`fsck --repair` and `replay-journal` reset a journal that contains no valid
+records newer than the durable metadata checkpoint. Such a tail is stale: the
+checkpoint already holds the newest recoverable state, so leaving the invalid
+entry behind would only make later writable mounts fail preflight forever. A
+newer replayable journal snapshot is still replayed and is never discarded by
+this cleanup. `fsck` without `--repair` remains read-only.
+
 Crash injection for loop/raw can be driven with `ARGOSFS_CRASH_POINT` using
 `before-data-write`, `after-data-write-before-flush`,
 `after-data-flush-before-journal-commit`,

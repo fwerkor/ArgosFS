@@ -676,6 +676,84 @@ fn raw_journal_partial_tail_is_audited_and_data_remains_readable() {
 }
 
 #[test]
+fn fsck_repair_clears_a_stale_raw_journal_tail() {
+    let tmp = TempDir::new().unwrap();
+    let images = loop_images(&tmp, 1);
+    let fs = ArgosFs::create_loop(
+        &images,
+        config(1, 0),
+        32 * 1024 * 1024,
+        "stale-journal-tail",
+        false,
+    )
+    .unwrap();
+    create_rootfs_mountpoints(&fs);
+    fs.write_file("/journal-tail", b"valid-before-tail", 0o644)
+        .unwrap();
+    fs.sync().unwrap();
+    drop(fs);
+
+    let disk = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&images[0])
+        .unwrap();
+    let mut header = [0u8; 4096];
+    disk.read_at(&mut header, JOURNAL_REGION_OFFSET).unwrap();
+    let end = u64::from_le_bytes(header[24..32].try_into().unwrap());
+    let mut bad = [0u8; 36];
+    bad[..4].copy_from_slice(&128u32.to_le_bytes());
+    disk.write_at(&bad, JOURNAL_REGION_OFFSET + end).unwrap();
+    header[24..32].copy_from_slice(&(end + bad.len() as u64).to_le_bytes());
+    disk.write_at(&header, JOURNAL_REGION_OFFSET).unwrap();
+    disk.sync_all().unwrap();
+
+    let read_only = ArgosFs::open_loop(&images, false).unwrap();
+    assert!(read_only.transaction_report().unwrap().invalid_entries > 0);
+    drop(read_only);
+
+    let image_list = images
+        .iter()
+        .map(|path| path.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join(",");
+    let repair = Command::new(argosfs_binary())
+        .args(["fsck", "--images", &image_list, "--repair", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        repair.status.success(),
+        "fsck --repair failed: {}",
+        String::from_utf8_lossy(&repair.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&repair.stdout).unwrap();
+    assert_eq!(report["journals_reset"], 1);
+
+    let preflight = Command::new(argosfs_binary())
+        .args([
+            "preflight-root",
+            "--images",
+            &image_list,
+            "--mode",
+            "rw",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        preflight.status.success(),
+        "preflight after fsck --repair failed: {}",
+        String::from_utf8_lossy(&preflight.stderr)
+    );
+
+    let reopened = ArgosFs::open_loop(&images, false).unwrap();
+    assert_eq!(
+        reopened.read_file("/journal-tail", true).unwrap(),
+        b"valid-before-tail"
+    );
+}
+
+#[test]
 fn raw_journal_member_reports_quorum_across_devices() {
     let tmp = TempDir::new().unwrap();
     let images = loop_images(&tmp, 3);
