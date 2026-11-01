@@ -181,10 +181,13 @@ checksum does not match before treating it as damaged:
 - The retry applies to full-shard reads, which is what scrub and normal
   whole-block reads use.  It does not hide persistent corruption.
 - Scrub's report (JSON and the human summary) includes
-  `shard_read_retries` (extra reads after a mismatch) and
-  `shard_read_recovered` (shards that read correctly on a retry).  A
-  non-zero `shard_read_retries` with `shard_read_recovered` equal to it means
-  every retry was a transient USB/controller error rather than bad media.
+  `shard_read_retries` (the number of additional read attempts after a
+  checksum or size mismatch) and `shard_read_recovered` (the number of shards
+  that eventually validated after at least one retry). A shard can require
+  multiple attempts but count as only one recovered shard, so these counters
+  need not match. Successful retries indicate that the first read did not
+  match the expected data; they cannot establish whether the cause was a
+  transient USB/controller problem, unreliable media, or another fault.
 
 `ARGOSFS_USB=1` is a convenience profile for USB card jukeboxes.  It changes
 the defaults of several options at once (an explicitly set option always
