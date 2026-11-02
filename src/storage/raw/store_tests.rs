@@ -486,6 +486,102 @@ fn known_signature_detection_covers_filesystems_partition_tables_and_swap() {
     assert!(!contains_swap_signature(&[0; 100]));
 }
 
+fn append_corrupt_raw_tail(backend: &dyn StorageBackend, sb: &RawSuperblock) {
+    let mut header = [0u8; RAW_HEADER_SIZE];
+    backend
+        .read_at(&sb.disk_id, sb.journal.offset, &mut header)
+        .unwrap();
+    let end = get_u64(&header, 24).unwrap();
+    let mut broken = [0u8; 36];
+    broken[..4].copy_from_slice(&128u32.to_le_bytes());
+    backend
+        .write_at(&sb.disk_id, sb.journal.offset + end, &broken)
+        .unwrap();
+    put_u64(&mut header, 24, end + broken.len() as u64);
+    backend
+        .write_at(&sb.disk_id, sb.journal.offset, &header)
+        .unwrap();
+    backend.flush_device(&sb.disk_id).unwrap();
+}
+
+fn raw_journal_end(backend: &dyn StorageBackend, sb: &RawSuperblock) -> u64 {
+    let mut header = [0u8; RAW_HEADER_SIZE];
+    backend
+        .read_at(&sb.disk_id, sb.journal.offset, &mut header)
+        .unwrap();
+    get_u64(&header, 24).unwrap()
+}
+
+#[test]
+fn stale_reset_keeps_journal_on_member_without_new_checkpoint() {
+    let (_dir, images, previous, superblocks) = quorum_fixture();
+    let backend = block_backend_for(&images);
+    let next = next_metadata(&previous, "partial-checkpoint");
+    append_transaction_with_trusted_integrity_quorum(
+        &backend,
+        &superblocks,
+        &next,
+        Some(&previous),
+        "test-checkpoint-failure",
+        serde_json::json!({}),
+    )
+    .unwrap();
+    for sb in &superblocks {
+        append_corrupt_raw_tail(&backend, sb);
+    }
+    let stale_end = raw_journal_end(&backend, &superblocks[2]);
+    let failing = WriteFailBackend {
+        inner: block_backend_for(&images),
+        failed: BTreeSet::from(["disk-0002".to_string()]),
+    };
+    write_metadata_copies_quorum(&failing, &superblocks, &next).unwrap();
+
+    let err = reset_journals_after_checkpoint(&backend, &superblocks, &next).unwrap_err();
+    assert!(err.to_string().contains("disk-0002"), "{err}");
+    assert_eq!(
+        raw_journal_end(&backend, &superblocks[0]),
+        RAW_HEADER_SIZE as u64
+    );
+    assert_eq!(
+        raw_journal_end(&backend, &superblocks[1]),
+        RAW_HEADER_SIZE as u64
+    );
+    assert_eq!(raw_journal_end(&backend, &superblocks[2]), stale_end);
+    assert!(read_metadata_candidates(&backend, &superblocks[2])
+        .unwrap()
+        .into_iter()
+        .all(|(meta, _)| meta.is_none_or(|meta| meta.txid != next.txid)));
+}
+
+#[test]
+fn stale_reset_continues_after_one_member_write_failure() {
+    let (_dir, images, previous, superblocks) = quorum_fixture();
+    let backend = block_backend_for(&images);
+    for sb in &superblocks {
+        append_corrupt_raw_tail(&backend, sb);
+    }
+    let old_end = raw_journal_end(&backend, &superblocks[1]);
+    let failing = WriteFailBackend {
+        inner: block_backend_for(&images),
+        failed: BTreeSet::from(["disk-0001".to_string()]),
+    };
+    let err = reset_journals_after_checkpoint(&failing, &superblocks, &previous).unwrap_err();
+    assert!(
+        err.to_string().contains("reset 2 journal region(s)"),
+        "{err}"
+    );
+    assert!(err.to_string().contains("disk-0001"), "{err}");
+    assert_eq!(
+        raw_journal_end(&backend, &superblocks[0]),
+        RAW_HEADER_SIZE as u64
+    );
+    assert_eq!(raw_journal_end(&backend, &superblocks[1]), old_end);
+    assert_eq!(
+        raw_journal_end(&backend, &superblocks[2]),
+        RAW_HEADER_SIZE as u64
+    );
+}
+
 #[test]
 fn raw_journal_quorum_ignores_unreadable_and_invalid_members() {
     assert!(raw_journal_quorum(&[], 0));

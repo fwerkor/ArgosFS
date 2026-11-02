@@ -744,13 +744,32 @@ impl ArgosFs {
             return Ok(0);
         }
         let superblocks = self.metadata_superblocks_locked(&meta)?;
-        if self.open_backend_covers_superblocks(&superblocks) {
-            raw_store::reset_journals(&*self.backend, &superblocks)?;
+        let mut stale = Vec::new();
+        for member in &report.raw_journal_members {
+            if member.invalid_entries == 0 {
+                continue;
+            }
+            if member.last_valid_txid > meta.txid
+                || member.last_valid_generation > meta.integrity.generation
+            {
+                return Err(ArgosError::CorruptedMetadata(format!(
+                    "journal on {} contains records newer than the durable checkpoint",
+                    member.disk_id
+                )));
+            }
+            if let Some(sb) = superblocks.iter().find(|sb| sb.disk_id == member.disk_id) {
+                stale.push(sb.clone());
+            }
+        }
+        if stale.is_empty() {
+            return Ok(0);
+        }
+        if self.open_backend_covers_superblocks(&stale) {
+            raw_store::reset_journals_after_checkpoint(&*self.backend, &stale, &meta)
         } else {
             let backend = self.metadata_block_backend_locked(&meta, &superblocks, true)?;
-            raw_store::reset_journals(&*backend, &superblocks)?;
+            raw_store::reset_journals_after_checkpoint(&*backend, &stale, &meta)
         }
-        Ok(superblocks.len() as u64)
     }
 
     pub fn deferred_commit_interval(&self) -> Option<Duration> {
