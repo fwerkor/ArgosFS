@@ -1,0 +1,57 @@
+[package]
+name = "argosfs-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+argosfs = { path = ".." }
+libfuzzer-sys = "0.4"
+serde_json = "1.0"
+tempfile = "3.10"
+uuid = "1.23"
+
+[[bin]]
+name = "raw_format"
+path = "fuzz_targets/raw_format.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "journal_record"
+path = "fuzz_targets/journal_record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "metadata_delta"
+path = "fuzz_targets/metadata_delta.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "paged_metadata"
+path = "fuzz_targets/paged_metadata.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "journal_recovery"
+path = "fuzz_targets/journal_recovery.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "erasure_codec"
+path = "fuzz_targets/erasure_codec.rs"
+test = false
+doc = false
+bench = false

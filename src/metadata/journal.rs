@@ -540,6 +540,12 @@ fn record_hash(record: &JournalRecord) -> Result<String> {
     Ok(sha256_hex(&serde_json::to_vec_pretty(&round_trip)?))
 }
 
+fn record_hash_decoded(record: &JournalRecord) -> Result<String> {
+    let mut clone = record.clone();
+    clone.record_hash.clear();
+    Ok(sha256_hex(&serde_json::to_vec_pretty(&clone)?))
+}
+
 fn record_hash_value(value: &serde_json::Value) -> Result<String> {
     let mut record = serde_json::from_value::<JournalRecord>(value.clone())?;
     record.record_hash.clear();
@@ -547,7 +553,8 @@ fn record_hash_value(value: &serde_json::Value) -> Result<String> {
 }
 
 fn record_hash_is_valid(value: &serde_json::Value, record: &JournalRecord) -> Result<bool> {
-    Ok(record_hash_value(value)? == record.record_hash
+    Ok(record_hash_decoded(record)? == record.record_hash
+        || record_hash_value(value)? == record.record_hash
         || legacy_record_hash_value(value).is_ok_and(|hash| hash == record.record_hash))
 }
 
@@ -585,14 +592,20 @@ fn legacy_record_hash_value(value: &serde_json::Value) -> Result<String> {
     Ok(sha256_hex(&serde_json::to_vec_pretty(&record)?))
 }
 
+fn canonical_metadata_hash_decoded(meta: &Metadata) -> Result<String> {
+    let mut clone = meta.clone();
+    clone.integrity = MetadataIntegrity::default();
+    Ok(sha256_hex(&serde_json::to_vec_pretty(&clone)?))
+}
+
 fn canonical_metadata_hash_bytes(bytes: &[u8]) -> Result<String> {
     let metadata = serde_json::from_slice::<Metadata>(bytes)?;
-    canonical_metadata_hash(&metadata)
+    canonical_metadata_hash_decoded(&metadata)
 }
 
 fn canonical_metadata_hash_value(value: &serde_json::Value) -> Result<String> {
     let metadata = serde_json::from_value::<Metadata>(value.clone())?;
-    canonical_metadata_hash(&metadata)
+    canonical_metadata_hash_decoded(&metadata)
 }
 
 fn append_record(root: &Path, record: &JournalRecord) -> Result<()> {
@@ -615,6 +628,14 @@ fn compact_journal_unlocked(root: &Path) -> Result<()> {
         return Ok(());
     };
     let mut compacted = records[checkpoint_index..].to_vec();
+    for record in &compacted {
+        if let Some(metadata) = &record.metadata {
+            // Rewriting a decoded float must not invalidate the stored snapshot hash.
+            if canonical_metadata_hash(metadata)? != record.meta_hash {
+                return Ok(());
+            }
+        }
+    }
     let mut previous_hash = String::new();
     for record in &mut compacted {
         record.previous_record_hash = previous_hash;
@@ -781,7 +802,9 @@ fn report_latest_recoverable_metadata(root: &Path) -> Result<Option<Metadata>> {
                     replay_failed = true;
                     continue;
                 };
-                if meta_hash != record.meta_hash {
+                if meta_hash != record.meta_hash
+                    && canonical_metadata_hash_decoded(&metadata)? != record.meta_hash
+                {
                     replay_failed = true;
                     continue;
                 }
@@ -897,7 +920,10 @@ pub fn apply_metadata_delta(previous: &Metadata, delta: &[MetadataDeltaOp]) -> R
     }
     let mut metadata = serde_json::from_value::<Metadata>(value)?;
     let hash = canonical_metadata_hash(&metadata)?;
-    validate_metadata(&mut metadata, &hash)?;
+    if validate_metadata(&mut metadata, &hash).is_err() {
+        let decoded_hash = canonical_metadata_hash_decoded(&metadata)?;
+        validate_metadata(&mut metadata, &decoded_hash)?;
+    }
     Ok(metadata)
 }
 
