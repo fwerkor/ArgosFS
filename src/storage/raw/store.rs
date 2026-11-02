@@ -675,12 +675,55 @@ fn initialize_journal_region(
     backend.write_at(&device_id.to_string(), sb.journal.offset, &header)
 }
 
-pub fn reset_journals(backend: &dyn StorageBackend, superblocks: &[RawSuperblock]) -> Result<()> {
-    for sb in superblocks {
-        initialize_journal_region(backend, &sb.disk_id, sb)?;
-        backend.flush_device(&sb.disk_id)?;
+/// Clear stale journal tails only on members that durably hold the checkpoint.
+/// A quorum checkpoint does not imply that every member received its copy.
+pub fn reset_journals_after_checkpoint(
+    backend: &dyn StorageBackend,
+    superblocks: &[RawSuperblock],
+    checkpoint: &Metadata,
+) -> Result<u64> {
+    // Metadata contains floating-point telemetry that can change its JSON
+    // representation on deserialization. Match the persisted transaction identity
+    // and integrity hash rather than requiring byte-for-byte reserialization.
+    if checkpoint.integrity.meta_hash.is_empty() {
+        return Err(ArgosError::CorruptedMetadata(
+            "cannot reset journals without a checkpoint integrity hash".to_string(),
+        ));
     }
-    Ok(())
+    let mut reset = 0;
+    let mut failures = Vec::new();
+    for sb in superblocks {
+        let result = (|| -> Result<()> {
+            let candidates = read_metadata_candidates(backend, sb)?;
+            let confirmed = candidates.into_iter().any(|(candidate, _)| {
+                candidate.is_some_and(|candidate| {
+                    candidate.txid == checkpoint.txid
+                        && candidate.integrity.generation == checkpoint.integrity.generation
+                        && candidate.integrity.meta_hash == checkpoint.integrity.meta_hash
+                })
+            });
+            if !confirmed {
+                return Err(ArgosError::CorruptedMetadata(format!(
+                    "{} has no durable copy of the selected checkpoint",
+                    sb.disk_id
+                )));
+            }
+            initialize_journal_region(backend, &sb.disk_id, sb)?;
+            backend.flush_device(&sb.disk_id)
+        })();
+        match result {
+            Ok(()) => reset += 1,
+            Err(err) => failures.push(format!("{}: {err}", sb.disk_id)),
+        }
+    }
+    if !failures.is_empty() {
+        return Err(ArgosError::CorruptedMetadata(format!(
+            "reset {reset} journal region(s), {} unresolved: {}",
+            failures.len(),
+            failures.join("; ")
+        )));
+    }
+    Ok(reset)
 }
 
 fn append_journal(

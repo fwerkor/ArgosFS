@@ -391,8 +391,12 @@ pub fn run() -> Result<()> {
             let storage = storage.resolve(BackendKind::LoopBlock)?;
             let fs = open_backend(None, storage.backend, storage.images, storage.devices, true)?;
             validate_requested_pool(&fs, storage.pool.as_deref())?;
-            let report = fs.transaction_report()?;
             fs.sync()?;
+            let reset = fs.reset_stale_journals()?;
+            if reset > 0 {
+                eprintln!("reset {reset} stale journal region(s)");
+            }
+            let report = fs.transaction_report()?;
             print_transaction_report(&report, json)?;
         }
         Command::MountRecovery { storage, target } => {
@@ -657,9 +661,10 @@ pub fn run() -> Result<()> {
                 repair || remove_orphans,
             )?;
             validate_requested_pool(&fs, storage.pool.as_deref())?;
-            let report = fs.fsck(repair, remove_orphans)?;
+            let mut report = fs.fsck(repair, remove_orphans)?;
             if repair || remove_orphans {
                 fs.sync()?;
+                report.journals_reset = fs.reset_stale_journals()?;
             }
             print_fsck_report(&report, json)?;
         }
@@ -1203,7 +1208,7 @@ fn print_fsck_report(report: &FsckReport, explicit_json: bool) -> Result<()> {
         return Ok(());
     }
     println!(
-        "checked files={} directories={} damaged={} repaired={} unrecoverable={} missing_shards={} checksum_errors={} shard_read_retries={} shard_read_recovered={} orphans={}",
+        "checked files={} directories={} damaged={} repaired={} unrecoverable={} missing_shards={} checksum_errors={} shard_read_retries={} shard_read_recovered={} orphans={} journals_reset={}",
         report.files_checked,
         report.directories_checked,
         report.damaged_files,
@@ -1213,7 +1218,8 @@ fn print_fsck_report(report: &FsckReport, explicit_json: bool) -> Result<()> {
         report.checksum_errors,
         report.shard_read_retries,
         report.shard_read_recovered,
-        report.orphan_shards
+        report.orphan_shards,
+        report.journals_reset
     );
     for error in &report.errors {
         eprintln!("error: {error}");

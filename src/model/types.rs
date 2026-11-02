@@ -760,6 +760,10 @@ pub struct FsckReport {
     pub shard_read_recovered: u64,
     pub orphan_shards: u64,
     pub removed_orphans: u64,
+    /// Journal regions reset because they held only stale entries below the
+    /// selected metadata checkpoint.  Set by `fsck --repair`.
+    #[serde(default)]
+    pub journals_reset: u64,
     pub errors: Vec<String>,
 }
 
