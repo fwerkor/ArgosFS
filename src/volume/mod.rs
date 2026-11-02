@@ -323,6 +323,7 @@ impl ArgosFs {
                     tier: probe.recommended_tier,
                     weight: probe.recommended_weight,
                     status: DiskStatus::Online,
+                    manually_offline: false,
                     capacity_bytes: probe.capacity_bytes,
                     capacity_source: CapacitySource::AutoProbe,
                     used_bytes: 0,
@@ -541,6 +542,7 @@ impl ArgosFs {
                     tier: StorageTier::Warm,
                     weight: 1.0,
                     status: DiskStatus::Online,
+                    manually_offline: false,
                     capacity_bytes: info.capacity,
                     capacity_source: CapacitySource::UserOverride,
                     used_bytes: 0,
@@ -712,6 +714,62 @@ impl ArgosFs {
             return raw_store::audit(&*backend, &superblocks);
         }
         journal::scan(&self.root)
+    }
+
+    /// Reset journal regions that only contain a stale invalid tail.
+    ///
+    /// Recovery selects the newest durable metadata checkpoint and replays a
+    /// newer journal snapshot when one exists.  If no replay was needed, every
+    /// valid journal record is at or below that checkpoint; an invalid tail
+    /// then cannot describe committed state.  Clearing it lets `fsck --repair`
+    /// or `replay-journal` leave a raw pool mountable writable instead of
+    /// tripping the preflight "invalid journal entries" check forever.
+    ///
+    /// Returns the number of journal regions reset.  A pool with no invalid
+    /// entries, a host backend, or a journal that still needs replay is left
+    /// untouched.  The caller must have written its metadata checkpoint first
+    /// (`ArgosFs::sync`), so the journal reset cannot roll back a repair.
+    pub fn reset_stale_journals(&self) -> Result<u64> {
+        let report = self.transaction_report()?;
+        if report.invalid_entries == 0 || report.replayed {
+            return Ok(0);
+        }
+        if !self.backend_writable {
+            return Err(ArgosError::PermissionDenied(
+                "volume is read-only; cannot reset stale journals".to_string(),
+            ));
+        }
+        let meta = self.meta.read();
+        if meta.backend == BackendKind::Host {
+            return Ok(0);
+        }
+        let superblocks = self.metadata_superblocks_locked(&meta)?;
+        let mut stale = Vec::new();
+        for member in &report.raw_journal_members {
+            if member.invalid_entries == 0 {
+                continue;
+            }
+            if member.last_valid_txid > meta.txid
+                || member.last_valid_generation > meta.integrity.generation
+            {
+                return Err(ArgosError::CorruptedMetadata(format!(
+                    "journal on {} contains records newer than the durable checkpoint",
+                    member.disk_id
+                )));
+            }
+            if let Some(sb) = superblocks.iter().find(|sb| sb.disk_id == member.disk_id) {
+                stale.push(sb.clone());
+            }
+        }
+        if stale.is_empty() {
+            return Ok(0);
+        }
+        if self.open_backend_covers_superblocks(&stale) {
+            raw_store::reset_journals_after_checkpoint(&*self.backend, &stale, &meta)
+        } else {
+            let backend = self.metadata_block_backend_locked(&meta, &superblocks, true)?;
+            raw_store::reset_journals_after_checkpoint(&*backend, &stale, &meta)
+        }
     }
 
     pub fn deferred_commit_interval(&self) -> Option<Duration> {

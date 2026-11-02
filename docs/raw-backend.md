@@ -67,7 +67,23 @@ entry checksum and an internal record hash. Records normally carry metadata
 deltas and periodic full snapshots, so open can replay a newer committed state
 when checkpoint copies are stale. Rw open marks member superblocks dirty. A
 clean unmount writes fresh metadata checkpoint copies before marking the member
-superblocks clean.
+superblocks clean. A pool counts as cleanly unmounted when at least a metadata
+quorum of its members is clean, not only when every member is clean: a card
+that failed during the unmount (or missed a later cleanup) can stay dirty
+without forcing every future writable mount to replay or refuse the pool.
+
+A member that is absent from an open scan is recorded as `Offline`. The
+raw/loop CLI has no administrative mark-offline command, but callers of the
+Rust API can explicitly isolate a member with `ArgosFs::mark_disk()`. Scan-
+derived `Offline` members return to `Online` when their devices are visible
+again, while explicitly isolated members remain `Offline` until marked
+otherwise. This allows a USB reader that briefly dropped off the bus to
+recover without silently undoing an administrator's isolation decision.
+
+The explicit-isolation marker is backward-compatible with older metadata:
+members without the marker are treated as scan-offline. An intentionally
+isolated member marked by an older binary has no provenance recorded and
+may therefore need to be re-isolated when upgrading.
 
 New loop/raw volumes created by the CLI use bounded group commit by default.
 Ordinary buffered updates are accumulated in memory and persisted as one journal
@@ -165,10 +181,13 @@ checksum does not match before treating it as damaged:
 - The retry applies to full-shard reads, which is what scrub and normal
   whole-block reads use.  It does not hide persistent corruption.
 - Scrub's report (JSON and the human summary) includes
-  `shard_read_retries` (extra reads after a mismatch) and
-  `shard_read_recovered` (shards that read correctly on a retry).  A
-  non-zero `shard_read_retries` with `shard_read_recovered` equal to it means
-  every retry was a transient USB/controller error rather than bad media.
+  `shard_read_retries` (the number of additional read attempts after a
+  checksum or size mismatch) and `shard_read_recovered` (the number of shards
+  that eventually validated after at least one retry). A shard can require
+  multiple attempts but count as only one recovered shard, so these counters
+  need not match. Successful retries indicate that the first read did not
+  match the expected data; they cannot establish whether the cause was a
+  transient USB/controller problem, unreliable media, or another fault.
 
 `ARGOSFS_USB=1` is a convenience profile for USB card jukeboxes.  It changes
 the defaults of several options at once (an explicitly set option always
@@ -210,6 +229,17 @@ Transaction audit reports include per-member raw journal status and a majority
 quorum flag. This makes partial fanout, unreadable member journals, and member
 tail corruption visible to preflight tooling instead of hiding them behind only
 the aggregate invalid-entry count.
+
+`fsck --repair` and `replay-journal` reset a journal that contains no valid
+records newer than the durable metadata checkpoint. Such a tail is stale: the
+checkpoint already holds the newest recoverable state, so leaving the invalid
+entry behind would only make later writable mounts fail preflight forever. A
+newer replayable journal snapshot is still replayed and is never discarded by
+this cleanup. Each affected member must have its own durable copy of the
+selected checkpoint before its journal can be reset; a successful quorum
+checkpoint alone is insufficient. Cleanup continues on other eligible members
+when one fails, but reports the unresolved members as an error. `fsck` without
+`--repair` remains read-only.
 
 Crash injection for loop/raw can be driven with `ARGOSFS_CRASH_POINT` using
 `before-data-write`, `after-data-write-before-flush`,

@@ -162,6 +162,38 @@ fn recommended_mode_prioritizes_backend_redundancy_and_recovery() {
 }
 
 #[test]
+fn removed_members_do_not_make_a_rootfs_degraded() {
+    let dir = tempdir().unwrap();
+    let images = (0..3)
+        .map(|index| dir.path().join(format!("removed-{index}.img")))
+        .collect::<Vec<_>>();
+    let fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "removed-rootfs",
+        false,
+    )
+    .unwrap();
+    for path in ["/dev", "/proc", "/run", "/sys"] {
+        fs.mkdir(path, 0o755).unwrap();
+    }
+    fs.mark_disk("disk-0000", DiskStatus::Removed).unwrap();
+
+    let report = preflight_report(&fs, RootMountMode::ReadWrite);
+
+    assert!(!report.degraded, "{:?}", report.issues);
+    assert_eq!(report.total_devices, 2);
+    assert_eq!(report.available_devices, 2);
+    assert_eq!(report.missing_devices, 0);
+    assert!(report.ok, "{:?}", report.errors);
+}
+
+#[test]
 fn host_volume_report_lists_missing_switch_root_mountpoints() {
     let dir = tempdir().unwrap();
     let fs = ArgosFs::create(

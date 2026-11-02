@@ -89,6 +89,7 @@ fn sample_metadata() -> Metadata {
             tier: StorageTier::Warm,
             weight: 1.0,
             status: DiskStatus::Online,
+            manually_offline: false,
             capacity_bytes: 1024 * 1024 * 1024,
             capacity_source: CapacitySource::UserOverride,
             used_bytes: 4096,
