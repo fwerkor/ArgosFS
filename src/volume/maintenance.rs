@@ -810,23 +810,30 @@ impl ArgosFs {
             report.files_checked += 1;
             match self.read_inode_with_damage_report(ino, 0, u64::MAX as usize, true) {
                 Ok((_, damaged, repaired)) => {
-                    if !damaged.is_empty() {
+                    // A member that is offline or failed is reported as
+                    // missing, but it is not damaged data: the file was
+                    // recovered from the remaining shards.  Only count a
+                    // damaged file when some shard needs a real repair.
+                    if damaged
+                        .iter()
+                        .any(|entry| !super::data_plane::damage_is_unavailable_member(entry))
+                    {
                         report.damaged_files += 1;
-                        report.checksum_errors += damaged
-                            .iter()
-                            .filter(|entry| entry.contains(":checksum:"))
-                            .count() as u64;
-                        report.missing_shards += damaged
-                            .iter()
-                            .filter(|entry| {
-                                entry.contains(":missing:")
-                                    || entry.contains(":missing-disk")
-                                    || entry.contains(":unavailable")
-                            })
-                            .count() as u64;
-                        if repaired {
-                            report.repaired_files += 1;
-                        }
+                    }
+                    report.checksum_errors += damaged
+                        .iter()
+                        .filter(|entry| entry.contains(":checksum:"))
+                        .count() as u64;
+                    report.missing_shards += damaged
+                        .iter()
+                        .filter(|entry| {
+                            entry.contains(":missing:")
+                                || entry.contains(":missing-disk")
+                                || entry.contains(":unavailable")
+                        })
+                        .count() as u64;
+                    if repaired {
+                        report.repaired_files += 1;
                     }
                 }
                 Err(err) => {
@@ -913,6 +920,19 @@ impl ArgosFs {
                     let mut meta = self.meta.write();
                     for block in &inode.blocks {
                         for shard in &block.shards {
+                            // Do not read a shard from a member that is
+                            // unavailable.  Its data is reconstructed from
+                            // parity, so counting it as damage would rewrite
+                            // every file in a degraded pool.
+                            if meta.disks.get(&shard.disk_id).is_some_and(|disk| {
+                                matches!(
+                                    disk.status,
+                                    DiskStatus::Failed | DiskStatus::Offline | DiskStatus::Removed
+                                )
+                            }) {
+                                report.missing_shards += 1;
+                                continue;
+                            }
                             match self.read_shard_verified_locked(&mut meta, shard) {
                                 Ok(Some(_)) => {}
                                 Ok(None) => {

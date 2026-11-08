@@ -439,7 +439,14 @@ impl ArgosFs {
         let (mut data, mut damaged) =
             self.decode_inode_range_from_inode_locked(&mut meta, &inode, start, end)?;
         let mut repaired = false;
-        if repair && !damaged.is_empty() {
+        // An unavailable member is not data damage: the block was rebuilt
+        // from the remaining shards.  Only rewrite the file for real damage
+        // (checksum, missing extent, invalid slot, ...).  Otherwise every
+        // read in a degraded pool would rewrite the file it just read.
+        let has_repairable_damage = damaged
+            .iter()
+            .any(|entry| !super::data_plane::damage_is_unavailable_member(entry));
+        if repair && has_repairable_damage {
             let mut repair_damaged = damaged.clone();
             let (full, full_damaged) = self.decode_inode_data_locked(&mut meta, &inode)?;
             for entry in full_damaged {

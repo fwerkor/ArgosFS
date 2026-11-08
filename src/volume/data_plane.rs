@@ -1542,6 +1542,19 @@ impl ArgosFs {
     }
 }
 
+/// True when a damage marker only says that a member is unavailable, not that
+/// the stored shard is corrupt.
+///
+/// `decode_block_locked` records `"<disk>:unavailable"` for a shard whose
+/// member is Offline, Failed or Removed and reconstructs the block from the
+/// remaining shards.  Such a block is readable; rewriting the whole file
+/// would only wear the healthy members and could rewrite every file in a
+/// degraded pool.  Actual checksum, extent and metadata damage still needs a
+/// repair.
+pub(super) fn damage_is_unavailable_member(entry: &str) -> bool {
+    entry.ends_with(":unavailable")
+}
+
 #[cfg(test)]
 #[path = "data_plane_tests.rs"]
 mod tests;

@@ -21,6 +21,49 @@ fn volume() -> (tempfile::TempDir, ArgosFs) {
     (dir, fs)
 }
 
+fn redundant_volume() -> (tempfile::TempDir, ArgosFs) {
+    let dir = tempdir().unwrap();
+    let fs = ArgosFs::create(
+        dir.path(),
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            compression: Compression::None,
+            chunk_size: 4096,
+            ..VolumeConfig::default()
+        },
+        4,
+        false,
+    )
+    .unwrap();
+    (dir, fs)
+}
+
+#[test]
+fn read_does_not_self_heal_a_file_when_only_a_member_is_unavailable() {
+    let (_dir, fs) = redundant_volume();
+    fs.write_file("/file", &vec![3u8; 8192], 0o600).unwrap();
+    let (disk_id, relpath) = {
+        let ino = fs.resolve_path("/file", true).unwrap();
+        let meta = fs.metadata_snapshot();
+        let shard = &meta.inodes[&ino].blocks[0].shards[0];
+        (shard.disk_id.clone(), shard.relpath.clone())
+    };
+    let shard_path = fs.shard_path_locked(&fs.metadata_snapshot(), &disk_id, &relpath);
+    fs.mark_disk(&disk_id, DiskStatus::Offline).unwrap();
+    std::fs::remove_file(shard_path).unwrap();
+    let txid_before = fs.metadata_snapshot().txid;
+
+    let data = fs.read_file("/file", true).unwrap();
+
+    assert_eq!(data, vec![3u8; 8192]);
+    assert_eq!(
+        fs.metadata_snapshot().txid,
+        txid_before,
+        "reading a recoverable file must not rewrite it for an offline member"
+    );
+}
+
 #[test]
 fn entry_names_round_trip_utf8_reserved_prefixes_and_non_utf8_bytes() {
     for invalid in ["", ".", "..", "a/b", "a\0b"] {

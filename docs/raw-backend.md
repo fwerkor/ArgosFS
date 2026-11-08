@@ -211,6 +211,17 @@ mode is not a free speed-up; it trades some throughput for more tolerance of
 transient card/controller errors.  Scrub still performs the full check and
 repair.
 
+## Unavailable members and self-healing
+
+A shard whose member is `Offline`, `Failed` or `Removed` is unavailable, not
+corrupt: the remaining shards reconstruct the block.  `fsck`/scrub report such
+shards in `missing_shards`, but they do not increment `damaged_files` or
+`repaired_files`, and ordinary reads do not rewrite the file for them.  Only
+real damage (a checksum mismatch, a missing extent on an online member, an
+invalid slot, ...) triggers a self-heal or a scrub repair.  This keeps a pool
+with one missing member readable without rewriting every file that is read,
+and prevents a temporary reader dropout from turning into a whole-pool write.
+
 ## Data Extents
 
 Host shards use `ShardLocation::HostPath`. Loop/raw shards use

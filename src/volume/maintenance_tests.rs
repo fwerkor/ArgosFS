@@ -23,6 +23,59 @@ fn host_volume(disks: usize) -> (tempfile::TempDir, ArgosFs) {
     (dir, fs)
 }
 
+fn redundant_host_volume() -> (tempfile::TempDir, ArgosFs) {
+    let dir = tempdir().unwrap();
+    let fs = ArgosFs::create(
+        dir.path(),
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            compression: Compression::None,
+            chunk_size: 4096,
+            ..VolumeConfig::default()
+        },
+        4,
+        false,
+    )
+    .unwrap();
+    (dir, fs)
+}
+
+/// Remove a member's shard and mark the member offline.  The file is still
+/// fully recoverable from parity, so this is degraded rather than damaged.
+fn lose_one_member(fs: &ArgosFs, path: &str) -> String {
+    let ino = fs.resolve_path(path, true).unwrap();
+    let (disk_id, relpath) = {
+        let meta = fs.metadata_snapshot();
+        let shard = &meta.inodes[&ino].blocks[0].shards[0];
+        (shard.disk_id.clone(), shard.relpath.clone())
+    };
+    let shard_path = fs.shard_path_locked(&fs.metadata_snapshot(), &disk_id, &relpath);
+    fs.mark_disk(&disk_id, DiskStatus::Offline).unwrap();
+    std::fs::remove_file(shard_path).unwrap();
+    disk_id
+}
+
+#[test]
+fn scrub_does_not_rewrite_files_for_an_offline_member() {
+    let (_dir, fs) = redundant_host_volume();
+    fs.write_file("/file", &vec![7u8; 8192], 0o600).unwrap();
+    lose_one_member(&fs, "/file");
+
+    let report = fs.scrub().unwrap();
+
+    assert_eq!(report.unrecoverable_files, 0, "{report:?}");
+    assert_eq!(report.damaged_files, 0, "{report:?}");
+    assert_eq!(report.repaired_files, 0, "{report:?}");
+    assert_eq!(report.checksum_errors, 0, "{report:?}");
+    assert!(report.missing_shards >= 1, "{report:?}");
+    assert_eq!(
+        fs.read_file("/file", false).unwrap(),
+        vec![7u8; 8192],
+        "the file must still read correctly"
+    );
+}
+
 #[test]
 fn io_policy_and_encryption_cover_empty_repeat_and_wrong_passphrases() {
     let _guard = env_lock();
