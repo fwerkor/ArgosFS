@@ -170,6 +170,100 @@ fn scrub_repairs_a_removed_member() {
 }
 
 #[test]
+fn briefly_missing_loop_member_returns_without_rewriting_stripes() {
+    let _guard = env_lock();
+    std::env::set_var("ARGOSFS_OFFLINE_GRACE_MS", "60000");
+    let dir = tempdir().unwrap();
+    let images = (0..4)
+        .map(|index| dir.path().join(format!("reconnect-{index}.img")))
+        .collect::<Vec<_>>();
+    let fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            compression: Compression::None,
+            chunk_size: 4096,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "reconnect",
+        false,
+    )
+    .unwrap();
+    for index in 0..3 {
+        fs.write_file(&format!("/file-{index}"), &vec![index as u8; 16384], 0o600)
+            .unwrap();
+    }
+    let original = fs.metadata_snapshot();
+    let stripes = original
+        .inodes
+        .iter()
+        .filter(|(_, inode)| inode.kind == NodeKind::File)
+        .map(|(ino, inode)| (*ino, serde_json::to_value(&inode.blocks).unwrap()))
+        .collect::<Vec<_>>();
+    let missing_id = original
+        .inodes
+        .values()
+        .find(|inode| inode.kind == NodeKind::File)
+        .unwrap()
+        .blocks[0]
+        .shards[0]
+        .disk_id
+        .clone();
+    fs.mark_clean_unmount().unwrap();
+    drop(fs);
+
+    let present_images = images
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| format!("disk-{index:04}") != missing_id)
+        .map(|(_, path)| path.clone())
+        .collect::<Vec<_>>();
+    let degraded = ArgosFs::open_loop(&present_images, true).unwrap();
+    let full = degraded.scrub().unwrap();
+    let (incremental, _) = degraded.scrub_limited(10, None);
+    for report in [&full, &incremental] {
+        assert_eq!(report.damaged_files, 0, "{report:?}");
+        assert_eq!(report.repaired_files, 0, "{report:?}");
+        assert_eq!(report.unrecoverable_files, 0, "{report:?}");
+        assert!(report.missing_shards > 0, "{report:?}");
+    }
+    for (ino, blocks) in &stripes {
+        assert_eq!(
+            serde_json::to_value(&degraded.metadata_snapshot().inodes[ino].blocks).unwrap(),
+            *blocks
+        );
+    }
+    degraded.mark_clean_unmount().unwrap();
+    drop(degraded);
+
+    let restored = ArgosFs::open_loop(&images, true).unwrap();
+    assert_eq!(
+        restored.metadata_snapshot().disks[&missing_id].status,
+        DiskStatus::Online
+    );
+    let after_return = restored.scrub().unwrap();
+    assert_eq!(after_return.repaired_files, 0, "{after_return:?}");
+    assert_eq!(after_return.missing_shards, 0, "{after_return:?}");
+    for (ino, blocks) in &stripes {
+        assert_eq!(
+            serde_json::to_value(&restored.metadata_snapshot().inodes[ino].blocks).unwrap(),
+            *blocks
+        );
+    }
+    for index in 0..3 {
+        assert_eq!(
+            restored
+                .read_file(&format!("/file-{index}"), false)
+                .unwrap(),
+            vec![index as u8; 16384]
+        );
+    }
+    std::env::remove_var("ARGOSFS_OFFLINE_GRACE_MS");
+}
+
+#[test]
 fn runtime_usb_quarantine_waits_for_grace_before_incremental_repair() {
     let _guard = env_lock();
     std::env::set_var("ARGOSFS_OFFLINE_GRACE_MS", "60000");
