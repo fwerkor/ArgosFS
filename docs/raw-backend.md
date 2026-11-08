@@ -236,6 +236,12 @@ This keeps a pool with one temporarily missing card readable without rewriting
 every file that is read, while a genuinely failed or retired card still
 restores redundancy automatically.
 
+If a USB member disappears *during* a mount, a fatal I/O error can quarantine it
+before the next open scan changes its state to `Offline`. The same grace period
+applies to its quarantined shards for reads and scrub, which still report them
+as missing. Quarantined devices require a new open scan to be considered for
+reuse after reconnection.
+
 ## Data Extents
 
 Host shards use `ShardLocation::HostPath`. Loop/raw shards use
