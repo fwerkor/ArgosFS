@@ -944,12 +944,21 @@ impl ArgosFs {
                             // minute) scrub rebuilds the shards.  Failed and
                             // removed members go through the normal repair
                             // path immediately.
-                            if meta.disks.get(&shard.disk_id).is_some_and(|disk| {
-                                disk.status == DiskStatus::Offline
-                                    && !offline_member_due_for_repair(disk)
-                            }) {
-                                report.missing_shards += 1;
-                                continue;
+                            if let Some(disk) = meta.disks.get(&shard.disk_id) {
+                                match disk.status {
+                                    DiskStatus::Offline if !offline_member_due_for_repair(disk) => {
+                                        report.missing_shards += 1;
+                                        continue;
+                                    }
+                                    DiskStatus::Offline | DiskStatus::Failed | DiskStatus::Removed => {
+                                        // A retired/failed shard is unavailable even if its
+                                        // old backing path still happens to be readable.
+                                        report.missing_shards += 1;
+                                        damaged = true;
+                                        continue;
+                                    }
+                                    _ => {}
+                                }
                             }
                             match self.read_shard_verified_locked(&mut meta, shard) {
                                 Ok(Some(_)) => {}

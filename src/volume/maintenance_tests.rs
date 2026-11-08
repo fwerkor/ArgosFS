@@ -170,6 +170,30 @@ fn scrub_repairs_a_removed_member() {
 }
 
 #[test]
+fn scrub_rebuilds_logically_retired_members_even_if_shards_are_readable() {
+    for status in [DiskStatus::Failed, DiskStatus::Removed] {
+        let (_dir, fs) = redundant_host_volume();
+        fs.write_file("/file", &vec![6u8; 8192], 0o600).unwrap();
+        let ino = fs.resolve_path("/file", true).unwrap();
+        let disk_id = fs.metadata_snapshot().inodes[&ino].blocks[0].shards[0]
+            .disk_id
+            .clone();
+        fs.mark_disk(&disk_id, status).unwrap();
+
+        let report = fs.scrub().unwrap();
+        assert_eq!(report.damaged_files, 1, "{status:?}: {report:?}");
+        assert_eq!(report.repaired_files, 1, "{status:?}: {report:?}");
+        assert_eq!(report.unrecoverable_files, 0, "{status:?}: {report:?}");
+        assert!(fs.metadata_snapshot().inodes[&ino]
+            .blocks
+            .iter()
+            .flat_map(|block| &block.shards)
+            .all(|shard| shard.disk_id != disk_id));
+        assert_eq!(fs.read_file("/file", false).unwrap(), vec![6u8; 8192]);
+    }
+}
+
+#[test]
 fn io_policy_and_encryption_cover_empty_repeat_and_wrong_passphrases() {
     let _guard = env_lock();
     let (_dir, fs) = host_volume(1);
