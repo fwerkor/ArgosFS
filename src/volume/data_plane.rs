@@ -1556,14 +1556,27 @@ impl ArgosFs {
 /// the operator has explicitly retired it, so the normal repair path still
 /// rebuilds the file.
 pub(super) fn damage_is_transient_offline_member(
+    fs: &ArgosFs,
     meta: &Metadata,
     entry: &str,
     repair_offline: bool,
 ) -> bool {
-    entry.strip_suffix(":unavailable").is_some_and(|disk_id| {
+    let disk_id = entry
+        .strip_suffix(":unavailable")
+        .or_else(|| entry.split_once(":missing:").map(|(disk_id, _)| disk_id));
+    disk_id.is_some_and(|disk_id| {
         meta.disks.get(disk_id).is_some_and(|disk| {
-            disk.status == DiskStatus::Offline
-                && !(repair_offline && offline_member_due_for_repair(disk))
+            if disk.status == DiskStatus::Offline {
+                return !(repair_offline && offline_member_due_for_repair(disk));
+            }
+            // During an active mount a disappearing USB device is quarantined
+            // before the next open scan can mark it Offline. The first fatal
+            // I/O failure starts the same grace period for scrub and reads.
+            meta.backend != BackendKind::Host
+                && disk.status != DiskStatus::Failed
+                && disk.status != DiskStatus::Removed
+                && fs.is_device_quarantined(disk_id)
+                && !(repair_offline && fs.quarantined_member_due_for_repair(disk_id))
         })
     })
 }

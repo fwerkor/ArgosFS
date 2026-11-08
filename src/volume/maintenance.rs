@@ -828,7 +828,7 @@ impl ArgosFs {
                         let meta = self.meta.read();
                         damaged.iter().any(|entry| {
                             !super::data_plane::damage_is_transient_offline_member(
-                                &meta, entry, true,
+                                self, &meta, entry, true,
                             )
                         })
                     };
@@ -950,7 +950,9 @@ impl ArgosFs {
                                         report.missing_shards += 1;
                                         continue;
                                     }
-                                    DiskStatus::Offline | DiskStatus::Failed | DiskStatus::Removed => {
+                                    DiskStatus::Offline
+                                    | DiskStatus::Failed
+                                    | DiskStatus::Removed => {
                                         // A retired/failed shard is unavailable even if its
                                         // old backing path still happens to be readable.
                                         report.missing_shards += 1;
@@ -960,6 +962,13 @@ impl ArgosFs {
                                     _ => {}
                                 }
                             }
+                            if meta.backend != BackendKind::Host
+                                && self.is_device_quarantined(&shard.disk_id)
+                                && !self.quarantined_member_due_for_repair(&shard.disk_id)
+                            {
+                                report.missing_shards += 1;
+                                continue;
+                            }
                             match self.read_shard_verified_locked(&mut meta, shard) {
                                 Ok(Some(_)) => {}
                                 Ok(None) => {
@@ -968,7 +977,15 @@ impl ArgosFs {
                                 }
                                 Err(_) => {
                                     report.missing_shards += 1;
-                                    damaged = true;
+                                    // A fatal I/O failure during this scan may
+                                    // have just quarantined an unplugged device.
+                                    // Do not rebuild it during the grace period.
+                                    if meta.backend == BackendKind::Host
+                                        || !self.is_device_quarantined(&shard.disk_id)
+                                        || self.quarantined_member_due_for_repair(&shard.disk_id)
+                                    {
+                                        damaged = true;
+                                    }
                                 }
                             }
                         }

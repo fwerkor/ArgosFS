@@ -170,6 +170,53 @@ fn scrub_repairs_a_removed_member() {
 }
 
 #[test]
+fn runtime_usb_quarantine_waits_for_grace_before_incremental_repair() {
+    let _guard = env_lock();
+    std::env::set_var("ARGOSFS_OFFLINE_GRACE_MS", "60000");
+    let dir = tempdir().unwrap();
+    let images = (0..4)
+        .map(|index| dir.path().join(format!("hotplug-{index}.img")))
+        .collect::<Vec<_>>();
+    let fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            compression: Compression::None,
+            chunk_size: 4096,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "hotplug",
+        false,
+    )
+    .unwrap();
+    fs.write_file("/file", &vec![5u8; 8192], 0o600).unwrap();
+    let ino = fs.resolve_path("/file", true).unwrap();
+    let disk_id = fs.metadata_snapshot().inodes[&ino].blocks[0].shards[0]
+        .disk_id
+        .clone();
+
+    // A fatal I/O failure is quarantined while this mount is still open.
+    // It must behave like a briefly missing scan member.
+    fs.quarantine_device(&disk_id);
+    assert_eq!(fs.read_file("/file", true).unwrap(), vec![5u8; 8192]);
+    let (recent, _) = fs.scrub_limited(1, None);
+    assert_eq!(recent.damaged_files, 0, "{recent:?}");
+    assert_eq!(recent.repaired_files, 0, "{recent:?}");
+    assert!(recent.missing_shards > 0, "{recent:?}");
+
+    fs.quarantine_since
+        .lock()
+        .insert(disk_id.clone(), now_f64() - 120.0);
+    let (expired, _) = fs.scrub_limited(1, None);
+    assert_eq!(expired.damaged_files, 1, "{expired:?}");
+    assert_eq!(expired.repaired_files, 1, "{expired:?}");
+    assert_eq!(fs.read_file("/file", false).unwrap(), vec![5u8; 8192]);
+    std::env::remove_var("ARGOSFS_OFFLINE_GRACE_MS");
+}
+
+#[test]
 fn scrub_rebuilds_logically_retired_members_even_if_shards_are_readable() {
     for status in [DiskStatus::Failed, DiskStatus::Removed] {
         let (_dir, fs) = redundant_host_volume();

@@ -478,7 +478,12 @@ impl ArgosFs {
         // self-heal.  Otherwise every read in a pool with one card out would
         // rewrite the file it just read.
         let has_repairable_damage = damaged.iter().any(|entry| {
-            !super::data_plane::damage_is_transient_offline_member(&meta, entry, repair_offline)
+            !super::data_plane::damage_is_transient_offline_member(
+                self,
+                &meta,
+                entry,
+                repair_offline,
+            )
         });
         if repair && has_repairable_damage {
             let mut repair_damaged = damaged.clone();
