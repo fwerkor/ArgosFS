@@ -51,13 +51,21 @@ fn lose_one_member(fs: &ArgosFs, path: &str) -> String {
         (shard.disk_id.clone(), shard.relpath.clone())
     };
     let shard_path = fs.shard_path_locked(&fs.metadata_snapshot(), &disk_id, &relpath);
-    fs.mark_disk(&disk_id, DiskStatus::Offline).unwrap();
+    {
+        let mut meta = fs.meta.write();
+        let disk = meta.disks.get_mut(&disk_id).unwrap();
+        disk.status = DiskStatus::Offline;
+        disk.manually_offline = false;
+        disk.offline_since = Some(now_f64());
+    }
     std::fs::remove_file(shard_path).unwrap();
     disk_id
 }
 
 #[test]
 fn scrub_does_not_rewrite_files_for_an_offline_member() {
+    let _guard = env_lock();
+    std::env::set_var("ARGOSFS_OFFLINE_GRACE_MS", "60000");
     let (_dir, fs) = redundant_host_volume();
     fs.write_file("/file", &vec![7u8; 8192], 0o600).unwrap();
     lose_one_member(&fs, "/file");
@@ -73,6 +81,65 @@ fn scrub_does_not_rewrite_files_for_an_offline_member() {
         fs.read_file("/file", false).unwrap(),
         vec![7u8; 8192],
         "the file must still read correctly"
+    );
+    std::env::remove_var("ARGOSFS_OFFLINE_GRACE_MS");
+}
+
+#[test]
+fn scrub_repairs_an_offline_member_after_the_grace_period() {
+    let _guard = env_lock();
+    std::env::set_var("ARGOSFS_OFFLINE_GRACE_MS", "60000");
+    let (_dir, fs) = redundant_host_volume();
+    fs.write_file("/file", &vec![7u8; 8192], 0o600).unwrap();
+    let disk_id = lose_one_member(&fs, "/file");
+    {
+        let mut meta = fs.meta.write();
+        meta.disks.get_mut(&disk_id).unwrap().offline_since = Some(now_f64() - 120.0);
+    }
+
+    let report = fs.scrub().unwrap();
+
+    assert_eq!(report.unrecoverable_files, 0, "{report:?}");
+    assert!(report.damaged_files >= 1, "{report:?}");
+    assert!(report.repaired_files >= 1, "{report:?}");
+    let report_after = fs.scrub().unwrap();
+    assert_eq!(report_after.damaged_files, 0, "{report_after:?}");
+    assert_eq!(report_after.repaired_files, 0, "{report_after:?}");
+    assert_eq!(
+        fs.read_file("/file", false).unwrap(),
+        vec![7u8; 8192],
+        "the file must still read correctly after the repair"
+    );
+    std::env::remove_var("ARGOSFS_OFFLINE_GRACE_MS");
+}
+
+#[test]
+fn scrub_repairs_a_removed_member() {
+    let (_dir, fs) = redundant_host_volume();
+    fs.write_file("/file", &vec![9u8; 8192], 0o600).unwrap();
+    let (disk_id, relpath) = {
+        let ino = fs.resolve_path("/file", true).unwrap();
+        let meta = fs.metadata_snapshot();
+        let shard = &meta.inodes[&ino].blocks[0].shards[0];
+        (shard.disk_id.clone(), shard.relpath.clone())
+    };
+    let shard_path = fs.shard_path_locked(&fs.metadata_snapshot(), &disk_id, &relpath);
+    fs.mark_disk(&disk_id, DiskStatus::Removed).unwrap();
+    std::fs::remove_file(shard_path).unwrap();
+
+    let report = fs.scrub().unwrap();
+
+    assert_eq!(report.unrecoverable_files, 0, "{report:?}");
+    assert!(report.damaged_files >= 1, "{report:?}");
+    assert!(report.repaired_files >= 1, "{report:?}");
+    assert_eq!(report.checksum_errors, 0, "{report:?}");
+    let report_after = fs.scrub().unwrap();
+    assert_eq!(report_after.damaged_files, 0, "{report_after:?}");
+    assert_eq!(report_after.repaired_files, 0, "{report_after:?}");
+    assert_eq!(
+        fs.read_file("/file", false).unwrap(),
+        vec![9u8; 8192],
+        "the file must still read correctly after the repair"
     );
 }
 

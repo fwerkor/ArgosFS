@@ -410,6 +410,29 @@ impl ArgosFs {
         size: usize,
         repair: bool,
     ) -> Result<(Vec<u8>, Vec<String>, bool)> {
+        self.read_inode_with_damage_report_policy(ino, offset, size, repair, false)
+    }
+
+    /// Scrub may rebuild an Offline member's shards after the configured
+    /// grace period.  Ordinary reads use the wrapper above and never do.
+    pub(super) fn read_inode_with_damage_report_for_scrub(
+        &self,
+        ino: InodeId,
+        offset: u64,
+        size: usize,
+        repair: bool,
+    ) -> Result<(Vec<u8>, Vec<String>, bool)> {
+        self.read_inode_with_damage_report_policy(ino, offset, size, repair, true)
+    }
+
+    fn read_inode_with_damage_report_policy(
+        &self,
+        ino: InodeId,
+        offset: u64,
+        size: usize,
+        repair: bool,
+        repair_offline: bool,
+    ) -> Result<(Vec<u8>, Vec<String>, bool)> {
         let mut meta = self.meta.write();
         let inode = meta
             .inodes
@@ -439,13 +462,14 @@ impl ArgosFs {
         let (mut data, mut damaged) =
             self.decode_inode_range_from_inode_locked(&mut meta, &inode, start, end)?;
         let mut repaired = false;
-        // An unavailable member is not data damage: the block was rebuilt
-        // from the remaining shards.  Only rewrite the file for real damage
-        // (checksum, missing extent, invalid slot, ...).  Otherwise every
-        // read in a degraded pool would rewrite the file it just read.
-        let has_repairable_damage = damaged
-            .iter()
-            .any(|entry| !super::data_plane::damage_is_unavailable_member(entry));
+        // An absent member is not data damage: the block was rebuilt from the
+        // remaining shards and the member may return.  Failed or removed
+        // members, real checksum/extent damage and invalid slots still
+        // self-heal.  Otherwise every read in a pool with one card out would
+        // rewrite the file it just read.
+        let has_repairable_damage = damaged.iter().any(|entry| {
+            !super::data_plane::damage_is_transient_offline_member(&meta, entry, repair_offline)
+        });
         if repair && has_repairable_damage {
             let mut repair_damaged = damaged.clone();
             let (full, full_damaged) = self.decode_inode_data_locked(&mut meta, &inode)?;

@@ -1542,17 +1542,30 @@ impl ArgosFs {
     }
 }
 
-/// True when a damage marker only says that a member is unavailable, not that
-/// the stored shard is corrupt.
+/// True when an unavailable damage marker should be left for a member that
+/// may still return.
 ///
 /// `decode_block_locked` records `"<disk>:unavailable"` for a shard whose
 /// member is Offline, Failed or Removed and reconstructs the block from the
-/// remaining shards.  Such a block is readable; rewriting the whole file
-/// would only wear the healthy members and could rewrite every file in a
-/// degraded pool.  Actual checksum, extent and metadata damage still needs a
-/// repair.
-pub(super) fn damage_is_unavailable_member(entry: &str) -> bool {
-    entry.ends_with(":unavailable")
+/// remaining shards.  An `Offline` member may simply be missing from this
+/// scan (a reader was power-cycled, a card is out of its slot) and can return
+/// on the next open.  `repair_offline` is false for ordinary reads, which
+/// must never rewrite a file for it.  Scrub passes true and waits for the
+/// configured grace period before rebuilding the shards.  A `Failed` or
+/// `Removed` member is a different case: the device is present but failed, or
+/// the operator has explicitly retired it, so the normal repair path still
+/// rebuilds the file.
+pub(super) fn damage_is_transient_offline_member(
+    meta: &Metadata,
+    entry: &str,
+    repair_offline: bool,
+) -> bool {
+    entry.strip_suffix(":unavailable").is_some_and(|disk_id| {
+        meta.disks.get(disk_id).is_some_and(|disk| {
+            disk.status == DiskStatus::Offline
+                && !(repair_offline && offline_member_due_for_repair(disk))
+        })
+    })
 }
 
 #[cfg(test)]

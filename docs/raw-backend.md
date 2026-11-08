@@ -199,6 +199,7 @@ wins):
 | `ARGOSFS_READ_RETRIES` | 0 | 1 |
 | `ARGOSFS_VERIFY_WRITE_AFTER_MS` | 0 (off) | 60 000 |
 | `ARGOS_VERIFY_WRITE_RETRIES` | 3 | 3 |
+| `ARGOSFS_OFFLINE_GRACE_MS` | 0 | 60 000 |
 
 For example, to mount a raw pool with all USB-friendly defaults:
 
@@ -213,14 +214,27 @@ repair.
 
 ## Unavailable members and self-healing
 
-A shard whose member is `Offline`, `Failed` or `Removed` is unavailable, not
-corrupt: the remaining shards reconstruct the block.  `fsck`/scrub report such
-shards in `missing_shards`, but they do not increment `damaged_files` or
-`repaired_files`, and ordinary reads do not rewrite the file for them.  Only
+A shard whose member is `Offline` is unavailable because the member was absent
+from the open scan.  The remaining shards reconstruct the block, and the
+member may return on the next open, so `fsck`/scrub report such shards in
+`missing_shards` without counting the file as damaged or rewriting it.
+Ordinary reads do not self-heal it for the same reason.
+
+A member that is `Failed` (present but failed) or `Removed` (explicitly
+retired by the operator) is repaired by the normal scrub/self-heal path, as is
 real damage (a checksum mismatch, a missing extent on an online member, an
-invalid slot, ...) triggers a self-heal or a scrub repair.  This keeps a pool
-with one missing member readable without rewriting every file that is read,
-and prevents a temporary reader dropout from turning into a whole-pool write.
+invalid slot, ...).  `remove-device` already drains and rewrites the member
+before marking it `Removed`.
+
+`ARGOSFS_OFFLINE_GRACE_MS` sets how long an `Offline` member is given to
+return before scrub rebuilds its shards; `0` disables the grace.  `ARGOSFS_USB=1`
+defaults it to 60,000 ms (one minute), so a reader that is briefly
+power-cycled or reset can come back before the pool is rewritten.  Without
+USB mode the default is 0, which preserves the old immediate-repair behavior.
+
+This keeps a pool with one temporarily missing card readable without rewriting
+every file that is read, while a genuinely failed or retired card still
+restores redundancy automatically.
 
 ## Data Extents
 

@@ -22,9 +22,10 @@ use verify_after_write::VerifyAfterWrite;
 
 mod verify_after_write;
 use crate::util::{
-    append_json_line, atomic_write, clean_path, configured_read_retries, content_hash_hex,
-    content_hash_matches, ensure_dir, ensure_private_dir, now_f64, parent_name,
-    relative_or_absolute, retry_verified, split_path, stable_u01,
+    append_json_line, atomic_write, clean_path, configured_offline_grace_ms,
+    configured_read_retries, content_hash_hex, content_hash_matches, ensure_dir,
+    ensure_private_dir, now_f64, parent_name, relative_or_absolute, retry_verified, split_path,
+    stable_u01,
 };
 use parking_lot::{Mutex, RwLock};
 use serde_json::json;
@@ -324,6 +325,7 @@ impl ArgosFs {
                     weight: probe.recommended_weight,
                     status: DiskStatus::Online,
                     manually_offline: false,
+                    offline_since: None,
                     capacity_bytes: probe.capacity_bytes,
                     capacity_source: CapacitySource::AutoProbe,
                     used_bytes: 0,
@@ -543,6 +545,7 @@ impl ArgosFs {
                     weight: 1.0,
                     status: DiskStatus::Online,
                     manually_offline: false,
+                    offline_since: None,
                     capacity_bytes: info.capacity,
                     capacity_source: CapacitySource::UserOverride,
                     used_bytes: 0,
