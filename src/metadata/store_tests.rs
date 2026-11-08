@@ -90,6 +90,7 @@ fn sample_metadata() -> Metadata {
             weight: 1.0,
             status: DiskStatus::Online,
             manually_offline: false,
+            offline_since: None,
             capacity_bytes: 1024 * 1024 * 1024,
             capacity_source: CapacitySource::UserOverride,
             used_bytes: 4096,

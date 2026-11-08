@@ -13,6 +13,7 @@ fn disk() -> Disk {
         weight: 1.0,
         status: DiskStatus::Online,
         manually_offline: false,
+        offline_since: None,
         capacity_bytes: 1_000,
         capacity_source: CapacitySource::UserOverride,
         used_bytes: 100,

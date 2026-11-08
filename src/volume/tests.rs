@@ -896,6 +896,65 @@ fn volume_constructors_validate_layouts_force_recreation_and_backend_kinds() {
 }
 
 #[test]
+fn loop_pool_tracks_absence_across_reopens_and_clears_grace_on_return() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..4)
+        .map(|index| dir.path().join(format!("rejoin-{index}.img")))
+        .collect::<Vec<_>>();
+    let fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            compression: Compression::None,
+            chunk_size: 4096,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "rejoin",
+        false,
+    )
+    .unwrap();
+    let data = vec![8u8; 8192];
+    fs.write_file("/file", &data, 0o600).unwrap();
+    let ino = fs.resolve_path("/file", true).unwrap();
+    let missing_id = fs.metadata_snapshot().inodes[&ino].blocks[0].shards[0]
+        .disk_id
+        .clone();
+    fs.mark_clean_unmount().unwrap();
+    drop(fs);
+
+    let present_images = images
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| format!("disk-{index:04}") != missing_id)
+        .map(|(_, path)| path.clone())
+        .collect::<Vec<_>>();
+    let first = ArgosFs::open_loop(&present_images, true).unwrap();
+    let absent = &first.metadata_snapshot().disks[&missing_id];
+    assert_eq!(absent.status, DiskStatus::Offline);
+    assert!(!absent.manually_offline);
+    let offline_since = absent
+        .offline_since
+        .expect("offline scan records first absence");
+    assert_eq!(first.read_file("/file", false).unwrap(), data);
+    first.mark_clean_unmount().unwrap();
+    drop(first);
+
+    let second = ArgosFs::open_loop(&present_images, true).unwrap();
+    let absent = &second.metadata_snapshot().disks[&missing_id];
+    assert_eq!(absent.offline_since, Some(offline_since));
+    second.mark_clean_unmount().unwrap();
+    drop(second);
+
+    let restored = ArgosFs::open_loop(&images, true).unwrap();
+    let returned = &restored.metadata_snapshot().disks[&missing_id];
+    assert_eq!(returned.status, DiskStatus::Online);
+    assert_eq!(returned.offline_since, None);
+    assert_eq!(restored.read_file("/file", false).unwrap(), data);
+}
+
+#[test]
 fn mknod_validates_rdev_types_inheritance_and_duplicates() {
     let (_dir, fs) = host_volume();
     assert!(matches!(

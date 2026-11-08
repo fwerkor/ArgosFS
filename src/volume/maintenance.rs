@@ -108,6 +108,7 @@ impl ArgosFs {
                 weight: final_weight,
                 status: DiskStatus::Online,
                 manually_offline: false,
+                offline_since: None,
                 capacity_bytes: final_capacity,
                 capacity_source,
                 used_bytes: 0,
@@ -206,6 +207,7 @@ impl ArgosFs {
                 weight: 1.0,
                 status: DiskStatus::Online,
                 manually_offline: false,
+                offline_since: None,
                 capacity_bytes: info.capacity,
                 capacity_source: CapacitySource::UserOverride,
                 used_bytes: 0,
@@ -255,6 +257,11 @@ impl ArgosFs {
             .ok_or_else(|| ArgosError::NotFound(disk_id.to_string()))?;
         disk.status = status;
         disk.manually_offline = status == DiskStatus::Offline;
+        disk.offline_since = if status == DiskStatus::Offline {
+            Some(now_f64())
+        } else {
+            None
+        };
         self.commit_locked(
             &mut meta,
             "mark-disk",
@@ -548,6 +555,7 @@ impl ArgosFs {
             .get_mut(disk_id)
             .ok_or_else(|| ArgosError::NotFound(disk_id.to_string()))?;
         disk.status = DiskStatus::Removed;
+        disk.offline_since = None;
         self.commit_locked(
             &mut meta,
             "remove-disk",
@@ -808,25 +816,39 @@ impl ArgosFs {
             let inode_lock = self.inode_lock(ino);
             let _inode_guard = inode_lock.lock();
             report.files_checked += 1;
-            match self.read_inode_with_damage_report(ino, 0, u64::MAX as usize, true) {
+            match self.read_inode_with_damage_report_for_scrub(ino, 0, u64::MAX as usize, true) {
                 Ok((_, damaged, repaired)) => {
-                    if !damaged.is_empty() {
+                    // A member that is absent from the scan is reported as
+                    // missing, but it is not damaged data: the file was
+                    // recovered from the remaining shards and the member may
+                    // return.  Failed/removed members and real damage still
+                    // count as damaged.  The grace period lets a briefly
+                    // absent reader come back before scrub rebuilds.
+                    let has_repairable_damage = {
+                        let meta = self.meta.read();
+                        damaged.iter().any(|entry| {
+                            !super::data_plane::damage_is_transient_offline_member(
+                                self, &meta, entry, true,
+                            )
+                        })
+                    };
+                    if has_repairable_damage {
                         report.damaged_files += 1;
-                        report.checksum_errors += damaged
-                            .iter()
-                            .filter(|entry| entry.contains(":checksum:"))
-                            .count() as u64;
-                        report.missing_shards += damaged
-                            .iter()
-                            .filter(|entry| {
-                                entry.contains(":missing:")
-                                    || entry.contains(":missing-disk")
-                                    || entry.contains(":unavailable")
-                            })
-                            .count() as u64;
-                        if repaired {
-                            report.repaired_files += 1;
-                        }
+                    }
+                    report.checksum_errors += damaged
+                        .iter()
+                        .filter(|entry| entry.contains(":checksum:"))
+                        .count() as u64;
+                    report.missing_shards += damaged
+                        .iter()
+                        .filter(|entry| {
+                            entry.contains(":missing:")
+                                || entry.contains(":missing-disk")
+                                || entry.contains(":unavailable")
+                        })
+                        .count() as u64;
+                    if repaired {
+                        report.repaired_files += 1;
                     }
                 }
                 Err(err) => {
@@ -913,6 +935,40 @@ impl ArgosFs {
                     let mut meta = self.meta.write();
                     for block in &inode.blocks {
                         for shard in &block.shards {
+                            // Do not read a shard from a member that is
+                            // merely absent from the scan.  Its data is
+                            // reconstructed from parity and the member may
+                            // return; counting it as damage would rewrite
+                            // every file in a pool with one card out.  After
+                            // the grace period (USB mode defaults it to one
+                            // minute) scrub rebuilds the shards.  Failed and
+                            // removed members go through the normal repair
+                            // path immediately.
+                            if let Some(disk) = meta.disks.get(&shard.disk_id) {
+                                match disk.status {
+                                    DiskStatus::Offline if !offline_member_due_for_repair(disk) => {
+                                        report.missing_shards += 1;
+                                        continue;
+                                    }
+                                    DiskStatus::Offline
+                                    | DiskStatus::Failed
+                                    | DiskStatus::Removed => {
+                                        // A retired/failed shard is unavailable even if its
+                                        // old backing path still happens to be readable.
+                                        report.missing_shards += 1;
+                                        damaged = true;
+                                        continue;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if meta.backend != BackendKind::Host
+                                && self.is_device_quarantined(&shard.disk_id)
+                                && !self.quarantined_member_due_for_repair(&shard.disk_id)
+                            {
+                                report.missing_shards += 1;
+                                continue;
+                            }
                             match self.read_shard_verified_locked(&mut meta, shard) {
                                 Ok(Some(_)) => {}
                                 Ok(None) => {
@@ -921,7 +977,15 @@ impl ArgosFs {
                                 }
                                 Err(_) => {
                                     report.missing_shards += 1;
-                                    damaged = true;
+                                    // A fatal I/O failure during this scan may
+                                    // have just quarantined an unplugged device.
+                                    // Do not rebuild it during the grace period.
+                                    if meta.backend == BackendKind::Host
+                                        || !self.is_device_quarantined(&shard.disk_id)
+                                        || self.quarantined_member_due_for_repair(&shard.disk_id)
+                                    {
+                                        damaged = true;
+                                    }
                                 }
                             }
                         }

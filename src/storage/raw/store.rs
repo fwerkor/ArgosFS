@@ -274,10 +274,20 @@ pub fn open_pool(kind: BackendKind, paths: &[PathBuf], write: bool) -> Result<Ra
             if disk.status == DiskStatus::Offline && !disk.manually_offline {
                 disk.status = DiskStatus::Online;
             }
+            if disk.status == DiskStatus::Online {
+                disk.offline_since = None;
+            }
         } else if !present.contains(disk_id)
             && !matches!(disk.status, DiskStatus::Removed | DiskStatus::Failed)
         {
-            disk.status = DiskStatus::Offline;
+            if disk.status != DiskStatus::Offline {
+                disk.status = DiskStatus::Offline;
+                disk.offline_since = Some(now_f64());
+            } else if disk.offline_since.is_none() {
+                // Metadata from an older build: start the grace period now
+                // instead of treating the member as gone immediately.
+                disk.offline_since = Some(now_f64());
+            }
         }
     }
     if !scan_errors.is_empty() {

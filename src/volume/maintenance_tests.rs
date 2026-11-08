@@ -23,6 +23,317 @@ fn host_volume(disks: usize) -> (tempfile::TempDir, ArgosFs) {
     (dir, fs)
 }
 
+fn redundant_host_volume() -> (tempfile::TempDir, ArgosFs) {
+    let dir = tempdir().unwrap();
+    let fs = ArgosFs::create(
+        dir.path(),
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            compression: Compression::None,
+            chunk_size: 4096,
+            ..VolumeConfig::default()
+        },
+        4,
+        false,
+    )
+    .unwrap();
+    (dir, fs)
+}
+
+/// Remove a member's shard and mark the member offline.  The file is still
+/// fully recoverable from parity, so this is degraded rather than damaged.
+fn lose_one_member(fs: &ArgosFs, path: &str) -> String {
+    let ino = fs.resolve_path(path, true).unwrap();
+    let (disk_id, relpath) = {
+        let meta = fs.metadata_snapshot();
+        let shard = &meta.inodes[&ino].blocks[0].shards[0];
+        (shard.disk_id.clone(), shard.relpath.clone())
+    };
+    let shard_path = fs.shard_path_locked(&fs.metadata_snapshot(), &disk_id, &relpath);
+    {
+        let mut meta = fs.meta.write();
+        let disk = meta.disks.get_mut(&disk_id).unwrap();
+        disk.status = DiskStatus::Offline;
+        disk.manually_offline = false;
+        disk.offline_since = Some(now_f64());
+    }
+    std::fs::remove_file(shard_path).unwrap();
+    disk_id
+}
+
+#[test]
+fn scrub_does_not_rewrite_files_for_an_offline_member() {
+    let _guard = env_lock();
+    std::env::set_var("ARGOSFS_OFFLINE_GRACE_MS", "60000");
+    let (_dir, fs) = redundant_host_volume();
+    fs.write_file("/file", &vec![7u8; 8192], 0o600).unwrap();
+    lose_one_member(&fs, "/file");
+
+    let report = fs.scrub().unwrap();
+
+    assert_eq!(report.unrecoverable_files, 0, "{report:?}");
+    assert_eq!(report.damaged_files, 0, "{report:?}");
+    assert_eq!(report.repaired_files, 0, "{report:?}");
+    assert_eq!(report.checksum_errors, 0, "{report:?}");
+    assert!(report.missing_shards >= 1, "{report:?}");
+    assert_eq!(
+        fs.read_file("/file", false).unwrap(),
+        vec![7u8; 8192],
+        "the file must still read correctly"
+    );
+    std::env::remove_var("ARGOSFS_OFFLINE_GRACE_MS");
+}
+
+#[test]
+fn scrub_repairs_an_offline_member_after_the_grace_period() {
+    let _guard = env_lock();
+    std::env::set_var("ARGOSFS_OFFLINE_GRACE_MS", "60000");
+    let (_dir, fs) = redundant_host_volume();
+    fs.write_file("/file", &vec![7u8; 8192], 0o600).unwrap();
+    let disk_id = lose_one_member(&fs, "/file");
+    {
+        let mut meta = fs.meta.write();
+        meta.disks.get_mut(&disk_id).unwrap().offline_since = Some(now_f64() - 120.0);
+    }
+
+    let report = fs.scrub().unwrap();
+
+    assert_eq!(report.unrecoverable_files, 0, "{report:?}");
+    assert!(report.damaged_files >= 1, "{report:?}");
+    assert!(report.repaired_files >= 1, "{report:?}");
+    let report_after = fs.scrub().unwrap();
+    assert_eq!(report_after.damaged_files, 0, "{report_after:?}");
+    assert_eq!(report_after.repaired_files, 0, "{report_after:?}");
+    assert_eq!(
+        fs.read_file("/file", false).unwrap(),
+        vec![7u8; 8192],
+        "the file must still read correctly after the repair"
+    );
+    std::env::remove_var("ARGOSFS_OFFLINE_GRACE_MS");
+}
+
+#[test]
+fn incremental_scrub_rechecks_cached_shards_after_offline_grace() {
+    let _guard = env_lock();
+    std::env::set_var("ARGOSFS_OFFLINE_GRACE_MS", "60000");
+    let (_dir, fs) = redundant_host_volume();
+    fs.write_file("/file", &vec![4u8; 8192], 0o600).unwrap();
+    let disk_id = lose_one_member(&fs, "/file");
+
+    // Decode the degraded file once so its complete contents are cached.
+    assert_eq!(fs.read_file("/file", false).unwrap(), vec![4u8; 8192]);
+    let before = fs.metadata_snapshot().txid;
+    {
+        let mut meta = fs.meta.write();
+        meta.disks.get_mut(&disk_id).unwrap().offline_since = Some(now_f64() - 120.0);
+    }
+
+    let (report, _) = fs.scrub_limited(1, None);
+    assert_eq!(report.files_checked, 1, "{report:?}");
+    assert_eq!(report.damaged_files, 1, "{report:?}");
+    assert_eq!(report.repaired_files, 1, "{report:?}");
+    assert!(report.missing_shards >= 1, "{report:?}");
+    assert!(fs.metadata_snapshot().txid > before);
+    assert_eq!(fs.read_file("/file", false).unwrap(), vec![4u8; 8192]);
+    std::env::remove_var("ARGOSFS_OFFLINE_GRACE_MS");
+}
+
+#[test]
+fn scrub_repairs_a_removed_member() {
+    let (_dir, fs) = redundant_host_volume();
+    fs.write_file("/file", &vec![9u8; 8192], 0o600).unwrap();
+    let (disk_id, relpath) = {
+        let ino = fs.resolve_path("/file", true).unwrap();
+        let meta = fs.metadata_snapshot();
+        let shard = &meta.inodes[&ino].blocks[0].shards[0];
+        (shard.disk_id.clone(), shard.relpath.clone())
+    };
+    let shard_path = fs.shard_path_locked(&fs.metadata_snapshot(), &disk_id, &relpath);
+    fs.mark_disk(&disk_id, DiskStatus::Removed).unwrap();
+    std::fs::remove_file(shard_path).unwrap();
+
+    let report = fs.scrub().unwrap();
+
+    assert_eq!(report.unrecoverable_files, 0, "{report:?}");
+    assert!(report.damaged_files >= 1, "{report:?}");
+    assert!(report.repaired_files >= 1, "{report:?}");
+    assert_eq!(report.checksum_errors, 0, "{report:?}");
+    let report_after = fs.scrub().unwrap();
+    assert_eq!(report_after.damaged_files, 0, "{report_after:?}");
+    assert_eq!(report_after.repaired_files, 0, "{report_after:?}");
+    assert_eq!(
+        fs.read_file("/file", false).unwrap(),
+        vec![9u8; 8192],
+        "the file must still read correctly after the repair"
+    );
+}
+
+#[test]
+fn briefly_missing_loop_member_returns_without_rewriting_stripes() {
+    let _guard = env_lock();
+    std::env::set_var("ARGOSFS_OFFLINE_GRACE_MS", "60000");
+    let dir = tempdir().unwrap();
+    let images = (0..4)
+        .map(|index| dir.path().join(format!("reconnect-{index}.img")))
+        .collect::<Vec<_>>();
+    let fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            compression: Compression::None,
+            chunk_size: 4096,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "reconnect",
+        false,
+    )
+    .unwrap();
+    for index in 0..3 {
+        fs.write_file(&format!("/file-{index}"), &vec![index as u8; 16384], 0o600)
+            .unwrap();
+    }
+    let original = fs.metadata_snapshot();
+    let stripes = original
+        .inodes
+        .iter()
+        .filter(|(_, inode)| inode.kind == NodeKind::File)
+        .map(|(ino, inode)| (*ino, serde_json::to_value(&inode.blocks).unwrap()))
+        .collect::<Vec<_>>();
+    let missing_id = original
+        .inodes
+        .values()
+        .find(|inode| inode.kind == NodeKind::File)
+        .unwrap()
+        .blocks[0]
+        .shards[0]
+        .disk_id
+        .clone();
+    fs.mark_clean_unmount().unwrap();
+    drop(fs);
+
+    let present_images = images
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| format!("disk-{index:04}") != missing_id)
+        .map(|(_, path)| path.clone())
+        .collect::<Vec<_>>();
+    let degraded = ArgosFs::open_loop(&present_images, true).unwrap();
+    let full = degraded.scrub().unwrap();
+    let (incremental, _) = degraded.scrub_limited(10, None);
+    for report in [&full, &incremental] {
+        assert_eq!(report.damaged_files, 0, "{report:?}");
+        assert_eq!(report.repaired_files, 0, "{report:?}");
+        assert_eq!(report.unrecoverable_files, 0, "{report:?}");
+        assert!(report.missing_shards > 0, "{report:?}");
+    }
+    for (ino, blocks) in &stripes {
+        assert_eq!(
+            serde_json::to_value(&degraded.metadata_snapshot().inodes[ino].blocks).unwrap(),
+            *blocks
+        );
+    }
+    degraded.mark_clean_unmount().unwrap();
+    drop(degraded);
+
+    let restored = ArgosFs::open_loop(&images, true).unwrap();
+    assert_eq!(
+        restored.metadata_snapshot().disks[&missing_id].status,
+        DiskStatus::Online
+    );
+    let after_return = restored.scrub().unwrap();
+    assert_eq!(after_return.repaired_files, 0, "{after_return:?}");
+    assert_eq!(after_return.missing_shards, 0, "{after_return:?}");
+    for (ino, blocks) in &stripes {
+        assert_eq!(
+            serde_json::to_value(&restored.metadata_snapshot().inodes[ino].blocks).unwrap(),
+            *blocks
+        );
+    }
+    for index in 0..3 {
+        assert_eq!(
+            restored
+                .read_file(&format!("/file-{index}"), false)
+                .unwrap(),
+            vec![index as u8; 16384]
+        );
+    }
+    std::env::remove_var("ARGOSFS_OFFLINE_GRACE_MS");
+}
+
+#[test]
+fn runtime_usb_quarantine_waits_for_grace_before_incremental_repair() {
+    let _guard = env_lock();
+    std::env::set_var("ARGOSFS_OFFLINE_GRACE_MS", "60000");
+    let dir = tempdir().unwrap();
+    let images = (0..4)
+        .map(|index| dir.path().join(format!("hotplug-{index}.img")))
+        .collect::<Vec<_>>();
+    let fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            compression: Compression::None,
+            chunk_size: 4096,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "hotplug",
+        false,
+    )
+    .unwrap();
+    fs.write_file("/file", &vec![5u8; 8192], 0o600).unwrap();
+    let ino = fs.resolve_path("/file", true).unwrap();
+    let disk_id = fs.metadata_snapshot().inodes[&ino].blocks[0].shards[0]
+        .disk_id
+        .clone();
+
+    // A fatal I/O failure is quarantined while this mount is still open.
+    // It must behave like a briefly missing scan member.
+    fs.quarantine_device(&disk_id);
+    assert_eq!(fs.read_file("/file", true).unwrap(), vec![5u8; 8192]);
+    let (recent, _) = fs.scrub_limited(1, None);
+    assert_eq!(recent.damaged_files, 0, "{recent:?}");
+    assert_eq!(recent.repaired_files, 0, "{recent:?}");
+    assert!(recent.missing_shards > 0, "{recent:?}");
+
+    fs.quarantine_since
+        .lock()
+        .insert(disk_id.clone(), now_f64() - 120.0);
+    let (expired, _) = fs.scrub_limited(1, None);
+    assert_eq!(expired.damaged_files, 1, "{expired:?}");
+    assert_eq!(expired.repaired_files, 1, "{expired:?}");
+    assert_eq!(fs.read_file("/file", false).unwrap(), vec![5u8; 8192]);
+    std::env::remove_var("ARGOSFS_OFFLINE_GRACE_MS");
+}
+
+#[test]
+fn scrub_rebuilds_logically_retired_members_even_if_shards_are_readable() {
+    for status in [DiskStatus::Failed, DiskStatus::Removed] {
+        let (_dir, fs) = redundant_host_volume();
+        fs.write_file("/file", &vec![6u8; 8192], 0o600).unwrap();
+        let ino = fs.resolve_path("/file", true).unwrap();
+        let disk_id = fs.metadata_snapshot().inodes[&ino].blocks[0].shards[0]
+            .disk_id
+            .clone();
+        fs.mark_disk(&disk_id, status).unwrap();
+
+        let report = fs.scrub().unwrap();
+        assert_eq!(report.damaged_files, 1, "{status:?}: {report:?}");
+        assert_eq!(report.repaired_files, 1, "{status:?}: {report:?}");
+        assert_eq!(report.unrecoverable_files, 0, "{status:?}: {report:?}");
+        assert!(fs.metadata_snapshot().inodes[&ino]
+            .blocks
+            .iter()
+            .flat_map(|block| &block.shards)
+            .all(|shard| shard.disk_id != disk_id));
+        assert_eq!(fs.read_file("/file", false).unwrap(), vec![6u8; 8192]);
+    }
+}
+
 #[test]
 fn io_policy_and_encryption_cover_empty_repeat_and_wrong_passphrases() {
     let _guard = env_lock();

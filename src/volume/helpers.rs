@@ -1,6 +1,23 @@
 use super::*;
 use std::os::unix::fs::PermissionsExt;
 
+/// True when an Offline member has been absent long enough for scrub to
+/// rebuild its shards.  Manually isolated members never become repairable.
+pub(super) fn offline_member_due_for_repair(disk: &Disk) -> bool {
+    if disk.status != DiskStatus::Offline {
+        return true;
+    }
+    if disk.manually_offline {
+        return false;
+    }
+    let grace_ms = configured_offline_grace_ms();
+    if grace_ms == 0 {
+        return true;
+    }
+    disk.offline_since
+        .is_some_and(|since| now_f64() - since >= grace_ms as f64 / 1000.0)
+}
+
 pub(super) fn canonical_or_self(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }

@@ -22,9 +22,10 @@ use verify_after_write::VerifyAfterWrite;
 
 mod verify_after_write;
 use crate::util::{
-    append_json_line, atomic_write, clean_path, configured_read_retries, content_hash_hex,
-    content_hash_matches, ensure_dir, ensure_private_dir, now_f64, parent_name,
-    relative_or_absolute, retry_verified, split_path, stable_u01,
+    append_json_line, atomic_write, clean_path, configured_offline_grace_ms,
+    configured_read_retries, content_hash_hex, content_hash_matches, ensure_dir,
+    ensure_private_dir, now_f64, parent_name, relative_or_absolute, retry_verified, split_path,
+    stable_u01,
 };
 use parking_lot::{Mutex, RwLock};
 use serde_json::json;
@@ -187,6 +188,7 @@ pub struct ArgosFs {
     quota_runtime: Arc<RwLock<QuotaRuntime>>,
     deferred_commit: Arc<Mutex<DeferredCommitState>>,
     quarantined_devices: Arc<Mutex<BTreeSet<String>>>,
+    quarantine_since: Arc<Mutex<BTreeMap<String, f64>>>,
     write_fence: Arc<Mutex<Option<String>>>,
     dirty_host_shards: Arc<Mutex<BTreeSet<PathBuf>>>,
     inode_locks: Arc<Mutex<BTreeMap<InodeId, Arc<Mutex<()>>>>>,
@@ -210,6 +212,7 @@ impl Clone for ArgosFs {
             quota_runtime: self.quota_runtime.clone(),
             deferred_commit: self.deferred_commit.clone(),
             quarantined_devices: self.quarantined_devices.clone(),
+            quarantine_since: self.quarantine_since.clone(),
             write_fence: self.write_fence.clone(),
             dirty_host_shards: self.dirty_host_shards.clone(),
             inode_locks: self.inode_locks.clone(),
@@ -324,6 +327,7 @@ impl ArgosFs {
                     weight: probe.recommended_weight,
                     status: DiskStatus::Online,
                     manually_offline: false,
+                    offline_since: None,
                     capacity_bytes: probe.capacity_bytes,
                     capacity_source: CapacitySource::AutoProbe,
                     used_bytes: 0,
@@ -439,6 +443,7 @@ impl ArgosFs {
             root: Arc::new(root),
             deferred_commit: Arc::new(Mutex::new(DeferredCommitState::new(&meta))),
             quarantined_devices: Arc::new(Mutex::new(BTreeSet::new())),
+            quarantine_since: Arc::new(Mutex::new(BTreeMap::new())),
             write_fence: Arc::new(Mutex::new(None)),
             quota_runtime: Arc::new(RwLock::new(QuotaRuntime::from_metadata(&meta)?)),
             meta: Arc::new(RwLock::new(meta)),
@@ -543,6 +548,7 @@ impl ArgosFs {
                     weight: 1.0,
                     status: DiskStatus::Online,
                     manually_offline: false,
+                    offline_since: None,
                     capacity_bytes: info.capacity,
                     capacity_source: CapacitySource::UserOverride,
                     used_bytes: 0,
@@ -667,6 +673,7 @@ impl ArgosFs {
             raw_superblocks: Arc::new(superblocks),
             deferred_commit,
             quarantined_devices,
+            quarantine_since: Arc::new(Mutex::new(BTreeMap::new())),
             write_fence,
             quota_runtime,
             meta,
@@ -798,7 +805,22 @@ impl ArgosFs {
     }
 
     fn quarantine_device(&self, disk_id: &str) {
+        self.quarantine_since
+            .lock()
+            .entry(disk_id.to_string())
+            .or_insert_with(now_f64);
         self.quarantined_devices.lock().insert(disk_id.to_string());
+    }
+
+    fn quarantined_member_due_for_repair(&self, disk_id: &str) -> bool {
+        let grace_ms = configured_offline_grace_ms();
+        if grace_ms == 0 {
+            return true;
+        }
+        self.quarantine_since
+            .lock()
+            .get(disk_id)
+            .is_some_and(|since| now_f64() - since >= grace_ms as f64 / 1000.0)
     }
 
     fn apply_quorum_write_report(
@@ -809,9 +831,8 @@ impl ArgosFs {
         if report.unavailable_devices.is_empty() {
             return Ok(());
         }
-        {
-            let mut quarantined = self.quarantined_devices.lock();
-            quarantined.extend(report.unavailable_devices);
+        for disk_id in &report.unavailable_devices {
+            self.quarantine_device(disk_id);
         }
         let unavailable = self.quarantined_devices.lock().clone();
         match self.validate_data_durability_locked(meta, &unavailable) {
@@ -1943,9 +1964,9 @@ impl ArgosFs {
                 }
             }
         }
-        self.quarantined_devices
-            .lock()
-            .extend(unavailable.iter().cloned());
+        for disk_id in &unavailable {
+            self.quarantine_device(disk_id);
+        }
 
         self.validate_data_durability_locked(meta, &unavailable)
     }

@@ -423,6 +423,10 @@ pub struct Disk {
     // Older metadata cannot distinguish scan- and manually-offline states.
     #[serde(default, skip_serializing_if = "is_false")]
     pub manually_offline: bool,
+    // Unix time when this member was first seen absent from the scan.  Scrub
+    // gives it a short grace period before rebuilding its shards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline_since: Option<f64>,
     pub capacity_bytes: u64,
     #[serde(default)]
     pub capacity_source: CapacitySource,
