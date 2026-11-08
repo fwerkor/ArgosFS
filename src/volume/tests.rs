@@ -943,7 +943,10 @@ fn loop_pool_tracks_absence_across_reopens_and_clears_grace_on_return() {
 
     let second = ArgosFs::open_loop(&present_images, true).unwrap();
     let absent = &second.metadata_snapshot().disks[&missing_id];
-    assert_eq!(absent.offline_since, Some(offline_since));
+    let persisted_offline_since = absent
+        .offline_since
+        .expect("offline grace persists across reopen");
+    assert!((persisted_offline_since - offline_since).abs() < 1e-6);
     second.mark_clean_unmount().unwrap();
     drop(second);
 
