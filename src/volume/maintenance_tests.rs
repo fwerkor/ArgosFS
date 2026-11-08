@@ -114,6 +114,32 @@ fn scrub_repairs_an_offline_member_after_the_grace_period() {
 }
 
 #[test]
+fn incremental_scrub_rechecks_cached_shards_after_offline_grace() {
+    let _guard = env_lock();
+    std::env::set_var("ARGOSFS_OFFLINE_GRACE_MS", "60000");
+    let (_dir, fs) = redundant_host_volume();
+    fs.write_file("/file", &vec![4u8; 8192], 0o600).unwrap();
+    let disk_id = lose_one_member(&fs, "/file");
+
+    // Decode the degraded file once so its complete contents are cached.
+    assert_eq!(fs.read_file("/file", false).unwrap(), vec![4u8; 8192]);
+    let before = fs.metadata_snapshot().txid;
+    {
+        let mut meta = fs.meta.write();
+        meta.disks.get_mut(&disk_id).unwrap().offline_since = Some(now_f64() - 120.0);
+    }
+
+    let (report, _) = fs.scrub_limited(1, None);
+    assert_eq!(report.files_checked, 1, "{report:?}");
+    assert_eq!(report.damaged_files, 1, "{report:?}");
+    assert_eq!(report.repaired_files, 1, "{report:?}");
+    assert!(report.missing_shards >= 1, "{report:?}");
+    assert!(fs.metadata_snapshot().txid > before);
+    assert_eq!(fs.read_file("/file", false).unwrap(), vec![4u8; 8192]);
+    std::env::remove_var("ARGOSFS_OFFLINE_GRACE_MS");
+}
+
+#[test]
 fn scrub_repairs_a_removed_member() {
     let (_dir, fs) = redundant_host_volume();
     fs.write_file("/file", &vec![9u8; 8192], 0o600).unwrap();

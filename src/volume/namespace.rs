@@ -459,6 +459,16 @@ impl ArgosFs {
             .map_err(|_| ArgosError::Invalid("inode logical size is too large".to_string()))?;
         let start = offset.min(logical_size as u64) as usize;
         let end = start.saturating_add(size).min(logical_size);
+        // Scrub must inspect the actual shards. A cached reconstructed block
+        // would otherwise hide an offline member even after its grace expires.
+        if repair_offline {
+            for block in &inode.blocks {
+                self.cache.remove(&format!(
+                    "{}:{}:{}",
+                    meta.uuid, block.stripe_id, block.raw_sha256
+                ));
+            }
+        }
         let (mut data, mut damaged) =
             self.decode_inode_range_from_inode_locked(&mut meta, &inode, start, end)?;
         let mut repaired = false;
