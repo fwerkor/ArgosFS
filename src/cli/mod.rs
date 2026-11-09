@@ -1187,6 +1187,14 @@ fn print_health_report(
         report.io_mode,
         report.encryption_enabled
     );
+    println!(
+        "  metadata inodes={} estimated_rss={} MiB inode_limit={}",
+        report.metadata_inodes,
+        report.metadata_estimated_rss_bytes / (1024 * 1024),
+        report
+            .metadata_inode_limit
+            .map_or_else(|| "unlimited".to_string(), |n| n.to_string())
+    );
     for disk in &report.disks {
         println!(
             "  {} status={:?} tier={:?} used={}/{} risk={:.2} predicted_failure={}",

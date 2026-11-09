@@ -903,6 +903,9 @@ impl ArgosFs {
             cache: self.cache.stats(),
             io_mode: meta.config.io_mode,
             encryption_enabled: meta.encryption.enabled,
+            metadata_inodes: meta.inodes.len(),
+            metadata_estimated_rss_bytes: metadata_budget::estimated_rss_bytes(meta.inodes.len()),
+            metadata_inode_limit: metadata_budget::inode_limit(meta.backend).ok().flatten(),
         }
     }
 
