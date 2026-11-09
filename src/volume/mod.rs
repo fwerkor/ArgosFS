@@ -92,7 +92,7 @@ use namespace::*;
 
 #[derive(Clone, Debug)]
 struct DeferredCommitState {
-    durable_metadata: Option<Metadata>,
+    durable_metadata: Option<Arc<Metadata>>,
     raw_uncommitted_metadata_dirty: bool,
     dirty_transactions: u64,
     dirty_since: Option<Instant>,
@@ -107,7 +107,7 @@ impl DeferredCommitState {
 
     fn new_with_raw_dirty(meta: &Metadata, raw_uncommitted_metadata_dirty: bool) -> Self {
         Self {
-            durable_metadata: (meta.backend != BackendKind::Host).then(|| meta.clone()),
+            durable_metadata: (meta.backend != BackendKind::Host).then(|| Arc::new(meta.clone())),
             raw_uncommitted_metadata_dirty,
             dirty_transactions: 0,
             dirty_since: None,
@@ -896,7 +896,7 @@ impl ArgosFs {
                 }
             };
             let mut state = self.deferred_commit.lock();
-            state.durable_metadata = Some(meta.clone());
+            state.durable_metadata = Some(Arc::new(meta.clone()));
             state.raw_uncommitted_metadata_dirty = false;
             durability?;
             return Ok(());
@@ -2043,14 +2043,18 @@ impl ArgosFs {
         }
         let checkpoint = checkpoint || state.raw_uncommitted_metadata_dirty;
 
+        // The committed image is shared rather than cloned for every group commit.
+        // A full rollback image is only needed if reclaiming old extents changes
+        // allocator counters during the commit attempt.
         let previous = state
             .durable_metadata
             .clone()
-            .unwrap_or_else(|| meta.clone());
-        let before_commit = meta.clone();
+            .unwrap_or_else(|| Arc::new(meta.clone()));
+        let before_commit = (!state.pending_reclaims.is_empty()).then(|| meta.clone());
+        let before_integrity = meta.integrity.clone();
         let dirty_transactions = state.dirty_transactions;
         let previous_meta_hash = if previous.integrity.meta_hash.is_empty() {
-            journal::canonical_metadata_hash(&previous)?
+            journal::canonical_metadata_hash(previous.as_ref())?
         } else {
             previous.integrity.meta_hash.clone()
         };
@@ -2099,7 +2103,11 @@ impl ArgosFs {
         match result {
             Ok(report) => {
                 let durability = self.apply_quorum_write_report(meta, report);
-                state.durable_metadata = Some(meta.clone());
+                drop(before_commit);
+                // The former durable Arc is no longer required after a durable commit.
+                state.durable_metadata = None;
+                drop(previous);
+                state.durable_metadata = Some(Arc::new(meta.clone()));
                 state.raw_uncommitted_metadata_dirty = false;
                 state.dirty_transactions = 0;
                 state.dirty_since = None;
@@ -2116,7 +2124,10 @@ impl ArgosFs {
                 }
             }
             Err(err) if Self::transaction_error_is_committed(&err) => {
-                state.durable_metadata = Some(meta.clone());
+                drop(before_commit);
+                state.durable_metadata = None;
+                drop(previous);
+                state.durable_metadata = Some(Arc::new(meta.clone()));
                 state.raw_uncommitted_metadata_dirty = false;
                 state.dirty_transactions = 0;
                 state.dirty_since = None;
@@ -2125,7 +2136,14 @@ impl ArgosFs {
                 Err(err)
             }
             Err(err) => {
-                *meta = before_commit;
+                if let Some(snapshot) = before_commit {
+                    *meta = snapshot;
+                } else {
+                    // No pending reclamation touched the inode/allocator graph.
+                    // Integrity is the only metadata field changed during the
+                    // failed commit attempt.
+                    meta.integrity = before_integrity;
+                }
                 self.rebuild_quota_runtime_locked(meta)?;
                 self.fence_on_quorum_loss(&err);
                 state.last_error = Some(err.to_string());
@@ -2233,7 +2251,7 @@ impl ArgosFs {
                         // mutation and fence further writes because referenced data is
                         // no longer reconstructable from runtime-available members.
                         let mut state = self.deferred_commit.lock();
-                        state.durable_metadata = Some(meta.clone());
+                        state.durable_metadata = Some(Arc::new(meta.clone()));
                         state.raw_uncommitted_metadata_dirty = false;
                         state.last_error = Some(err.to_string());
                         drop(state);
@@ -2306,7 +2324,7 @@ impl ArgosFs {
         recompute_disk_usage_from_metadata(meta);
         self.rebuild_quota_runtime_locked(meta)?;
         let mut state = self.deferred_commit.lock();
-        state.durable_metadata = Some(meta.clone());
+        state.durable_metadata = Some(Arc::new(meta.clone()));
         // Recovery may normalize/recompute fields after validating the persisted hash.
         // Re-establish a full durable checkpoint before trusting a delta base again.
         state.raw_uncommitted_metadata_dirty = true;
