@@ -90,7 +90,7 @@ pub(crate) fn check_new_inode(meta: &Metadata) -> Result<()> {
     if let Some(limit) = inode_limit(meta.backend)? {
         let used = meta.inodes.len();
         reject_at_limit(used, limit)?;
-        if used >= limit.saturating_mul(8) / 10 && used % 1024 == 0 {
+        if used >= limit.saturating_mul(8) / 10 && used.is_multiple_of(1024) {
             eprintln!(
                 "argosfs: metadata inode budget warning: {used}/{limit} (estimate: {} MiB RSS)",
                 estimated_rss_bytes(used) / (1024 * 1024)
@@ -112,7 +112,7 @@ mod tests {
         );
         let cap =
             default_inode_limit(BackendKind::LoopBlock, Some(16 * 1024 * 1024 * 1024)).unwrap();
-        assert!(cap >= 20_000 && cap <= 40_000);
+        assert!((20_000..=40_000).contains(&cap));
         assert_eq!(default_inode_limit(BackendKind::RawBlock, None), None);
     }
 
