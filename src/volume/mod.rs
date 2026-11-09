@@ -409,7 +409,7 @@ impl ArgosFs {
             encryption: EncryptionConfig::default(),
             integrity: MetadataIntegrity::default(),
             disks,
-            inodes,
+            inodes: inodes.into_iter().collect(),
         };
         let mut meta = meta;
         normalize_metadata_layouts(&mut meta);
@@ -602,7 +602,7 @@ impl ArgosFs {
             encryption: EncryptionConfig::default(),
             integrity: MetadataIntegrity::default(),
             disks,
-            inodes,
+            inodes: inodes.into_iter().collect(),
         };
         normalize_metadata_layouts(&mut meta);
         journal::prepare_metadata_integrity_for_external_store(&mut meta)?;
@@ -895,6 +895,9 @@ impl ArgosFs {
                     return Err(err);
                 }
             };
+            // A successful metadata checkpoint is durable even when a
+            // subsequent device-loss fence reports CommittedDurabilityLoss.
+            meta.inodes.mark_committed();
             let mut state = self.deferred_commit.lock();
             state.durable_metadata = Some(Arc::new(meta.clone()));
             state.raw_uncommitted_metadata_dirty = false;
@@ -2103,6 +2106,7 @@ impl ArgosFs {
         match result {
             Ok(report) => {
                 let durability = self.apply_quorum_write_report(meta, report);
+                meta.inodes.mark_committed();
                 drop(before_commit);
                 // The former durable Arc is no longer required after a durable commit.
                 state.durable_metadata = None;
@@ -2124,6 +2128,7 @@ impl ArgosFs {
                 }
             }
             Err(err) if Self::transaction_error_is_committed(&err) => {
+                meta.inodes.mark_committed();
                 drop(before_commit);
                 state.durable_metadata = None;
                 drop(previous);
@@ -2250,6 +2255,7 @@ impl ArgosFs {
                         // Keep the live metadata at that durable state, but fail the
                         // mutation and fence further writes because referenced data is
                         // no longer reconstructable from runtime-available members.
+                        meta.inodes.mark_committed();
                         let mut state = self.deferred_commit.lock();
                         state.durable_metadata = Some(Arc::new(meta.clone()));
                         state.raw_uncommitted_metadata_dirty = false;
@@ -2262,6 +2268,7 @@ impl ArgosFs {
                 Err(commit_err) => {
                     self.fence_on_quorum_loss(&commit_err);
                     if Self::transaction_error_is_committed(&commit_err) {
+                        meta.inodes.mark_committed();
                         self.deferred_commit.lock().raw_uncommitted_metadata_dirty = false;
                         self.rebuild_quota_runtime_locked(meta)?;
                     }
@@ -2280,6 +2287,7 @@ impl ArgosFs {
                     return Err(commit_err);
                 }
             }
+            meta.inodes.mark_committed();
             self.deferred_commit.lock().raw_uncommitted_metadata_dirty = false;
             return Ok(());
         }
@@ -2302,10 +2310,14 @@ impl ArgosFs {
                 recompute_disk_usage_from_metadata(meta);
                 self.rebuild_quota_runtime_locked(meta)?;
             } else {
+                meta.inodes.mark_committed();
                 self.rebuild_quota_runtime_locked(meta)?;
             }
         }
 
+        if result.is_ok() {
+            meta.inodes.mark_committed();
+        }
         result
     }
 

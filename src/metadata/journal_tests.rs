@@ -595,3 +595,150 @@ fn incremental_delta_matches_full_json_diff_for_mixed_namespace_changes() {
     assert_eq!(actual_value, expected_value);
     assert_eq!(actual_value, serde_json::to_value(&next).unwrap());
 }
+
+#[test]
+fn persistent_inode_diff_preserves_wire_identity_and_signed_zero_changes() {
+    let (_dir, fs) = volume();
+    let mut previous = fs.metadata_snapshot();
+    let template = previous.inodes[&1].clone();
+    for ino in 2..10_002 {
+        let mut file = template.clone();
+        file.id = ino;
+        file.kind = crate::types::NodeKind::File;
+        file.entries.clear();
+        previous.inodes.insert(ino, file);
+    }
+    let mut next = previous.clone();
+    // A COW fork must keep the old snapshot isolated even when the mutation
+    // runs inside a path-sharing persistent B-tree.
+    next.inodes.get_mut(&2).unwrap().workload_score = -0.0;
+    next.inodes.get_mut(&3).unwrap().size += 1;
+    next.inodes.remove(&4);
+    next.txid += 1;
+    assert_eq!(previous.inodes[&3].size, 0);
+    assert!(previous.inodes.contains_key(&4));
+
+    let delta = metadata_delta(&previous, &next).unwrap();
+    let inode_ops = delta
+        .iter()
+        .filter(|op| match op {
+            MetadataDeltaOp::Add { path, .. }
+            | MetadataDeltaOp::Remove { path }
+            | MetadataDeltaOp::Replace { path, .. } => path.starts_with("/inodes/"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(inode_ops.len(), 3);
+    assert!(inode_ops
+        .iter()
+        .any(|op| matches!(op, MetadataDeltaOp::Remove { path } if path == "/inodes/4")));
+    assert!(inode_ops.iter().any(|op| matches!(op, MetadataDeltaOp::Replace { path, .. } if path == "/inodes/2/workload_score")));
+
+    // Compare exact canonical JSON bytes with the previous full JSON approach.
+    let mut value = serde_json::to_value(&previous).unwrap();
+    for op in &delta {
+        apply_delta_op(&mut value, op).unwrap();
+    }
+    assert_eq!(value, serde_json::to_value(&next).unwrap());
+    let canonical_btree_json = serde_json::to_string_pretty(
+        &previous
+            .inodes
+            .iter()
+            .map(|(key, value)| (*key, value))
+            .collect::<BTreeMap<_, _>>(),
+    )
+    .unwrap();
+    assert_eq!(
+        canonical_btree_json,
+        serde_json::to_string_pretty(&previous.inodes).unwrap()
+    );
+}
+
+/// Explicit, opt-in memory stress regression for issue #212. This avoids
+/// writing hundreds of thousands of disposable files while exercising the
+/// actual inode and eight-shard metadata types used by the production mount.
+#[test]
+#[ignore = "run manually with cargo test --lib metadata_scale_274k -- --ignored --nocapture"]
+fn metadata_scale_274k_eight_shard_inodes() {
+    fn rss_mib() -> f64 {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let rss = status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmRSS:"))
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        rss as f64 / 1024.0
+    }
+    let (dir, fs) = volume();
+    fs.write_file("/sample-8-shards", b"a real one-block sample", 0o644)
+        .unwrap();
+    let mut meta = fs.metadata_snapshot();
+    let file_id = meta.inodes[&1].entries["sample-8-shards"];
+    let mut sample = meta.inodes[&file_id].clone();
+    let template_shard = sample.blocks[0].shards[0].clone();
+    sample.blocks[0].shards = (0..8)
+        .map(|slot| {
+            let mut shard = template_shard.clone();
+            shard.slot = slot;
+            shard
+        })
+        .collect();
+    let count = std::env::var("ARGOSFS_SCALE_INODES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(274_103);
+    let initial_rss = rss_mib();
+    let started = std::time::Instant::now();
+    for ino in 3..count + 3 {
+        let mut file = sample.clone();
+        file.id = ino;
+        meta.inodes.insert(ino, file);
+        if ino % 50_000 == 0 {
+            eprintln!(
+                "inodes={ino} RSS={:.1} MiB elapsed={:.1}s",
+                rss_mib(),
+                started.elapsed().as_secs_f64()
+            );
+        }
+    }
+    let built_rss = rss_mib();
+    struct ByteCounter(u64);
+    impl std::io::Write for ByteCounter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len() as u64;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut checkpoint = ByteCounter(0);
+    serde_json::to_writer(&mut checkpoint, &meta).unwrap();
+    eprintln!(
+        "checkpoint_json_bytes={} checkpoint_json_mib={:.1}",
+        checkpoint.0,
+        checkpoint.0 as f64 / (1024.0 * 1024.0)
+    );
+    meta.inodes.mark_committed();
+    let snapshot = meta.clone();
+    let cloned_rss = rss_mib();
+    // Clone and mutate only a handful of entries, as in a normal journal commit.
+    for ino in [3, count / 2, count + 2] {
+        meta.inodes.get_mut(&ino).unwrap().size += 1;
+    }
+    let ops = metadata_delta(&snapshot, &meta).unwrap();
+    let mutated_rss = rss_mib();
+    eprintln!(
+        "METADATA_SCALE inodes={} shards_per_inode=8 initial_rss_mib={:.1} built_rss_mib={:.1} cloned_rss_mib={:.1} mutated_rss_mib={:.1} \
+         elapsed_sec={:.1} delta_ops={} relative_build_mib={:.1} snapshot_growth_mib={:.1}",
+        count, initial_rss, built_rss, cloned_rss, mutated_rss,
+        started.elapsed().as_secs_f64(), ops.len(),
+        built_rss - initial_rss, cloned_rss - built_rss
+    );
+    assert_eq!(ops.len(), 3);
+    assert_eq!(snapshot.inodes[&3].size + 1, meta.inodes[&3].size);
+    drop((dir, fs));
+}

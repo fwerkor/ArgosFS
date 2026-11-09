@@ -558,7 +558,7 @@ impl PagedMetadata {
             encryption: header.encryption,
             integrity: header.integrity,
             disks,
-            inodes,
+            inodes: inodes.into_iter().collect(),
         })
     }
 
