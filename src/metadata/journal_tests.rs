@@ -547,3 +547,51 @@ fn valid_chain_filter_skips_blank_malformed_legacy_bad_hash_and_bad_links() {
     assert_eq!(records[0].action, "first");
     assert_eq!(records[1].action, "second");
 }
+
+#[test]
+fn incremental_delta_matches_full_json_diff_for_mixed_namespace_changes() {
+    let (_dir, fs) = volume();
+    fs.write_file("/removed", b"x", 0o644).unwrap();
+    fs.write_file("/kept", b"xyz", 0o644).unwrap();
+    let previous = fs.metadata_snapshot();
+    let mut next = previous.clone();
+
+    let removed_id = *next.inodes[&1].entries.get("removed").unwrap();
+    let kept_id = *next.inodes[&1].entries.get("kept").unwrap();
+    next.inodes.remove(&removed_id);
+    next.inodes.get_mut(&1).unwrap().entries.remove("removed");
+    next.inodes
+        .get_mut(&1)
+        .unwrap()
+        .entries
+        .insert("new/name~".into(), kept_id + 100);
+    let mut new_inode = next.inodes[&kept_id].clone();
+    new_inode.id = kept_id + 100;
+    new_inode.blocks.clear();
+    new_inode.size = 0;
+    next.inodes.insert(new_inode.id, new_inode);
+    next.inodes.get_mut(&kept_id).unwrap().mode = 0o100600;
+    next.config.fsname = "updated".into();
+    next.txid += 1;
+    next.disks.values_mut().next().unwrap().used_bytes += 1;
+
+    let mut expected = Vec::new();
+    diff_json(
+        "",
+        &serde_json::to_value(&previous).unwrap(),
+        &serde_json::to_value(&next).unwrap(),
+        &mut expected,
+    );
+    let actual = metadata_delta(&previous, &next).unwrap();
+    // Op order can differ across independent subtrees; exact effects cannot.
+    let mut expected_value = serde_json::to_value(&previous).unwrap();
+    let mut actual_value = expected_value.clone();
+    for op in &expected {
+        apply_delta_op(&mut expected_value, op).unwrap();
+    }
+    for op in &actual {
+        apply_delta_op(&mut actual_value, op).unwrap();
+    }
+    assert_eq!(actual_value, expected_value);
+    assert_eq!(actual_value, serde_json::to_value(&next).unwrap());
+}

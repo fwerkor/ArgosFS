@@ -1,4 +1,5 @@
 use crate::error::{ArgosError, Result};
+use crate::metadata::store::MetadataHeaderPage;
 use crate::types::{
     Metadata, MetadataCandidateReport, MetadataIntegrity, TransactionReport, FORMAT_VERSION,
 };
@@ -6,7 +7,7 @@ use crate::util::{append_json_line, atomic_write, now_f64, read_to_vec, sha256_h
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -882,12 +883,59 @@ fn has_valid_checkpoint(root: &Path) -> Result<bool> {
     Ok(false)
 }
 
+/// Build a JSON-compatible journal delta without materializing the full
+/// previous/next metadata trees. Existing journal records remain readable.
 pub fn metadata_delta(previous: &Metadata, next: &Metadata) -> Result<Vec<MetadataDeltaOp>> {
-    let previous = serde_json::to_value(previous)?;
-    let next = serde_json::to_value(next)?;
     let mut ops = Vec::new();
-    diff_json("", &previous, &next, &mut ops);
+    // HeaderPage contains all Metadata fields except disks/inodes. Its size
+    // is bounded independently of the namespace (allocator lists excluded).
+    let previous_header = serde_json::to_value(MetadataHeaderPage::from(previous))?;
+    let next_header = serde_json::to_value(MetadataHeaderPage::from(next))?;
+    diff_json("", &previous_header, &next_header, &mut ops);
+
+    diff_metadata_map("/disks", &previous.disks, &next.disks, &mut ops)?;
+    diff_metadata_map("/inodes", &previous.inodes, &next.inodes, &mut ops)?;
     Ok(ops)
+}
+
+/// Iterating B-tree keys is O(total inodes); transient JSON memory is limited
+/// to a single changed inode rather than two copies of the entire namespace.
+/// Full changed-record tracking can later avoid scanning unchanged keys.
+fn diff_metadata_map<K, V>(
+    prefix: &str,
+    previous: &BTreeMap<K, V>,
+    next: &BTreeMap<K, V>,
+    ops: &mut Vec<MetadataDeltaOp>,
+) -> Result<()>
+where
+    K: Ord + ToString,
+    V: Serialize,
+{
+    for key in previous.keys() {
+        if !next.contains_key(key) {
+            ops.push(MetadataDeltaOp::Remove {
+                path: push_json_pointer(prefix, &key.to_string()),
+            });
+        }
+    }
+    for (key, next_item) in next {
+        let path = push_json_pointer(prefix, &key.to_string());
+        if let Some(previous_item) = previous.get(key) {
+            // Serialize a single inode before allocating its JSON tree. This
+            // also avoids adding any new PartialEq requirements to metadata.
+            if serde_json::to_vec(previous_item)? != serde_json::to_vec(next_item)? {
+                let old = serde_json::to_value(previous_item)?;
+                let new = serde_json::to_value(next_item)?;
+                diff_json(&path, &old, &new, ops);
+            }
+        } else {
+            ops.push(MetadataDeltaOp::Add {
+                path,
+                value: serde_json::to_value(next_item)?,
+            });
+        }
+    }
+    Ok(())
 }
 
 pub fn apply_metadata_delta(previous: &Metadata, delta: &[MetadataDeltaOp]) -> Result<Metadata> {
