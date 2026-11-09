@@ -43,7 +43,8 @@ Coverage:
 An opt-in run with 274,103 synthetic file inodes and eight shards per file,
 using unique deterministic shard hashes and paths, produced 1,015.1 MiB of
 uncompressed checkpoint JSON and 109.7 MiB at zstd level 3 (9.25x).
-The inode table occupied about 2.0 GiB RSS; cloning the metadata snapshot
+With the maintained imbl backing map, the inode table occupied about
+1.46 GiB RSS; cloning the metadata snapshot
 did not materially increase it. These numbers are from a constructed
 workload, not the reporter's actual SD cards, directory tree or FUSE writes.
 
