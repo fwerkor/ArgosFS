@@ -278,7 +278,7 @@ fn inode_helpers_touch_allocate_paths_and_attributes() {
     let (_dir, fs) = host_volume();
     let mut meta = fs.meta.write();
     let next = meta.next_inode;
-    assert_eq!(fs.alloc_inode_locked(&mut meta), next);
+    assert_eq!(fs.alloc_inode_locked(&mut meta).unwrap(), next);
     assert_eq!(meta.next_inode, next + 1);
     let before = meta.inodes[&ROOT_INO].clone();
     fs.touch_inode_locked(&mut meta, ROOT_INO, true, false);

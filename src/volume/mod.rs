@@ -81,6 +81,7 @@ mod autopilot;
 mod data_plane;
 mod helpers;
 mod maintenance;
+mod metadata_budget;
 mod namespace;
 #[cfg(test)]
 mod tests;
@@ -1115,7 +1116,7 @@ impl ArgosFs {
             return Err(ArgosError::AlreadyExists(name.to_string()));
         }
         let now = now_f64();
-        let ino = self.alloc_inode_locked(meta);
+        let ino = self.alloc_inode_locked(meta)?;
         let (gid, inherit_setgid) = {
             let parent_inode = self.dir_inode_locked(meta, parent)?;
             (
@@ -1237,7 +1238,7 @@ impl ArgosFs {
             )));
         };
         let now = now_f64();
-        let ino = self.alloc_inode_locked(meta);
+        let ino = self.alloc_inode_locked(meta)?;
         let gid = {
             let parent_inode = self.dir_inode_locked(meta, parent)?;
             if parent_inode.mode & libc::S_ISGID != 0 {
@@ -1880,10 +1881,11 @@ impl ArgosFs {
         }
     }
 
-    fn alloc_inode_locked(&self, meta: &mut Metadata) -> InodeId {
+    fn alloc_inode_locked(&self, meta: &mut Metadata) -> Result<InodeId> {
+        metadata_budget::check_new_inode(meta)?;
         let ino = meta.next_inode;
         meta.next_inode += 1;
-        ino
+        Ok(ino)
     }
 
     fn shard_path_locked(&self, meta: &Metadata, disk_id: &str, relpath: &Path) -> PathBuf {

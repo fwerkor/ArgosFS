@@ -747,6 +747,12 @@ pub struct HealthReport {
     pub cache: BTreeMap<String, serde_json::Value>,
     pub io_mode: IoMode,
     pub encryption_enabled: bool,
+    #[serde(default)]
+    pub metadata_inodes: usize,
+    #[serde(default)]
+    pub metadata_estimated_rss_bytes: u64,
+    #[serde(default)]
+    pub metadata_inode_limit: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

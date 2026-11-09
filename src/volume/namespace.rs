@@ -998,7 +998,7 @@ impl ArgosFs {
         {
             return Err(ArgosError::AlreadyExists(name));
         }
-        let ino = self.alloc_inode_locked(&mut meta);
+        let ino = self.alloc_inode_locked(&mut meta)?;
         let gid = {
             let parent_inode = self.dir_inode_locked(&meta, parent)?;
             if parent_inode.mode & libc::S_ISGID != 0 {

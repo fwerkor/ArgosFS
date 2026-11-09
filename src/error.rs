@@ -30,6 +30,8 @@ pub enum ArgosError {
         required: u64,
         available: u64,
     },
+    #[error("metadata inode budget exceeded: {used} inodes, limit {limit} (ARGOSFS_METADATA_MAX_INODES)")]
+    MetadataInodeLimit { used: usize, limit: usize },
     #[error("directory quota exceeded for inode {inode}: used {used} bytes, limit {limit} bytes")]
     QuotaExceeded { inode: u64, used: u64, limit: u64 },
     #[error("unrecoverable stripe {stripe_id}: {reason}")]
@@ -110,7 +112,7 @@ impl ArgosError {
             ArgosError::IsDirectory(_) => libc::EISDIR,
             ArgosError::DirectoryNotEmpty(_) => libc::ENOTEMPTY,
             ArgosError::NotEnoughDisks { .. } => libc::ENOSPC,
-            ArgosError::DiskFull { .. } => libc::ENOSPC,
+            ArgosError::DiskFull { .. } | ArgosError::MetadataInodeLimit { .. } => libc::ENOSPC,
             ArgosError::QuotaExceeded { .. } => libc::EDQUOT,
             ArgosError::UnrecoverableStripe { .. } => libc::EIO,
             ArgosError::Invalid(_) => libc::EINVAL,
