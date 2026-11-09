@@ -1,3 +1,4 @@
+use super::inodes::TrackedInodes;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -623,7 +624,7 @@ pub struct Metadata {
     #[serde(default)]
     pub integrity: MetadataIntegrity,
     pub disks: BTreeMap<String, Disk>,
-    pub inodes: BTreeMap<InodeId, Inode>,
+    pub inodes: TrackedInodes,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

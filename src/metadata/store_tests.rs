@@ -250,7 +250,7 @@ fn sample_metadata() -> Metadata {
         last_written_at: created_at,
     };
 
-    let mut inodes = BTreeMap::new();
+    let mut inodes: BTreeMap<InodeId, Inode> = BTreeMap::new();
     inodes.insert(1, root);
     inodes.insert(2, file);
     inodes.insert(3, symlink);
@@ -288,7 +288,7 @@ fn sample_metadata() -> Metadata {
         encryption: EncryptionConfig::default(),
         integrity: MetadataIntegrity::default(),
         disks,
-        inodes,
+        inodes: inodes.into_iter().collect(),
     }
 }
 

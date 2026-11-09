@@ -181,11 +181,13 @@ fn previous_snapshot_policy_distinguishes_host_and_deferred_block_backends() {
 #[test]
 fn layout_normalization_and_lookup_repair_legacy_metadata() {
     let mut meta = metadata();
-    let file = meta
+    let ino = *meta
         .inodes
-        .values_mut()
-        .find(|inode| inode.kind == NodeKind::Directory)
+        .iter()
+        .find(|(_, inode)| inode.kind == NodeKind::Directory)
+        .map(|(ino, _)| ino)
         .unwrap();
+    let file = meta.inodes.get_mut(&ino).unwrap();
     file.blocks.push(FileBlock {
         layout_id: String::new(),
         ..block(0, 1)
@@ -410,7 +412,8 @@ fn utility_helpers_generate_aad_and_update_latency_ewmas() {
 fn recompute_usage_counts_raw_extents_and_normalizes_layouts() {
     let mut meta = metadata();
     let disk_id = meta.disks.keys().next().unwrap().clone();
-    let inode = meta.inodes.values_mut().next().unwrap();
+    let ino = *meta.inodes.keys().next().unwrap();
+    let inode = meta.inodes.get_mut(&ino).unwrap();
     inode.blocks.push(FileBlock {
         layout_id: String::new(),
         shards: vec![

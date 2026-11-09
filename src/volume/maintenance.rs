@@ -723,14 +723,15 @@ impl ArgosFs {
 
     pub(super) fn next_reshape_inode(&self, target_layout: &str) -> Option<InodeId> {
         let meta = self.meta.read();
-        meta.inodes.iter().find_map(|(ino, inode)| {
+        let found = meta.inodes.iter().find_map(|(ino, inode)| {
             (inode.kind == NodeKind::File
                 && inode
                     .blocks
                     .iter()
                     .any(|block| block_layout_id(block) != target_layout))
             .then_some(*ino)
-        })
+        });
+        found
     }
 
     pub(super) fn reshape_remaining_files(&self, target_layout: &str) -> usize {

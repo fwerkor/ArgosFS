@@ -4,8 +4,8 @@
 use super::*;
 use std::sync::OnceLock;
 
-pub(crate) const ESTIMATED_RSS_BYTES_PER_INODE: u64 = 160 * 1024;
-const DEFAULT_METADATA_MEMORY_PERCENT: u64 = 30;
+pub(crate) const ESTIMATED_RSS_BYTES_PER_INODE: u64 = 32 * 1024;
+const DEFAULT_METADATA_MEMORY_PERCENT: u64 = 65;
 const MIN_INODE_LIMIT: u64 = 1024;
 
 fn read_limit(path: &str) -> Option<u64> {
@@ -112,7 +112,13 @@ mod tests {
         );
         let cap =
             default_inode_limit(BackendKind::LoopBlock, Some(16 * 1024 * 1024 * 1024)).unwrap();
-        assert!((20_000..=40_000).contains(&cap));
+        assert!((300_000..=400_000).contains(&cap));
+        // The original 274,103-entry backup must not be rejected by the
+        // *default* admission guard on the reported 15 GiB machine.
+        assert!(
+            default_inode_limit(BackendKind::RawBlock, Some(15 * 1024 * 1024 * 1024)).unwrap()
+                > 274_103
+        );
         assert_eq!(default_inode_limit(BackendKind::RawBlock, None), None);
     }
 
@@ -126,7 +132,7 @@ mod tests {
                 limit: 10
             })
         ));
-        assert_eq!(estimated_rss_bytes(10), 10 * 160 * 1024);
+        assert_eq!(estimated_rss_bytes(10), 10 * 32 * 1024);
         assert_eq!(
             ArgosError::MetadataInodeLimit {
                 used: 10,

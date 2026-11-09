@@ -198,12 +198,17 @@ fn path_iteration_and_file_windows_cover_nested_non_utf8_and_cursor_wrap() {
     assert!(fs.file_window(None, 0).is_empty());
     let all = fs.file_window(None, usize::MAX);
     assert_eq!(all.len(), 4);
+    assert!(all.windows(2).all(|pair| pair[0].0 < pair[1].0));
     let first = fs.file_window(None, 2);
     assert_eq!(first.len(), 2);
+    assert_eq!(first[0].0, all[0].0);
     let after = fs.file_window(Some(first[1].0), 2);
-    assert!(!after.is_empty());
+    assert_eq!(after[0].0, all[2].0);
     let wrapped = fs.file_window(Some(u64::MAX), 2);
-    assert_eq!(wrapped.len(), 2);
+    assert_eq!(
+        wrapped.iter().map(|(ino, _)| *ino).collect::<Vec<_>>(),
+        first.iter().map(|(ino, _)| *ino).collect::<Vec<_>>()
+    );
 }
 
 #[test]

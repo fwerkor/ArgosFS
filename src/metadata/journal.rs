@@ -894,8 +894,36 @@ pub fn metadata_delta(previous: &Metadata, next: &Metadata) -> Result<Vec<Metada
     diff_json("", &previous_header, &next_header, &mut ops);
 
     diff_metadata_map("/disks", &previous.disks, &next.disks, &mut ops)?;
-    diff_metadata_map("/inodes", &previous.inodes, &next.inodes, &mut ops)?;
+    diff_inodes(&previous.inodes, &next.inodes, &mut ops)?;
     Ok(ops)
+}
+
+/// Committed baselines and mutation tracking bound normal group commits to
+/// modified inode keys; independent images fall back to exhaustive scans. The
+/// operation order is independent of the full-tree implementation but replay
+/// produces the identical JSON metadata.
+fn diff_inodes(
+    previous: &crate::model::inodes::TrackedInodes,
+    next: &crate::model::inodes::TrackedInodes,
+    ops: &mut Vec<MetadataDeltaOp>,
+) -> Result<()> {
+    for ino in previous.changed_candidates(next) {
+        let path = push_json_pointer("/inodes", &ino.to_string());
+        match (previous.get(&ino), next.get(&ino)) {
+            (None, Some(inode)) => ops.push(MetadataDeltaOp::Add {
+                path,
+                value: serde_json::to_value(inode)?,
+            }),
+            (Some(_), None) => ops.push(MetadataDeltaOp::Remove { path }),
+            (Some(old), Some(updated)) => {
+                let old_value = serde_json::to_value(old)?;
+                let new_value = serde_json::to_value(updated)?;
+                diff_json(&path, &old_value, &new_value, ops);
+            }
+            (None, None) => {}
+        }
+    }
+    Ok(())
 }
 
 /// Iterating B-tree keys is O(total inodes); transient JSON memory is limited
@@ -974,11 +1002,33 @@ fn diff_json(
                 }
             }
         }
-        _ if previous != next => ops.push(MetadataDeltaOp::Replace {
+        // Value::PartialEq treats -0.0 and +0.0 as equal, although those
+        // serialize to distinct bytes and therefore change the metadata hash.
+        _ if !json_values_identical(previous, next) => ops.push(MetadataDeltaOp::Replace {
             path: path.to_string(),
             value: next.clone(),
         }),
         _ => {}
+    }
+}
+
+// Value's numeric equality ignores the sign bit of zero, but a journal
+// delta must reproduce exact serialized bytes to validate integrity hashes.
+fn json_values_identical(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    match (a, b) {
+        (serde_json::Value::Number(left), serde_json::Value::Number(right))
+            if left.is_f64() && right.is_f64() =>
+        {
+            left.as_f64().map(f64::to_bits) == right.as_f64().map(f64::to_bits)
+        }
+        (serde_json::Value::Array(left), serde_json::Value::Array(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(a, b)| json_values_identical(a, b))
+        }
+        _ => a == b,
     }
 }
 

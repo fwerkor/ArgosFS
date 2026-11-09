@@ -13,6 +13,7 @@ use crate::types::{
 use crate::util::{now_f64, sha256_hex};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -25,6 +26,9 @@ const RAW_QUORUM_COMMIT_ACTION: &str = "__argosfs_quorum_commit__";
 const RAW_HEADER_SIZE: usize = 4096;
 const METADATA_FORMAT_LEGACY: u32 = 0;
 const METADATA_FORMAT_TREE: u32 = 1;
+const METADATA_FORMAT_TREE_ZSTD: u32 = 2;
+const METADATA_DECOMPRESSED_MAX: u64 = 4 * 1024 * 1024 * 1024;
+const CHECKPOINT_ZSTD_LEVEL: i32 = 3;
 const METADATA_PAGE_SIZE: usize = 4096;
 const METADATA_INDEX_ENTRY_SIZE: usize = 48;
 const HASH_HEX_LEN: usize = 64;
@@ -414,10 +418,10 @@ pub fn write_metadata_copies(
 ) -> Result<()> {
     // Store compact JSON: the metadata checkpoint has half the fixed metadata
     // region, and pretty-printing wastes about a third of that space.
-    let bytes = serde_json::to_vec(metadata)?;
-    let hash = sha256_hex(&bytes);
+    let payload = prepare_checkpoint_payload(metadata, superblocks)?;
+    let hash = sha256_hex(&payload.bytes);
     for sb in superblocks {
-        write_metadata_member(backend, sb, metadata, &bytes, &hash)?;
+        write_metadata_member(backend, sb, metadata, &payload, &hash)?;
     }
     Ok(())
 }
@@ -435,13 +439,13 @@ pub(crate) fn write_metadata_copies_quorum(
             superblocks.len(),
         ));
     }
-    let bytes = serde_json::to_vec(metadata)?;
-    let hash = sha256_hex(&bytes);
+    let payload = prepare_checkpoint_payload(metadata, superblocks)?;
+    let hash = sha256_hex(&payload.bytes);
     let mut report = QuorumWriteReport::default();
     let mut durable = 0usize;
     let mut uncertain_write = false;
     for sb in superblocks {
-        match write_metadata_member(backend, sb, metadata, &bytes, &hash) {
+        match write_metadata_member(backend, sb, metadata, &payload, &hash) {
             Ok(()) => durable += 1,
             Err(err) => {
                 // DiskFull is raised while constructing the checkpoint before any
@@ -462,20 +466,82 @@ pub(crate) fn write_metadata_copies_quorum(
     Ok(report)
 }
 
+/// On existing pools, emit the original v1 checkpoint format whenever it
+/// fits. Only a checkpoint that would otherwise hit ENOSPC is compressed.
+struct CheckpointPayload {
+    bytes: Vec<u8>,
+    original: Option<(u64, String)>,
+}
+
+fn checkpoint_fits(bytes: usize, slot_len: u64) -> bool {
+    if bytes == 0 {
+        return false;
+    }
+    let pages = bytes.div_ceil(METADATA_PAGE_SIZE);
+    let Some(index_len) = pages.checked_mul(METADATA_INDEX_ENTRY_SIZE) else {
+        return false;
+    };
+    let Some(index_end) = (RAW_HEADER_SIZE as u64).checked_add(index_len as u64) else {
+        return false;
+    };
+    let Some(data_bytes) = (pages as u64).checked_mul(METADATA_PAGE_SIZE as u64) else {
+        return false;
+    };
+    align_up(index_end, METADATA_PAGE_SIZE as u64)
+        .checked_add(data_bytes)
+        .is_some_and(|end| end <= slot_len)
+}
+
+fn prepare_checkpoint_payload(
+    metadata: &Metadata,
+    superblocks: &[RawSuperblock],
+) -> Result<CheckpointPayload> {
+    let bytes = serde_json::to_vec(metadata)?;
+    if superblocks
+        .iter()
+        .all(|sb| checkpoint_fits(bytes.len(), sb.metadata.length / 2))
+    {
+        return Ok(CheckpointPayload {
+            bytes,
+            original: None,
+        });
+    }
+    if bytes.len() as u64 > METADATA_DECOMPRESSED_MAX {
+        return Err(ArgosError::Invalid(format!(
+            "metadata checkpoint exceeds {}-byte supported expansion limit",
+            METADATA_DECOMPRESSED_MAX
+        )));
+    }
+    let original = (bytes.len() as u64, sha256_hex(&bytes));
+    let compressed = zstd::stream::encode_all(bytes.as_slice(), CHECKPOINT_ZSTD_LEVEL)?;
+    Ok(CheckpointPayload {
+        bytes: compressed,
+        original: Some(original),
+    })
+}
+
 fn write_metadata_member(
     backend: &dyn StorageBackend,
     sb: &RawSuperblock,
     metadata: &Metadata,
-    bytes: &[u8],
+    payload: &CheckpointPayload,
     hash: &str,
 ) -> Result<()> {
     let slot_len = sb.metadata.length / 2;
     let slot = (metadata.txid % 2) * slot_len;
     let offset = sb.metadata.offset + slot;
-    write_metadata_slot(backend, sb, offset, slot_len, metadata, bytes, hash)?;
+    write_metadata_slot(backend, sb, offset, slot_len, metadata, payload, hash)?;
     let mirror_slot = ((metadata.txid + 1) % 2) * slot_len;
     let mirror_offset = sb.metadata.offset + mirror_slot;
-    write_metadata_slot(backend, sb, mirror_offset, slot_len, metadata, bytes, hash)
+    write_metadata_slot(
+        backend,
+        sb,
+        mirror_offset,
+        slot_len,
+        metadata,
+        payload,
+        hash,
+    )
 }
 
 fn write_metadata_slot(
@@ -484,16 +550,17 @@ fn write_metadata_slot(
     offset: u64,
     slot_len: u64,
     metadata: &Metadata,
-    bytes: &[u8],
+    payload: &CheckpointPayload,
     hash: &str,
 ) -> Result<()> {
-    let checkpoint = metadata_tree_checkpoint(
+    let checkpoint = metadata_tree_checkpoint_encoded(
         &sb.disk_id,
         metadata.txid,
         metadata.integrity.generation,
-        bytes,
+        &payload.bytes,
         hash,
         slot_len,
+        payload.original.as_ref(),
     )?;
     for (relative_offset, data) in checkpoint.body_writes {
         backend.write_at(&sb.disk_id, offset + relative_offset, &data)?;
@@ -1471,7 +1538,9 @@ fn read_metadata_candidate(
         METADATA_FORMAT_LEGACY => {
             read_legacy_metadata_candidate(backend, sb, offset, slot_len, header)
         }
-        METADATA_FORMAT_TREE => read_tree_metadata_candidate(backend, sb, offset, slot_len, header),
+        METADATA_FORMAT_TREE | METADATA_FORMAT_TREE_ZSTD => {
+            read_tree_metadata_candidate(backend, sb, offset, slot_len, header)
+        }
         format => Err(ArgosError::IncompatibleFormat(format!(
             "unsupported raw metadata checkpoint format {format}"
         ))),
@@ -1591,7 +1660,28 @@ fn read_tree_metadata_candidate(
             "raw metadata checksum mismatch".to_string(),
         ));
     }
-    Ok(serde_json::from_slice::<Metadata>(&bytes)?)
+    if get_u32(header, 20)? != METADATA_FORMAT_TREE_ZSTD {
+        return Ok(serde_json::from_slice::<Metadata>(&bytes)?);
+    }
+    let expanded_len = get_u64(header, 232)?;
+    if expanded_len == 0 || expanded_len > METADATA_DECOMPRESSED_MAX {
+        return Err(ArgosError::CorruptedMetadata(
+            "invalid compressed checkpoint expanded length".to_string(),
+        ));
+    }
+    let expanded_hash = get_fixed_hex(header, 240, HASH_HEX_LEN)?;
+    // Bound the decompressor to the claimed expanded length, not the
+    // compressed bytes. A corrupt zstd frame must never exhaust RAM.
+    let decoder = zstd::stream::read::Decoder::new(bytes.as_slice())?;
+    let mut bounded = decoder.take(expanded_len + 1);
+    let mut expanded = Vec::new();
+    bounded.read_to_end(&mut expanded)?;
+    if expanded.len() as u64 != expanded_len || sha256_hex(&expanded) != expanded_hash {
+        return Err(ArgosError::Checksum(
+            "compressed metadata checkpoint content mismatch".to_string(),
+        ));
+    }
+    Ok(serde_json::from_slice::<Metadata>(&expanded)?)
 }
 
 fn read_latest_journal_metadata(
@@ -1987,6 +2077,7 @@ struct MetadataTreeCheckpoint {
     body_writes: Vec<(u64, Vec<u8>)>,
 }
 
+#[cfg(test)]
 fn metadata_tree_checkpoint(
     disk_id: &str,
     txid: u64,
@@ -1994,6 +2085,18 @@ fn metadata_tree_checkpoint(
     bytes: &[u8],
     hash: &str,
     slot_len: u64,
+) -> Result<MetadataTreeCheckpoint> {
+    metadata_tree_checkpoint_encoded(disk_id, txid, generation, bytes, hash, slot_len, None)
+}
+
+fn metadata_tree_checkpoint_encoded(
+    disk_id: &str,
+    txid: u64,
+    generation: u64,
+    bytes: &[u8],
+    hash: &str,
+    slot_len: u64,
+    original: Option<&(u64, String)>,
 ) -> Result<MetadataTreeCheckpoint> {
     let page_count = bytes.len().div_ceil(METADATA_PAGE_SIZE);
     let index_len = page_count
@@ -2068,7 +2171,19 @@ fn metadata_tree_checkpoint(
     let mut out = [0u8; RAW_HEADER_SIZE];
     out[..16].copy_from_slice(METADATA_MAGIC);
     put_u32(&mut out, 16, RAW_STORE_VERSION);
-    put_u32(&mut out, 20, METADATA_FORMAT_TREE);
+    put_u32(
+        &mut out,
+        20,
+        if original.is_some() {
+            METADATA_FORMAT_TREE_ZSTD
+        } else {
+            METADATA_FORMAT_TREE
+        },
+    );
+    if let Some((expanded_len, expanded_hash)) = original {
+        put_u64(&mut out, 232, *expanded_len);
+        put_fixed_str(&mut out, 240, HASH_HEX_LEN, expanded_hash);
+    }
     put_u64(&mut out, 24, txid);
     put_u64(&mut out, 32, bytes.len() as u64);
     put_fixed_str(&mut out, 64, 64, hash);

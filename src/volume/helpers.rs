@@ -210,10 +210,23 @@ pub(super) fn normalize_metadata_layouts(meta: &mut Metadata) {
     {
         meta.current_write_layout = DEFAULT_LAYOUT_ID.to_string();
     }
-    for inode in meta.inodes.values_mut() {
-        for block in &mut inode.blocks {
-            if block.layout_id.is_empty() {
-                block.layout_id = DEFAULT_LAYOUT_ID.to_string();
+    let missing_layout = meta
+        .inodes
+        .iter()
+        .filter_map(|(ino, inode)| {
+            inode
+                .blocks
+                .iter()
+                .any(|block| block.layout_id.is_empty())
+                .then_some(*ino)
+        })
+        .collect::<Vec<_>>();
+    for ino in missing_layout {
+        if let Some(inode) = meta.inodes.get_mut(&ino) {
+            for block in &mut inode.blocks {
+                if block.layout_id.is_empty() {
+                    block.layout_id = DEFAULT_LAYOUT_ID.to_string();
+                }
             }
         }
     }
