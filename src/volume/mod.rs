@@ -1074,29 +1074,31 @@ impl ArgosFs {
     }
 
     fn file_window(&self, cursor: Option<InodeId>, max_files: usize) -> Vec<(InodeId, Inode)> {
-        let meta = self.meta.read();
-        let files = meta
-            .inodes
-            .iter()
-            .filter_map(|(ino, inode)| {
-                (inode.kind == NodeKind::File).then_some((*ino, inode.clone()))
-            })
-            .collect::<Vec<_>>();
-        if files.is_empty() || max_files == 0 {
+        if max_files == 0 {
             return Vec::new();
         }
-        if max_files == usize::MAX {
-            return files;
-        }
-        let start = cursor
-            .and_then(|cursor| files.iter().position(|(ino, _)| *ino > cursor))
-            .unwrap_or(0);
-        files
+        let meta = self.meta.read();
+        // HashMap iteration is deliberately unordered. Scrub/rebalance cursors
+        // must advance in numeric inode order, and cloning every file's shard
+        // records merely to select 128 entries can exceed the memory budget.
+        let mut ids = meta
+            .inodes
             .iter()
+            .filter_map(|(ino, inode)| (inode.kind == NodeKind::File).then_some(*ino))
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        ids.sort_unstable();
+        let start = cursor
+            .map(|value| ids.partition_point(|ino| *ino <= value))
+            .filter(|start| *start < ids.len())
+            .unwrap_or(0);
+        ids.iter()
             .cycle()
             .skip(start)
-            .take(max_files.min(files.len()))
-            .cloned()
+            .take(max_files.min(ids.len()))
+            .filter_map(|ino| meta.inodes.get(ino).map(|inode| (*ino, inode.clone())))
             .collect()
     }
 
