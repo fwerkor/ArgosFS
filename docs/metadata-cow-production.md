@@ -27,7 +27,9 @@ The preceding PR uses a conservative 160 KiB/inode at 30% of physical/cgroup
 RAM as a temporary fail-safe. With copy-on-write metadata, an opt-in synthetic
 stress run allocated 274,103 inodes with 8 realistic shard records each:
 RSS rose by 1,944.8 MiB, or about 7.1 KiB per inode, and cloning a full
-metadata snapshot did not visibly increase RSS. This test exercised the same
+metadata snapshot did not visibly increase RSS. Repeating the benchmark
+with distinct hash/path values for all shards used about 1,991 MiB for
+274,103 files and produced a 109.7 MiB compressed checkpoint. This test exercised the same
 Rust metadata model, not 274k FUSE file writes, journal checkpoints or
 power-loss recovery.
 

@@ -37,3 +37,19 @@ Coverage:
 - Existing raw journal crash-consistency and compatibility integration tests
 - Opt-in 274,103 inode / eight-shard synthetic benchmark can additionally
   report the zstd checkpoint size via ARGOSFS_SCALE_COMPRESS_CHECKPOINT=1
+
+## Reproducible scale characterization
+
+An opt-in run with 274,103 synthetic file inodes and eight shards per file,
+using unique deterministic shard hashes and paths, produced 1,015.1 MiB of
+uncompressed checkpoint JSON and 109.7 MiB at zstd level 3 (9.25x).
+The inode table occupied about 2.0 GiB RSS; cloning the metadata snapshot
+did not materially increase it. These numbers are from a constructed
+workload, not the reporter's actual SD cards, directory tree or FUSE writes.
+
+Reproduce using:
+    ARGOSFS_SCALE_UNIQUE_SHARDS=1 ARGOSFS_SCALE_COMPRESS_CHECKPOINT=1
+    cargo test --lib metadata_scale_274k -- --ignored --nocapture
+
+The 109.7 MiB payload fits a metadata slot on a sufficiently large
+device, but the smallest member's region layout remains authoritative.

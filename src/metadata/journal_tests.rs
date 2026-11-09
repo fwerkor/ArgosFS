@@ -691,10 +691,36 @@ fn metadata_scale_274k_eight_shard_inodes() {
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(274_103);
     let initial_rss = rss_mib();
+    let varied_shards = std::env::var_os("ARGOSFS_SCALE_UNIQUE_SHARDS").is_some();
     let started = std::time::Instant::now();
     for ino in 3..count + 3 {
         let mut file = sample.clone();
         file.id = ino;
+        if varied_shards {
+            for block in &mut file.blocks {
+                block.stripe_id = format!("s{ino:016x}");
+                for shard in &mut block.shards {
+                    let slot = shard.slot;
+                    let digest = blake3::hash(format!("{ino}:{slot}").as_bytes())
+                        .to_hex()
+                        .to_string();
+                    shard.sha256 = digest.clone();
+                    shard.subblock_sha256 = vec![digest];
+                    let relpath = std::path::PathBuf::from(format!(
+                        "shards/{:02x}/s{ino:016x}.{slot:03}.blk",
+                        ino % 256,
+                    ));
+                    shard.relpath = relpath.clone();
+                    if let Some(crate::types::ShardLocation::HostPath {
+                        relpath: location_path,
+                        ..
+                    }) = &mut shard.location
+                    {
+                        *location_path = relpath;
+                    }
+                }
+            }
+        }
         meta.inodes.insert(ino, file);
         if ino % 50_000 == 0 {
             eprintln!(
@@ -721,11 +747,18 @@ fn metadata_scale_274k_eight_shard_inodes() {
         let checkpoint = serde_json::to_vec(&meta).unwrap();
         let compressed = zstd::stream::encode_all(checkpoint.as_slice(), 3).unwrap();
         eprintln!(
-            "checkpoint_json_mib={:.1} checkpoint_zstd_mib={:.1} compression_ratio={:.2}",
+            "checkpoint_json_mib={:.1} checkpoint_zstd_mib={:.1} compression_ratio={:.2} unique_shards={}",
             checkpoint.len() as f64 / (1024.0 * 1024.0),
             compressed.len() as f64 / (1024.0 * 1024.0),
             checkpoint.len() as f64 / compressed.len() as f64,
+            varied_shards,
         );
+        if varied_shards {
+            assert!(
+                compressed.len() < 512 * 1024 * 1024,
+                "representative 274k-file checkpoint must fit a 512 MiB raw metadata slot"
+            );
+        }
     } else {
         let mut checkpoint = ByteCounter(0);
         serde_json::to_writer(&mut checkpoint, &meta).unwrap();
