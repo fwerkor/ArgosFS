@@ -715,13 +715,26 @@ fn metadata_scale_274k_eight_shard_inodes() {
             Ok(())
         }
     }
-    let mut checkpoint = ByteCounter(0);
-    serde_json::to_writer(&mut checkpoint, &meta).unwrap();
-    eprintln!(
-        "checkpoint_json_bytes={} checkpoint_json_mib={:.1}",
-        checkpoint.0,
-        checkpoint.0 as f64 / (1024.0 * 1024.0)
-    );
+    if std::env::var_os("ARGOSFS_SCALE_COMPRESS_CHECKPOINT").is_some() {
+        // Opt-in: allocate a whole JSON checkpoint and compress it exactly
+        // as the raw writer does once its original slot is too small.
+        let checkpoint = serde_json::to_vec(&meta).unwrap();
+        let compressed = zstd::stream::encode_all(checkpoint.as_slice(), 3).unwrap();
+        eprintln!(
+            "checkpoint_json_mib={:.1} checkpoint_zstd_mib={:.1} compression_ratio={:.2}",
+            checkpoint.len() as f64 / (1024.0 * 1024.0),
+            compressed.len() as f64 / (1024.0 * 1024.0),
+            checkpoint.len() as f64 / compressed.len() as f64,
+        );
+    } else {
+        let mut checkpoint = ByteCounter(0);
+        serde_json::to_writer(&mut checkpoint, &meta).unwrap();
+        eprintln!(
+            "checkpoint_json_bytes={} checkpoint_json_mib={:.1}",
+            checkpoint.0,
+            checkpoint.0 as f64 / (1024.0 * 1024.0)
+        );
+    }
     meta.inodes.mark_committed();
     let snapshot = meta.clone();
     let cloned_rss = rss_mib();

@@ -1513,3 +1513,141 @@ fn journal_falls_back_to_checkpoint_when_delta_base_hash_is_stale() {
         next.disks.values().next().unwrap().used_bytes
     );
 }
+
+#[test]
+fn compressed_checkpoint_quorum_round_trip_and_corruption_checks() {
+    let (_dir, images, previous, mut superblocks) = quorum_fixture();
+    let mut next = previous.clone();
+    let template = next
+        .inodes
+        .values()
+        .find(|i| i.kind == crate::types::NodeKind::File)
+        .unwrap()
+        .clone();
+    for ino in 10_000..18_000 {
+        let mut inode = template.clone();
+        inode.id = ino;
+        next.inodes.insert(ino, inode);
+    }
+    next.next_inode = 18_000;
+    next.txid += 1;
+    next.updated_at += 1.0;
+    journal::prepare_metadata_integrity_with_previous(
+        &mut next,
+        previous.integrity.meta_hash.clone(),
+    )
+    .unwrap();
+    // The real loop files have enough space; simulate a smaller metadata
+    // slot to force the new encoding without exhausting CI disk capacity.
+    for sb in &mut superblocks {
+        sb.metadata.length = 1024 * 1024;
+    }
+    let payload = prepare_checkpoint_payload(&next, &superblocks).unwrap();
+    assert!(
+        payload.original.is_some(),
+        "full JSON should not fit the test slot"
+    );
+    assert!(checkpoint_fits(
+        payload.bytes.len(),
+        superblocks[0].metadata.length / 2
+    ));
+    let backend = block_backend_for(&images);
+    write_metadata_copies_quorum(&backend, &superblocks, &next).unwrap();
+
+    for sb in &superblocks {
+        for slot in 0..2u64 {
+            let mut header = [0u8; RAW_HEADER_SIZE];
+            backend
+                .read_at(
+                    &sb.disk_id,
+                    sb.metadata.offset + slot * sb.metadata.length / 2,
+                    &mut header,
+                )
+                .unwrap();
+            assert_eq!(get_u32(&header, 20).unwrap(), METADATA_FORMAT_TREE_ZSTD);
+            assert_eq!(
+                get_u64(&header, 232).unwrap(),
+                payload.original.as_ref().unwrap().0
+            );
+            let recovered = read_metadata_candidate(
+                &backend,
+                sb,
+                sb.metadata.offset + slot * sb.metadata.length / 2,
+                sb.metadata.length / 2,
+                &header,
+            )
+            .unwrap();
+            assert_eq!(recovered.txid, next.txid);
+            assert_eq!(recovered.integrity.meta_hash, next.integrity.meta_hash);
+            assert_eq!(recovered.inodes.len(), next.inodes.len());
+        }
+    }
+
+    // Both earlier v1 and new compressed slots are valid recovery candidates;
+    // the quorum must choose the newer generation.
+    let recovered = recover_metadata(&backend, &superblocks).unwrap();
+    assert_eq!(recovered.txid, next.txid);
+    assert_eq!(recovered.inodes.len(), next.inodes.len());
+
+    let sb = &superblocks[0];
+    let mut header = [0u8; RAW_HEADER_SIZE];
+    backend
+        .read_at(&sb.disk_id, sb.metadata.offset, &mut header)
+        .unwrap();
+    let original_header = header;
+    put_u64(&mut header, 232, METADATA_DECOMPRESSED_MAX + 1);
+    assert!(matches!(
+        read_metadata_candidate(
+            &backend,
+            sb,
+            sb.metadata.offset,
+            sb.metadata.length / 2,
+            &header
+        ),
+        Err(ArgosError::CorruptedMetadata(_))
+    ));
+    let index_end = get_u64(&original_header, 160).unwrap() + RAW_HEADER_SIZE as u64;
+    let body_offset = align_up(index_end, METADATA_PAGE_SIZE as u64);
+    let mut first = [0u8; 1];
+    backend
+        .read_at(&sb.disk_id, sb.metadata.offset + body_offset, &mut first)
+        .unwrap();
+    first[0] ^= 0x01;
+    backend
+        .write_at(&sb.disk_id, sb.metadata.offset + body_offset, &first)
+        .unwrap();
+    assert!(matches!(
+        read_metadata_candidate(
+            &backend,
+            sb,
+            sb.metadata.offset,
+            sb.metadata.length / 2,
+            &original_header
+        ),
+        Err(ArgosError::Checksum(_))
+    ));
+    // Its second slot is still intact, so a single torn page is recoverable.
+    let recovered = recover_metadata(&backend, &superblocks).unwrap();
+    assert_eq!(recovered.txid, next.txid);
+}
+
+#[test]
+fn checkpoint_uses_old_encoding_when_it_fits() {
+    let (_dir, _images, metadata, superblocks) = quorum_fixture();
+    let payload = prepare_checkpoint_payload(&metadata, &superblocks).unwrap();
+    assert!(payload.original.is_none());
+    let checkpoint = metadata_tree_checkpoint_encoded(
+        "test",
+        metadata.txid,
+        metadata.integrity.generation,
+        &payload.bytes,
+        &sha256_hex(&payload.bytes),
+        superblocks[0].metadata.length / 2,
+        payload.original.as_ref(),
+    )
+    .unwrap();
+    assert_eq!(
+        get_u32(&checkpoint.header, 20).unwrap(),
+        METADATA_FORMAT_TREE
+    );
+}

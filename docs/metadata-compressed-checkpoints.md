@@ -1,0 +1,39 @@
+# Oversized raw metadata checkpoints (#212, #200)
+
+The existing raw/loop checkpoint format stores compact JSON as separately
+hashed 4 KiB pages, with two fully written and fsynced metadata slots on each
+member and a quorum commit certificate. Its capacity is bounded by half the
+metadata region on the smallest member (up to 512 MiB per slot).
+
+ArgosFS now keeps format 1 (uncompressed JSON, v1 wire-compatible) for any
+checkpoint that fits on every member. If the uncompressed checkpoint would
+exceed a slot, the writer compresses the identical JSON with zstd level 3
+and stores it as checkpoint format 2. The page hash/index and two-phase
+publication remain identical to the original format. The new header includes
+the original JSON length and SHA-256 digest; raw payload and every stored
+page have their own SHA-256 digests as before. The reader validates all
+checksums, requires the decompressed length/hash to match, and bounds
+expanded metadata to 4 GiB to avoid unbounded decompression.
+
+Compatibility: this code reads existing raw v1 checkpoints unchanged, and
+continues writing v1 until a specific checkpoint no longer fits. **Once a
+pool has written format 2, do not downgrade the binary to v1.2.0 or earlier.**
+Older readers do not understand format 2. Restoring an old binary may fail
+to mount, and unsupported recovery paths must never be used to override the
+newly committed state. Keep a current binary available during recovery.
+
+The writer still serializes the full inode table to prepare a checkpoint;
+this does not provide true disk-paged inode lookup or constant-memory
+checkpoint generation. Compressibility varies with inode names, extended
+attributes, block count and shard checksums. An extremely large or mostly
+incompressible checkpoint can still return ENOSPC, and journal capacity is
+separate. This is not a replacement for a future bounded on-demand metadata
+engine with a migration protocol.
+
+Coverage:
+- Oversize-to-format-2 and v1 format-preserving decisions
+- Quorum write/read, mirror recovery after one corrupt page
+- Invalid expanded-length rejection and page digest checks
+- Existing raw journal crash-consistency and compatibility integration tests
+- Opt-in 274,103 inode / eight-shard synthetic benchmark can additionally
+  report the zstd checkpoint size via ARGOSFS_SCALE_COMPRESS_CHECKPOINT=1
