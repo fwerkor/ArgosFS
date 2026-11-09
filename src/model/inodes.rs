@@ -3,7 +3,7 @@
 //! The in-memory representation is independent of the serialized Metadata
 //! format: JSON always writes keys in increasing inode order.
 use super::types::{Inode, InodeId};
-use im::HashMap;
+use imbl::HashMap;
 use serde::de::Deserializer;
 use serde::ser::{SerializeMap, Serializer};
 use serde::{Deserialize, Serialize};
@@ -129,7 +129,7 @@ impl FromIterator<(InodeId, Inode)> for TrackedInodes {
 
 impl<'a> IntoIterator for &'a TrackedInodes {
     type Item = (&'a InodeId, &'a Inode);
-    type IntoIter = im::hashmap::Iter<'a, InodeId, Inode>;
+    type IntoIter = imbl::hashmap::Iter<'a, InodeId, Inode, imbl::shared_ptr::DefaultSharedPtr>;
     fn into_iter(self) -> Self::IntoIter {
         self.map.iter()
     }
@@ -137,7 +137,8 @@ impl<'a> IntoIterator for &'a TrackedInodes {
 
 impl IntoIterator for TrackedInodes {
     type Item = (InodeId, Inode);
-    type IntoIter = im::hashmap::ConsumingIter<(InodeId, Inode)>;
+    type IntoIter =
+        imbl::hashmap::ConsumingIter<(InodeId, Inode), imbl::shared_ptr::DefaultSharedPtr>;
     fn into_iter(self) -> Self::IntoIter {
         self.map.into_iter()
     }
