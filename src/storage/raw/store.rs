@@ -1311,22 +1311,31 @@ fn load_or_recover(
     superblocks: &[RawSuperblock],
     checkpoint_replay: bool,
 ) -> Result<(Metadata, TransactionReport)> {
+    // Checkpoints replicated across members have identical serialized contents.
+    // Verify each physical copy, but deserialize each distinct payload only once.
+    let mut decoded = BTreeMap::new();
     let mut candidates = Vec::new();
     for sb in superblocks {
         candidates.extend(
-            read_metadata_candidates(backend, sb)?
+            read_metadata_candidates_cached(backend, sb, &mut decoded)?
                 .into_iter()
                 .map(|(metadata, report)| (sb.disk_id.clone(), metadata, report)),
         );
     }
+    drop(decoded);
     let mut report = TransactionReport::default();
     report.metadata_candidates = candidates
         .iter()
         .map(|(_, _, report)| report.clone())
         .collect();
     let mut best = select_quorum_metadata_candidate(&candidates)?;
-    let journal_best =
-        read_latest_journal_metadata(backend, superblocks, &mut report, best.as_ref())?;
+    let journal_best = read_latest_journal_metadata(
+        backend,
+        superblocks,
+        &mut report,
+        best.as_ref(),
+        &candidates,
+    )?;
     if let Some(journal_meta) = journal_best {
         if best
             .as_ref()
@@ -1490,6 +1499,17 @@ fn read_metadata_candidates(
     backend: &dyn StorageBackend,
     sb: &RawSuperblock,
 ) -> Result<Vec<(Option<Metadata>, MetadataCandidateReport)>> {
+    read_metadata_candidates_cached(backend, sb, &mut BTreeMap::new())
+}
+
+// This cache exists only during one recovery. Its key covers the entire slot
+// header, while independently verifying every member's on-disk payload before
+// borrowing an already decoded Metadata. It is never used to attest quorum.
+fn read_metadata_candidates_cached(
+    backend: &dyn StorageBackend,
+    sb: &RawSuperblock,
+    decoded: &mut BTreeMap<String, Metadata>,
+) -> Result<Vec<(Option<Metadata>, MetadataCandidateReport)>> {
     let slot_len = sb.metadata.length / 2;
     let mut out = Vec::new();
     for slot in 0..2u64 {
@@ -1502,7 +1522,20 @@ fn read_metadata_candidates(
         let metadata = match backend.read_at(&sb.disk_id, offset, &mut header) {
             Ok(()) if &header[..16] == METADATA_MAGIC => {
                 report.present = true;
-                match read_metadata_candidate(backend, sb, offset, slot_len, &header) {
+                // A matching header is not evidence of valid physical data.
+                // read_metadata_payload checks its stored checksum and every
+                // page checksum before a member can vote for this checkpoint.
+                let candidate = (|| -> Result<Metadata> {
+                    let bytes = read_metadata_payload(backend, sb, offset, slot_len, &header)?;
+                    let key = sha256_hex(&header);
+                    if let Some(metadata) = decoded.get(&key) {
+                        return Ok(metadata.clone());
+                    }
+                    let metadata = decode_metadata_payload(&header, &bytes)?;
+                    decoded.insert(key, metadata.clone());
+                    Ok(metadata)
+                })();
+                match candidate {
                     Ok(metadata) => {
                         report.valid = true;
                         report.txid = metadata.txid;
@@ -1527,6 +1560,7 @@ fn read_metadata_candidates(
     Ok(out)
 }
 
+#[cfg(test)]
 fn read_metadata_candidate(
     backend: &dyn StorageBackend,
     sb: &RawSuperblock,
@@ -1534,6 +1568,17 @@ fn read_metadata_candidate(
     slot_len: u64,
     header: &[u8],
 ) -> Result<Metadata> {
+    let bytes = read_metadata_payload(backend, sb, offset, slot_len, header)?;
+    decode_metadata_payload(header, &bytes)
+}
+
+fn read_metadata_payload(
+    backend: &dyn StorageBackend,
+    sb: &RawSuperblock,
+    offset: u64,
+    slot_len: u64,
+    header: &[u8],
+) -> Result<Vec<u8>> {
     match get_u32(header, 20)? {
         METADATA_FORMAT_LEGACY => {
             read_legacy_metadata_candidate(backend, sb, offset, slot_len, header)
@@ -1547,13 +1592,38 @@ fn read_metadata_candidate(
     }
 }
 
+fn decode_metadata_payload(header: &[u8], bytes: &[u8]) -> Result<Metadata> {
+    if get_u32(header, 20)? != METADATA_FORMAT_TREE_ZSTD {
+        return Ok(serde_json::from_slice(bytes)?);
+    }
+    let expanded_len = get_u64(header, 232)?;
+    if expanded_len == 0 || expanded_len > METADATA_DECOMPRESSED_MAX {
+        return Err(ArgosError::CorruptedMetadata(
+            "invalid compressed checkpoint expanded length".to_string(),
+        ));
+    }
+    let expanded_hash = get_fixed_hex(header, 240, HASH_HEX_LEN)?;
+    // Bound the decompressor to the claimed expanded length, not the
+    // compressed bytes. A corrupt zstd frame must never exhaust RAM.
+    let decoder = zstd::stream::read::Decoder::new(bytes)?;
+    let mut bounded = decoder.take(expanded_len + 1);
+    let mut expanded = Vec::new();
+    bounded.read_to_end(&mut expanded)?;
+    if expanded.len() as u64 != expanded_len || sha256_hex(&expanded) != expanded_hash {
+        return Err(ArgosError::Checksum(
+            "compressed metadata checkpoint content mismatch".to_string(),
+        ));
+    }
+    Ok(serde_json::from_slice::<Metadata>(&expanded)?)
+}
+
 fn read_legacy_metadata_candidate(
     backend: &dyn StorageBackend,
     sb: &RawSuperblock,
     offset: u64,
     slot_len: u64,
     header: &[u8],
-) -> Result<Metadata> {
+) -> Result<Vec<u8>> {
     let len = checked_usize(get_u64(header, 32)?, "raw metadata length")?;
     let stored_hash = get_fixed_hex(header, 64, HASH_HEX_LEN)?;
     if len == 0 || len as u64 > slot_len.saturating_sub(RAW_HEADER_SIZE as u64) {
@@ -1568,7 +1638,7 @@ fn read_legacy_metadata_candidate(
             "raw metadata checksum mismatch".to_string(),
         ));
     }
-    Ok(serde_json::from_slice::<Metadata>(&bytes)?)
+    Ok(bytes)
 }
 
 fn read_tree_metadata_candidate(
@@ -1577,7 +1647,7 @@ fn read_tree_metadata_candidate(
     offset: u64,
     slot_len: u64,
     header: &[u8],
-) -> Result<Metadata> {
+) -> Result<Vec<u8>> {
     let len = checked_usize(get_u64(header, 32)?, "raw metadata length")?;
     let stored_hash = get_fixed_hex(header, 64, HASH_HEX_LEN)?;
     let page_size = checked_usize(get_u64(header, 144)?, "raw metadata page size")?;
@@ -1660,28 +1730,7 @@ fn read_tree_metadata_candidate(
             "raw metadata checksum mismatch".to_string(),
         ));
     }
-    if get_u32(header, 20)? != METADATA_FORMAT_TREE_ZSTD {
-        return Ok(serde_json::from_slice::<Metadata>(&bytes)?);
-    }
-    let expanded_len = get_u64(header, 232)?;
-    if expanded_len == 0 || expanded_len > METADATA_DECOMPRESSED_MAX {
-        return Err(ArgosError::CorruptedMetadata(
-            "invalid compressed checkpoint expanded length".to_string(),
-        ));
-    }
-    let expanded_hash = get_fixed_hex(header, 240, HASH_HEX_LEN)?;
-    // Bound the decompressor to the claimed expanded length, not the
-    // compressed bytes. A corrupt zstd frame must never exhaust RAM.
-    let decoder = zstd::stream::read::Decoder::new(bytes.as_slice())?;
-    let mut bounded = decoder.take(expanded_len + 1);
-    let mut expanded = Vec::new();
-    bounded.read_to_end(&mut expanded)?;
-    if expanded.len() as u64 != expanded_len || sha256_hex(&expanded) != expanded_hash {
-        return Err(ArgosError::Checksum(
-            "compressed metadata checkpoint content mismatch".to_string(),
-        ));
-    }
-    Ok(serde_json::from_slice::<Metadata>(&expanded)?)
+    Ok(bytes)
 }
 
 fn read_latest_journal_metadata(
@@ -1689,6 +1738,7 @@ fn read_latest_journal_metadata(
     superblocks: &[RawSuperblock],
     report: &mut TransactionReport,
     base_metadata: Option<&Metadata>,
+    checkpoint_catalog: &[(String, Option<Metadata>, MetadataCandidateReport)],
 ) -> Result<Option<Metadata>> {
     let mut supported =
         BTreeMap::<(u64, u64, String), (Metadata, std::collections::BTreeSet<String>)>::new();
@@ -1706,9 +1756,13 @@ fn read_latest_journal_metadata(
         let mut member_candidates = BTreeMap::<(u64, u64, String), Metadata>::new();
         let mut record_candidates = BTreeMap::<String, Metadata>::new();
         let mut checkpoint_candidates = BTreeMap::<String, Metadata>::new();
-        for (candidate, _) in read_metadata_candidates(backend, sb)? {
+        for (_, candidate, _) in checkpoint_catalog
+            .iter()
+            .filter(|(disk_id, _, _)| disk_id == &sb.disk_id)
+        {
             if let Some(candidate) = candidate {
-                checkpoint_candidates.insert(metadata_hash_for_replay(&candidate)?, candidate);
+                checkpoint_candidates
+                    .insert(metadata_hash_for_replay(candidate)?, candidate.clone());
             }
         }
         let mut header = vec![0u8; RAW_HEADER_SIZE];

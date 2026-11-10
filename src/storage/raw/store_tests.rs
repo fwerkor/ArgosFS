@@ -1009,11 +1009,26 @@ fn journal_recovery_ignores_one_member_payload_eio_when_quorum_is_readable() {
         fail_from: failed.journal.offset + RAW_HEADER_SIZE as u64 + 36,
         fail_to: failed.journal.offset + failed.journal.length,
     };
+    let mut decoded = BTreeMap::new();
+    let mut candidates = Vec::new();
+    for sb in &superblocks {
+        candidates.extend(
+            read_metadata_candidates_cached(&backend, sb, &mut decoded)
+                .unwrap()
+                .into_iter()
+                .map(|(metadata, report)| (sb.disk_id.clone(), metadata, report)),
+        );
+    }
     let mut report = TransactionReport::default();
-    let recovered =
-        read_latest_journal_metadata(&backend, &superblocks, &mut report, Some(&previous))
-            .unwrap()
-            .unwrap();
+    let recovered = read_latest_journal_metadata(
+        &backend,
+        &superblocks,
+        &mut report,
+        Some(&previous),
+        &candidates,
+    )
+    .unwrap()
+    .unwrap();
 
     assert_eq!(recovered.txid, next.txid);
     assert_eq!(recovered.raw_pool.pool_name, "recover-with-payload-eio");
@@ -1650,4 +1665,50 @@ fn checkpoint_uses_old_encoding_when_it_fits() {
         get_u32(&checkpoint.header, 20).unwrap(),
         METADATA_FORMAT_TREE
     );
+}
+
+#[test]
+fn recovery_validates_each_slot_but_decodes_identical_checkpoints_once() {
+    let (_dir, images, metadata, superblocks) = quorum_fixture();
+    let backend = block_backend_for(&images);
+    let mut decoded = BTreeMap::new();
+    for sb in &superblocks {
+        let reports = read_metadata_candidates_cached(&backend, sb, &mut decoded).unwrap();
+        assert_eq!(reports.len(), 2);
+        assert!(
+            reports.iter().all(|(_, report)| report.valid),
+            "{reports:?}"
+        );
+    }
+    // Three independent voting devices, two slots each, but one parsed state.
+    assert_eq!(decoded.len(), 1);
+    assert_eq!(decoded.values().next().unwrap().txid, metadata.txid);
+
+    // A matching header cannot trick the cache into voting for damaged data.
+    let sb = &superblocks[1];
+    let slot_offset = sb.metadata.offset;
+    let mut header = [0u8; RAW_HEADER_SIZE];
+    backend
+        .read_at(&sb.disk_id, slot_offset, &mut header)
+        .unwrap();
+    let body = align_up(
+        RAW_HEADER_SIZE as u64 + get_u64(&header, 160).unwrap(),
+        METADATA_PAGE_SIZE as u64,
+    );
+    let mut byte = [0u8; 1];
+    backend
+        .read_at(&sb.disk_id, slot_offset + body, &mut byte)
+        .unwrap();
+    byte[0] ^= 1;
+    backend
+        .write_at(&sb.disk_id, slot_offset + body, &byte)
+        .unwrap();
+    let reports = read_metadata_candidates_cached(&backend, sb, &mut decoded).unwrap();
+    assert!(!reports[0].1.valid);
+    assert!(reports[0].1.error.as_ref().unwrap().contains("checksum"));
+    assert!(reports[1].1.valid);
+    assert_eq!(decoded.len(), 1);
+    // The rest of the pool still forms a valid quorum.
+    let recovered = recover_metadata(&backend, &superblocks).unwrap();
+    assert_eq!(recovered.txid, metadata.txid);
 }
