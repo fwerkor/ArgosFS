@@ -711,6 +711,18 @@ impl ArgosFs {
         self.meta.read().clone()
     }
 
+    /// Nonblocking metadata observation for advisory queries such as statfs.
+    /// A checkpoint may hold the writer lock for slow device I/O.
+    pub(crate) fn try_metadata_snapshot(&self) -> Option<Metadata> {
+        self.meta.try_read().map(|meta| meta.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_with_metadata_write_lock(&self, action: impl FnOnce()) {
+        let _guard = self.meta.write();
+        action();
+    }
+
     pub fn transaction_report(&self) -> Result<TransactionReport> {
         let meta = self.meta.read();
         if meta.backend != BackendKind::Host {

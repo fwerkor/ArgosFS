@@ -28,6 +28,35 @@ pub struct ArgosFuse {
     commit_worker: Option<DeferredCommitWorker>,
     writeback: Mutex<FuseWriteback>,
     handles: Mutex<FuseHandles>,
+    statfs_cache: Mutex<StatfsSnapshot>,
+}
+
+/// Advisory space accounting, independent of the metadata checkpoint I/O lock.
+/// The last published value remains usable while a slow checkpoint is written.
+#[derive(Clone, Debug)]
+struct StatfsSnapshot {
+    usable_bytes: u64,
+    free_bytes: u64,
+    inode_count: u64,
+    block_size: u64,
+    unavailable: BTreeSet<String>,
+}
+
+impl StatfsSnapshot {
+    fn from_metadata(
+        volume: &ArgosFs,
+        meta: &crate::types::Metadata,
+        unavailable: BTreeSet<String>,
+    ) -> Self {
+        let (usable_bytes, free_bytes) = statfs_bytes(meta, volume.root(), &unavailable);
+        Self {
+            usable_bytes,
+            free_bytes,
+            inode_count: meta.inodes.len() as u64,
+            block_size: (meta.config.chunk_size as u64).max(4096),
+            unavailable,
+        }
+    }
 }
 
 struct DeferredCommitWorker {
@@ -188,13 +217,36 @@ impl ArgosFuse {
     }
 
     fn try_new(volume: ArgosFs) -> Result<Self> {
+        // Seed the snapshot before the first FUSE request, so statfs never
+        // needs to block on a metadata write lock even during the first commit.
+        let unavailable = volume.runtime_unavailable_devices();
+        let snapshot =
+            StatfsSnapshot::from_metadata(&volume, &volume.metadata_snapshot(), unavailable);
         let commit_worker = DeferredCommitWorker::start(&volume)?;
         Ok(Self {
             volume,
             commit_worker,
             writeback: Mutex::new(FuseWriteback::default()),
             handles: Mutex::new(FuseHandles::default()),
+            statfs_cache: Mutex::new(snapshot),
         })
+    }
+
+    fn statfs_snapshot(&self) -> StatfsSnapshot {
+        let unavailable = self.volume.runtime_unavailable_devices();
+        if let Some(meta) = self.volume.try_metadata_snapshot() {
+            let snapshot = StatfsSnapshot::from_metadata(&self.volume, &meta, unavailable);
+            *self.statfs_cache.lock() = snapshot.clone();
+            return snapshot;
+        }
+        // A checkpoint is holding the metadata writer lock. Do not wait, and
+        // never advertise cached free capacity when additional members have
+        // been quarantined since the last observation.
+        let mut cached = self.statfs_cache.lock().clone();
+        if !unavailable.is_subset(&cached.unavailable) {
+            cached.free_bytes = 0;
+        }
+        cached
     }
 
     fn require_access(&self, req: &Request, ino: INodeNo, mask: i32) -> Result<()> {
@@ -1077,16 +1129,15 @@ impl Filesystem for ArgosFuse {
     }
 
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
-        self.flush_all_writeback_best_effort();
-        let meta = self.volume.metadata_snapshot();
-        let unavailable = self.volume.runtime_unavailable_devices();
-        let block = (meta.config.chunk_size as u64).max(4096);
-        let (usable, free) = statfs_bytes(&meta, self.volume.root(), &unavailable);
+        // statfs is an observation, not a durability boundary. Flushing every
+        // dirty inode here could itself start a multi-minute checkpoint.
+        let snapshot = self.statfs_snapshot();
+        let block = snapshot.block_size;
         reply.statfs(
-            usable / block,
-            free / block,
-            free / block,
-            meta.inodes.len() as u64 + 1_000_000,
+            snapshot.usable_bytes / block,
+            snapshot.free_bytes / block,
+            snapshot.free_bytes / block,
+            snapshot.inode_count + 1_000_000,
             1_000_000,
             block as u32,
             255,

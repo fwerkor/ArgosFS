@@ -945,3 +945,42 @@ fn regular_file_and_handle_validation_report_expected_errors() {
         Err(ArgosError::Invalid(_))
     ));
 }
+
+#[test]
+fn statfs_returns_published_snapshot_during_metadata_write_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let volume = ArgosFs::create(
+        dir.path(),
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            ..VolumeConfig::default()
+        },
+        1,
+        false,
+    )
+    .unwrap();
+    let fuse = ArgosFuse::new(volume.clone());
+    let original = fuse.statfs_snapshot();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        volume.test_with_metadata_write_lock(|| {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+    });
+    started_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    let started = std::time::Instant::now();
+    let cached = fuse.statfs_snapshot();
+    let elapsed = started.elapsed();
+    release_tx.send(()).unwrap();
+    writer.join().unwrap();
+    assert_eq!(cached.usable_bytes, original.usable_bytes);
+    assert_eq!(cached.free_bytes, original.free_bytes);
+    assert_eq!(cached.inode_count, original.inode_count);
+    assert!(
+        elapsed < Duration::from_millis(200),
+        "statfs blocked: {elapsed:?}"
+    );
+}
