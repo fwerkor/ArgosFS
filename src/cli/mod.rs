@@ -361,6 +361,10 @@ pub fn run() -> Result<()> {
                     open_backend(None, backend, images.clone(), devices.clone(), false)?;
                 validate_requested_pool(&preflight_fs, pool.as_deref())?;
                 rootfs::preflight_volume(&preflight_fs, mode)?;
+                // The writable open builds its own recovery snapshot. Keeping
+                // the read-only preflight handle alive across the blocking
+                // FUSE mount would pin two independent inode tables.
+                drop(preflight_fs);
                 let fs = open_backend(None, backend, images, devices, true)?;
                 validate_requested_pool(&fs, pool.as_deref())?;
                 fusefs::mount_volume(fs, target, foreground, root_mount_options(option))?;
