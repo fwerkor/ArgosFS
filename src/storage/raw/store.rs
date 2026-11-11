@@ -12,6 +12,7 @@ use crate::types::{
 };
 use crate::util::{now_f64, sha256_hex};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::PathBuf;
@@ -1603,18 +1604,33 @@ fn decode_metadata_payload(header: &[u8], bytes: &[u8]) -> Result<Metadata> {
         ));
     }
     let expanded_hash = get_fixed_hex(header, 240, HASH_HEX_LEN)?;
-    // Bound the decompressor to the claimed expanded length, not the
-    // compressed bytes. A corrupt zstd frame must never exhaust RAM.
+    // Verify the expanded data *before* interpreting it. Stream the digest
+    // rather than retaining the entire expanded JSON alongside the inode
+    // table. Keep the legacy checksum-before-parse error ordering.
     let decoder = zstd::stream::read::Decoder::new(bytes)?;
     let mut bounded = decoder.take(expanded_len + 1);
-    let mut expanded = Vec::new();
-    bounded.read_to_end(&mut expanded)?;
-    if expanded.len() as u64 != expanded_len || sha256_hex(&expanded) != expanded_hash {
+    let mut digest = Sha256::new();
+    let mut total = 0u64;
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let read = bounded.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        total += read as u64;
+        digest.update(&chunk[..read]);
+    }
+    if total != expanded_len || hex::encode(digest.finalize()) != expanded_hash {
         return Err(ArgosError::Checksum(
             "compressed metadata checkpoint content mismatch".to_string(),
         ));
     }
-    Ok(serde_json::from_slice::<Metadata>(&expanded)?)
+    // A second bounded decompression uses a fixed-size input buffer and
+    // deserializes directly into the persistent inode map. It avoids a
+    // potentially multi-GiB expanded Vec at recovery time.
+    let decoder = zstd::stream::read::Decoder::new(bytes)?;
+    let input = std::io::BufReader::new(decoder.take(expanded_len + 1));
+    Ok(serde_json::from_reader::<_, Metadata>(input)?)
 }
 
 fn read_legacy_metadata_candidate(
