@@ -216,6 +216,55 @@ fn metadata_delta_round_trip_handles_add_remove_replace_and_escaped_keys() {
 }
 
 #[test]
+fn cow_replay_matches_legacy_json_pointer_semantics() {
+    let (_dir, fs) = volume();
+    fs.write_file("/sample", b"one block", 0o644).unwrap();
+    let mut previous = fs.metadata_snapshot();
+    // With no stored hash, both readers must derive integrity identically.
+    previous.integrity.meta_hash.clear();
+    let ino = previous.inodes[&1].entries["sample"];
+    let mut next = previous.clone();
+    next.txid += 1;
+    next.config.fsname = "replay-diff".to_owned();
+    next.inodes.get_mut(&ino).unwrap().mode = 0o600;
+    next.inodes.get_mut(&ino).unwrap().blocks[0].shards[0].sha256 = "nested-changed".into();
+    next.inodes
+        .get_mut(&1)
+        .unwrap()
+        .entries
+        .insert("a/b~c".into(), ino);
+    let mut added = next.inodes[&ino].clone();
+    added.id = 50_000;
+    next.inodes.insert(50_000, added);
+    next.next_inode = 50_001;
+    let disk_key = next.disks.keys().next().unwrap().clone();
+    next.disks.get_mut(&disk_key).unwrap().used_bytes += 1;
+    let ops = metadata_delta(&previous, &next).unwrap();
+    assert!(ops.iter().any(|op| delta_path(op).starts_with("/inodes/")));
+    let cow = apply_metadata_delta(&previous, &ops).unwrap();
+    let legacy = apply_metadata_delta_legacy(&previous, &ops).unwrap();
+    assert_eq!(
+        serde_json::to_value(&cow).unwrap(),
+        serde_json::to_value(&legacy).unwrap()
+    );
+    assert_eq!(cow.inodes[&ino].mode, 0o600);
+    assert_eq!(cow.inodes[&1].entries["a/b~c"], ino);
+    assert_eq!(cow.inodes[&50_000].id, 50_000);
+
+    // Old writers can replace the entire inode index; use the fallback.
+    let whole = vec![MetadataDeltaOp::Replace {
+        path: "/inodes".to_owned(),
+        value: serde_json::to_value(&next.inodes).unwrap(),
+    }];
+    let cow = apply_metadata_delta(&previous, &whole).unwrap();
+    let legacy = apply_metadata_delta_legacy(&previous, &whole).unwrap();
+    assert_eq!(
+        serde_json::to_value(cow).unwrap(),
+        serde_json::to_value(legacy).unwrap()
+    );
+}
+
+#[test]
 fn initialized_volume_scans_appends_events_transactions_and_conflicts() {
     let (dir, fs) = volume();
     let root = dir.path();
@@ -786,5 +835,36 @@ fn metadata_scale_274k_eight_shard_inodes() {
     );
     assert_eq!(ops.len(), 3);
     assert_eq!(snapshot.inodes[&3].size + 1, meta.inodes[&3].size);
+    if std::env::var_os("ARGOSFS_SCALE_PROFILE_RECOVERY").is_some() {
+        // Profile the real deserialization, delta replay and integrity hash at
+        // report-size inode counts. Kept opt-in to avoid heavy CI allocations.
+        let checkpoint = serde_json::to_vec(&snapshot).unwrap();
+        let compressed = zstd::stream::encode_all(checkpoint.as_slice(), 3).unwrap();
+        eprintln!(
+            "RECOVERY_PROFILE checkpoint={} compressed={} rss_mib={:.1}",
+            checkpoint.len(),
+            compressed.len(),
+            rss_mib()
+        );
+        let expanded = zstd::stream::decode_all(compressed.as_slice()).unwrap();
+        let mut recovered: Metadata = serde_json::from_slice(&expanded).unwrap();
+        eprintln!(
+            "RECOVERY_PROFILE decoded={} rss_mib={:.1}",
+            recovered.inodes.len(),
+            rss_mib()
+        );
+        // Synthetic mutations are not a committed journal record. Clear the
+        // stale baseline hash so recovery derives the expected updated hash.
+        recovered.integrity.meta_hash.clear();
+        let replayed = apply_metadata_delta(&recovered, &ops).unwrap();
+        eprintln!(
+            "RECOVERY_PROFILE replayed={} rss_mib={:.1}",
+            replayed.inodes.len(),
+            rss_mib()
+        );
+        assert_eq!(replayed.inodes[&3].size, meta.inodes[&3].size);
+        let hash = canonical_metadata_hash(&replayed).unwrap();
+        eprintln!("RECOVERY_PROFILE hash={} rss_mib={:.1}", hash, rss_mib());
+    }
     drop((dir, fs));
 }
