@@ -265,6 +265,113 @@ fn cow_replay_matches_legacy_json_pointer_semantics() {
 }
 
 #[test]
+fn batched_directory_replay_matches_legacy_for_many_interleaved_changes() {
+    let (_dir, fs) = volume();
+    fs.write_file("/data", b"data", 0o644).unwrap();
+    let mut previous = fs.metadata_snapshot();
+    let file_id = previous.inodes[&1].entries["data"];
+    previous.integrity.meta_hash.clear();
+    let root = previous.inodes.get_mut(&1).unwrap();
+    for i in 0..8_000 {
+        root.entries.insert(format!("existing-{i:05}"), file_id);
+    }
+    previous.inodes.mark_committed();
+
+    let mut ops = Vec::new();
+    for i in 0..900 {
+        ops.push(MetadataDeltaOp::Add {
+            path: format!("/inodes/1/entries/new-{i:05}"),
+            value: json!(file_id),
+        });
+    }
+    for i in 0..400 {
+        ops.push(MetadataDeltaOp::Remove {
+            path: format!("/inodes/1/entries/existing-{i:05}"),
+        });
+    }
+    // Interleaving a different inode, a disk, and header data flushes the
+    // pending directory without reordering any previously applied changes.
+    ops.push(MetadataDeltaOp::Replace {
+        path: format!("/inodes/{file_id}/mode"),
+        value: json!(0o600),
+    });
+    let disk_key = previous.disks.keys().next().unwrap();
+    let disk_bytes = previous.disks[disk_key].used_bytes;
+    for increment in [10, 20] {
+        ops.push(MetadataDeltaOp::Replace {
+            path: push_json_pointer("/disks", disk_key) + "/used_bytes",
+            value: json!(disk_bytes + increment),
+        });
+    }
+    ops.push(MetadataDeltaOp::Replace {
+        path: "/txid".to_owned(),
+        value: json!(previous.txid + 1),
+    });
+    for i in 900..1_200 {
+        ops.push(MetadataDeltaOp::Add {
+            path: format!("/inodes/1/entries/new-{i:05}"),
+            value: json!(file_id),
+        });
+    }
+    let batched = apply_metadata_delta(&previous, &ops).unwrap();
+    let legacy = apply_metadata_delta_legacy(&previous, &ops).unwrap();
+    assert_eq!(
+        serde_json::to_value(&batched).unwrap(),
+        serde_json::to_value(&legacy).unwrap()
+    );
+    assert_eq!(batched.inodes[&1].entries.len(), 8_001 + 1_200 - 400);
+    assert_eq!(batched.inodes[&file_id].mode, 0o600);
+    assert_eq!(batched.disks[disk_key].used_bytes, disk_bytes + 20);
+    assert!(batched.inodes[&1].entries.contains_key("new-01199"));
+    assert!(!batched.inodes[&1].entries.contains_key("existing-00000"));
+}
+
+#[test]
+fn batched_replay_preserves_whole_inode_operation_order_and_validation() {
+    let (_dir, fs) = volume();
+    let mut previous = fs.metadata_snapshot();
+    previous.integrity.meta_hash.clear();
+    let base_root = previous.inodes[&1].clone();
+    let mut replacement = base_root.clone();
+    replacement.entries.insert("replacement".into(), 1);
+    let ops = vec![
+        MetadataDeltaOp::Add {
+            path: "/inodes/1/entries/temporary".into(),
+            value: json!(1),
+        },
+        MetadataDeltaOp::Replace {
+            path: "/inodes/1".into(),
+            value: serde_json::to_value(&replacement).unwrap(),
+        },
+        MetadataDeltaOp::Add {
+            path: "/inodes/1/entries/final".into(),
+            value: json!(1),
+        },
+    ];
+    let batched = apply_metadata_delta(&previous, &ops).unwrap();
+    let legacy = apply_metadata_delta_legacy(&previous, &ops).unwrap();
+    assert_eq!(
+        serde_json::to_value(&batched).unwrap(),
+        serde_json::to_value(&legacy).unwrap()
+    );
+    assert!(!batched.inodes[&1].entries.contains_key("temporary"));
+    assert!(batched.inodes[&1].entries.contains_key("replacement"));
+    assert!(batched.inodes[&1].entries.contains_key("final"));
+
+    let invalid = vec![
+        MetadataDeltaOp::Add {
+            path: "/inodes/1/entries/valid".into(),
+            value: json!(1),
+        },
+        MetadataDeltaOp::Remove {
+            path: "/inodes/1/entries/missing".into(),
+        },
+    ];
+    assert!(apply_metadata_delta(&previous, &invalid).is_err());
+    assert_eq!(previous.inodes[&1].entries, base_root.entries);
+}
+
+#[test]
 fn initialized_volume_scans_appends_events_transactions_and_conflicts() {
     let (dir, fs) = volume();
     let root = dir.path();

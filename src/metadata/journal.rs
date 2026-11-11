@@ -982,14 +982,21 @@ pub fn apply_metadata_delta(previous: &Metadata, delta: &[MetadataDeltaOp]) -> R
     // handful of entries, then built an entirely new HAMT on every record.
     let mut metadata = previous.clone();
     let mut header: Option<serde_json::Value> = None;
+    // The delta writer groups changes to a given inode. Keep at most one
+    // expanded inode (and disk) while applying successive nested operations;
+    // caching every changed inode would reintroduce unbounded replay memory.
+    let mut pending_inode: Option<(crate::types::InodeId, serde_json::Value)> = None;
+    let mut pending_disk: Option<(String, serde_json::Value)> = None;
     for op in delta {
         let tokens = json_pointer_tokens(delta_path(op))?;
         match tokens.as_slice() {
             [root, key, tail @ ..] if root == "inodes" => {
+                flush_pending_disk(&mut metadata, &mut pending_disk)?;
                 let ino = key.parse::<crate::types::InodeId>().map_err(|_| {
                     ArgosError::Invalid(format!("invalid inode key in metadata delta: {key}"))
                 })?;
                 if tail.is_empty() {
+                    flush_pending_inode(&mut metadata, &mut pending_inode)?;
                     match op {
                         MetadataDeltaOp::Add { value, .. } => {
                             metadata
@@ -1017,18 +1024,27 @@ pub fn apply_metadata_delta(previous: &Metadata, delta: &[MetadataDeltaOp]) -> R
                         }
                     }
                 } else {
-                    let inode = metadata.inodes.get(&ino).ok_or_else(|| {
-                        ArgosError::Invalid(format!(
-                            "metadata delta parent does not exist: /inodes/{key}"
-                        ))
-                    })?;
-                    let mut value = serde_json::to_value(inode)?;
-                    apply_delta_op(&mut value, &scoped_delta(op, tail))?;
-                    metadata.inodes.insert(ino, serde_json::from_value(value)?);
+                    if pending_inode.as_ref().is_some_and(|(id, _)| *id != ino) {
+                        flush_pending_inode(&mut metadata, &mut pending_inode)?;
+                    }
+                    if pending_inode.is_none() {
+                        let inode = metadata.inodes.get(&ino).ok_or_else(|| {
+                            ArgosError::Invalid(format!(
+                                "metadata delta parent does not exist: /inodes/{key}"
+                            ))
+                        })?;
+                        pending_inode = Some((ino, serde_json::to_value(inode)?));
+                    }
+                    apply_delta_op(
+                        &mut pending_inode.as_mut().expect("pending inode exists").1,
+                        &scoped_delta(op, tail),
+                    )?;
                 }
             }
             [root, key, tail @ ..] if root == "disks" => {
+                flush_pending_inode(&mut metadata, &mut pending_inode)?;
                 if tail.is_empty() {
+                    flush_pending_disk(&mut metadata, &mut pending_disk)?;
                     match op {
                         MetadataDeltaOp::Add { value, .. } => {
                             metadata
@@ -1056,20 +1072,26 @@ pub fn apply_metadata_delta(previous: &Metadata, delta: &[MetadataDeltaOp]) -> R
                         }
                     }
                 } else {
-                    let disk = metadata.disks.get(key).ok_or_else(|| {
-                        ArgosError::Invalid(format!(
-                            "metadata delta parent does not exist: /disks/{}",
-                            key
-                        ))
-                    })?;
-                    let mut value = serde_json::to_value(disk)?;
-                    apply_delta_op(&mut value, &scoped_delta(op, tail))?;
-                    metadata
-                        .disks
-                        .insert(key.clone(), serde_json::from_value(value)?);
+                    if pending_disk.as_ref().is_some_and(|(id, _)| id != key) {
+                        flush_pending_disk(&mut metadata, &mut pending_disk)?;
+                    }
+                    if pending_disk.is_none() {
+                        let disk = metadata.disks.get(key).ok_or_else(|| {
+                            ArgosError::Invalid(format!(
+                                "metadata delta parent does not exist: /disks/{key}"
+                            ))
+                        })?;
+                        pending_disk = Some((key.clone(), serde_json::to_value(disk)?));
+                    }
+                    apply_delta_op(
+                        &mut pending_disk.as_mut().expect("pending disk exists").1,
+                        &scoped_delta(op, tail),
+                    )?;
                 }
             }
             _ => {
+                flush_pending_inode(&mut metadata, &mut pending_inode)?;
+                flush_pending_disk(&mut metadata, &mut pending_disk)?;
                 let value = match header.as_mut() {
                     Some(value) => value,
                     None => {
@@ -1080,6 +1102,8 @@ pub fn apply_metadata_delta(previous: &Metadata, delta: &[MetadataDeltaOp]) -> R
             }
         }
     }
+    flush_pending_inode(&mut metadata, &mut pending_inode)?;
+    flush_pending_disk(&mut metadata, &mut pending_disk)?;
 
     if let Some(value) = header {
         // HeaderPage contains all Metadata fields except disks/inodes. The
@@ -1107,6 +1131,26 @@ pub fn apply_metadata_delta(previous: &Metadata, delta: &[MetadataDeltaOp]) -> R
     // The old JSON round-trip restored a fresh, clean tracking baseline.
     metadata.inodes.mark_committed();
     Ok(metadata)
+}
+
+fn flush_pending_inode(
+    metadata: &mut Metadata,
+    pending: &mut Option<(crate::types::InodeId, serde_json::Value)>,
+) -> Result<()> {
+    if let Some((ino, value)) = pending.take() {
+        metadata.inodes.insert(ino, serde_json::from_value(value)?);
+    }
+    Ok(())
+}
+
+fn flush_pending_disk(
+    metadata: &mut Metadata,
+    pending: &mut Option<(String, serde_json::Value)>,
+) -> Result<()> {
+    if let Some((id, value)) = pending.take() {
+        metadata.disks.insert(id, serde_json::from_value(value)?);
+    }
+    Ok(())
 }
 
 fn delta_path(op: &MetadataDeltaOp) -> &str {
