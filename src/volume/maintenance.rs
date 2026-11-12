@@ -935,9 +935,10 @@ impl ArgosFs {
                     let inode_lock = self.inode_lock(ino);
                     let _inode_guard = inode_lock.lock();
                     report.files_checked += 1;
-                    let mut damaged = false;
+                    let mut damaged_blocks = Vec::new();
                     let mut meta = self.meta.write();
                     for block in &inode.blocks {
+                        let mut block_damaged = false;
                         for shard in &block.shards {
                             // Do not read a shard from a member that is
                             // merely absent from the scan.  Its data is
@@ -960,7 +961,7 @@ impl ArgosFs {
                                         // A retired/failed shard is unavailable even if its
                                         // old backing path still happens to be readable.
                                         report.missing_shards += 1;
-                                        damaged = true;
+                                        block_damaged = true;
                                         continue;
                                     }
                                     _ => {}
@@ -977,7 +978,7 @@ impl ArgosFs {
                                 Ok(Some(_)) => {}
                                 Ok(None) => {
                                     report.checksum_errors += 1;
-                                    damaged = true;
+                                    block_damaged = true;
                                 }
                                 Err(_) => {
                                     report.missing_shards += 1;
@@ -988,36 +989,77 @@ impl ArgosFs {
                                         || !self.is_device_quarantined(&shard.disk_id)
                                         || self.quarantined_member_due_for_repair(&shard.disk_id)
                                     {
-                                        damaged = true;
+                                        block_damaged = true;
                                     }
                                 }
                             }
                         }
+                        if block_damaged {
+                            damaged_blocks.push(block);
+                        }
                     }
                     drop(meta);
-                    match self.read_inode(ino, 0, u64::MAX as usize, false) {
-                        Ok(data) => {
-                            if damaged {
-                                report.damaged_files += 1;
-                                if repair {
-                                    maintenance_after_read_delay();
-                                    let mut meta = self.meta.write();
-                                    self.replace_inode_data_locked(
-                                        &mut meta,
-                                        ino,
-                                        &data,
-                                        "fsck-repair",
-                                        json!({"inode": ino}),
-                                        false,
-                                        &BTreeSet::new(),
-                                    )?;
-                                    report.repaired_files += 1;
-                                }
+                    if !damaged_blocks.is_empty() {
+                        report.damaged_files += 1;
+                        // Only reconstruct stripes that failed verification. A healthy
+                        // file must not be decoded in full: its logical size may be
+                        // arbitrarily larger than MAX_IN_MEMORY_IO_BYTES.
+                        // Check all damaged stripes before mutating the inode so an
+                        // unrecoverable stripe cannot cause a partial repair.
+                        let reconstruction = damaged_blocks.iter().try_for_each(|block| {
+                            let data =
+                                self.read_inode(ino, block.raw_offset, block.raw_size, false)?;
+                            if data.len() != block.raw_size {
+                                return Err(ArgosError::Invalid(format!(
+                                    "stripe {} decoded {} bytes, expected {}",
+                                    block.stripe_id,
+                                    data.len(),
+                                    block.raw_size
+                                )));
                             }
-                        }
-                        Err(err) => {
+                            Ok(())
+                        });
+                        if let Err(err) = reconstruction {
                             report.unrecoverable_files += 1;
                             report.errors.push(format!("inode {ino}: {err}"));
+                            continue;
+                        }
+                        if repair {
+                            let file_size = usize::try_from(inode.size).map_err(|_| {
+                                ArgosError::Invalid(format!("inode {ino} size exceeds usize"))
+                            })?;
+                            for block in damaged_blocks {
+                                let data =
+                                    self.read_inode(ino, block.raw_offset, block.raw_size, false)?;
+                                let start = usize::try_from(block.raw_offset).map_err(|_| {
+                                    ArgosError::Invalid(format!(
+                                        "stripe {} offset exceeds usize",
+                                        block.stripe_id
+                                    ))
+                                })?;
+                                let end = start.checked_add(block.raw_size).ok_or_else(|| {
+                                    ArgosError::Invalid(format!(
+                                        "stripe {} offset overflow",
+                                        block.stripe_id
+                                    ))
+                                })?;
+                                maintenance_after_read_delay();
+                                let mut meta = self.meta.write();
+                                self.rewrite_inode_window_locked(
+                                    &mut meta,
+                                    ino,
+                                    start,
+                                    end,
+                                    file_size,
+                                    &data,
+                                    0,
+                                    false,
+                                    true,
+                                    "fsck-repair",
+                                    json!({"inode": ino, "stripe": block.stripe_id}),
+                                )?;
+                            }
+                            report.repaired_files += 1;
                         }
                     }
                 }
