@@ -863,3 +863,32 @@ fn fsck_reports_unreadable_stripe_during_offline_grace_without_repair() {
     assert_eq!(after.blocks[0].stripe_id, before.blocks[0].stripe_id);
     std::env::remove_var("ARGOSFS_OFFLINE_GRACE_MS");
 }
+
+#[test]
+fn fsck_detects_raw_integrity_failure_with_valid_shard_checksums() {
+    let (_dir, fs) = redundant_host_volume();
+    fs.write_file("/large", &[0x78; 8192], 0o600).unwrap();
+    let ino = fs.resolve_path("/large", true).unwrap();
+    fs.truncate_inode(ino, MAX_IN_MEMORY_IO_BYTES as u64 + 4096)
+        .unwrap();
+    {
+        let mut meta = fs.meta.write();
+        let inode = meta.inodes.get_mut(&ino).unwrap();
+        // Individual shard hashes still match stored bytes; only the
+        // end-to-end reconstructed block checksum is inconsistent.
+        inode.blocks[0].raw_sha256 = content_hash_hex(b"incorrect raw data");
+    }
+    for repair in [false, true] {
+        let report = fs.fsck(repair, false).unwrap();
+        assert_eq!(report.files_checked, 1, "{report:?}");
+        assert_eq!(report.checksum_errors, 0, "{report:?}");
+        assert_eq!(report.missing_shards, 0, "{report:?}");
+        assert_eq!(report.damaged_files, 1, "{report:?}");
+        assert_eq!(report.unrecoverable_files, 1, "{report:?}");
+        assert_eq!(report.repaired_files, 0, "{report:?}");
+        assert!(report
+            .errors
+            .iter()
+            .any(|error| error.contains("raw checksum mismatch")));
+    }
+}
