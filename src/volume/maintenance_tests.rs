@@ -764,3 +764,102 @@ fn fsck_reports_genuinely_unrecoverable_large_file_without_replacing_data() {
     assert_eq!(after.blocks[0].stripe_id, before.blocks[0].stripe_id);
     assert_eq!(after.size, before.size);
 }
+
+#[test]
+fn fsck_uses_current_inode_after_initial_id_scan() {
+    let (_dir, fs) = redundant_host_volume();
+    fs.write_file("/file", &[0x45; 8192], 0o600).unwrap();
+    let ino = fs.resolve_path("/file", true).unwrap();
+    // A completed writer can extend the file after fsck collects its IDs.
+    let inode_ids = fs.metadata_snapshot().inodes.keys().copied().collect();
+    let extension = b"written after the inode ID scan";
+    fs.write_inode_range(ino, 8192, extension).unwrap();
+    let current = fs.metadata_snapshot().inodes[&ino].clone();
+    let shard = &current.blocks[0].shards[0];
+    let path = fs.shard_path_locked(&fs.metadata_snapshot(), &shard.disk_id, &shard.relpath);
+    std::fs::write(&path, b"corrupt").unwrap();
+
+    let report = fs.fsck_inodes(inode_ids, true, false).unwrap();
+    assert_eq!(report.damaged_files, 1, "{report:?}");
+    assert_eq!(report.repaired_files, 1, "{report:?}");
+    assert_eq!(report.unrecoverable_files, 0, "{report:?}");
+    let after = fs.metadata_snapshot().inodes[&ino].clone();
+    assert_eq!(after.size, current.size);
+    assert_eq!(after.blocks[1].stripe_id, current.blocks[1].stripe_id);
+    assert_eq!(
+        fs.read_inode(ino, 8192, extension.len(), false).unwrap(),
+        extension
+    );
+}
+
+#[test]
+fn fsck_rejects_invalid_inline_checksum_and_length() {
+    for corrupt_length in [false, true] {
+        let (_dir, fs) = host_volume(1);
+        fs.write_file("/small", b"inline-data", 0o600).unwrap();
+        let ino = fs.resolve_path("/small", true).unwrap();
+        {
+            let mut meta = fs.meta.write();
+            let inode = meta.inodes.get_mut(&ino).unwrap();
+            inode.blocks.clear();
+            inode.inline_data = Some(b"inline-data".to_vec());
+            inode.inline_sha256 = content_hash_hex(b"inline-data");
+            if corrupt_length {
+                inode.size += 1;
+            } else {
+                inode.inline_sha256 = "bad checksum".to_string();
+            }
+        }
+        for repair in [false, true] {
+            let report = fs.fsck(repair, false).unwrap();
+            assert_eq!(report.files_checked, 1, "{report:?}");
+            assert_eq!(report.damaged_files, 1, "{report:?}");
+            assert_eq!(report.unrecoverable_files, 1, "{report:?}");
+            assert_eq!(report.repaired_files, 0, "{report:?}");
+            assert!(report
+                .errors
+                .iter()
+                .any(|error| error.contains("inline inode")));
+        }
+    }
+}
+
+#[test]
+fn fsck_reports_unreadable_stripe_during_offline_grace_without_repair() {
+    let _guard = env_lock();
+    std::env::set_var("ARGOSFS_OFFLINE_GRACE_MS", "600000");
+    let (_dir, fs) = redundant_host_volume();
+    fs.write_file("/file", &[0x42; 8192], 0o600).unwrap();
+    let ino = fs.resolve_path("/file", true).unwrap();
+    let before = fs.metadata_snapshot().inodes[&ino].clone();
+    let offline_disks = before.blocks[0]
+        .shards
+        .iter()
+        .take(2)
+        .map(|shard| shard.disk_id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(offline_disks.len(), 2);
+    {
+        let mut meta = fs.meta.write();
+        for disk_id in offline_disks {
+            let disk = meta.disks.get_mut(&disk_id).unwrap();
+            disk.status = DiskStatus::Offline;
+            disk.offline_since = Some(now_f64());
+        }
+    }
+    for repair in [false, true] {
+        let report = fs.fsck(repair, false).unwrap();
+        assert_eq!(report.files_checked, 1, "{report:?}");
+        assert_eq!(report.damaged_files, 1, "{report:?}");
+        assert_eq!(report.missing_shards, 2, "{report:?}");
+        assert_eq!(report.unrecoverable_files, 1, "{report:?}");
+        assert_eq!(report.repaired_files, 0, "{report:?}");
+        assert!(report
+            .errors
+            .iter()
+            .any(|error| error.contains("verified shards available")));
+    }
+    let after = fs.metadata_snapshot().inodes[&ino].clone();
+    assert_eq!(after.blocks[0].stripe_id, before.blocks[0].stripe_id);
+    std::env::remove_var("ARGOSFS_OFFLINE_GRACE_MS");
+}
