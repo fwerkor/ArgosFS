@@ -892,3 +892,55 @@ fn fsck_detects_raw_integrity_failure_with_valid_shard_checksums() {
             .any(|error| error.contains("raw checksum mismatch")));
     }
 }
+
+#[test]
+fn fsck_reports_unknown_layout_and_continues_to_other_files() {
+    let (_dir, fs) = redundant_host_volume();
+    fs.write_file("/broken", &[0x21; 8192], 0o600).unwrap();
+    fs.write_file("/healthy", &[0x37; 8192], 0o600).unwrap();
+    let bad_ino = fs.resolve_path("/broken", true).unwrap();
+    let healthy_ino = fs.resolve_path("/healthy", true).unwrap();
+    {
+        let mut meta = fs.meta.write();
+        meta.inodes.get_mut(&bad_ino).unwrap().blocks[0].layout_id = "missing-layout".to_string();
+    }
+    for repair in [false, true] {
+        let report = fs.fsck(repair, false).unwrap();
+        assert_eq!(report.files_checked, 2, "{report:?}");
+        assert_eq!(report.unrecoverable_files, 1, "{report:?}");
+        assert_eq!(report.repaired_files, 0, "{report:?}");
+        assert!(report
+            .errors
+            .iter()
+            .any(|error| error.contains("unknown layout")));
+        assert_eq!(
+            fs.read_inode(healthy_ino, 0, 8192, false).unwrap(),
+            [0x37; 8192]
+        );
+    }
+}
+
+#[test]
+fn fsck_validates_encrypted_multistripe_files_and_reports_missing_key() {
+    let _guard = env_lock();
+    let (_dir, fs) = redundant_host_volume();
+    fs.enable_encryption("fsck-test-key").unwrap();
+    std::env::set_var("ARGOSFS_KEY", "fsck-test-key");
+    fs.write_file("/encrypted", &[0x42; 24_576], 0o600).unwrap();
+    let ino = fs.resolve_path("/encrypted", true).unwrap();
+    let before = fs.metadata_snapshot().inodes[&ino].clone();
+    assert_eq!(before.blocks.len(), 3);
+    assert!(before.blocks.iter().all(|block| block.encrypted));
+    let report = fs.fsck(false, false).unwrap();
+    assert_eq!(report.files_checked, 1, "{report:?}");
+    assert_eq!(report.unrecoverable_files, 0, "{report:?}");
+    assert!(report.errors.is_empty(), "{report:?}");
+    std::env::remove_var("ARGOSFS_KEY");
+    let missing_key = fs.fsck(false, false).unwrap();
+    assert_eq!(missing_key.files_checked, 1, "{missing_key:?}");
+    assert_eq!(missing_key.unrecoverable_files, 1, "{missing_key:?}");
+    assert!(missing_key
+        .errors
+        .iter()
+        .any(|error| error.contains("ARGOSFS_KEY")));
+}
