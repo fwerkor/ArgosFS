@@ -630,6 +630,7 @@ impl ArgosFs {
             &window,
             data.len() as u64,
             clear_setid,
+            false,
             "write-range",
             json!({"inode": ino, "offset": offset, "bytes": data.len(), "rewrite": "stripe-window-local"}),
         )?;
@@ -805,6 +806,7 @@ impl ArgosFs {
                 &window,
                 0,
                 clear_setid,
+                false,
                 "truncate",
                 json!({"inode": ino, "size": requested_size, "rewrite": "sparse-extend"}),
             );
@@ -827,6 +829,7 @@ impl ArgosFs {
             &window,
             0,
             clear_setid,
+            false,
             "truncate",
             json!({"inode": ino, "size": requested_size, "rewrite": "stripe-window-local"}),
         )

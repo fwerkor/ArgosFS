@@ -665,3 +665,282 @@ fn health_report_counts_all_inode_kinds_and_delay_parser_is_best_effort() {
     }
     std::env::remove_var("ARGOSFS_TEST_MAINTENANCE_AFTER_READ_DELAY_MS");
 }
+
+#[test]
+fn fsck_accepts_healthy_file_above_io_window_limit() {
+    let (_dir, fs) = host_volume(1);
+    let payload = vec![0x5a; 8192];
+    fs.write_file("/large", &payload, 0o600).unwrap();
+    let ino = fs.resolve_path("/large", true).unwrap();
+    let large_size = MAX_IN_MEMORY_IO_BYTES as u64 + 4096;
+    // A sparse extension gives a real >256 MiB inode without consuming
+    // hundreds of megabytes or writing synthetic data for the regression.
+    fs.truncate_inode(ino, large_size).unwrap();
+    let before = fs.metadata_snapshot().inodes[&ino].clone();
+
+    for repair in [false, true] {
+        let report = fs.fsck(repair, false).unwrap();
+        assert_eq!(report.files_checked, 1, "{report:?}");
+        assert_eq!(report.damaged_files, 0, "{report:?}");
+        assert_eq!(report.unrecoverable_files, 0, "{report:?}");
+        assert!(report.errors.is_empty(), "{report:?}");
+    }
+    let after = fs.metadata_snapshot().inodes[&ino].clone();
+    assert_eq!(after.size, large_size);
+    assert_eq!(after.mtime, before.mtime);
+    assert_eq!(after.blocks.len(), before.blocks.len());
+    assert_eq!(
+        fs.read_inode(ino, 0, payload.len(), false).unwrap(),
+        payload
+    );
+    assert_eq!(
+        fs.read_inode(ino, large_size - 16, 16, false).unwrap(),
+        [0; 16]
+    );
+}
+
+#[test]
+fn fsck_repairs_only_damaged_stripes_in_large_file() {
+    let (_dir, fs) = redundant_host_volume();
+    let payload = vec![0x36; 16_384];
+    fs.write_file("/large", &payload, 0o600).unwrap();
+    let ino = fs.resolve_path("/large", true).unwrap();
+    let large_size = MAX_IN_MEMORY_IO_BYTES as u64 + 4096;
+    fs.truncate_inode(ino, large_size).unwrap();
+    let before = fs.metadata_snapshot().inodes[&ino].clone();
+    assert_eq!(before.blocks.len(), 2);
+    let shard = &before.blocks[0].shards[0];
+    let path = fs.shard_path_locked(&fs.metadata_snapshot(), &shard.disk_id, &shard.relpath);
+    std::fs::write(&path, b"corrupted shard").unwrap();
+
+    let checked = fs.fsck(false, false).unwrap();
+    assert_eq!(checked.files_checked, 1, "{checked:?}");
+    assert_eq!(checked.damaged_files, 1, "{checked:?}");
+    assert_eq!(checked.unrecoverable_files, 0, "{checked:?}");
+    assert!(checked.checksum_errors > 0, "{checked:?}");
+    assert_eq!(checked.repaired_files, 0, "{checked:?}");
+
+    let repaired = fs.fsck(true, false).unwrap();
+    assert_eq!(repaired.damaged_files, 1, "{repaired:?}");
+    assert_eq!(repaired.repaired_files, 1, "{repaired:?}");
+    assert_eq!(repaired.unrecoverable_files, 0, "{repaired:?}");
+    let after = fs.metadata_snapshot().inodes[&ino].clone();
+    assert_eq!(after.size, large_size);
+    assert_eq!(after.mtime, before.mtime, "fsck must preserve file mtime");
+    assert_eq!(after.blocks.len(), 2);
+    assert_ne!(after.blocks[0].stripe_id, before.blocks[0].stripe_id);
+    assert_eq!(after.blocks[1].stripe_id, before.blocks[1].stripe_id);
+    assert_eq!(
+        fs.read_inode(ino, 0, payload.len(), false).unwrap(),
+        payload
+    );
+    assert_eq!(
+        fs.read_inode(ino, large_size - 16, 16, false).unwrap(),
+        [0; 16]
+    );
+    let clean = fs.fsck(false, false).unwrap();
+    assert_eq!(clean.damaged_files, 0, "{clean:?}");
+    assert_eq!(clean.unrecoverable_files, 0, "{clean:?}");
+}
+
+#[test]
+fn fsck_reports_genuinely_unrecoverable_large_file_without_replacing_data() {
+    let (_dir, fs) = host_volume(1);
+    fs.write_file("/large", &[0x3a; 8192], 0o600).unwrap();
+    let ino = fs.resolve_path("/large", true).unwrap();
+    fs.truncate_inode(ino, MAX_IN_MEMORY_IO_BYTES as u64 + 1)
+        .unwrap();
+    let before = fs.metadata_snapshot().inodes[&ino].clone();
+    let shard = &before.blocks[0].shards[0];
+    let path = fs.shard_path_locked(&fs.metadata_snapshot(), &shard.disk_id, &shard.relpath);
+    std::fs::write(&path, b"corrupted shard").unwrap();
+
+    let report = fs.fsck(true, false).unwrap();
+    assert_eq!(report.damaged_files, 1, "{report:?}");
+    assert_eq!(report.unrecoverable_files, 1, "{report:?}");
+    assert_eq!(report.repaired_files, 0, "{report:?}");
+    assert!(report.errors.iter().any(|error| error.contains("inode")));
+    let after = fs.metadata_snapshot().inodes[&ino].clone();
+    assert_eq!(after.blocks[0].stripe_id, before.blocks[0].stripe_id);
+    assert_eq!(after.size, before.size);
+}
+
+#[test]
+fn fsck_uses_current_inode_after_initial_id_scan() {
+    let (_dir, fs) = redundant_host_volume();
+    fs.write_file("/file", &[0x45; 8192], 0o600).unwrap();
+    let ino = fs.resolve_path("/file", true).unwrap();
+    // A completed writer can extend the file after fsck collects its IDs.
+    let inode_ids = fs.metadata_snapshot().inodes.keys().copied().collect();
+    let extension = b"written after the inode ID scan";
+    fs.write_inode_range(ino, 8192, extension).unwrap();
+    let current = fs.metadata_snapshot().inodes[&ino].clone();
+    let shard = &current.blocks[0].shards[0];
+    let path = fs.shard_path_locked(&fs.metadata_snapshot(), &shard.disk_id, &shard.relpath);
+    std::fs::write(&path, b"corrupt").unwrap();
+
+    let report = fs.fsck_inodes(inode_ids, true, false).unwrap();
+    assert_eq!(report.damaged_files, 1, "{report:?}");
+    assert_eq!(report.repaired_files, 1, "{report:?}");
+    assert_eq!(report.unrecoverable_files, 0, "{report:?}");
+    let after = fs.metadata_snapshot().inodes[&ino].clone();
+    assert_eq!(after.size, current.size);
+    assert_eq!(after.blocks[1].stripe_id, current.blocks[1].stripe_id);
+    assert_eq!(
+        fs.read_inode(ino, 8192, extension.len(), false).unwrap(),
+        extension
+    );
+}
+
+#[test]
+fn fsck_rejects_invalid_inline_checksum_and_length() {
+    for corrupt_length in [false, true] {
+        let (_dir, fs) = host_volume(1);
+        fs.write_file("/small", b"inline-data", 0o600).unwrap();
+        let ino = fs.resolve_path("/small", true).unwrap();
+        {
+            let mut meta = fs.meta.write();
+            let inode = meta.inodes.get_mut(&ino).unwrap();
+            inode.blocks.clear();
+            inode.inline_data = Some(b"inline-data".to_vec());
+            inode.inline_sha256 = content_hash_hex(b"inline-data");
+            if corrupt_length {
+                inode.size += 1;
+            } else {
+                inode.inline_sha256 = "bad checksum".to_string();
+            }
+        }
+        for repair in [false, true] {
+            let report = fs.fsck(repair, false).unwrap();
+            assert_eq!(report.files_checked, 1, "{report:?}");
+            assert_eq!(report.damaged_files, 1, "{report:?}");
+            assert_eq!(report.unrecoverable_files, 1, "{report:?}");
+            assert_eq!(report.repaired_files, 0, "{report:?}");
+            assert!(report
+                .errors
+                .iter()
+                .any(|error| error.contains("inline inode")));
+        }
+    }
+}
+
+#[test]
+fn fsck_reports_unreadable_stripe_during_offline_grace_without_repair() {
+    let _guard = env_lock();
+    std::env::set_var("ARGOSFS_OFFLINE_GRACE_MS", "600000");
+    let (_dir, fs) = redundant_host_volume();
+    fs.write_file("/file", &[0x42; 8192], 0o600).unwrap();
+    let ino = fs.resolve_path("/file", true).unwrap();
+    let before = fs.metadata_snapshot().inodes[&ino].clone();
+    let offline_disks = before.blocks[0]
+        .shards
+        .iter()
+        .take(2)
+        .map(|shard| shard.disk_id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(offline_disks.len(), 2);
+    {
+        let mut meta = fs.meta.write();
+        for disk_id in offline_disks {
+            let disk = meta.disks.get_mut(&disk_id).unwrap();
+            disk.status = DiskStatus::Offline;
+            disk.offline_since = Some(now_f64());
+        }
+    }
+    for repair in [false, true] {
+        let report = fs.fsck(repair, false).unwrap();
+        assert_eq!(report.files_checked, 1, "{report:?}");
+        assert_eq!(report.damaged_files, 1, "{report:?}");
+        assert_eq!(report.missing_shards, 2, "{report:?}");
+        assert_eq!(report.unrecoverable_files, 1, "{report:?}");
+        assert_eq!(report.repaired_files, 0, "{report:?}");
+        assert!(report
+            .errors
+            .iter()
+            .any(|error| error.contains("verified shards available")));
+    }
+    let after = fs.metadata_snapshot().inodes[&ino].clone();
+    assert_eq!(after.blocks[0].stripe_id, before.blocks[0].stripe_id);
+    std::env::remove_var("ARGOSFS_OFFLINE_GRACE_MS");
+}
+
+#[test]
+fn fsck_detects_raw_integrity_failure_with_valid_shard_checksums() {
+    let (_dir, fs) = redundant_host_volume();
+    fs.write_file("/large", &[0x78; 8192], 0o600).unwrap();
+    let ino = fs.resolve_path("/large", true).unwrap();
+    fs.truncate_inode(ino, MAX_IN_MEMORY_IO_BYTES as u64 + 4096)
+        .unwrap();
+    {
+        let mut meta = fs.meta.write();
+        let inode = meta.inodes.get_mut(&ino).unwrap();
+        // Individual shard hashes still match stored bytes; only the
+        // end-to-end reconstructed block checksum is inconsistent.
+        inode.blocks[0].raw_sha256 = content_hash_hex(b"incorrect raw data");
+    }
+    for repair in [false, true] {
+        let report = fs.fsck(repair, false).unwrap();
+        assert_eq!(report.files_checked, 1, "{report:?}");
+        assert_eq!(report.checksum_errors, 0, "{report:?}");
+        assert_eq!(report.missing_shards, 0, "{report:?}");
+        assert_eq!(report.damaged_files, 1, "{report:?}");
+        assert_eq!(report.unrecoverable_files, 1, "{report:?}");
+        assert_eq!(report.repaired_files, 0, "{report:?}");
+        assert!(report
+            .errors
+            .iter()
+            .any(|error| error.contains("raw checksum mismatch")));
+    }
+}
+
+#[test]
+fn fsck_reports_unknown_layout_and_continues_to_other_files() {
+    let (_dir, fs) = redundant_host_volume();
+    fs.write_file("/broken", &[0x21; 8192], 0o600).unwrap();
+    fs.write_file("/healthy", &[0x37; 8192], 0o600).unwrap();
+    let bad_ino = fs.resolve_path("/broken", true).unwrap();
+    let healthy_ino = fs.resolve_path("/healthy", true).unwrap();
+    {
+        let mut meta = fs.meta.write();
+        meta.inodes.get_mut(&bad_ino).unwrap().blocks[0].layout_id = "missing-layout".to_string();
+    }
+    for repair in [false, true] {
+        let report = fs.fsck(repair, false).unwrap();
+        assert_eq!(report.files_checked, 2, "{report:?}");
+        assert_eq!(report.unrecoverable_files, 1, "{report:?}");
+        assert_eq!(report.repaired_files, 0, "{report:?}");
+        assert!(report
+            .errors
+            .iter()
+            .any(|error| error.contains("unknown layout")));
+        assert_eq!(
+            fs.read_inode(healthy_ino, 0, 8192, false).unwrap(),
+            [0x37; 8192]
+        );
+    }
+}
+
+#[test]
+fn fsck_validates_encrypted_multistripe_files_and_reports_missing_key() {
+    let _guard = env_lock();
+    let (_dir, fs) = redundant_host_volume();
+    fs.enable_encryption("fsck-test-key").unwrap();
+    std::env::set_var("ARGOSFS_KEY", "fsck-test-key");
+    fs.write_file("/encrypted", &[0x42; 24_576], 0o600).unwrap();
+    let ino = fs.resolve_path("/encrypted", true).unwrap();
+    let before = fs.metadata_snapshot().inodes[&ino].clone();
+    assert_eq!(before.blocks.len(), 3);
+    assert!(before.blocks.iter().all(|block| block.encrypted));
+    let report = fs.fsck(false, false).unwrap();
+    assert_eq!(report.files_checked, 1, "{report:?}");
+    assert_eq!(report.unrecoverable_files, 0, "{report:?}");
+    assert!(report.errors.is_empty(), "{report:?}");
+    std::env::remove_var("ARGOSFS_KEY");
+    let missing_key = fs.fsck(false, false).unwrap();
+    assert_eq!(missing_key.files_checked, 1, "{missing_key:?}");
+    assert_eq!(missing_key.unrecoverable_files, 1, "{missing_key:?}");
+    assert!(missing_key
+        .errors
+        .iter()
+        .any(|error| error.contains("ARGOSFS_KEY")));
+}
