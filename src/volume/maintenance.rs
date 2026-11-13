@@ -1050,6 +1050,25 @@ impl ArgosFs {
                                 available_slots.len(),
                                 layout.k
                             ));
+                            continue;
+                        }
+                        // Shard checksums do not prove that reconstruction,
+                        // decompression, decryption and the raw block checksum
+                        // are valid. Validate each stripe with bounded memory,
+                        // including stripes with no damaged shards.
+                        let decrypt_key = if block.encrypted {
+                            Some(self.encryption_key_locked(&meta)?)
+                        } else {
+                            None
+                        };
+                        let mut decode_damage = Vec::new();
+                        if let Err(err) = self.decode_block_locked(
+                            &mut meta,
+                            block,
+                            decrypt_key.as_ref(),
+                            &mut decode_damage,
+                        ) {
+                            unrecoverable_blocks.push(format!("stripe {}: {err}", block.stripe_id));
                         } else if block_damaged {
                             damaged_blocks.push(block);
                         }
