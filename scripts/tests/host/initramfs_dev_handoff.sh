@@ -59,6 +59,38 @@ sed '$d' "$repo/integrations/capos/initramfs/argosfs-root.sh" >"$tmp/rootscript.
     echo 'device handoff accepted a mount without a mountpoint' >&2
     exit 1
   fi
+
+  # An existing /dev mount must be handed off to the new root rather
+  # than silently replaced with another tmpfs instance.
+  : >"$tmp/source-mounted"
+  is_mounted() {
+    case "$1" in
+      /dev) [ -e "$tmp/source-mounted" ] ;;
+      "$sysroot/dev") [ -e "$tmp/mounted" ] ;;
+      *) return 1 ;;
+    esac
+  }
+  mount() {
+    [ "$#" -eq 4 ] || return 1
+    [ "$1" = -o ] && [ "$2" = move ] || return 1
+    [ "$3" = /dev ] && [ "$4" = "$sysroot/dev" ] || return 1
+    rm -f "$tmp/source-mounted"
+    : >"$tmp/mounted"
+  }
+  mknod() { ln -s /dev/null "$1"; }
+  prepare_new_root_dev
+  [ -e "$tmp/mounted" ]
+  [ ! -e "$tmp/source-mounted" ]
+
+  # A failed handoff must prevent switch_root, even if character
+  # devices happen to be present on the target's backing directory.
+  rm -f "$tmp/mounted"
+  : >"$tmp/source-mounted"
+  move_mount_or_mount() { return 1; }
+  if prepare_new_root_dev; then
+    echo 'device handoff accepted a failed /dev mount move' >&2
+    exit 1
+  fi
 )
 
 echo 'CapOS initramfs device handoff tests passed'
