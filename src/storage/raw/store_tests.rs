@@ -1647,6 +1647,32 @@ fn compressed_checkpoint_quorum_round_trip_and_corruption_checks() {
 }
 
 #[test]
+fn compressed_decode_stream_verifies_expanded_hash_and_length_before_parse() {
+    let (_dir, _images, metadata, _) = quorum_fixture();
+    let expanded = serde_json::to_vec(&metadata).unwrap();
+    let compressed = zstd::stream::encode_all(expanded.as_slice(), 3).unwrap();
+    let mut header = [0u8; RAW_HEADER_SIZE];
+    put_u32(&mut header, 20, METADATA_FORMAT_TREE_ZSTD);
+    put_u64(&mut header, 232, expanded.len() as u64);
+    header[240..240 + HASH_HEX_LEN].copy_from_slice(sha256_hex(&expanded).as_bytes());
+    let decoded = decode_metadata_payload(&header, &compressed).unwrap();
+    assert_eq!(decoded.inodes.len(), metadata.inodes.len());
+    assert_eq!(decoded.txid, metadata.txid);
+
+    header[240] = if header[240] == b'0' { b'1' } else { b'0' };
+    assert!(matches!(
+        decode_metadata_payload(&header, &compressed),
+        Err(ArgosError::Checksum(_))
+    ));
+    header[240..240 + HASH_HEX_LEN].copy_from_slice(sha256_hex(&expanded).as_bytes());
+    put_u64(&mut header, 232, expanded.len() as u64 + 1);
+    assert!(matches!(
+        decode_metadata_payload(&header, &compressed),
+        Err(ArgosError::Checksum(_))
+    ));
+}
+
+#[test]
 fn checkpoint_uses_old_encoding_when_it_fits() {
     let (_dir, _images, metadata, superblocks) = quorum_fixture();
     let payload = prepare_checkpoint_payload(&metadata, &superblocks).unwrap();

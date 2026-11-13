@@ -224,6 +224,7 @@ impl ArgosFs {
         window: &[u8],
         logical_write_bytes: u64,
         clear_setid: bool,
+        preserve_mtime: bool,
         action: &str,
         details: serde_json::Value,
     ) -> Result<()> {
@@ -295,7 +296,9 @@ impl ArgosFs {
         inode.write_bytes = inode.write_bytes.saturating_add(logical_write_bytes);
         inode.last_written_at = now;
         inode.workload_score = inode.workload_score * 0.90 + 2.0;
-        inode.mtime = now;
+        if !preserve_mtime {
+            inode.mtime = now;
+        }
         inode.ctime = now;
         if clear_setid {
             inode.mode &= !(libc::S_ISUID | libc::S_ISGID);

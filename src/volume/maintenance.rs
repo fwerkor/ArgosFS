@@ -911,6 +911,16 @@ impl ArgosFs {
     }
 
     pub fn fsck(&self, repair: bool, remove_orphans: bool) -> Result<FsckReport> {
+        let inodes = self.metadata_snapshot().inodes.keys().copied().collect();
+        self.fsck_inodes(inodes, repair, remove_orphans)
+    }
+
+    fn fsck_inodes(
+        &self,
+        inodes: Vec<InodeId>,
+        repair: bool,
+        remove_orphans: bool,
+    ) -> Result<FsckReport> {
         let mut report = FsckReport::default();
         let retries_before = self
             .read_retries_seen
@@ -918,26 +928,92 @@ impl ArgosFs {
         let recovered_before = self
             .read_recovered
             .load(std::sync::atomic::Ordering::Relaxed);
-        let inodes = self.metadata_snapshot().inodes;
-        for (ino, inode) in inodes {
-            match inode.kind {
-                NodeKind::Directory => {
+        for ino in inodes {
+            let kind = self
+                .meta
+                .read()
+                .inodes
+                .get(&ino)
+                .map(|inode| inode.kind.clone());
+            match kind {
+                Some(NodeKind::Directory) => {
+                    let meta = self.meta.read();
+                    let Some(inode) = meta.inodes.get(&ino) else {
+                        continue;
+                    };
                     report.directories_checked += 1;
                     for child in inode.entries.values() {
-                        if !self.metadata_snapshot().inodes.contains_key(child) {
+                        if !meta.inodes.contains_key(child) {
                             report
                                 .errors
                                 .push(format!("directory {ino} references missing inode {child}"));
                         }
                     }
                 }
-                NodeKind::File => {
+                Some(NodeKind::File) => {
                     let inode_lock = self.inode_lock(ino);
                     let _inode_guard = inode_lock.lock();
+                    // A writer may have changed the inode after the ID scan.
+                    // The inode lock is held before reading *any* repair state.
+                    let inode = {
+                        let meta = self.meta.read();
+                        meta.inodes
+                            .get(&ino)
+                            .filter(|i| i.kind == NodeKind::File)
+                            .cloned()
+                    };
+                    let Some(inode) = inode else {
+                        continue;
+                    };
                     report.files_checked += 1;
-                    let mut damaged = false;
+                    if inode.inline_data.is_some() {
+                        if let Err(err) = decode_inline_data(&inode) {
+                            report.damaged_files += 1;
+                            report.unrecoverable_files += 1;
+                            report.errors.push(format!("inode {ino}: {err}"));
+                            continue;
+                        }
+                        if inode.blocks.is_empty() {
+                            continue;
+                        }
+                    }
+                    // Argon2 key derivation is expensive; perform it once per
+                    // inode, outside the metadata write lock, for all stripes.
+                    let decrypt_key = if inode.blocks.iter().any(|block| block.encrypted) {
+                        let meta = self.meta.read();
+                        match self.encryption_key_locked(&meta) {
+                            Ok(key) => Some(key),
+                            Err(err) => {
+                                report.unrecoverable_files += 1;
+                                report.errors.push(format!("inode {ino}: {err}"));
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    let mut damaged_blocks = Vec::new();
+                    let mut unrecoverable_blocks = Vec::new();
                     let mut meta = self.meta.write();
                     for block in &inode.blocks {
+                        let mut block_damaged = false;
+                        let mut available_slots = BTreeSet::new();
+                        let layout = match layout_by_id(&meta, block_layout_id(block)) {
+                            Ok(layout) => layout,
+                            Err(err) => {
+                                unrecoverable_blocks
+                                    .push(format!("stripe {}: {err}", block.stripe_id));
+                                continue;
+                            }
+                        };
+                        let total_slots = match layout_total(&layout) {
+                            Ok(total) => total,
+                            Err(err) => {
+                                unrecoverable_blocks
+                                    .push(format!("stripe {}: {err}", block.stripe_id));
+                                continue;
+                            }
+                        };
                         for shard in &block.shards {
                             // Do not read a shard from a member that is
                             // merely absent from the scan.  Its data is
@@ -960,7 +1036,7 @@ impl ArgosFs {
                                         // A retired/failed shard is unavailable even if its
                                         // old backing path still happens to be readable.
                                         report.missing_shards += 1;
-                                        damaged = true;
+                                        block_damaged = true;
                                         continue;
                                     }
                                     _ => {}
@@ -974,10 +1050,14 @@ impl ArgosFs {
                                 continue;
                             }
                             match self.read_shard_verified_locked(&mut meta, shard) {
-                                Ok(Some(_)) => {}
+                                Ok(Some(_)) => {
+                                    if shard.slot < total_slots {
+                                        available_slots.insert(shard.slot);
+                                    }
+                                }
                                 Ok(None) => {
                                     report.checksum_errors += 1;
-                                    damaged = true;
+                                    block_damaged = true;
                                 }
                                 Err(_) => {
                                     report.missing_shards += 1;
@@ -988,40 +1068,112 @@ impl ArgosFs {
                                         || !self.is_device_quarantined(&shard.disk_id)
                                         || self.quarantined_member_due_for_repair(&shard.disk_id)
                                     {
-                                        damaged = true;
+                                        block_damaged = true;
                                     }
                                 }
                             }
                         }
+                        if available_slots.len() < layout.k {
+                            unrecoverable_blocks.push(format!(
+                                "stripe {} has {}/{} verified shards available",
+                                block.stripe_id,
+                                available_slots.len(),
+                                layout.k
+                            ));
+                            continue;
+                        }
+                        // Shard checksums do not prove that reconstruction,
+                        // decompression, decryption and the raw block checksum
+                        // are valid. Validate each stripe with bounded memory,
+                        // including stripes with no damaged shards.
+                        let mut decode_damage = Vec::new();
+                        if let Err(err) = self.decode_block_locked(
+                            &mut meta,
+                            block,
+                            decrypt_key.as_ref(),
+                            &mut decode_damage,
+                        ) {
+                            unrecoverable_blocks.push(format!("stripe {}: {err}", block.stripe_id));
+                        } else if block_damaged {
+                            damaged_blocks.push(block);
+                        }
                     }
                     drop(meta);
-                    match self.read_inode(ino, 0, u64::MAX as usize, false) {
-                        Ok(data) => {
-                            if damaged {
-                                report.damaged_files += 1;
-                                if repair {
-                                    maintenance_after_read_delay();
-                                    let mut meta = self.meta.write();
-                                    self.replace_inode_data_locked(
-                                        &mut meta,
-                                        ino,
-                                        &data,
-                                        "fsck-repair",
-                                        json!({"inode": ino}),
-                                        false,
-                                        &BTreeSet::new(),
-                                    )?;
-                                    report.repaired_files += 1;
-                                }
+                    if !unrecoverable_blocks.is_empty() {
+                        report.damaged_files += 1;
+                        report.unrecoverable_files += 1;
+                        report.errors.extend(
+                            unrecoverable_blocks
+                                .into_iter()
+                                .map(|error| format!("inode {ino}: {error}")),
+                        );
+                        continue;
+                    }
+                    if !damaged_blocks.is_empty() {
+                        report.damaged_files += 1;
+                        // Only reconstruct stripes that failed verification. A healthy
+                        // file must not be decoded in full: its logical size may be
+                        // arbitrarily larger than MAX_IN_MEMORY_IO_BYTES.
+                        // Check all damaged stripes before mutating the inode so an
+                        // unrecoverable stripe cannot cause a partial repair.
+                        let reconstruction = damaged_blocks.iter().try_for_each(|block| {
+                            let data =
+                                self.read_inode(ino, block.raw_offset, block.raw_size, false)?;
+                            if data.len() != block.raw_size {
+                                return Err(ArgosError::Invalid(format!(
+                                    "stripe {} decoded {} bytes, expected {}",
+                                    block.stripe_id,
+                                    data.len(),
+                                    block.raw_size
+                                )));
                             }
-                        }
-                        Err(err) => {
+                            Ok(())
+                        });
+                        if let Err(err) = reconstruction {
                             report.unrecoverable_files += 1;
                             report.errors.push(format!("inode {ino}: {err}"));
+                            continue;
+                        }
+                        if repair {
+                            let file_size = usize::try_from(inode.size).map_err(|_| {
+                                ArgosError::Invalid(format!("inode {ino} size exceeds usize"))
+                            })?;
+                            for block in damaged_blocks {
+                                let data =
+                                    self.read_inode(ino, block.raw_offset, block.raw_size, false)?;
+                                let start = usize::try_from(block.raw_offset).map_err(|_| {
+                                    ArgosError::Invalid(format!(
+                                        "stripe {} offset exceeds usize",
+                                        block.stripe_id
+                                    ))
+                                })?;
+                                let end = start.checked_add(block.raw_size).ok_or_else(|| {
+                                    ArgosError::Invalid(format!(
+                                        "stripe {} offset overflow",
+                                        block.stripe_id
+                                    ))
+                                })?;
+                                maintenance_after_read_delay();
+                                let mut meta = self.meta.write();
+                                self.rewrite_inode_window_locked(
+                                    &mut meta,
+                                    ino,
+                                    start,
+                                    end,
+                                    file_size,
+                                    &data,
+                                    0,
+                                    false,
+                                    true,
+                                    "fsck-repair",
+                                    json!({"inode": ino, "stripe": block.stripe_id}),
+                                )?;
+                            }
+                            report.repaired_files += 1;
                         }
                     }
                 }
-                NodeKind::Symlink | NodeKind::Special => {}
+                Some(NodeKind::Symlink | NodeKind::Special) | None => {}
             }
         }
         let meta = self.meta.read();

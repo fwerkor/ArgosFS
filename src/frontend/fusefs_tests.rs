@@ -57,6 +57,23 @@ fn allow_other_wins_over_allow_root() {
 }
 
 #[test]
+fn mounts_dispatch_multiple_requests_with_independent_linux_fuse_channels() {
+    let config = mount_config(vec![MountOption::CUSTOM("ro".to_string())]);
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(config.n_threads, Some(FUSE_REQUEST_THREADS));
+        assert!(config.n_threads.unwrap() >= 2);
+        assert!(config.clone_fd);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        assert_eq!(config.n_threads, None);
+        assert!(!config.clone_fd);
+    }
+    assert!(config.mount_options.contains(&MountOption::RO));
+}
+
+#[test]
 fn proc_status_group_parser_reads_supplementary_groups() {
     let status =
         "Name:\ttest\nUid:\t1000 1000 1000 1000\nGid:\t2000 2000 2000 2000\nGroups:\t10 20 30 \n";

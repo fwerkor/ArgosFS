@@ -15,6 +15,34 @@ page have their own SHA-256 digests as before. The reader validates all
 checksums, requires the decompressed length/hash to match, and bounds
 expanded metadata to 4 GiB to avoid unbounded decompression.
 
+## Bounded-memory recovery (#221)
+
+Format-2 recovery validates the claimed expanded length and SHA-256 in a
+bounded zstd read pass, then decompresses again directly into the serde
+deserializer. It no longer retains a full expanded JSON `Vec` while building
+the inode map. The second pass trades decompression CPU for lower peak memory;
+page and compressed-payload integrity checks remain unchanged.
+
+Journal deltas are applied to individual inode/disk objects and small header
+fields on a persistent COW metadata snapshot instead of allocating a complete
+`serde_json::Value` tree for each record. The original full-JSON fallback is
+retained for uncommon root or whole-map replacements in old journal records.
+Writable `mount-root` also releases its read-only preflight snapshot before
+opening the pool for writing.
+
+The full active inode index still resides in memory, and integrity hashing
+still serializes the metadata. These changes reduce recovery transients; they
+are not a guarantee of a fixed RSS bound for arbitrary workloads.
+
+An opt-in 144,550-inode recovery-memory test can be run on a disposable host
+with sufficient resources (the synthetic dataset has eight shards per inode):
+
+    ARGOSFS_SCALE_INODES=144550 ARGOSFS_SCALE_UNIQUE_SHARDS=1 \
+      ARGOSFS_SCALE_PROFILE_RECOVERY=1 \
+      cargo test --lib metadata_scale_274k_eight_shard_inodes -- --ignored --nocapture
+
+Use a process memory limit when qualifying host-specific recovery budgets.
+
 Compatibility: this code reads existing raw v1 checkpoints unchanged, and
 continues writing v1 until a specific checkpoint no longer fits. **Once a
 pool has written format 2, do not downgrade the binary to v1.2.0 or earlier.**
