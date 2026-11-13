@@ -977,13 +977,43 @@ impl ArgosFs {
                             continue;
                         }
                     }
+                    // Argon2 key derivation is expensive; perform it once per
+                    // inode, outside the metadata write lock, for all stripes.
+                    let decrypt_key = if inode.blocks.iter().any(|block| block.encrypted) {
+                        let meta = self.meta.read();
+                        match self.encryption_key_locked(&meta) {
+                            Ok(key) => Some(key),
+                            Err(err) => {
+                                report.unrecoverable_files += 1;
+                                report.errors.push(format!("inode {ino}: {err}"));
+                                continue;
+                            }
+                        }
+                    } else {
+                        None
+                    };
                     let mut damaged_blocks = Vec::new();
                     let mut unrecoverable_blocks = Vec::new();
                     let mut meta = self.meta.write();
                     for block in &inode.blocks {
                         let mut block_damaged = false;
                         let mut available_slots = BTreeSet::new();
-                        let layout = layout_by_id(&meta, block_layout_id(block))?;
+                        let layout = match layout_by_id(&meta, block_layout_id(block)) {
+                            Ok(layout) => layout,
+                            Err(err) => {
+                                unrecoverable_blocks
+                                    .push(format!("stripe {}: {err}", block.stripe_id));
+                                continue;
+                            }
+                        };
+                        let total_slots = match layout_total(&layout) {
+                            Ok(total) => total,
+                            Err(err) => {
+                                unrecoverable_blocks
+                                    .push(format!("stripe {}: {err}", block.stripe_id));
+                                continue;
+                            }
+                        };
                         for shard in &block.shards {
                             // Do not read a shard from a member that is
                             // merely absent from the scan.  Its data is
@@ -1021,7 +1051,7 @@ impl ArgosFs {
                             }
                             match self.read_shard_verified_locked(&mut meta, shard) {
                                 Ok(Some(_)) => {
-                                    if shard.slot < layout_total(&layout)? {
+                                    if shard.slot < total_slots {
                                         available_slots.insert(shard.slot);
                                     }
                                 }
@@ -1056,11 +1086,6 @@ impl ArgosFs {
                         // decompression, decryption and the raw block checksum
                         // are valid. Validate each stripe with bounded memory,
                         // including stripes with no damaged shards.
-                        let decrypt_key = if block.encrypted {
-                            Some(self.encryption_key_locked(&meta)?)
-                        } else {
-                            None
-                        };
                         let mut decode_damage = Vec::new();
                         if let Err(err) = self.decode_block_locked(
                             &mut meta,
