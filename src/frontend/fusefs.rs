@@ -22,6 +22,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const TTL: Duration = Duration::from_secs(5);
 const FUSE_WRITEBACK_MAX_BYTES: usize = 1024 * 1024;
+// A slow writeback or checkpoint must not monopolize the FUSE request queue.
+// Keep the worker count bounded, including on small rootfs devices.
+#[cfg(target_os = "linux")]
+const FUSE_REQUEST_THREADS: usize = 4;
 
 pub struct ArgosFuse {
     volume: ArgosFs,
@@ -498,6 +502,14 @@ pub fn mount_volume(
 
 fn mount_config(options: Vec<MountOption>) -> Config {
     let mut config = Config::default();
+    // Linux FUSE can dispatch requests on separate channels. In particular,
+    // statfs must be able to reach its lock-free cached snapshot while a
+    // different request is blocked on writeback or metadata persistence.
+    #[cfg(target_os = "linux")]
+    {
+        config.n_threads = Some(FUSE_REQUEST_THREADS);
+        config.clone_fd = true;
+    }
     for option in options {
         match option {
             MountOption::CUSTOM(ref value) if value == "allow_other" => {
