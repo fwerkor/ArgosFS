@@ -21,7 +21,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const TTL: Duration = Duration::from_secs(5);
-const FUSE_WRITEBACK_MAX_BYTES: usize = 1024 * 1024;
+// The kernel still sends at most 1 MiB per request. Accumulating up to four
+// adjacent requests amortizes one partially-covered stripe at each boundary
+// across a larger sequential write, without unbounded per-inode buffering.
+const FUSE_WRITEBACK_MAX_BYTES: usize = 4 * 1024 * 1024;
 // A slow writeback or checkpoint must not monopolize the FUSE request queue.
 // Keep the worker count bounded, including on small rootfs devices.
 #[cfg(target_os = "linux")]
