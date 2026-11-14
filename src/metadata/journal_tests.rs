@@ -897,7 +897,10 @@ fn metadata_scale_274k_eight_shard_inodes() {
             Ok(())
         }
     }
-    if std::env::var_os("ARGOSFS_SCALE_COMPRESS_CHECKPOINT").is_some() {
+    if std::env::var_os("ARGOSFS_SCALE_DELTA_INTEGRITY_BENCH").is_some() {
+        // Benchmark O(changed) without also serializing gigabytes of an
+        // unrelated checkpoint. This is a synthetic, uncommitted fixture.
+    } else if std::env::var_os("ARGOSFS_SCALE_COMPRESS_CHECKPOINT").is_some() {
         // Opt-in: allocate a whole JSON checkpoint and compress it exactly
         // as the raw writer does once its original slot is too small.
         let checkpoint = serde_json::to_vec(&meta).unwrap();
@@ -932,6 +935,24 @@ fn metadata_scale_274k_eight_shard_inodes() {
         meta.inodes.get_mut(&ino).unwrap().size += 1;
     }
     let ops = metadata_delta(&snapshot, &meta).unwrap();
+    if std::env::var_os("ARGOSFS_SCALE_DELTA_INTEGRITY_BENCH").is_some() {
+        let mut next = meta.clone();
+        next.txid += 1;
+        next.updated_at += 1.0;
+        let timer = std::time::Instant::now();
+        prepare_delta_integrity(&mut next, &snapshot).unwrap();
+        let hash_ms = timer.elapsed().as_secs_f64() * 1000.0;
+        let timer = std::time::Instant::now();
+        let replayed =
+            apply_metadata_delta(&snapshot, &metadata_delta(&snapshot, &next).unwrap()).unwrap();
+        let replay_ms = timer.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(replayed.integrity.meta_hash, next.integrity.meta_hash);
+        assert_eq!(replayed.inodes.len(), next.inodes.len());
+        eprintln!(
+            "DELTA_INTEGRITY_BENCH inodes={} shards_per_inode=8 hash_ms={:.3} replay_ms={:.3} ops={} rss_mib={:.1}",
+            count, hash_ms, replay_ms, ops.len(), rss_mib()
+        );
+    }
     let mutated_rss = rss_mib();
     eprintln!(
         "METADATA_SCALE inodes={} shards_per_inode=8 initial_rss_mib={:.1} built_rss_mib={:.1} cloned_rss_mib={:.1} mutated_rss_mib={:.1} \
@@ -974,4 +995,49 @@ fn metadata_scale_274k_eight_shard_inodes() {
         eprintln!("RECOVERY_PROFILE hash={} rss_mib={:.1}", hash, rss_mib());
     }
     drop((dir, fs));
+}
+
+#[test]
+fn delta_integrity_v2_binds_changes_and_replays_without_full_hash() {
+    let (_dir, fs) = volume();
+    let mut base = fs.metadata_snapshot();
+    base.inodes.mark_committed();
+    let mut next = base.clone();
+    next.txid += 1;
+    next.updated_at += 1.0;
+    next.inodes.get_mut(&1).unwrap().read_bytes += 341;
+    prepare_delta_integrity(&mut next, &base).unwrap();
+    assert_eq!(next.integrity.hash_scheme, Some(DELTA_INTEGRITY_SCHEME));
+    assert_eq!(next.integrity.meta_hash.len(), 64);
+    let ops = metadata_delta(&base, &next).unwrap();
+    let replayed = apply_metadata_delta(&base, &ops).unwrap();
+    assert_eq!(replayed.integrity, next.integrity);
+    assert_eq!(replayed.inodes[&1].read_bytes, next.inodes[&1].read_bytes);
+    let mut tampered = ops.clone();
+    let inode_change = tampered
+        .iter_mut()
+        .find_map(|op| match op {
+            MetadataDeltaOp::Replace { path, value } if path.ends_with("/read_bytes") => {
+                Some(value)
+            }
+            _ => None,
+        })
+        .unwrap();
+    *inode_change = json!(9999999);
+    assert!(apply_metadata_delta(&base, &tampered).is_err());
+    let mut unrelated = base.clone();
+    unrelated.integrity.meta_hash = "f".repeat(64);
+    assert!(apply_metadata_delta(&unrelated, &ops).is_err());
+
+    let mut third = next.clone();
+    third.inodes.mark_committed();
+    third.txid += 1;
+    third.updated_at += 2.0;
+    third.inodes.get_mut(&1).unwrap().read_bytes += 1;
+    prepare_delta_integrity(&mut third, &next).unwrap();
+    let third_ops = metadata_delta(&next, &third).unwrap();
+    assert_eq!(
+        apply_metadata_delta(&next, &third_ops).unwrap().integrity,
+        third.integrity
+    );
 }
