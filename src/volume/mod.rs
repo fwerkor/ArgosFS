@@ -2468,13 +2468,15 @@ impl ArgosFs {
             return match result {
                 Ok(report) => {
                     self.apply_quorum_write_report(&journal_meta, report)?;
-                    // An event record may have rolled over to a *canonical*
-                    // checkpoint with the same txid as a v2 state. Until the
-                    // next canonical checkpoint completes, the cached v2
-                    // durable baseline is no longer a safe journal ancestor.
-                    // Conservatively re-anchor after *every* v2 event, so
-                    // even a non-rollover event cannot leave a divergent tip.
-                    if meta.integrity.hash_scheme == Some(journal::DELTA_INTEGRITY_SCHEME) {
+                    // An event may roll over to a canonical checkpoint using
+                    // a different digest from the cached durable baseline.
+                    // This also applies to an upgraded pool still carrying
+                    // the legacy scheme with post-read telemetry changes.
+                    // Re-anchor before the next delta even if the event did
+                    // not actually roll over: its tip is not a safe ancestor.
+                    if journal_meta.integrity.meta_hash != meta.integrity.meta_hash
+                        || meta.integrity.hash_scheme == Some(journal::DELTA_INTEGRITY_SCHEME)
+                    {
                         let mut state = self.deferred_commit.lock();
                         state.raw_uncommitted_metadata_dirty = true;
                         state.raw_checkpoint_required = true;

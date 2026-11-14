@@ -1347,3 +1347,59 @@ fn v2_added_block_members_inherit_required_features_and_survive_recovery() {
         b"quorum with six upgraded members"
     );
 }
+
+#[test]
+fn upgraded_legacy_event_rollover_with_read_telemetry_reanchors_before_first_v2_delta() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|n| dir.path().join(format!("event-legacy-{n}.img")))
+        .collect::<Vec<_>>();
+    let mut fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            defer_metadata_commit: true,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "legacy-event-v2",
+        false,
+    )
+    .unwrap();
+    fs.write_file("/old", b"old payload", 0o600).unwrap();
+    fs.sync().unwrap();
+    fs.upgrade_delta_integrity().unwrap();
+    assert_eq!(fs.metadata_snapshot().integrity.hash_scheme, None);
+    assert_eq!(fs.read_file("/old", false).unwrap(), b"old payload");
+    assert!(fs.deferred_commit.lock().raw_uncommitted_metadata_dirty);
+    {
+        let meta = fs.meta.read();
+        fs.journal_locked(
+            &meta,
+            "snapshot",
+            json!({"audit": "x".repeat(3 * 1024 * 1024)}),
+        )
+        .unwrap();
+    }
+    assert!(fs.deferred_commit.lock().raw_checkpoint_required);
+    fs.write_file("/first-new", b"first new", 0o600).unwrap();
+    fs.sync().unwrap();
+    assert_eq!(fs.metadata_snapshot().integrity.hash_scheme, None);
+    fs.write_file("/v2", b"v2 data", 0o600).unwrap();
+    fs.sync().unwrap();
+    assert_eq!(
+        fs.metadata_snapshot().integrity.hash_scheme,
+        Some(journal::DELTA_INTEGRITY_SCHEME)
+    );
+    drop(fs);
+    let reopened = ArgosFs::open_loop(&images, false).unwrap();
+    for (path, bytes) in [
+        ("/old", b"old payload".as_slice()),
+        ("/first-new", b"first new".as_slice()),
+        ("/v2", b"v2 data".as_slice()),
+    ] {
+        assert_eq!(reopened.read_file(path, false).unwrap(), bytes);
+    }
+}
