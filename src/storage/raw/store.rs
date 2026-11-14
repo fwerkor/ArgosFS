@@ -3,7 +3,8 @@ use crate::error::{ArgosError, Result};
 use crate::journal;
 use crate::raw_format::{
     align_down, align_up, RawDeviceLabel, RawSuperblock, BACKUP_REGION_SIZE, DEVICE_LABEL_OFFSET,
-    DEVICE_LABEL_SIZE, PRIMARY_SUPERBLOCK_OFFSET, PROTECTIVE_HEADER_OFFSET, SUPERBLOCK_SIZE,
+    DEVICE_LABEL_SIZE, PRIMARY_SUPERBLOCK_OFFSET, PROTECTIVE_HEADER_OFFSET,
+    REQUIRED_FEATURE_DELTA_INTEGRITY, SUPERBLOCK_SIZE,
 };
 use crate::storage::guard::GuardedBackend;
 use crate::types::{
@@ -600,6 +601,73 @@ fn write_metadata_slot(
     Ok(())
 }
 
+/// Upgrade every active member's primary AND backup superblock before any
+/// delta-chain record is emitted. This is an explicit offline maintenance
+/// operation: a partially completed upgrade can be retried, and no v2 record
+/// is written until *all* active members are confirmed upgraded.
+pub(crate) fn upgrade_delta_integrity_members(
+    backend: &dyn StorageBackend,
+    superblocks: &[RawSuperblock],
+    metadata: &Metadata,
+) -> Result<Vec<RawSuperblock>> {
+    let active = metadata
+        .disks
+        .iter()
+        .filter(|(_, disk)| disk.status != DiskStatus::Removed)
+        .count();
+    if superblocks.len() != active {
+        return Err(ArgosError::QuorumUnavailable {
+            operation: "upgrade raw delta integrity: all active members must be present"
+                .to_string(),
+            need: active,
+            have: superblocks.len(),
+        });
+    }
+    let mut upgraded = Vec::with_capacity(superblocks.len());
+    for sb in superblocks {
+        if !metadata_has_voting_member(metadata, &sb.disk_id) {
+            return Err(ArgosError::Invalid(format!(
+                "raw integrity upgrade found unknown/removed member {}",
+                sb.disk_id
+            )));
+        }
+        let mut primary = [0u8; SUPERBLOCK_SIZE];
+        let mut backup = [0u8; SUPERBLOCK_SIZE];
+        backend.read_at(&sb.disk_id, PRIMARY_SUPERBLOCK_OFFSET, &mut primary)?;
+        backend.read_at(&sb.disk_id, sb.backup_superblock_offset, &mut backup)?;
+        let primary = RawSuperblock::decode(&primary)?;
+        let backup = RawSuperblock::decode(&backup)?;
+        for copy in [&primary, &backup] {
+            if copy.pool_uuid != sb.pool_uuid
+                || copy.device_uuid != sb.device_uuid
+                || copy.disk_id != sb.disk_id
+                || copy.generation != primary.generation
+            {
+                return Err(ArgosError::CorruptedMetadata(format!(
+                    "raw integrity upgrade superblock copy mismatch on {}",
+                    sb.disk_id
+                )));
+            }
+        }
+        let mut next = primary;
+        next.required_feature_flags |= REQUIRED_FEATURE_DELTA_INTEGRITY;
+        for offset in [sb.backup_superblock_offset, PRIMARY_SUPERBLOCK_OFFSET] {
+            backend.write_at(&sb.disk_id, offset, &next.encode())?;
+            backend.flush_device(&sb.disk_id)?;
+            let mut readback = [0u8; SUPERBLOCK_SIZE];
+            backend.read_at(&sb.disk_id, offset, &mut readback)?;
+            if RawSuperblock::decode(&readback)? != next {
+                return Err(ArgosError::Checksum(format!(
+                    "raw integrity feature did not persist on {} at {offset}",
+                    sb.disk_id
+                )));
+            }
+        }
+        upgraded.push(next);
+    }
+    Ok(upgraded)
+}
+
 pub fn recover_metadata(
     backend: &dyn StorageBackend,
     superblocks: &[RawSuperblock],
@@ -873,6 +941,13 @@ fn build_journal_entry(
     // Periodically embedding the entire namespace in its bounded journal
     // serializes hundreds of MiB only to discover that the entry cannot fit.
     // Use a delta whenever a validated previous image is available.
+    if metadata.integrity.hash_scheme == Some(journal::DELTA_INTEGRITY_SCHEME)
+        && delta_base.is_none()
+    {
+        return Err(ArgosError::IncompatibleFormat(
+            "raw delta integrity requires a validated previous image".to_string(),
+        ));
+    }
     let write_checkpoint = delta_base.is_none();
     let metadata_delta = if write_checkpoint {
         None
@@ -1408,6 +1483,32 @@ fn load_or_recover(
             "no valid raw metadata checkpoint or journal record found".to_string(),
         ));
     };
+    if !matches!(
+        metadata.integrity.hash_scheme,
+        None | Some(journal::DELTA_INTEGRITY_SCHEME)
+    ) {
+        return Err(ArgosError::IncompatibleFormat(
+            "unknown raw metadata integrity hash scheme".to_string(),
+        ));
+    }
+    // An integrity-v2 state can only be selected when a quorum of physical
+    // members has the required downgrade-prevention bit. Otherwise refuse to
+    // mount: older binaries would still accept the remaining v1 members.
+    if metadata.integrity.hash_scheme == Some(journal::DELTA_INTEGRITY_SCHEME) {
+        let upgraded = superblocks
+            .iter()
+            .filter(|sb| {
+                sb.required_feature_flags & REQUIRED_FEATURE_DELTA_INTEGRITY != 0
+                    && metadata_has_voting_member(&metadata, &sb.disk_id)
+            })
+            .count();
+        let need = metadata_quorum_requirement(&metadata);
+        if upgraded < need {
+            return Err(ArgosError::IncompatibleFormat(format!(
+                "raw delta integrity requires {need} upgraded members, found {upgraded}"
+            )));
+        }
+    }
     report.selected_metadata_source = "raw-metadata-or-journal".to_string();
     if checkpoint_replay && report.replayed {
         journal::inject_crash(FaultPoint::DuringReplay.as_str())?;
@@ -1963,6 +2064,14 @@ fn read_latest_journal_metadata(
                         continue;
                     }
                     let candidate = if let Some(metadata) = record.metadata {
+                        if metadata.integrity.hash_scheme == Some(journal::DELTA_INTEGRITY_SCHEME) {
+                            report.invalid_entries += 1;
+                            report.errors.push(format!(
+                                "raw journal {}:{} contains an unverified v2 full metadata snapshot",
+                                sb.disk_id, cursor
+                            ));
+                            break;
+                        }
                         let metadata_hash = journal::canonical_metadata_hash(&metadata)?;
                         if metadata_hash != record.meta_hash {
                             report.invalid_entries += 1;
@@ -2019,7 +2128,13 @@ fn read_latest_journal_metadata(
                         }
                         match journal::apply_metadata_delta(base, delta) {
                             Ok(metadata) => {
-                                let metadata_hash = journal::canonical_metadata_hash(&metadata)?;
+                                let metadata_hash = if metadata.integrity.hash_scheme
+                                    == Some(journal::DELTA_INTEGRITY_SCHEME)
+                                {
+                                    metadata.integrity.meta_hash.clone()
+                                } else {
+                                    journal::canonical_metadata_hash(&metadata)?
+                                };
                                 if metadata_hash != record.meta_hash {
                                     report.invalid_entries += 1;
                                     report.errors.push(format!(

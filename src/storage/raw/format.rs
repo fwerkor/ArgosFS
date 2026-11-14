@@ -31,7 +31,10 @@ pub const RAW_BLOCK_SIZE: u64 = 4096;
 pub const RAW_SUPER_MAGIC: &[u8; 16] = b"ARGOSFS-RAW-SB\0\0";
 pub const RAW_LABEL_MAGIC: &[u8; 16] = b"ARGOSFS-RAW-LB\0\0";
 pub const ENDIAN_MARKER: u32 = 0x1234_5678;
-const SUPPORTED_REQUIRED_FEATURE_FLAGS: u64 = 0;
+/// Persistent opt-in: old releases reject any member with this bit set.
+/// Only enable after every active member is fenced against legacy writers.
+pub const REQUIRED_FEATURE_DELTA_INTEGRITY: u64 = 1 << 0;
+const SUPPORTED_REQUIRED_FEATURE_FLAGS: u64 = REQUIRED_FEATURE_DELTA_INTEGRITY;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RawRegion {

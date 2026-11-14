@@ -1770,3 +1770,64 @@ fn journal_rollover_checkpoints_shared_state_and_recovers_after_reset() {
     assert_eq!(recovered.txid, next.txid);
     assert_eq!(recovered.raw_pool.pool_name, "rollover-shared-checkpoint");
 }
+
+#[test]
+fn delta_integrity_v2_journal_quorum_replays_without_checkpoint() {
+    let (_dir, images, previous, superblocks) = quorum_fixture();
+    let backend = block_backend_for(&images);
+    let upgraded = upgrade_delta_integrity_members(&backend, &superblocks, &previous).unwrap();
+    let mut next = previous.clone();
+    next.raw_pool.pool_name = "journal-delta-v2".to_string();
+    next.txid += 1;
+    next.updated_at += 1.0;
+    journal::prepare_delta_integrity(&mut next, &previous).unwrap();
+    append_transaction_with_trusted_integrity_quorum(
+        &backend,
+        &upgraded,
+        &next,
+        Some(&previous),
+        "v2-journal-quorum",
+        serde_json::json!({"previous_meta_hash": previous.integrity.meta_hash}),
+    )
+    .unwrap();
+    let (recovered, report) = load_or_recover(&backend, &upgraded, false).unwrap();
+    assert!(report.replayed);
+    assert_eq!(recovered.txid, next.txid);
+    assert_eq!(recovered.integrity.meta_hash, next.integrity.meta_hash);
+    assert_eq!(recovered.raw_pool.pool_name, "journal-delta-v2");
+    assert_eq!(report.invalid_entries, 0, "{:?}", report.errors);
+
+    // Without a quorum of downgrade-fencing feature flags, v2 metadata must
+    // never be selected for use (nor trusted as a crash-recovery base).
+    let error = load_or_recover(&backend, &superblocks, false).unwrap_err();
+    assert!(matches!(error, ArgosError::IncompatibleFormat(_)));
+}
+
+#[test]
+fn interrupted_integrity_feature_upgrade_is_retryable_without_v2_records() {
+    let (_dir, images, previous, superblocks) = quorum_fixture();
+    let failed = WriteFailBackend {
+        inner: block_backend_for(&images),
+        failed: BTreeSet::from(["disk-0002".to_string()]),
+    };
+    assert!(upgrade_delta_integrity_members(&failed, &superblocks, &previous).is_err());
+    drop(failed);
+    let backend = block_backend_for(&images);
+    // A half-finished feature upgrade does not alter the v1 checkpoint or
+    // journal, so no metadata changes are lost. Repeating finishes all copies.
+    assert_eq!(
+        recover_metadata(&backend, &superblocks).unwrap().txid,
+        previous.txid
+    );
+    let upgraded = upgrade_delta_integrity_members(&backend, &superblocks, &previous).unwrap();
+    for sb in &upgraded {
+        assert_ne!(
+            sb.required_feature_flags & REQUIRED_FEATURE_DELTA_INTEGRITY,
+            0
+        );
+    }
+    assert_eq!(
+        recover_metadata(&backend, &upgraded).unwrap().txid,
+        previous.txid
+    );
+}
