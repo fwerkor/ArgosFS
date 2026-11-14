@@ -1235,3 +1235,115 @@ fn v2_recovery_checkpoint_reanchors_normalized_metadata_before_next_delta() {
         assert_eq!(recovered.read_file(path, false).unwrap(), contents);
     }
 }
+
+#[test]
+fn v2_event_rollover_reanchors_deferred_hash_before_next_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|n| dir.path().join(format!("event-rollover-{n}.img")))
+        .collect::<Vec<_>>();
+    let mut fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            defer_metadata_commit: true,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "v2-event-rollover",
+        false,
+    )
+    .unwrap();
+    fs.upgrade_delta_integrity().unwrap();
+    fs.write_file("/base", b"base", 0o600).unwrap();
+    fs.sync().unwrap();
+    assert_eq!(
+        fs.metadata_snapshot().integrity.hash_scheme,
+        Some(journal::DELTA_INTEGRITY_SCHEME)
+    );
+    // >2 MiB entry forces raw journal rollover/checkpoint. The same-txid
+    // event checkpoint has a canonical digest rather than the old v2 digest.
+    {
+        let meta = fs.meta.read();
+        fs.journal_locked(
+            &meta,
+            "autopilot",
+            json!({"audit": "x".repeat(3 * 1024 * 1024)}),
+        )
+        .unwrap();
+    }
+    assert!(fs.deferred_commit.lock().raw_checkpoint_required);
+    fs.write_file("/after-event", b"acknowledged", 0o600)
+        .unwrap();
+    fs.sync().unwrap();
+    assert_eq!(fs.metadata_snapshot().integrity.hash_scheme, None);
+    fs.write_file("/v2-again", b"new-chain", 0o600).unwrap();
+    fs.sync().unwrap();
+    assert_eq!(
+        fs.metadata_snapshot().integrity.hash_scheme,
+        Some(journal::DELTA_INTEGRITY_SCHEME)
+    );
+    drop(fs);
+    let reopened = ArgosFs::open_loop(&images, false).unwrap();
+    assert_eq!(reopened.read_file("/base", false).unwrap(), b"base");
+    assert_eq!(
+        reopened.read_file("/after-event", false).unwrap(),
+        b"acknowledged"
+    );
+    assert_eq!(
+        reopened.read_file("/v2-again", false).unwrap(),
+        b"new-chain"
+    );
+    assert_eq!(reopened.transaction_report().unwrap().invalid_entries, 0);
+}
+
+#[test]
+fn v2_added_block_members_inherit_required_features_and_survive_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut images = (0..3)
+        .map(|n| dir.path().join(format!("grow-{n}.img")))
+        .collect::<Vec<_>>();
+    let mut fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            defer_metadata_commit: true,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "v2-grow",
+        false,
+    )
+    .unwrap();
+    fs.upgrade_delta_integrity().unwrap();
+    for n in 3..6 {
+        let next = dir.path().join(format!("grow-{n}.img"));
+        fs.add_block_device(next.clone(), 32 * 1024 * 1024, false)
+            .unwrap();
+        images.push(next);
+    }
+    fs.write_file("/grown", b"quorum with six upgraded members", 0o600)
+        .unwrap();
+    fs.sync().unwrap();
+    assert_eq!(
+        fs.metadata_snapshot().integrity.hash_scheme,
+        Some(journal::DELTA_INTEGRITY_SCHEME)
+    );
+    for path in &images {
+        let (sb, _) = raw_store::inspect_device(BackendKind::LoopBlock, path.clone()).unwrap();
+        assert_ne!(
+            sb.required_feature_flags & raw_format::REQUIRED_FEATURE_DELTA_INTEGRITY,
+            0
+        );
+    }
+    drop(fs);
+    let recovered = ArgosFs::open_loop(&images, false).unwrap();
+    assert_eq!(
+        recovered.read_file("/grown", false).unwrap(),
+        b"quorum with six upgraded members"
+    );
+}

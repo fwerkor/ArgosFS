@@ -179,7 +179,7 @@ impl ArgosFs {
         let pool_uuid = Uuid::parse_str(&meta.uuid)
             .map_err(|err| ArgosError::Invalid(format!("invalid pool UUID: {err}")))?;
         let layout = current_write_layout(&meta)?;
-        let sb = raw_store::superblock_for_device(
+        let mut sb = raw_store::superblock_for_device(
             pool_uuid,
             next,
             &id,
@@ -189,6 +189,14 @@ impl ArgosFs {
             info.capacity,
             &meta.raw_pool.pool_name,
         )?;
+        // A member joining an upgraded pool must reject older writers from
+        // its very first persistent superblock. This includes both backup
+        // and primary copies written by initialize_pool below.
+        if self.raw_superblocks.iter().any(|member| {
+            member.required_feature_flags & raw_format::REQUIRED_FEATURE_DELTA_INTEGRITY != 0
+        }) {
+            sb.required_feature_flags |= raw_format::REQUIRED_FEATURE_DELTA_INTEGRITY;
+        }
         let new_backend_with_id =
             FileBlockBackend::open_with_ids(kind, vec![(id.clone(), path.clone())], true)?;
         raw_store::preflight_devices_empty(&new_backend_with_id, std::slice::from_ref(&sb), force)?;

@@ -2096,11 +2096,21 @@ impl ArgosFs {
         {
             return Ok(false);
         }
+        // A pool can grow after mount. Never decide the integrity scheme from
+        // the superblocks cached at open: dynamically added voting members
+        // must also carry the mandatory downgrade-prevention feature.
+        let current_members = self.metadata_superblocks_locked(meta)?;
+        let active_members = meta
+            .disks
+            .values()
+            .filter(|disk| disk.status != DiskStatus::Removed)
+            .count();
         let incremental_integrity_enabled = state.dirty_transactions > 0
-            && self.raw_superblocks.iter().all(|sb| {
+            && current_members.len() == active_members
+            && active_members > 0
+            && current_members.iter().all(|sb| {
                 sb.required_feature_flags & raw_format::REQUIRED_FEATURE_DELTA_INTEGRITY != 0
-            })
-            && !self.raw_superblocks.is_empty();
+            });
         let checkpoint = checkpoint
             || state.raw_checkpoint_required
             || (state.raw_uncommitted_metadata_dirty && !incremental_integrity_enabled);
@@ -2458,6 +2468,17 @@ impl ArgosFs {
             return match result {
                 Ok(report) => {
                     self.apply_quorum_write_report(&journal_meta, report)?;
+                    // An event record may have rolled over to a *canonical*
+                    // checkpoint with the same txid as a v2 state. Until the
+                    // next canonical checkpoint completes, the cached v2
+                    // durable baseline is no longer a safe journal ancestor.
+                    // Conservatively re-anchor after *every* v2 event, so
+                    // even a non-rollover event cannot leave a divergent tip.
+                    if meta.integrity.hash_scheme == Some(journal::DELTA_INTEGRITY_SCHEME) {
+                        let mut state = self.deferred_commit.lock();
+                        state.raw_uncommitted_metadata_dirty = true;
+                        state.raw_checkpoint_required = true;
+                    }
                     Ok(())
                 }
                 Err(err) => {
