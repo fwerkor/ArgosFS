@@ -1301,3 +1301,69 @@ fn concurrent_read_rechecks_corrupt_shard_before_self_heal() {
     );
     assert!(!repaired_again);
 }
+#[test]
+fn deferred_durability_cache_tracks_changed_inodes_and_device_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|i| dir.path().join(format!("durability-cache-{i}.img")))
+        .collect::<Vec<_>>();
+    let fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            compression: Compression::None,
+            defer_metadata_commit: true,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "durability-cache",
+        false,
+    )
+    .unwrap();
+    fs.write_file("/one", &vec![1; 8192], 0o600).unwrap();
+    fs.write_file("/two", &vec![2; 8192], 0o600).unwrap();
+    fs.sync().unwrap();
+    let base = fs.metadata_snapshot();
+    let mut cache = None;
+    let unavailable = BTreeSet::new();
+    ArgosFs::validate_deferred_data_durability(&base, &unavailable, &mut cache).unwrap();
+    assert_eq!(cache.as_ref().unwrap().last_scanned_blocks, 2);
+
+    let mut changed = base.clone();
+    let one = changed.inodes[&1].entries["one"];
+    changed.inodes.get_mut(&one).unwrap().read_bytes += 1;
+    ArgosFs::validate_deferred_data_durability(&changed, &unavailable, &mut cache).unwrap();
+    assert_eq!(cache.as_ref().unwrap().last_scanned_blocks, 1);
+
+    // Disk availability changes invalidate the saved whole-namespace proof,
+    // even when the inode map and all shard descriptors are unchanged.
+    let one_device = changed.inodes[&one].blocks[0].shards[0].disk_id.clone();
+    let unavailable = BTreeSet::from([one_device]);
+    ArgosFs::validate_deferred_data_durability(&changed, &unavailable, &mut cache).unwrap();
+    assert_eq!(cache.as_ref().unwrap().last_scanned_blocks, 2);
+
+    // Layout parity changes must also invalidate the previously checked
+    // snapshot, even if no inode was dirtied since the last validation.
+    let mut reduced_parity = changed.clone();
+    for layout in reduced_parity.layouts.values_mut() {
+        layout.m = 0;
+    }
+    assert!(matches!(
+        ArgosFs::validate_deferred_data_durability(&reduced_parity, &unavailable, &mut cache),
+        Err(ArgosError::QuorumUnavailable { .. })
+    ));
+
+    // Altering the placement of a changed block must still reject loss of
+    // data quorum. A failed validation must not poison the good cache.
+    let mut corrupted = changed.clone();
+    let shards = &mut corrupted.inodes.get_mut(&one).unwrap().blocks[0].shards;
+    shards[0].disk_id = "missing-A".to_string();
+    shards[1].disk_id = "missing-B".to_string();
+    assert!(matches!(
+        ArgosFs::validate_deferred_data_durability(&corrupted, &unavailable, &mut cache),
+        Err(ArgosError::QuorumUnavailable { .. })
+    ));
+    assert_eq!(cache.as_ref().unwrap().last_scanned_blocks, 2);
+}
