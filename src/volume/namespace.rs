@@ -712,25 +712,34 @@ impl ArgosFs {
             .saturating_mul(stripe_raw_size)
             .min(new_size);
 
-        let mut window =
-            self.decode_inode_window_locked(&mut meta, ino, affected_start, affected_end)?;
-        if start > old_size && old_size > affected_start {
-            let gap_start = old_size - affected_start;
-            let gap_end = start - affected_start;
-            window[gap_start..gap_end].fill(0);
-        }
         if end > affected_end {
             return Err(ArgosError::Invalid(
                 "write affected window overflow".to_string(),
             ));
         }
+        // Only read the bytes that must survive this write. Fully covered
+        // stripes are replaced outright: decoding their old data (including
+        // Reed-Solomon reconstruction) is wasted work and can fail on a shard
+        // that is irrelevant to the replacement. Sparse gaps stay zero.
+        let mut window = zeroed_io_buffer(
+            affected_end.saturating_sub(affected_start),
+            "stripe rewrite window",
+        )?;
+        let prefix_end = start.min(old_size);
+        if prefix_end > affected_start {
+            let prefix =
+                self.decode_inode_window_locked(&mut meta, ino, affected_start, prefix_end)?;
+            window[..prefix.len()].copy_from_slice(&prefix);
+        }
+        let suffix_end = affected_end.min(old_size);
+        if suffix_end > end {
+            let suffix = self.decode_inode_window_locked(&mut meta, ino, end, suffix_end)?;
+            let offset = end - affected_start;
+            window[offset..offset + suffix.len()].copy_from_slice(&suffix);
+        }
         let local_start = start - affected_start;
         let local_end = local_start + data.len();
-        if local_end > window.len() {
-            window.resize(local_end, 0);
-        }
         window[local_start..local_end].copy_from_slice(data);
-        window.truncate(affected_end.saturating_sub(affected_start));
 
         self.rewrite_inode_window_locked(
             &mut meta,

@@ -1001,3 +1001,34 @@ fn statfs_returns_published_snapshot_during_metadata_write_lock() {
         "statfs blocked: {elapsed:?}"
     );
 }
+
+#[test]
+fn sequential_writeback_merges_four_mib_without_cross_inode_growth() {
+    let dir = tempfile::tempdir().unwrap();
+    let volume = ArgosFs::create(
+        dir.path(),
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            ..VolumeConfig::default()
+        },
+        1,
+        false,
+    )
+    .unwrap();
+    let fuse = ArgosFuse::new(volume);
+    let one_mib = vec![0x51; 1024 * 1024];
+    for i in 0..4 {
+        assert!(fuse.queue_writeback(17, i * one_mib.len() as u64, &one_mib));
+    }
+    let state = fuse.writeback.lock();
+    let extent = state.dirty.get(&17).unwrap();
+    assert_eq!(extent.offset, 0);
+    assert_eq!(extent.data.len(), 4 * 1024 * 1024);
+    assert!(extent.data.iter().all(|&b| b == 0x51));
+    drop(state);
+    assert!(!fuse.queue_writeback(17, 4 * one_mib.len() as u64, &one_mib));
+    assert!(fuse.queue_writeback(19, 0, &one_mib));
+    let state = fuse.writeback.lock();
+    assert_eq!(state.dirty.get(&19).unwrap().data.len(), 1024 * 1024);
+}
