@@ -61,7 +61,10 @@ fn mounts_dispatch_multiple_requests_with_independent_linux_fuse_channels() {
     let config = mount_config(vec![MountOption::CUSTOM("ro".to_string())]);
     #[cfg(target_os = "linux")]
     {
-        assert_eq!(config.n_threads, Some(FUSE_REQUEST_THREADS));
+        assert_eq!(
+            config.n_threads,
+            Some(fuse_thread_count("ARGOSFS_FUSE_REQUEST_THREADS", 2, 8))
+        );
         assert!(config.n_threads.unwrap() >= 2);
         assert!(config.clone_fd);
     }
