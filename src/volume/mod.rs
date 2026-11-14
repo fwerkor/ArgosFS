@@ -93,6 +93,7 @@ use namespace::*;
 #[derive(Clone, Debug)]
 struct DeferredCommitState {
     durable_metadata: Option<Arc<Metadata>>,
+    durability_cache: Option<DurabilityValidationCache>,
     raw_uncommitted_metadata_dirty: bool,
     // Recovery normalization requires a full one-time checkpoint before
     // establishing a trusted v2 delta baseline.
@@ -103,6 +104,20 @@ struct DeferredCommitState {
     last_error: Option<String>,
 }
 
+/// A checked data-durability image. Its copy-on-write inode baseline lets
+/// subsequent group commits inspect only modified inodes, provided the disk
+/// availability and layout definitions are unchanged. A changed condition
+/// forces a full validation, never a speculative fast path.
+#[derive(Clone, Debug)]
+struct DurabilityValidationCache {
+    inodes: crate::model::inodes::TrackedInodes,
+    disk_statuses: BTreeMap<String, DiskStatus>,
+    layouts: Vec<u8>,
+    unavailable: BTreeSet<String>,
+    #[cfg(test)]
+    last_scanned_blocks: usize,
+}
+
 impl DeferredCommitState {
     fn new(meta: &Metadata) -> Self {
         Self::new_with_raw_dirty(meta, false)
@@ -111,6 +126,7 @@ impl DeferredCommitState {
     fn new_with_raw_dirty(meta: &Metadata, raw_uncommitted_metadata_dirty: bool) -> Self {
         Self {
             durable_metadata: (meta.backend != BackendKind::Host).then(|| Arc::new(meta.clone())),
+            durability_cache: None,
             raw_uncommitted_metadata_dirty,
             raw_checkpoint_required: raw_uncommitted_metadata_dirty,
             dirty_transactions: 0,
@@ -2010,6 +2026,7 @@ impl ArgosFs {
         meta: &Metadata,
         backend: &dyn StorageBackend,
         superblocks: &[RawSuperblock],
+        durability_cache: &mut Option<DurabilityValidationCache>,
     ) -> Result<()> {
         let mut unavailable = self.quarantined_devices.lock().clone();
         for sb in superblocks {
@@ -2025,7 +2042,55 @@ impl ArgosFs {
             self.quarantine_device(disk_id);
         }
 
-        self.validate_data_durability_locked(meta, &unavailable)
+        Self::validate_deferred_data_durability(meta, &unavailable, durability_cache)
+    }
+
+    fn validate_deferred_data_durability(
+        meta: &Metadata,
+        unavailable: &BTreeSet<String>,
+        cache: &mut Option<DurabilityValidationCache>,
+    ) -> Result<()> {
+        let disk_statuses = meta
+            .disks
+            .iter()
+            .map(|(disk_id, disk)| (disk_id.clone(), disk.status))
+            .collect::<BTreeMap<_, _>>();
+        let layouts = serde_json::to_vec(&meta.layouts)?;
+        let can_reuse = cache.as_ref().is_some_and(|previous| {
+            previous.unavailable == *unavailable
+                && previous.disk_statuses == disk_statuses
+                && previous.layouts == layouts
+        });
+        let checked = if can_reuse {
+            let changed = meta
+                .inodes
+                .changed_candidates(&cache.as_ref().expect("validated cache exists").inodes);
+            Self::validate_data_durability_blocks(
+                meta,
+                unavailable,
+                changed
+                    .iter()
+                    .filter_map(|ino| meta.inodes.get(ino))
+                    .flat_map(|inode| inode.blocks.iter()),
+            )?
+        } else {
+            Self::validate_data_durability_blocks(
+                meta,
+                unavailable,
+                meta.inodes.values().flat_map(|inode| inode.blocks.iter()),
+            )?
+        };
+        *cache = Some(DurabilityValidationCache {
+            inodes: meta.inodes.clone(),
+            disk_statuses,
+            layouts,
+            unavailable: unavailable.clone(),
+            #[cfg(test)]
+            last_scanned_blocks: checked,
+        });
+        #[cfg(not(test))]
+        let _ = checked;
+        Ok(())
     }
 
     fn validate_data_durability_locked(
@@ -2040,7 +2105,22 @@ impl ArgosFs {
         meta: &Metadata,
         unavailable: &BTreeSet<String>,
     ) -> Result<()> {
-        for block in meta.inodes.values().flat_map(|inode| inode.blocks.iter()) {
+        Self::validate_data_durability_blocks(
+            meta,
+            unavailable,
+            meta.inodes.values().flat_map(|inode| inode.blocks.iter()),
+        )
+        .map(|_| ())
+    }
+
+    fn validate_data_durability_blocks<'a>(
+        meta: &Metadata,
+        unavailable: &BTreeSet<String>,
+        blocks: impl Iterator<Item = &'a FileBlock>,
+    ) -> Result<usize> {
+        let mut checked = 0;
+        for block in blocks {
+            checked += 1;
             let layout = layout_by_id(meta, block_layout_id(block))?;
             let missing = block
                 .shards
@@ -2064,7 +2144,7 @@ impl ArgosFs {
                 });
             }
         }
-        Ok(())
+        Ok(checked)
     }
 
     fn note_deferred_transaction_locked(&self, meta: &mut Metadata) -> Result<()> {
@@ -2146,31 +2226,44 @@ impl ArgosFs {
             }
             let superblocks = self.metadata_superblocks_locked(meta)?;
             let unavailable = self.quarantined_devices.lock().clone();
-            self.validate_data_durability_locked(meta, &unavailable)?;
-            let commit = |backend: &dyn StorageBackend| -> Result<raw_store::QuorumWriteReport> {
-                if dirty_transactions > 0 && (meta.config.defer_data_flush || bulk_import_enabled())
-                {
-                    self.flush_deferred_data_locked(meta, backend, &superblocks)?;
-                    journal::inject_crash(FaultPoint::AfterDataFlushBeforeJournalCommit.as_str())?;
-                }
-                if checkpoint {
-                    raw_store::write_metadata_copies_quorum(backend, &superblocks, meta)
-                } else {
-                    raw_store::append_transaction_with_trusted_integrity_quorum(
-                        backend,
-                        &superblocks,
-                        meta,
-                        Some(&previous),
-                        "group-commit",
-                        json!({
-                            "transactions": dirty_transactions,
-                            "previous_txid": previous.txid,
-                            "previous_meta_hash": previous_meta_hash,
-                            "txid": meta.txid,
-                        }),
-                    )
-                }
-            };
+            Self::validate_deferred_data_durability(
+                meta,
+                &unavailable,
+                &mut state.durability_cache,
+            )?;
+            let mut commit =
+                |backend: &dyn StorageBackend| -> Result<raw_store::QuorumWriteReport> {
+                    if dirty_transactions > 0
+                        && (meta.config.defer_data_flush || bulk_import_enabled())
+                    {
+                        self.flush_deferred_data_locked(
+                            meta,
+                            backend,
+                            &superblocks,
+                            &mut state.durability_cache,
+                        )?;
+                        journal::inject_crash(
+                            FaultPoint::AfterDataFlushBeforeJournalCommit.as_str(),
+                        )?;
+                    }
+                    if checkpoint {
+                        raw_store::write_metadata_copies_quorum(backend, &superblocks, meta)
+                    } else {
+                        raw_store::append_transaction_with_trusted_integrity_quorum(
+                            backend,
+                            &superblocks,
+                            meta,
+                            Some(&previous),
+                            "group-commit",
+                            json!({
+                                "transactions": dirty_transactions,
+                                "previous_txid": previous.txid,
+                                "previous_meta_hash": previous_meta_hash,
+                                "txid": meta.txid,
+                            }),
+                        )
+                    }
+                };
             if self.open_backend_covers_superblocks(&superblocks) {
                 commit(&*self.backend)
             } else {
@@ -2183,6 +2276,10 @@ impl ArgosFs {
             Ok(report) => {
                 let durability = self.apply_quorum_write_report(meta, report);
                 meta.inodes.mark_committed();
+                if let Some(cache) = &mut state.durability_cache {
+                    // Reset the tracked baseline with the committed inode map.
+                    cache.inodes = meta.inodes.clone();
+                }
                 drop(before_commit);
                 // The former durable Arc is no longer required after a durable commit.
                 state.durable_metadata = None;
@@ -2206,6 +2303,10 @@ impl ArgosFs {
             }
             Err(err) if Self::transaction_error_is_committed(&err) => {
                 meta.inodes.mark_committed();
+                if let Some(cache) = &mut state.durability_cache {
+                    // Reset the tracked baseline with the committed inode map.
+                    cache.inodes = meta.inodes.clone();
+                }
                 drop(before_commit);
                 state.durable_metadata = None;
                 drop(previous);
