@@ -84,7 +84,7 @@ pub fn metadata_from(data: &[u8], salt: usize) -> Metadata {
         encryption: Default::default(),
         integrity: MetadataIntegrity::default(),
         disks: BTreeMap::new(),
-        inodes: BTreeMap::new(),
+        inodes: Default::default(),
     }
 }
 
