@@ -1831,3 +1831,93 @@ fn interrupted_integrity_feature_upgrade_is_retryable_without_v2_records() {
         previous.txid
     );
 }
+
+#[test]
+fn v2_journal_wire_roundtrip_preserves_signed_zero_and_float_hashes() {
+    let (_dir, images, previous, superblocks) = quorum_fixture();
+    let backend = block_backend_for(&images);
+    let upgraded = upgrade_delta_integrity_members(&backend, &superblocks, &previous).unwrap();
+    let mut next = previous.clone();
+    next.txid += 1;
+    next.updated_at = 1.2345678901234567e19;
+    let ino = next.inodes.keys().copied().find(|id| *id != 1).unwrap();
+    let inode = next.inodes.get_mut(&ino).unwrap();
+    inode.mtime = -0.0;
+    inode.ctime = 1e-10;
+    inode.last_accessed_at = -1e19;
+    next.disks.values_mut().next().unwrap().read_latency_ewma_ms = 1.0 / 3.0;
+    journal::prepare_delta_integrity(&mut next, &previous).unwrap();
+    append_transaction_with_trusted_integrity_quorum(
+        &backend,
+        &upgraded,
+        &next,
+        Some(&previous),
+        "v2-float-wire",
+        serde_json::json!({"previous_meta_hash": previous.integrity.meta_hash}),
+    )
+    .unwrap();
+    let recovered = recover_metadata(&backend, &upgraded).unwrap();
+    assert_eq!(recovered.integrity.meta_hash, next.integrity.meta_hash);
+    assert_eq!(recovered.inodes[&ino].mtime.to_bits(), (-0.0f64).to_bits());
+    assert_eq!(recovered.inodes[&ino].ctime, next.inodes[&ino].ctime);
+    assert_eq!(
+        recovered.inodes[&ino].last_accessed_at,
+        next.inodes[&ino].last_accessed_at
+    );
+}
+
+#[test]
+fn v2_partial_fanout_crash_does_not_commit_unacknowledged_delta() {
+    let (_dir, images, previous, superblocks) = quorum_fixture();
+    let backend = block_backend_for(&images);
+    let upgraded = upgrade_delta_integrity_members(&backend, &superblocks, &previous).unwrap();
+    let mut next = previous.clone();
+    next.txid += 1;
+    next.updated_at += 1.0;
+    next.raw_pool.pool_name = "v2-orphan".to_string();
+    journal::prepare_delta_integrity(&mut next, &previous).unwrap();
+    let guard = journal::thread_crash_point(FaultPoint::AfterPartialJournalFanout.as_str());
+    let err = append_transaction_with_trusted_integrity_quorum(
+        &backend,
+        &upgraded,
+        &next,
+        Some(&previous),
+        "v2-partial-crash",
+        serde_json::json!({}),
+    )
+    .unwrap_err();
+    drop(guard);
+    assert!(matches!(err, ArgosError::InjectedCrash(_)));
+    let recovered = recover_metadata(&backend, &upgraded).unwrap();
+    assert_eq!(recovered.txid, previous.txid);
+    assert_ne!(recovered.raw_pool.pool_name, "v2-orphan");
+}
+
+#[test]
+fn v2_crash_after_quorum_commit_recovers_authenticated_delta() {
+    let (_dir, images, previous, superblocks) = quorum_fixture();
+    let backend = block_backend_for(&images);
+    let upgraded = upgrade_delta_integrity_members(&backend, &superblocks, &previous).unwrap();
+    let mut next = previous.clone();
+    next.txid += 1;
+    next.updated_at += 1.0;
+    next.raw_pool.pool_name = "v2-committed".to_string();
+    journal::prepare_delta_integrity(&mut next, &previous).unwrap();
+    let guard =
+        journal::thread_crash_point(FaultPoint::AfterJournalCommitBeforeMetadataCommit.as_str());
+    let err = append_transaction_with_trusted_integrity_quorum(
+        &backend,
+        &upgraded,
+        &next,
+        Some(&previous),
+        "v2-committed-crash",
+        serde_json::json!({}),
+    )
+    .unwrap_err();
+    drop(guard);
+    assert!(matches!(err, ArgosError::InjectedCrash(_)));
+    let recovered = recover_metadata(&backend, &upgraded).unwrap();
+    assert_eq!(recovered.txid, next.txid);
+    assert_eq!(recovered.integrity.meta_hash, next.integrity.meta_hash);
+    assert_eq!(recovered.raw_pool.pool_name, "v2-committed");
+}
