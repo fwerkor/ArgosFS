@@ -1231,6 +1231,42 @@ fn concurrent_readers_share_metadata_guard_and_merge_telemetry() {
     );
 }
 
+#[test]
+fn read_decoder_snapshot_excludes_allocator_and_dirty_inode_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = dir.path().join("snapshot.img");
+    let fs = ArgosFs::create_loop(
+        std::slice::from_ref(&image),
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            chunk_size: 4096,
+            compression: Compression::None,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "read-snapshot",
+        false,
+    )
+    .unwrap();
+    fs.write_file("/data", &[0x41; 8192], 0o600).unwrap();
+    let ino = fs.resolve_path("/data", true).unwrap();
+    let live = fs.meta.read();
+    assert!(!live.raw_pool.allocators.is_empty());
+    assert!(!live.inodes.is_empty());
+    let decoder = ArgosFs::read_decoder_metadata(&live);
+    assert!(decoder.raw_pool.allocators.is_empty());
+    assert!(decoder.inodes.is_empty());
+    assert_eq!(decoder.uuid, live.uuid);
+    assert_eq!(decoder.disks.len(), live.disks.len());
+    assert_eq!(decoder.layouts.len(), live.layouts.len());
+    drop(live);
+    assert_eq!(
+        fs.read_inode(ino, 0, 8192, false).unwrap(),
+        vec![0x41; 8192]
+    );
+}
+
 /// Freeze scrub after it starts decoding its first physical stripe, so a
 /// concurrent read can cache a reconstructed *later* stripe before scrub
 /// reaches it. Scrub must still discover the later stripe's damage.

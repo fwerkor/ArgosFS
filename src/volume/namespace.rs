@@ -433,11 +433,12 @@ impl ArgosFs {
         repair: bool,
         repair_offline: bool,
     ) -> Result<(Vec<u8>, Vec<String>, bool)> {
-        // Hold the shared metadata guard for the entire physical read, so
-        // concurrent writers cannot reclaim in-flight shard extents.
+        // Keep the shared guard across all physical I/O so writers cannot
+        // reclaim any of the decoded extents. The decoder only needs inode
+        // geometry, layout, disk state and configuration: do not clone the
+        // pool allocator's free lists or the pending inode dirty set.
         let guard = self.meta.read();
-        let mut snapshot = guard.clone();
-        let inode = snapshot
+        let inode = guard
             .inodes
             .get(&ino)
             .ok_or_else(|| ArgosError::NotFound(format!("inode {ino}")))?
@@ -462,6 +463,7 @@ impl ArgosFs {
             .map_err(|_| ArgosError::Invalid("inode logical size is too large".to_string()))?;
         let start = offset.min(logical_size as u64) as usize;
         let end = start.saturating_add(size).min(logical_size);
+        let mut snapshot = Self::read_decoder_metadata(&guard);
         let cache_policy = if repair_offline {
             BlockCachePolicy::Bypass
         } else {
@@ -531,6 +533,32 @@ impl ArgosFs {
             );
         }
         decoded.map(|(data, damaged)| (data, damaged, false))
+    }
+
+    /// Minimal metadata for the legacy mutable decoder. Only fields consulted
+    /// by shard reads are populated; the allocator and inode map are *never*
+    /// accessed by decoding. This stays bounded independently of filesystem
+    /// fragmentation and the number of pending inode changes.
+    pub(super) fn read_decoder_metadata(meta: &Metadata) -> Metadata {
+        Metadata {
+            format: meta.format.clone(),
+            uuid: meta.uuid.clone(),
+            backend: meta.backend,
+            raw_pool: RawPoolMetadata::default(),
+            created_at: meta.created_at,
+            updated_at: meta.updated_at,
+            txid: meta.txid,
+            next_inode: meta.next_inode,
+            next_stripe: meta.next_stripe,
+            config: meta.config.clone(),
+            layouts: meta.layouts.clone(),
+            current_write_layout: meta.current_write_layout.clone(),
+            reshape: None,
+            encryption: meta.encryption.clone(),
+            integrity: MetadataIntegrity::default(),
+            disks: meta.disks.clone(),
+            inodes: Default::default(),
+        }
     }
 
     fn read_inode_with_damage_report_policy_exclusive(
