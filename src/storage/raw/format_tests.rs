@@ -37,7 +37,10 @@ fn superblock_rejects_unknown_required_features_and_overlapping_regions() {
         "capos-root".to_string(),
     )
     .unwrap();
-    sb.required_feature_flags = 1;
+    sb.required_feature_flags = REQUIRED_FEATURE_DELTA_INTEGRITY;
+    assert_eq!(RawSuperblock::decode(&sb.encode()).unwrap(), sb);
+    // Any future required bit remains fail-closed until explicitly supported.
+    sb.required_feature_flags = 1 << 1;
     assert!(matches!(
         RawSuperblock::decode(&sb.encode()).unwrap_err(),
         ArgosError::IncompatibleFormat(_)

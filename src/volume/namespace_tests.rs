@@ -21,6 +21,49 @@ fn volume() -> (tempfile::TempDir, ArgosFs) {
     (dir, fs)
 }
 
+fn redundant_volume() -> (tempfile::TempDir, ArgosFs) {
+    let dir = tempdir().unwrap();
+    let fs = ArgosFs::create(
+        dir.path(),
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            compression: Compression::None,
+            chunk_size: 4096,
+            ..VolumeConfig::default()
+        },
+        4,
+        false,
+    )
+    .unwrap();
+    (dir, fs)
+}
+
+#[test]
+fn read_does_not_self_heal_a_file_when_only_a_member_is_unavailable() {
+    let (_dir, fs) = redundant_volume();
+    fs.write_file("/file", &vec![3u8; 8192], 0o600).unwrap();
+    let (disk_id, relpath) = {
+        let ino = fs.resolve_path("/file", true).unwrap();
+        let meta = fs.metadata_snapshot();
+        let shard = &meta.inodes[&ino].blocks[0].shards[0];
+        (shard.disk_id.clone(), shard.relpath.clone())
+    };
+    let shard_path = fs.shard_path_locked(&fs.metadata_snapshot(), &disk_id, &relpath);
+    fs.mark_disk(&disk_id, DiskStatus::Offline).unwrap();
+    std::fs::remove_file(shard_path).unwrap();
+    let txid_before = fs.metadata_snapshot().txid;
+
+    let data = fs.read_file("/file", true).unwrap();
+
+    assert_eq!(data, vec![3u8; 8192]);
+    assert_eq!(
+        fs.metadata_snapshot().txid,
+        txid_before,
+        "reading a recoverable file must not rewrite it for an offline member"
+    );
+}
+
 #[test]
 fn entry_names_round_trip_utf8_reserved_prefixes_and_non_utf8_bytes() {
     for invalid in ["", ".", "..", "a/b", "a\0b"] {
@@ -607,4 +650,68 @@ fn symlinks_do_not_consume_regular_file_quota() {
     fs.set_directory_quota("/q", 0).unwrap();
     fs.symlink_path("a/long/symlink/target", "/q/link").unwrap();
     assert_eq!(fs.directory_quota("/q").unwrap(), (Some(0), 0));
+}
+
+#[test]
+fn complete_stripe_replacement_never_reads_corrupt_old_shards() {
+    let dir = tempdir().unwrap();
+    let image = dir.path().join("overwrite-corrupt.img");
+    let fs = ArgosFs::create_loop(
+        std::slice::from_ref(&image),
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            chunk_size: 4096,
+            compression: Compression::None,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "overwrite-corrupt",
+        false,
+    )
+    .unwrap();
+    let mut expected = (0..16 * 1024).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+    fs.write_file("/file", &expected, 0o600).unwrap();
+    fs.sync().unwrap();
+    let ino = fs.resolve_path("/file", true).unwrap();
+    let meta = fs.metadata_snapshot();
+    let block = meta.inodes[&ino]
+        .blocks
+        .iter()
+        .find(|block| block.raw_offset == 4096)
+        .expect("second stripe exists");
+    let extent = match block.shards[0].location.as_ref().unwrap() {
+        ShardLocation::RawExtent(extent) => extent,
+        _ => panic!("raw extent required"),
+    };
+    fs.cache.remove(&format!(
+        "{}:{}:{}",
+        meta.uuid, block.stripe_id, block.raw_sha256
+    ));
+    let image_file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&image)
+        .unwrap();
+    std::os::unix::fs::FileExt::write_at(&image_file, &[0xFF; 128], extent.offset).unwrap();
+    image_file.sync_all().unwrap();
+
+    // A full overwrite does not depend on the former stripe, even if its
+    // checksum is now invalid. The unaffected neighboring stripes survive.
+    let replacement = vec![0xA5; 8192];
+    fs.write_inode_range(ino, 4096, &replacement).unwrap();
+    expected[4096..12288].copy_from_slice(&replacement);
+    assert_eq!(fs.read_file("/file", false).unwrap(), expected);
+}
+
+#[test]
+fn partial_stripe_replacement_preserves_both_boundary_fragments() {
+    let (_dir, fs) = volume();
+    let mut expected = (0..24 * 1024).map(|i| (i % 199) as u8).collect::<Vec<_>>();
+    fs.write_file("/long", &expected, 0o600).unwrap();
+    let ino = fs.resolve_path("/long", true).unwrap();
+    let offset = 4096 + 137;
+    let payload = vec![0xAA; 3 * 4096 + 1049];
+    fs.write_inode_range(ino, offset as u64, &payload).unwrap();
+    expected[offset..offset + payload.len()].copy_from_slice(&payload);
+    assert_eq!(fs.read_file("/long", false).unwrap(), expected);
 }

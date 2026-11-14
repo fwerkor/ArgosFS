@@ -198,12 +198,17 @@ fn path_iteration_and_file_windows_cover_nested_non_utf8_and_cursor_wrap() {
     assert!(fs.file_window(None, 0).is_empty());
     let all = fs.file_window(None, usize::MAX);
     assert_eq!(all.len(), 4);
+    assert!(all.windows(2).all(|pair| pair[0].0 < pair[1].0));
     let first = fs.file_window(None, 2);
     assert_eq!(first.len(), 2);
+    assert_eq!(first[0].0, all[0].0);
     let after = fs.file_window(Some(first[1].0), 2);
-    assert!(!after.is_empty());
+    assert_eq!(after[0].0, all[2].0);
     let wrapped = fs.file_window(Some(u64::MAX), 2);
-    assert_eq!(wrapped.len(), 2);
+    assert_eq!(
+        wrapped.iter().map(|(ino, _)| *ino).collect::<Vec<_>>(),
+        first.iter().map(|(ino, _)| *ino).collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -278,7 +283,7 @@ fn inode_helpers_touch_allocate_paths_and_attributes() {
     let (_dir, fs) = host_volume();
     let mut meta = fs.meta.write();
     let next = meta.next_inode;
-    assert_eq!(fs.alloc_inode_locked(&mut meta), next);
+    assert_eq!(fs.alloc_inode_locked(&mut meta).unwrap(), next);
     assert_eq!(meta.next_inode, next + 1);
     let before = meta.inodes[&ROOT_INO].clone();
     fs.touch_inode_locked(&mut meta, ROOT_INO, true, false);
@@ -896,6 +901,68 @@ fn volume_constructors_validate_layouts_force_recreation_and_backend_kinds() {
 }
 
 #[test]
+fn loop_pool_tracks_absence_across_reopens_and_clears_grace_on_return() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..4)
+        .map(|index| dir.path().join(format!("rejoin-{index}.img")))
+        .collect::<Vec<_>>();
+    let fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            compression: Compression::None,
+            chunk_size: 4096,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "rejoin",
+        false,
+    )
+    .unwrap();
+    let data = vec![8u8; 8192];
+    fs.write_file("/file", &data, 0o600).unwrap();
+    let ino = fs.resolve_path("/file", true).unwrap();
+    let missing_id = fs.metadata_snapshot().inodes[&ino].blocks[0].shards[0]
+        .disk_id
+        .clone();
+    fs.mark_clean_unmount().unwrap();
+    drop(fs);
+
+    let present_images = images
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| format!("disk-{index:04}") != missing_id)
+        .map(|(_, path)| path.clone())
+        .collect::<Vec<_>>();
+    let first = ArgosFs::open_loop(&present_images, true).unwrap();
+    let absent = &first.metadata_snapshot().disks[&missing_id];
+    assert_eq!(absent.status, DiskStatus::Offline);
+    assert!(!absent.manually_offline);
+    let offline_since = absent
+        .offline_since
+        .expect("offline scan records first absence");
+    assert_eq!(first.read_file("/file", false).unwrap(), data);
+    first.mark_clean_unmount().unwrap();
+    drop(first);
+
+    let second = ArgosFs::open_loop(&present_images, true).unwrap();
+    let absent = &second.metadata_snapshot().disks[&missing_id];
+    let persisted_offline_since = absent
+        .offline_since
+        .expect("offline grace persists across reopen");
+    assert!((persisted_offline_since - offline_since).abs() < 1e-6);
+    second.mark_clean_unmount().unwrap();
+    drop(second);
+
+    let restored = ArgosFs::open_loop(&images, true).unwrap();
+    let returned = &restored.metadata_snapshot().disks[&missing_id];
+    assert_eq!(returned.status, DiskStatus::Online);
+    assert_eq!(returned.offline_since, None);
+    assert_eq!(restored.read_file("/file", false).unwrap(), data);
+}
+
+#[test]
 fn mknod_validates_rdev_types_inheritance_and_duplicates() {
     let (_dir, fs) = host_volume();
     assert!(matches!(
@@ -1042,4 +1109,740 @@ fn quota_rejected_rename_does_not_stage_deferred_reclaims() {
     assert!(fs.deferred_commit.lock().pending_reclaims.is_empty());
     assert_eq!(fs.read_file("/q/existing", false).unwrap(), vec![b'd'; 600]);
     assert_eq!(fs.read_file("/src/file", false).unwrap(), vec![b's'; 800]);
+}
+
+struct OverlapProbeBackend {
+    inner: Arc<dyn StorageBackend>,
+    data_offset: u64,
+    active: AtomicUsize,
+    max_active: AtomicUsize,
+}
+
+impl StorageBackend for OverlapProbeBackend {
+    fn backend_kind(&self) -> BackendKind {
+        self.inner.backend_kind()
+    }
+    fn list_devices(&self) -> Result<Vec<crate::backend::BackendDeviceInfo>> {
+        self.inner.list_devices()
+    }
+    fn read_at(&self, device_id: &String, offset: u64, buf: &mut [u8]) -> Result<()> {
+        if offset != self.data_offset {
+            return self.inner.read_at(device_id, offset, buf);
+        }
+        let n = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_active.fetch_max(n, Ordering::SeqCst);
+        // Long enough for a second reader to reach the backend, with a
+        // bounded duration if an exclusive metadata lock serializes them.
+        std::thread::sleep(Duration::from_millis(250));
+        let result = self.inner.read_at(device_id, offset, buf);
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        result
+    }
+    fn write_at(&self, device_id: &String, offset: u64, data: &[u8]) -> Result<()> {
+        self.inner.write_at(device_id, offset, data)
+    }
+    fn flush_device(&self, device_id: &String) -> Result<()> {
+        self.inner.flush_device(device_id)
+    }
+    fn flush_all(&self) -> Result<()> {
+        self.inner.flush_all()
+    }
+    fn drop_cache(&self, device_id: &String, offset: u64, length: u64) -> Result<()> {
+        self.inner.drop_cache(device_id, offset, length)
+    }
+    fn capacity(&self, device_id: &String) -> Result<u64> {
+        self.inner.capacity(device_id)
+    }
+    fn device_status(&self, device_id: &String) -> Result<DiskStatus> {
+        self.inner.device_status(device_id)
+    }
+    fn capabilities(&self) -> crate::backend::BackendCapabilities {
+        self.inner.capabilities()
+    }
+}
+
+#[test]
+fn concurrent_readers_share_metadata_guard_and_merge_telemetry() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = dir.path().join("parallel-read.img");
+    let mut fs = ArgosFs::create_loop(
+        std::slice::from_ref(&image),
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            chunk_size: 4096,
+            compression: Compression::None,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "parallel-read",
+        false,
+    )
+    .unwrap();
+    let payload = vec![0x59u8; 8192];
+    fs.write_file("/data", &payload, 0o600).unwrap();
+    fs.sync().unwrap();
+    let ino = fs.resolve_path("/data", true).unwrap();
+    let original = fs.metadata_snapshot();
+    let block = &original.inodes[&ino].blocks[0];
+    let offset = match block.shards[0].location.as_ref().unwrap() {
+        ShardLocation::RawExtent(extent) => extent.offset,
+        _ => panic!("expected raw extent"),
+    };
+    fs.cache.remove(&format!(
+        "{}:{}:{}",
+        original.uuid, block.stripe_id, block.raw_sha256
+    ));
+    let backend = Arc::new(OverlapProbeBackend {
+        inner: fs.backend.clone(),
+        data_offset: offset,
+        active: AtomicUsize::new(0),
+        max_active: AtomicUsize::new(0),
+    });
+    fs.backend = backend.clone();
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let handles: Vec<_> = (0..2)
+        .map(|_| {
+            let fs = fs.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                fs.read_inode(ino, 0, 8192, true).unwrap()
+            })
+        })
+        .collect();
+    barrier.wait();
+    for handle in handles {
+        assert_eq!(handle.join().unwrap(), payload);
+    }
+    assert_eq!(
+        backend.max_active.load(Ordering::SeqCst),
+        2,
+        "parallel read requests must reach the raw backend concurrently"
+    );
+    let latest = fs.metadata_snapshot();
+    assert_eq!(
+        latest.inodes[&ino].read_bytes,
+        original.inodes[&ino].read_bytes + 2 * 8192
+    );
+    assert!(
+        latest.disks.values().next().unwrap().io_samples
+            >= original.disks.values().next().unwrap().io_samples + 2
+    );
+}
+
+#[test]
+fn read_decoder_snapshot_excludes_allocator_and_dirty_inode_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = dir.path().join("snapshot.img");
+    let fs = ArgosFs::create_loop(
+        std::slice::from_ref(&image),
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            chunk_size: 4096,
+            compression: Compression::None,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "read-snapshot",
+        false,
+    )
+    .unwrap();
+    fs.write_file("/data", &[0x41; 8192], 0o600).unwrap();
+    let ino = fs.resolve_path("/data", true).unwrap();
+    let live = fs.meta.read();
+    assert!(!live.raw_pool.allocators.is_empty());
+    assert!(!live.inodes.is_empty());
+    let decoder = ArgosFs::read_decoder_metadata(&live);
+    assert!(decoder.raw_pool.allocators.is_empty());
+    assert!(decoder.inodes.is_empty());
+    assert_eq!(decoder.uuid, live.uuid);
+    assert_eq!(decoder.disks.len(), live.disks.len());
+    assert_eq!(decoder.layouts.len(), live.layouts.len());
+    drop(live);
+    assert_eq!(
+        fs.read_inode(ino, 0, 8192, false).unwrap(),
+        vec![0x41; 8192]
+    );
+}
+
+/// Freeze scrub after it starts decoding its first physical stripe, so a
+/// concurrent read can cache a reconstructed *later* stripe before scrub
+/// reaches it. Scrub must still discover the later stripe's damage.
+struct ScrubPauseBackend {
+    inner: Arc<dyn StorageBackend>,
+    pause_offset: u64,
+    pause_once: std::sync::atomic::AtomicBool,
+    paused: std::sync::mpsc::Sender<()>,
+    resume: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl StorageBackend for ScrubPauseBackend {
+    fn backend_kind(&self) -> BackendKind {
+        self.inner.backend_kind()
+    }
+    fn list_devices(&self) -> Result<Vec<crate::backend::BackendDeviceInfo>> {
+        self.inner.list_devices()
+    }
+    fn read_at(&self, device_id: &String, offset: u64, buf: &mut [u8]) -> Result<()> {
+        if offset == self.pause_offset && self.pause_once.swap(false, Ordering::SeqCst) {
+            self.paused.send(()).unwrap();
+            self.resume.lock().unwrap().recv().unwrap();
+        }
+        self.inner.read_at(device_id, offset, buf)
+    }
+    fn write_at(&self, device_id: &String, offset: u64, data: &[u8]) -> Result<()> {
+        self.inner.write_at(device_id, offset, data)
+    }
+    fn flush_device(&self, device_id: &String) -> Result<()> {
+        self.inner.flush_device(device_id)
+    }
+    fn flush_all(&self) -> Result<()> {
+        self.inner.flush_all()
+    }
+    fn drop_cache(&self, device_id: &String, offset: u64, length: u64) -> Result<()> {
+        self.inner.drop_cache(device_id, offset, length)
+    }
+    fn capacity(&self, device_id: &String) -> Result<u64> {
+        self.inner.capacity(device_id)
+    }
+    fn device_status(&self, device_id: &String) -> Result<DiskStatus> {
+        self.inner.device_status(device_id)
+    }
+    fn capabilities(&self) -> crate::backend::BackendCapabilities {
+        self.inner.capabilities()
+    }
+}
+
+#[test]
+fn scrub_checks_physical_shards_despite_concurrent_reconstruction_cache_insert() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|i| dir.path().join(format!("scrub-race-{i}.img")))
+        .collect::<Vec<_>>();
+    let mut fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            compression: Compression::None,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "scrub-cache-race",
+        false,
+    )
+    .unwrap();
+    let payload = (0..64 * 1024).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+    fs.write_file("/data", &payload, 0o600).unwrap();
+    fs.sync().unwrap();
+    let ino = fs.resolve_path("/data", true).unwrap();
+    let meta = fs.metadata_snapshot();
+    let blocks = &meta.inodes[&ino].blocks;
+    assert!(blocks.len() >= 2);
+    let first_extent = match blocks[0].shards[0].location.as_ref().unwrap() {
+        ShardLocation::RawExtent(extent) => extent,
+        _ => panic!("expected raw extent"),
+    };
+    let corrupt = &blocks[1];
+    let corrupt_shard = &corrupt.shards[0];
+    let damaged_extent = match corrupt_shard.location.as_ref().unwrap() {
+        ShardLocation::RawExtent(extent) => extent,
+        _ => panic!("expected raw extent"),
+    };
+    let path = &images[corrupt_shard
+        .disk_id
+        .trim_start_matches("disk-")
+        .parse::<usize>()
+        .unwrap()];
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    std::os::unix::fs::FileExt::write_at(&file, &[0x42; 128], damaged_extent.offset).unwrap();
+    file.sync_all().unwrap();
+    let cache_key = format!("{}:{}:{}", meta.uuid, corrupt.stripe_id, corrupt.raw_sha256);
+    fs.cache.remove(&cache_key);
+
+    let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    fs.backend = Arc::new(ScrubPauseBackend {
+        inner: fs.backend.clone(),
+        pause_offset: first_extent.offset,
+        pause_once: std::sync::atomic::AtomicBool::new(true),
+        paused: paused_tx,
+        resume: std::sync::Mutex::new(resume_rx),
+    });
+    let scrub_fs = fs.clone();
+    let read_len = payload.len();
+    let handle = std::thread::spawn(move || {
+        scrub_fs.read_inode_with_damage_report_for_scrub(ino, 0, read_len, false)
+    });
+    paused_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("scrub must reach first stripe");
+    let start = corrupt.raw_offset;
+    let reader_fs = fs.clone();
+    let read_size = corrupt.raw_size;
+    let reader = std::thread::spawn(move || reader_fs.read_inode(ino, start, read_size, false));
+    // The reader cannot finish merging telemetry while scrub holds its
+    // shared metadata guard. Observe cache publication instead of waiting
+    // for the entire read, or the test itself would deadlock.
+    let mut cached = false;
+    for _ in 0..500 {
+        if fs
+            .cache
+            .get(&cache_key, Some(&corrupt.raw_sha256))
+            .is_some()
+        {
+            cached = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    resume_tx.send(()).unwrap();
+    let read = reader.join().unwrap().unwrap();
+    assert_eq!(
+        read,
+        payload[start as usize..start as usize + corrupt.raw_size]
+    );
+    assert!(
+        cached,
+        "ordinary read should reconstruct and cache damaged stripe"
+    );
+    let (scrub_read, damaged, repaired) = handle.join().unwrap().unwrap();
+    assert_eq!(scrub_read, payload);
+    assert!(!repaired);
+    assert!(
+        damaged.iter().any(|entry| entry.contains(&corrupt_shard.disk_id)),
+        "scrub must report physical shard damage despite the concurrent cache insertion: {damaged:?}"
+    );
+}
+
+#[test]
+fn concurrent_read_rechecks_corrupt_shard_before_self_heal() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|i| dir.path().join(format!("repair-shard-{i}.img")))
+        .collect::<Vec<_>>();
+    let fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            compression: Compression::None,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "self-heal-cache",
+        false,
+    )
+    .unwrap();
+    let payload = (0..64 * 1024).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+    fs.write_file("/damage", &payload, 0o600).unwrap();
+    fs.sync().unwrap();
+    let ino = fs.resolve_path("/damage", true).unwrap();
+    let metadata = fs.metadata_snapshot();
+    let block = &metadata.inodes[&ino].blocks[0];
+    let shard = &block.shards[0];
+    let extent = match shard.location.as_ref().unwrap() {
+        ShardLocation::RawExtent(extent) => extent,
+        _ => panic!("expected raw extent"),
+    };
+    let path = &images[shard
+        .disk_id
+        .trim_start_matches("disk-")
+        .parse::<usize>()
+        .unwrap()];
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    std::os::unix::fs::FileExt::write_at(&file, &[0x4F; 128], extent.offset).unwrap();
+    file.sync_all().unwrap();
+    fs.cache.remove(&format!(
+        "{}:{}:{}",
+        metadata.uuid, block.stripe_id, block.raw_sha256
+    ));
+    let txid = metadata.txid;
+    let (read, damaged, repaired) = fs
+        .read_inode_with_damage_report(ino, 0, payload.len(), true)
+        .unwrap();
+    assert_eq!(read, payload);
+    assert!(
+        repaired,
+        "the exclusive reread must ignore cached reconstructed data"
+    );
+    assert!(
+        !damaged.is_empty(),
+        "physical shard damage must be reported"
+    );
+    assert!(
+        fs.metadata_snapshot().txid > txid,
+        "self-heal writes a new valid stripe"
+    );
+    let (second, damage_after, repaired_again) = fs
+        .read_inode_with_damage_report(ino, 0, payload.len(), true)
+        .unwrap();
+    assert_eq!(second, payload);
+    assert!(
+        damage_after.is_empty(),
+        "the recovered stripes must be healthy"
+    );
+    assert!(!repaired_again);
+}
+#[test]
+fn offline_delta_integrity_upgrade_replays_transactions_and_fences_downgrade() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|index| dir.path().join(format!("v2-{index}.img")))
+        .collect::<Vec<_>>();
+    let mut fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            compression: Compression::None,
+            defer_metadata_commit: true,
+            defer_journal_flush: true,
+            defer_data_flush: true,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "delta-v2-upgrade",
+        false,
+    )
+    .unwrap();
+    fs.write_file("/before", b"legacy snapshot", 0o600).unwrap();
+    fs.sync().unwrap();
+    assert_eq!(fs.metadata_snapshot().integrity.hash_scheme, None);
+    fs.upgrade_delta_integrity().unwrap();
+    for sb in fs.raw_superblocks.iter() {
+        assert_ne!(
+            sb.required_feature_flags & raw_format::REQUIRED_FEATURE_DELTA_INTEGRITY,
+            0
+        );
+        // Both copies have the mandatory feature. A pre-v2 binary with
+        // SUPPORTED_REQUIRED_FEATURE_FLAGS=0 rejects each member.
+        let image = images
+            .iter()
+            .find(|path| {
+                path.to_string_lossy()
+                    .contains(&format!("-{}.img", sb.disk_index))
+            })
+            .unwrap();
+        let image_file = std::fs::File::open(image).unwrap();
+        for offset in [
+            raw_format::PRIMARY_SUPERBLOCK_OFFSET,
+            sb.backup_superblock_offset,
+        ] {
+            let mut data = [0u8; raw_format::SUPERBLOCK_SIZE];
+            std::os::unix::fs::FileExt::read_at(&image_file, &mut data, offset).unwrap();
+            assert_ne!(u64::from_le_bytes(data[48..56].try_into().unwrap()), 0);
+        }
+    }
+    fs.write_file("/after", b"fast and durable", 0o600).unwrap();
+    fs.sync().unwrap();
+    assert_eq!(
+        fs.metadata_snapshot().integrity.hash_scheme,
+        Some(journal::DELTA_INTEGRITY_SCHEME)
+    );
+    let txid = fs.metadata_snapshot().txid;
+    drop(fs);
+    let reopened = ArgosFs::open_loop(&images, false).unwrap();
+    assert_eq!(reopened.metadata_snapshot().txid, txid);
+    assert_eq!(
+        reopened.read_file("/before", false).unwrap(),
+        b"legacy snapshot"
+    );
+    assert_eq!(
+        reopened.read_file("/after", false).unwrap(),
+        b"fast and durable"
+    );
+}
+
+#[test]
+fn v2_recovery_checkpoint_reanchors_normalized_metadata_before_next_delta() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|index| dir.path().join(format!("v2-restart-{index}.img")))
+        .collect::<Vec<_>>();
+    let mut fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            defer_metadata_commit: true,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "v2-restart",
+        false,
+    )
+    .unwrap();
+    fs.upgrade_delta_integrity().unwrap();
+    fs.write_file("/first", b"one", 0o600).unwrap();
+    fs.sync().unwrap();
+    assert_eq!(
+        fs.metadata_snapshot().integrity.hash_scheme,
+        Some(journal::DELTA_INTEGRITY_SCHEME)
+    );
+    drop(fs);
+
+    let fs = ArgosFs::open_loop(&images, true).unwrap();
+    assert!(fs.deferred_commit.lock().raw_checkpoint_required);
+    fs.write_file("/second", b"two", 0o600).unwrap();
+    fs.sync().unwrap();
+    // The first post-recovery checkpoint verifies the normalized current
+    // namespace rather than treating its recovered v2 digest as canonical.
+    assert_eq!(fs.metadata_snapshot().integrity.hash_scheme, None);
+    assert!(!fs.deferred_commit.lock().raw_checkpoint_required);
+    fs.write_file("/third", b"three", 0o600).unwrap();
+    fs.sync().unwrap();
+    assert_eq!(
+        fs.metadata_snapshot().integrity.hash_scheme,
+        Some(journal::DELTA_INTEGRITY_SCHEME)
+    );
+    drop(fs);
+    let recovered = ArgosFs::open_loop(&images, false).unwrap();
+    for (path, contents) in [
+        ("/first", b"one".as_slice()),
+        ("/second", b"two".as_slice()),
+        ("/third", b"three".as_slice()),
+    ] {
+        assert_eq!(recovered.read_file(path, false).unwrap(), contents);
+    }
+}
+
+#[test]
+fn v2_event_rollover_reanchors_deferred_hash_before_next_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|n| dir.path().join(format!("event-rollover-{n}.img")))
+        .collect::<Vec<_>>();
+    let mut fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            defer_metadata_commit: true,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "v2-event-rollover",
+        false,
+    )
+    .unwrap();
+    fs.upgrade_delta_integrity().unwrap();
+    fs.write_file("/base", b"base", 0o600).unwrap();
+    fs.sync().unwrap();
+    assert_eq!(
+        fs.metadata_snapshot().integrity.hash_scheme,
+        Some(journal::DELTA_INTEGRITY_SCHEME)
+    );
+    // >2 MiB entry forces raw journal rollover/checkpoint. The same-txid
+    // event checkpoint has a canonical digest rather than the old v2 digest.
+    {
+        let meta = fs.meta.read();
+        fs.journal_locked(
+            &meta,
+            "autopilot",
+            json!({"audit": "x".repeat(3 * 1024 * 1024)}),
+        )
+        .unwrap();
+    }
+    assert!(fs.deferred_commit.lock().raw_checkpoint_required);
+    fs.write_file("/after-event", b"acknowledged", 0o600)
+        .unwrap();
+    fs.sync().unwrap();
+    assert_eq!(fs.metadata_snapshot().integrity.hash_scheme, None);
+    fs.write_file("/v2-again", b"new-chain", 0o600).unwrap();
+    fs.sync().unwrap();
+    assert_eq!(
+        fs.metadata_snapshot().integrity.hash_scheme,
+        Some(journal::DELTA_INTEGRITY_SCHEME)
+    );
+    drop(fs);
+    let reopened = ArgosFs::open_loop(&images, false).unwrap();
+    assert_eq!(reopened.read_file("/base", false).unwrap(), b"base");
+    assert_eq!(
+        reopened.read_file("/after-event", false).unwrap(),
+        b"acknowledged"
+    );
+    assert_eq!(
+        reopened.read_file("/v2-again", false).unwrap(),
+        b"new-chain"
+    );
+    assert_eq!(reopened.transaction_report().unwrap().invalid_entries, 0);
+}
+
+#[test]
+fn v2_added_block_members_inherit_required_features_and_survive_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut images = (0..3)
+        .map(|n| dir.path().join(format!("grow-{n}.img")))
+        .collect::<Vec<_>>();
+    let mut fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            defer_metadata_commit: true,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "v2-grow",
+        false,
+    )
+    .unwrap();
+    fs.upgrade_delta_integrity().unwrap();
+    for n in 3..6 {
+        let next = dir.path().join(format!("grow-{n}.img"));
+        fs.add_block_device(next.clone(), 32 * 1024 * 1024, false)
+            .unwrap();
+        images.push(next);
+    }
+    fs.write_file("/grown", b"quorum with six upgraded members", 0o600)
+        .unwrap();
+    fs.sync().unwrap();
+    assert_eq!(
+        fs.metadata_snapshot().integrity.hash_scheme,
+        Some(journal::DELTA_INTEGRITY_SCHEME)
+    );
+    for path in &images {
+        let (sb, _) = raw_store::inspect_device(BackendKind::LoopBlock, path.clone()).unwrap();
+        assert_ne!(
+            sb.required_feature_flags & raw_format::REQUIRED_FEATURE_DELTA_INTEGRITY,
+            0
+        );
+    }
+    drop(fs);
+    let recovered = ArgosFs::open_loop(&images, false).unwrap();
+    assert_eq!(
+        recovered.read_file("/grown", false).unwrap(),
+        b"quorum with six upgraded members"
+    );
+}
+
+#[test]
+fn upgraded_legacy_event_rollover_with_read_telemetry_reanchors_before_first_v2_delta() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|n| dir.path().join(format!("event-legacy-{n}.img")))
+        .collect::<Vec<_>>();
+    let mut fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            defer_metadata_commit: true,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "legacy-event-v2",
+        false,
+    )
+    .unwrap();
+    fs.write_file("/old", b"old payload", 0o600).unwrap();
+    fs.sync().unwrap();
+    fs.upgrade_delta_integrity().unwrap();
+    assert_eq!(fs.metadata_snapshot().integrity.hash_scheme, None);
+    assert_eq!(fs.read_file("/old", false).unwrap(), b"old payload");
+    assert!(fs.deferred_commit.lock().raw_uncommitted_metadata_dirty);
+    {
+        let meta = fs.meta.read();
+        fs.journal_locked(
+            &meta,
+            "snapshot",
+            json!({"audit": "x".repeat(3 * 1024 * 1024)}),
+        )
+        .unwrap();
+    }
+    assert!(fs.deferred_commit.lock().raw_checkpoint_required);
+    fs.write_file("/first-new", b"first new", 0o600).unwrap();
+    fs.sync().unwrap();
+    assert_eq!(fs.metadata_snapshot().integrity.hash_scheme, None);
+    fs.write_file("/v2", b"v2 data", 0o600).unwrap();
+    fs.sync().unwrap();
+    assert_eq!(
+        fs.metadata_snapshot().integrity.hash_scheme,
+        Some(journal::DELTA_INTEGRITY_SCHEME)
+    );
+    drop(fs);
+    let reopened = ArgosFs::open_loop(&images, false).unwrap();
+    for (path, bytes) in [
+        ("/old", b"old payload".as_slice()),
+        ("/first-new", b"first new".as_slice()),
+        ("/v2", b"v2 data".as_slice()),
+    ] {
+        assert_eq!(reopened.read_file(path, false).unwrap(), bytes);
+    }
+}
+#[test]
+fn deferred_durability_cache_tracks_changed_inodes_and_device_status() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|i| dir.path().join(format!("durability-cache-{i}.img")))
+        .collect::<Vec<_>>();
+    let fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            compression: Compression::None,
+            defer_metadata_commit: true,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "durability-cache",
+        false,
+    )
+    .unwrap();
+    fs.write_file("/one", &vec![1; 8192], 0o600).unwrap();
+    fs.write_file("/two", &vec![2; 8192], 0o600).unwrap();
+    fs.sync().unwrap();
+    let base = fs.metadata_snapshot();
+    let mut cache = None;
+    let unavailable = BTreeSet::new();
+    ArgosFs::validate_deferred_data_durability(&base, &unavailable, &mut cache).unwrap();
+    assert_eq!(cache.as_ref().unwrap().last_scanned_blocks, 2);
+
+    let mut changed = base.clone();
+    let one = changed.inodes[&1].entries["one"];
+    changed.inodes.get_mut(&one).unwrap().read_bytes += 1;
+    ArgosFs::validate_deferred_data_durability(&changed, &unavailable, &mut cache).unwrap();
+    assert_eq!(cache.as_ref().unwrap().last_scanned_blocks, 1);
+
+    // Disk availability changes invalidate the saved whole-namespace proof,
+    // even when the inode map and all shard descriptors are unchanged.
+    let one_device = changed.inodes[&one].blocks[0].shards[0].disk_id.clone();
+    let unavailable = BTreeSet::from([one_device]);
+    ArgosFs::validate_deferred_data_durability(&changed, &unavailable, &mut cache).unwrap();
+    assert_eq!(cache.as_ref().unwrap().last_scanned_blocks, 2);
+
+    // Layout parity changes must also invalidate the previously checked
+    // snapshot, even if no inode was dirtied since the last validation.
+    let mut reduced_parity = changed.clone();
+    for layout in reduced_parity.layouts.values_mut() {
+        layout.m = 0;
+    }
+    assert!(matches!(
+        ArgosFs::validate_deferred_data_durability(&reduced_parity, &unavailable, &mut cache),
+        Err(ArgosError::QuorumUnavailable { .. })
+    ));
+
+    // Altering the placement of a changed block must still reject loss of
+    // data quorum. A failed validation must not poison the good cache.
+    let mut corrupted = changed.clone();
+    let shards = &mut corrupted.inodes.get_mut(&one).unwrap().blocks[0].shards;
+    shards[0].disk_id = "missing-A".to_string();
+    shards[1].disk_id = "missing-B".to_string();
+    assert!(matches!(
+        ArgosFs::validate_deferred_data_durability(&corrupted, &unavailable, &mut cache),
+        Err(ArgosError::QuorumUnavailable { .. })
+    ));
+    assert_eq!(cache.as_ref().unwrap().last_scanned_blocks, 2);
 }

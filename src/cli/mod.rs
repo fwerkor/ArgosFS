@@ -159,6 +159,31 @@ pub fn run() -> Result<()> {
             };
             print_health_report(&fs.health_report(), json, true)?;
         }
+        Command::UpgradeIntegrity {
+            storage,
+            offline_confirmed,
+        } => {
+            if !offline_confirmed {
+                bail!("unmount all other users of this pool, then pass --offline-confirmed");
+            }
+            let storage = storage.resolve(BackendKind::LoopBlock)?;
+            if storage.backend == BackendKind::Host {
+                bail!("upgrade-integrity requires a raw or loop backend");
+            }
+            let mut fs =
+                open_backend(None, storage.backend, storage.images, storage.devices, true)?;
+            validate_requested_pool(&fs, storage.pool.as_deref())?;
+            fs.upgrade_delta_integrity()?;
+            fs.mark_clean_unmount()?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "upgraded": true,
+                    "required_feature": "raw-delta-integrity-v2",
+                    "pool_uuid": fs.metadata_snapshot().uuid
+                })
+            );
+        }
         Command::Scan { storage } => {
             let storage = storage.resolve(BackendKind::LoopBlock)?;
             let paths = backend_paths(storage.backend, storage.images, storage.devices)?;
@@ -361,6 +386,10 @@ pub fn run() -> Result<()> {
                     open_backend(None, backend, images.clone(), devices.clone(), false)?;
                 validate_requested_pool(&preflight_fs, pool.as_deref())?;
                 rootfs::preflight_volume(&preflight_fs, mode)?;
+                // The writable open builds its own recovery snapshot. Keeping
+                // the read-only preflight handle alive across the blocking
+                // FUSE mount would pin two independent inode tables.
+                drop(preflight_fs);
                 let fs = open_backend(None, backend, images, devices, true)?;
                 validate_requested_pool(&fs, pool.as_deref())?;
                 fusefs::mount_volume(fs, target, foreground, root_mount_options(option))?;
@@ -1186,6 +1215,14 @@ fn print_health_report(
         report.disks.len(),
         report.io_mode,
         report.encryption_enabled
+    );
+    println!(
+        "  metadata inodes={} estimated_rss={} MiB inode_limit={}",
+        report.metadata_inodes,
+        report.metadata_estimated_rss_bytes / (1024 * 1024),
+        report
+            .metadata_inode_limit
+            .map_or_else(|| "unlimited".to_string(), |n| n.to_string())
     );
     for disk in &report.disks {
         println!(

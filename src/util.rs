@@ -68,6 +68,36 @@ pub fn configured_read_retries() -> usize {
     .unwrap_or_else(|| usize::from(usb_mode()))
 }
 
+/// How long an absent member is given to return before scrub rebuilds its
+/// shards.
+pub const DEFAULT_OFFLINE_GRACE_MS: u64 = 0;
+pub const USB_OFFLINE_GRACE_MS: u64 = 60_000;
+pub const MAX_OFFLINE_GRACE_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// Grace period for a member that is absent from the open scan.
+///
+/// `ARGOSFS_OFFLINE_GRACE_MS` sets it explicitly (0 disables the grace).
+/// USB mode defaults it to one minute so a reader that is briefly
+/// power-cycled or reset can come back before scrub rewrites every file.
+/// Without USB mode the default is 0, preserving the old behavior.
+pub fn configured_offline_grace_ms() -> u64 {
+    resolve_offline_grace_ms(
+        std::env::var("ARGOSFS_OFFLINE_GRACE_MS").ok().as_deref(),
+        usb_mode(),
+    )
+}
+
+fn resolve_offline_grace_ms(value: Option<&str>, usb: bool) -> u64 {
+    value
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|value| value.min(MAX_OFFLINE_GRACE_MS))
+        .unwrap_or(if usb {
+            USB_OFFLINE_GRACE_MS
+        } else {
+            DEFAULT_OFFLINE_GRACE_MS
+        })
+}
+
 /// Read a value up to `attempts` times.  An error is returned immediately;
 /// a successful value that does not validate is retried, and `None` means
 /// every attempt produced an invalid value.  The second value is the number
@@ -293,6 +323,25 @@ mod tests {
         );
         assert_eq!(env_usize(Some("not-a-number"), MAX_READ_RETRIES), None);
         assert_eq!(env_usize(None, MAX_READ_RETRIES), None);
+    }
+
+    #[test]
+    fn offline_grace_uses_usb_default_and_explicit_override() {
+        assert_eq!(
+            resolve_offline_grace_ms(None, false),
+            DEFAULT_OFFLINE_GRACE_MS
+        );
+        assert_eq!(resolve_offline_grace_ms(None, true), USB_OFFLINE_GRACE_MS);
+        assert_eq!(resolve_offline_grace_ms(Some("1500"), false), 1500);
+        assert_eq!(resolve_offline_grace_ms(Some("0"), true), 0);
+        assert_eq!(
+            resolve_offline_grace_ms(Some("999999999999"), true),
+            MAX_OFFLINE_GRACE_MS
+        );
+        assert_eq!(
+            resolve_offline_grace_ms(Some("bad"), true),
+            USB_OFFLINE_GRACE_MS
+        );
     }
 
     #[test]

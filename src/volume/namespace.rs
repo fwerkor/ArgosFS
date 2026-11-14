@@ -410,6 +410,165 @@ impl ArgosFs {
         size: usize,
         repair: bool,
     ) -> Result<(Vec<u8>, Vec<String>, bool)> {
+        self.read_inode_with_damage_report_policy(ino, offset, size, repair, false)
+    }
+
+    /// Scrub may rebuild an Offline member's shards after the configured
+    /// grace period.  Ordinary reads use the wrapper above and never do.
+    pub(super) fn read_inode_with_damage_report_for_scrub(
+        &self,
+        ino: InodeId,
+        offset: u64,
+        size: usize,
+        repair: bool,
+    ) -> Result<(Vec<u8>, Vec<String>, bool)> {
+        self.read_inode_with_damage_report_policy(ino, offset, size, repair, true)
+    }
+
+    fn read_inode_with_damage_report_policy(
+        &self,
+        ino: InodeId,
+        offset: u64,
+        size: usize,
+        repair: bool,
+        repair_offline: bool,
+    ) -> Result<(Vec<u8>, Vec<String>, bool)> {
+        // Keep the shared guard across all physical I/O so writers cannot
+        // reclaim any of the decoded extents. The decoder only needs inode
+        // geometry, layout, disk state and configuration: do not clone the
+        // pool allocator's free lists or the pending inode dirty set.
+        let guard = self.meta.read();
+        let inode = guard
+            .inodes
+            .get(&ino)
+            .ok_or_else(|| ArgosError::NotFound(format!("inode {ino}")))?
+            .clone();
+        match inode.kind {
+            NodeKind::Directory => return Err(ArgosError::IsDirectory(format!("inode {ino}"))),
+            NodeKind::Symlink => {
+                return Ok((
+                    decode_symlink_target_bytes(inode.target.as_deref().unwrap_or_default()),
+                    Vec::new(),
+                    false,
+                ))
+            }
+            NodeKind::Special => {
+                return Err(ArgosError::Unsupported(format!(
+                    "special inode {ino} has no data stream"
+                )))
+            }
+            NodeKind::File => {}
+        }
+        let logical_size = usize::try_from(inode.size)
+            .map_err(|_| ArgosError::Invalid("inode logical size is too large".to_string()))?;
+        let start = offset.min(logical_size as u64) as usize;
+        let end = start.saturating_add(size).min(logical_size);
+        let mut snapshot = Self::read_decoder_metadata(&guard);
+        let cache_policy = if repair_offline {
+            BlockCachePolicy::Bypass
+        } else {
+            BlockCachePolicy::Normal
+        };
+        let capture = ReadLatencyCapture::start();
+        let decoded = self.decode_inode_range_with_cache_policy_locked(
+            &mut snapshot,
+            &inode,
+            start,
+            end,
+            cache_policy,
+        );
+        let samples = capture.finish();
+        drop(guard);
+        // Merge latency EWMAs into the live copy after all concurrent reads
+        // release their shared guards, preserving every sample and the inode
+        // counters. Never overwrite concurrent metadata with a stale clone.
+        {
+            let mut live = self.meta.write();
+            for sample in samples {
+                self.update_read_latency_locked(
+                    &mut live,
+                    &sample.disk_id,
+                    sample.bytes,
+                    sample.elapsed_seconds,
+                );
+            }
+            if let Ok((ref data, ref damaged)) = decoded {
+                let must_repair = repair
+                    && damaged.iter().any(|entry| {
+                        !super::data_plane::damage_is_transient_offline_member(
+                            self,
+                            &live,
+                            entry,
+                            repair_offline,
+                        )
+                    });
+                if !must_repair {
+                    if live.backend != BackendKind::Host {
+                        self.deferred_commit.lock().raw_uncommitted_metadata_dirty = true;
+                    }
+                    if let Some(inode) = live.inodes.get_mut(&ino) {
+                        inode.access_count = inode.access_count.saturating_add(1);
+                        inode.read_bytes = inode.read_bytes.saturating_add(data.len() as u64);
+                        inode.last_accessed_at = now_f64();
+                        inode.workload_score = inode.workload_score * 0.98 + 1.0;
+                    }
+                    return decoded.map(|(data, damaged)| (data, damaged, false));
+                }
+            }
+        }
+        // Failure requiring repair is rare. Run the previous exclusive path
+        // against the current inode, rather than trying to repair a snapshot
+        // that may have changed while transitioning between locks.
+        if repair
+            && decoded
+                .as_ref()
+                .is_ok_and(|(_, damaged)| !damaged.is_empty())
+        {
+            return self.read_inode_with_damage_report_policy_exclusive(
+                ino,
+                offset,
+                size,
+                repair,
+                repair_offline,
+            );
+        }
+        decoded.map(|(data, damaged)| (data, damaged, false))
+    }
+
+    /// Minimal metadata for the legacy mutable decoder. Only fields consulted
+    /// by shard reads are populated; the allocator and inode map are *never*
+    /// accessed by decoding. This stays bounded independently of filesystem
+    /// fragmentation and the number of pending inode changes.
+    pub(super) fn read_decoder_metadata(meta: &Metadata) -> Metadata {
+        Metadata {
+            format: meta.format.clone(),
+            uuid: meta.uuid.clone(),
+            backend: meta.backend,
+            raw_pool: RawPoolMetadata::default(),
+            created_at: meta.created_at,
+            updated_at: meta.updated_at,
+            txid: meta.txid,
+            next_inode: meta.next_inode,
+            next_stripe: meta.next_stripe,
+            config: meta.config.clone(),
+            layouts: meta.layouts.clone(),
+            current_write_layout: meta.current_write_layout.clone(),
+            reshape: None,
+            encryption: meta.encryption.clone(),
+            integrity: MetadataIntegrity::default(),
+            disks: meta.disks.clone(),
+            inodes: Default::default(),
+        }
+    }
+
+    fn read_inode_with_damage_report_policy_exclusive(
+        &self,
+        ino: InodeId,
+        offset: u64,
+        size: usize,
+        repair: bool,
+        repair_offline: bool,
+    ) -> Result<(Vec<u8>, Vec<String>, bool)> {
         let mut meta = self.meta.write();
         let inode = meta
             .inodes
@@ -436,12 +595,42 @@ impl ArgosFs {
             .map_err(|_| ArgosError::Invalid("inode logical size is too large".to_string()))?;
         let start = offset.min(logical_size as u64) as usize;
         let end = start.saturating_add(size).min(logical_size);
-        let (mut data, mut damaged) =
-            self.decode_inode_range_from_inode_locked(&mut meta, &inode, start, end)?;
+        // Recheck the current inode's actual shards after dropping the shared
+        // guard. Bypassing the cache is stronger than evicting it: a concurrent
+        // reader cannot reinsert reconstructed data between eviction and read.
+        let cache_policy = if repair || repair_offline {
+            BlockCachePolicy::Bypass
+        } else {
+            BlockCachePolicy::Normal
+        };
+        let (mut data, mut damaged) = self.decode_inode_range_with_cache_policy_locked(
+            &mut meta,
+            &inode,
+            start,
+            end,
+            cache_policy,
+        )?;
         let mut repaired = false;
-        if repair && !damaged.is_empty() {
+        // An absent member is not data damage: the block was rebuilt from the
+        // remaining shards and the member may return.  Failed or removed
+        // members, real checksum/extent damage and invalid slots still
+        // self-heal.  Otherwise every read in a pool with one card out would
+        // rewrite the file it just read.
+        let has_repairable_damage = damaged.iter().any(|entry| {
+            !super::data_plane::damage_is_transient_offline_member(
+                self,
+                &meta,
+                entry,
+                repair_offline,
+            )
+        });
+        if repair && has_repairable_damage {
             let mut repair_damaged = damaged.clone();
-            let (full, full_damaged) = self.decode_inode_data_locked(&mut meta, &inode)?;
+            let (full, full_damaged) = self.decode_inode_data_with_cache_policy_locked(
+                &mut meta,
+                &inode,
+                BlockCachePolicy::Bypass,
+            )?;
             for entry in full_damaged {
                 if !repair_damaged.contains(&entry) {
                     repair_damaged.push(entry);
@@ -555,25 +744,34 @@ impl ArgosFs {
             .saturating_mul(stripe_raw_size)
             .min(new_size);
 
-        let mut window =
-            self.decode_inode_window_locked(&mut meta, ino, affected_start, affected_end)?;
-        if start > old_size && old_size > affected_start {
-            let gap_start = old_size - affected_start;
-            let gap_end = start - affected_start;
-            window[gap_start..gap_end].fill(0);
-        }
         if end > affected_end {
             return Err(ArgosError::Invalid(
                 "write affected window overflow".to_string(),
             ));
         }
+        // Only read the bytes that must survive this write. Fully covered
+        // stripes are replaced outright: decoding their old data (including
+        // Reed-Solomon reconstruction) is wasted work and can fail on a shard
+        // that is irrelevant to the replacement. Sparse gaps stay zero.
+        let mut window = zeroed_io_buffer(
+            affected_end.saturating_sub(affected_start),
+            "stripe rewrite window",
+        )?;
+        let prefix_end = start.min(old_size);
+        if prefix_end > affected_start {
+            let prefix =
+                self.decode_inode_window_locked(&mut meta, ino, affected_start, prefix_end)?;
+            window[..prefix.len()].copy_from_slice(&prefix);
+        }
+        let suffix_end = affected_end.min(old_size);
+        if suffix_end > end {
+            let suffix = self.decode_inode_window_locked(&mut meta, ino, end, suffix_end)?;
+            let offset = end - affected_start;
+            window[offset..offset + suffix.len()].copy_from_slice(&suffix);
+        }
         let local_start = start - affected_start;
         let local_end = local_start + data.len();
-        if local_end > window.len() {
-            window.resize(local_end, 0);
-        }
         window[local_start..local_end].copy_from_slice(data);
-        window.truncate(affected_end.saturating_sub(affected_start));
 
         self.rewrite_inode_window_locked(
             &mut meta,
@@ -584,6 +782,7 @@ impl ArgosFs {
             &window,
             data.len() as u64,
             clear_setid,
+            false,
             "write-range",
             json!({"inode": ino, "offset": offset, "bytes": data.len(), "rewrite": "stripe-window-local"}),
         )?;
@@ -759,6 +958,7 @@ impl ArgosFs {
                 &window,
                 0,
                 clear_setid,
+                false,
                 "truncate",
                 json!({"inode": ino, "size": requested_size, "rewrite": "sparse-extend"}),
             );
@@ -781,6 +981,7 @@ impl ArgosFs {
             &window,
             0,
             clear_setid,
+            false,
             "truncate",
             json!({"inode": ino, "size": requested_size, "rewrite": "stripe-window-local"}),
         )
@@ -952,7 +1153,7 @@ impl ArgosFs {
         {
             return Err(ArgosError::AlreadyExists(name));
         }
-        let ino = self.alloc_inode_locked(&mut meta);
+        let ino = self.alloc_inode_locked(&mut meta)?;
         let gid = {
             let parent_inode = self.dir_inode_locked(&meta, parent)?;
             if parent_inode.mode & libc::S_ISGID != 0 {

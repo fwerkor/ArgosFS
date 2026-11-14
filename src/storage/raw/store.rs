@@ -3,7 +3,8 @@ use crate::error::{ArgosError, Result};
 use crate::journal;
 use crate::raw_format::{
     align_down, align_up, RawDeviceLabel, RawSuperblock, BACKUP_REGION_SIZE, DEVICE_LABEL_OFFSET,
-    DEVICE_LABEL_SIZE, PRIMARY_SUPERBLOCK_OFFSET, PROTECTIVE_HEADER_OFFSET, SUPERBLOCK_SIZE,
+    DEVICE_LABEL_SIZE, PRIMARY_SUPERBLOCK_OFFSET, PROTECTIVE_HEADER_OFFSET,
+    REQUIRED_FEATURE_DELTA_INTEGRITY, SUPERBLOCK_SIZE,
 };
 use crate::storage::guard::GuardedBackend;
 use crate::types::{
@@ -12,7 +13,9 @@ use crate::types::{
 };
 use crate::util::{now_f64, sha256_hex};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -25,6 +28,9 @@ const RAW_QUORUM_COMMIT_ACTION: &str = "__argosfs_quorum_commit__";
 const RAW_HEADER_SIZE: usize = 4096;
 const METADATA_FORMAT_LEGACY: u32 = 0;
 const METADATA_FORMAT_TREE: u32 = 1;
+const METADATA_FORMAT_TREE_ZSTD: u32 = 2;
+const METADATA_DECOMPRESSED_MAX: u64 = 4 * 1024 * 1024 * 1024;
+const CHECKPOINT_ZSTD_LEVEL: i32 = 3;
 const METADATA_PAGE_SIZE: usize = 4096;
 const METADATA_INDEX_ENTRY_SIZE: usize = 48;
 const HASH_HEX_LEN: usize = 64;
@@ -274,10 +280,20 @@ pub fn open_pool(kind: BackendKind, paths: &[PathBuf], write: bool) -> Result<Ra
             if disk.status == DiskStatus::Offline && !disk.manually_offline {
                 disk.status = DiskStatus::Online;
             }
+            if disk.status == DiskStatus::Online {
+                disk.offline_since = None;
+            }
         } else if !present.contains(disk_id)
             && !matches!(disk.status, DiskStatus::Removed | DiskStatus::Failed)
         {
-            disk.status = DiskStatus::Offline;
+            if disk.status != DiskStatus::Offline {
+                disk.status = DiskStatus::Offline;
+                disk.offline_since = Some(now_f64());
+            } else if disk.offline_since.is_none() {
+                // Metadata from an older build: start the grace period now
+                // instead of treating the member as gone immediately.
+                disk.offline_since = Some(now_f64());
+            }
         }
     }
     if !scan_errors.is_empty() {
@@ -404,12 +420,39 @@ pub fn write_metadata_copies(
 ) -> Result<()> {
     // Store compact JSON: the metadata checkpoint has half the fixed metadata
     // region, and pretty-printing wastes about a third of that space.
-    let bytes = serde_json::to_vec(metadata)?;
-    let hash = sha256_hex(&bytes);
-    for sb in superblocks {
-        write_metadata_member(backend, sb, metadata, &bytes, &hash)?;
+    let checkpoint = prepare_checkpoint_writes(metadata, superblocks)?;
+    let writes = write_metadata_members_parallel(backend, superblocks, metadata, &checkpoint);
+    // Join all in-flight writes even when one member fails.
+    for (_, result) in writes {
+        result?;
     }
     Ok(())
+}
+
+/// The payload is shared across members. Each member writes its own two slots
+/// in order, including the flush-before-header protocol, on a separate worker.
+fn write_metadata_members_parallel(
+    backend: &dyn StorageBackend,
+    superblocks: &[RawSuperblock],
+    metadata: &Metadata,
+    checkpoint: &MetadataTreeCheckpoint,
+) -> Vec<(String, Result<()>)> {
+    std::thread::scope(|scope| {
+        let jobs: Vec<_> = superblocks
+            .iter()
+            .map(|sb| {
+                scope.spawn(move || {
+                    (
+                        sb.disk_id.clone(),
+                        write_metadata_member(backend, sb, metadata, checkpoint),
+                    )
+                })
+            })
+            .collect();
+        jobs.into_iter()
+            .map(|job| job.join().expect("checkpoint member worker panicked"))
+            .collect()
+    })
 }
 
 pub(crate) fn write_metadata_copies_quorum(
@@ -425,20 +468,19 @@ pub(crate) fn write_metadata_copies_quorum(
             superblocks.len(),
         ));
     }
-    let bytes = serde_json::to_vec(metadata)?;
-    let hash = sha256_hex(&bytes);
+    let checkpoint = prepare_checkpoint_writes(metadata, superblocks)?;
     let mut report = QuorumWriteReport::default();
     let mut durable = 0usize;
     let mut uncertain_write = false;
-    for sb in superblocks {
-        match write_metadata_member(backend, sb, metadata, &bytes, &hash) {
+    for (disk_id, result) in
+        write_metadata_members_parallel(backend, superblocks, metadata, &checkpoint)
+    {
+        match result {
             Ok(()) => durable += 1,
             Err(err) => {
-                // DiskFull is raised while constructing the checkpoint before any
-                // member write occurs. Other write/flush failures can leave the new
-                // checkpoint exposed even when durability cannot be confirmed.
+                // Even a failed flush can have exposed the new slot header.
                 uncertain_write |= !matches!(err, ArgosError::DiskFull { .. });
-                report.record_failure(&sb.disk_id, &err);
+                report.record_failure(&disk_id, &err);
             }
         }
     }
@@ -452,46 +494,178 @@ pub(crate) fn write_metadata_copies_quorum(
     Ok(report)
 }
 
+/// On existing pools, emit the original v1 checkpoint format whenever it
+/// fits. Only a checkpoint that would otherwise hit ENOSPC is compressed.
+struct CheckpointPayload {
+    bytes: Vec<u8>,
+    original: Option<(u64, String)>,
+}
+
+fn checkpoint_fits(bytes: usize, slot_len: u64) -> bool {
+    if bytes == 0 {
+        return false;
+    }
+    let pages = bytes.div_ceil(METADATA_PAGE_SIZE);
+    let Some(index_len) = pages.checked_mul(METADATA_INDEX_ENTRY_SIZE) else {
+        return false;
+    };
+    let Some(index_end) = (RAW_HEADER_SIZE as u64).checked_add(index_len as u64) else {
+        return false;
+    };
+    let Some(data_bytes) = (pages as u64).checked_mul(METADATA_PAGE_SIZE as u64) else {
+        return false;
+    };
+    align_up(index_end, METADATA_PAGE_SIZE as u64)
+        .checked_add(data_bytes)
+        .is_some_and(|end| end <= slot_len)
+}
+
+fn prepare_checkpoint_payload(
+    metadata: &Metadata,
+    superblocks: &[RawSuperblock],
+) -> Result<CheckpointPayload> {
+    let bytes = serde_json::to_vec(metadata)?;
+    if superblocks
+        .iter()
+        .all(|sb| checkpoint_fits(bytes.len(), sb.metadata.length / 2))
+    {
+        return Ok(CheckpointPayload {
+            bytes,
+            original: None,
+        });
+    }
+    if bytes.len() as u64 > METADATA_DECOMPRESSED_MAX {
+        return Err(ArgosError::Invalid(format!(
+            "metadata checkpoint exceeds {}-byte supported expansion limit",
+            METADATA_DECOMPRESSED_MAX
+        )));
+    }
+    let original = (bytes.len() as u64, sha256_hex(&bytes));
+    let compressed = zstd::stream::encode_all(bytes.as_slice(), CHECKPOINT_ZSTD_LEVEL)?;
+    Ok(CheckpointPayload {
+        bytes: compressed,
+        original: Some(original),
+    })
+}
+
+// Compute the page digests and index once, not once per member and per slot.
+fn prepare_checkpoint_writes(
+    metadata: &Metadata,
+    superblocks: &[RawSuperblock],
+) -> Result<MetadataTreeCheckpoint> {
+    let payload = prepare_checkpoint_payload(metadata, superblocks)?;
+    let hash = sha256_hex(&payload.bytes);
+    metadata_tree_checkpoint_encoded(
+        "checkpoint",
+        metadata.txid,
+        metadata.integrity.generation,
+        &payload.bytes,
+        &hash,
+        u64::MAX,
+        payload.original.as_ref(),
+    )
+}
+
 fn write_metadata_member(
     backend: &dyn StorageBackend,
     sb: &RawSuperblock,
     metadata: &Metadata,
-    bytes: &[u8],
-    hash: &str,
+    checkpoint: &MetadataTreeCheckpoint,
 ) -> Result<()> {
     let slot_len = sb.metadata.length / 2;
+    if checkpoint.required_len > slot_len {
+        return Err(ArgosError::DiskFull {
+            disk_id: sb.disk_id.clone(),
+            required: checkpoint.required_len,
+            available: slot_len,
+        });
+    }
     let slot = (metadata.txid % 2) * slot_len;
-    let offset = sb.metadata.offset + slot;
-    write_metadata_slot(backend, sb, offset, slot_len, metadata, bytes, hash)?;
+    write_metadata_slot(backend, sb, sb.metadata.offset + slot, checkpoint)?;
     let mirror_slot = ((metadata.txid + 1) % 2) * slot_len;
-    let mirror_offset = sb.metadata.offset + mirror_slot;
-    write_metadata_slot(backend, sb, mirror_offset, slot_len, metadata, bytes, hash)
+    write_metadata_slot(backend, sb, sb.metadata.offset + mirror_slot, checkpoint)
 }
 
 fn write_metadata_slot(
     backend: &dyn StorageBackend,
     sb: &RawSuperblock,
     offset: u64,
-    slot_len: u64,
-    metadata: &Metadata,
-    bytes: &[u8],
-    hash: &str,
+    checkpoint: &MetadataTreeCheckpoint,
 ) -> Result<()> {
-    let checkpoint = metadata_tree_checkpoint(
-        &sb.disk_id,
-        metadata.txid,
-        metadata.integrity.generation,
-        bytes,
-        hash,
-        slot_len,
-    )?;
-    for (relative_offset, data) in checkpoint.body_writes {
-        backend.write_at(&sb.disk_id, offset + relative_offset, &data)?;
+    for (relative_offset, data) in &checkpoint.body_writes {
+        backend.write_at(&sb.disk_id, offset + relative_offset, data)?;
     }
     backend.flush_device(&sb.disk_id)?;
     backend.write_at(&sb.disk_id, offset, &checkpoint.header)?;
     backend.flush_device(&sb.disk_id)?;
     Ok(())
+}
+
+/// Upgrade every active member's primary AND backup superblock before any
+/// delta-chain record is emitted. This is an explicit offline maintenance
+/// operation: a partially completed upgrade can be retried, and no v2 record
+/// is written until *all* active members are confirmed upgraded.
+pub(crate) fn upgrade_delta_integrity_members(
+    backend: &dyn StorageBackend,
+    superblocks: &[RawSuperblock],
+    metadata: &Metadata,
+) -> Result<Vec<RawSuperblock>> {
+    let active = metadata
+        .disks
+        .iter()
+        .filter(|(_, disk)| disk.status != DiskStatus::Removed)
+        .count();
+    if superblocks.len() != active {
+        return Err(ArgosError::QuorumUnavailable {
+            operation: "upgrade raw delta integrity: all active members must be present"
+                .to_string(),
+            need: active,
+            have: superblocks.len(),
+        });
+    }
+    let mut upgraded = Vec::with_capacity(superblocks.len());
+    for sb in superblocks {
+        if !metadata_has_voting_member(metadata, &sb.disk_id) {
+            return Err(ArgosError::Invalid(format!(
+                "raw integrity upgrade found unknown/removed member {}",
+                sb.disk_id
+            )));
+        }
+        let mut primary = [0u8; SUPERBLOCK_SIZE];
+        let mut backup = [0u8; SUPERBLOCK_SIZE];
+        backend.read_at(&sb.disk_id, PRIMARY_SUPERBLOCK_OFFSET, &mut primary)?;
+        backend.read_at(&sb.disk_id, sb.backup_superblock_offset, &mut backup)?;
+        let primary = RawSuperblock::decode(&primary)?;
+        let backup = RawSuperblock::decode(&backup)?;
+        for copy in [&primary, &backup] {
+            if copy.pool_uuid != sb.pool_uuid
+                || copy.device_uuid != sb.device_uuid
+                || copy.disk_id != sb.disk_id
+                || copy.generation != primary.generation
+            {
+                return Err(ArgosError::CorruptedMetadata(format!(
+                    "raw integrity upgrade superblock copy mismatch on {}",
+                    sb.disk_id
+                )));
+            }
+        }
+        let mut next = primary;
+        next.required_feature_flags |= REQUIRED_FEATURE_DELTA_INTEGRITY;
+        for offset in [sb.backup_superblock_offset, PRIMARY_SUPERBLOCK_OFFSET] {
+            backend.write_at(&sb.disk_id, offset, &next.encode())?;
+            backend.flush_device(&sb.disk_id)?;
+            let mut readback = [0u8; SUPERBLOCK_SIZE];
+            backend.read_at(&sb.disk_id, offset, &mut readback)?;
+            if RawSuperblock::decode(&readback)? != next {
+                return Err(ArgosError::Checksum(format!(
+                    "raw integrity feature did not persist on {} at {offset}",
+                    sb.disk_id
+                )));
+            }
+        }
+        upgraded.push(next);
+    }
+    Ok(upgraded)
 }
 
 pub fn recover_metadata(
@@ -763,10 +937,18 @@ fn build_journal_entry(
         }
         _ => None,
     };
-    let write_checkpoint = delta_base.is_none()
-        || metadata
-            .txid
-            .is_multiple_of(journal::checkpoint_interval_txids());
+    // A raw pool already checkpoints into two per-member metadata slots.
+    // Periodically embedding the entire namespace in its bounded journal
+    // serializes hundreds of MiB only to discover that the entry cannot fit.
+    // Use a delta whenever a validated previous image is available.
+    if metadata.integrity.hash_scheme == Some(journal::DELTA_INTEGRITY_SCHEME)
+        && delta_base.is_none()
+    {
+        return Err(ArgosError::IncompatibleFormat(
+            "raw delta integrity requires a validated previous image".to_string(),
+        ));
+    }
+    let write_checkpoint = delta_base.is_none();
     let metadata_delta = if write_checkpoint {
         None
     } else {
@@ -1016,8 +1198,11 @@ fn append_journal_with_previous_validation(
         append_positions.push(position);
     }
     if rollover {
-        for sb in superblocks {
-            checkpoint_and_reset_journal(backend, sb, metadata)?;
+        let checkpoint = prepare_checkpoint_writes(metadata, superblocks)?;
+        for (_, result) in
+            checkpoint_members_and_reset_parallel(backend, superblocks, metadata, &checkpoint)
+        {
+            result?;
         }
         return Ok(());
     }
@@ -1126,14 +1311,20 @@ fn append_journal_quorum(
     if rollover {
         let mut durable = BTreeSet::new();
         let mut uncertain_write = false;
-        for (sb, _) in positions {
-            match checkpoint_and_reset_journal(backend, sb, metadata) {
+        let eligible: Vec<_> = positions.into_iter().map(|(sb, _)| sb.clone()).collect();
+        // All members receive the exact same checkpoint bytes and hash.
+        // Prepare once before touching any journal or metadata slot.
+        let checkpoint = prepare_checkpoint_writes(metadata, &eligible)?;
+        for (disk_id, result) in
+            checkpoint_members_and_reset_parallel(backend, &eligible, metadata, &checkpoint)
+        {
+            match result {
                 Ok(()) => {
-                    durable.insert(sb.disk_id.clone());
+                    durable.insert(disk_id);
                 }
                 Err(err) => {
                     uncertain_write |= !matches!(err, ArgosError::DiskFull { .. });
-                    report.record_failure(&sb.disk_id, &err);
+                    report.record_failure(&disk_id, &err);
                 }
             }
         }
@@ -1219,14 +1410,32 @@ fn append_journal_quorum(
     Ok(report)
 }
 
-fn checkpoint_and_reset_journal(
+fn checkpoint_members_and_reset_parallel(
     backend: &dyn StorageBackend,
-    sb: &RawSuperblock,
+    superblocks: &[RawSuperblock],
     metadata: &Metadata,
-) -> Result<()> {
-    write_metadata_copies(backend, std::slice::from_ref(sb), metadata)?;
-    initialize_journal_region(backend, &sb.disk_id, sb)?;
-    backend.flush_device(&sb.disk_id)
+    checkpoint: &MetadataTreeCheckpoint,
+) -> Vec<(String, Result<()>)> {
+    std::thread::scope(|scope| {
+        let jobs: Vec<_> = superblocks
+            .iter()
+            .map(|sb| {
+                scope.spawn(move || {
+                    let result = (|| {
+                        write_metadata_member(backend, sb, metadata, checkpoint)?;
+                        // Never discard the old journal before both checkpoint
+                        // slots have been flushed and their headers committed.
+                        initialize_journal_region(backend, &sb.disk_id, sb)?;
+                        backend.flush_device(&sb.disk_id)
+                    })();
+                    (sb.disk_id.clone(), result)
+                })
+            })
+            .collect();
+        jobs.into_iter()
+            .map(|job| job.join().expect("journal rollover worker panicked"))
+            .collect()
+    })
 }
 
 fn load_or_recover(
@@ -1234,22 +1443,31 @@ fn load_or_recover(
     superblocks: &[RawSuperblock],
     checkpoint_replay: bool,
 ) -> Result<(Metadata, TransactionReport)> {
+    // Checkpoints replicated across members have identical serialized contents.
+    // Verify each physical copy, but deserialize each distinct payload only once.
+    let mut decoded = BTreeMap::new();
     let mut candidates = Vec::new();
     for sb in superblocks {
         candidates.extend(
-            read_metadata_candidates(backend, sb)?
+            read_metadata_candidates_cached(backend, sb, &mut decoded)?
                 .into_iter()
                 .map(|(metadata, report)| (sb.disk_id.clone(), metadata, report)),
         );
     }
+    drop(decoded);
     let mut report = TransactionReport::default();
     report.metadata_candidates = candidates
         .iter()
         .map(|(_, _, report)| report.clone())
         .collect();
     let mut best = select_quorum_metadata_candidate(&candidates)?;
-    let journal_best =
-        read_latest_journal_metadata(backend, superblocks, &mut report, best.as_ref())?;
+    let journal_best = read_latest_journal_metadata(
+        backend,
+        superblocks,
+        &mut report,
+        best.as_ref(),
+        &candidates,
+    )?;
     if let Some(journal_meta) = journal_best {
         if best
             .as_ref()
@@ -1265,6 +1483,32 @@ fn load_or_recover(
             "no valid raw metadata checkpoint or journal record found".to_string(),
         ));
     };
+    if !matches!(
+        metadata.integrity.hash_scheme,
+        None | Some(journal::DELTA_INTEGRITY_SCHEME)
+    ) {
+        return Err(ArgosError::IncompatibleFormat(
+            "unknown raw metadata integrity hash scheme".to_string(),
+        ));
+    }
+    // An integrity-v2 state can only be selected when a quorum of physical
+    // members has the required downgrade-prevention bit. Otherwise refuse to
+    // mount: older binaries would still accept the remaining v1 members.
+    if metadata.integrity.hash_scheme == Some(journal::DELTA_INTEGRITY_SCHEME) {
+        let upgraded = superblocks
+            .iter()
+            .filter(|sb| {
+                sb.required_feature_flags & REQUIRED_FEATURE_DELTA_INTEGRITY != 0
+                    && metadata_has_voting_member(&metadata, &sb.disk_id)
+            })
+            .count();
+        let need = metadata_quorum_requirement(&metadata);
+        if upgraded < need {
+            return Err(ArgosError::IncompatibleFormat(format!(
+                "raw delta integrity requires {need} upgraded members, found {upgraded}"
+            )));
+        }
+    }
     report.selected_metadata_source = "raw-metadata-or-journal".to_string();
     if checkpoint_replay && report.replayed {
         journal::inject_crash(FaultPoint::DuringReplay.as_str())?;
@@ -1413,6 +1657,17 @@ fn read_metadata_candidates(
     backend: &dyn StorageBackend,
     sb: &RawSuperblock,
 ) -> Result<Vec<(Option<Metadata>, MetadataCandidateReport)>> {
+    read_metadata_candidates_cached(backend, sb, &mut BTreeMap::new())
+}
+
+// This cache exists only during one recovery. Its key covers the entire slot
+// header, while independently verifying every member's on-disk payload before
+// borrowing an already decoded Metadata. It is never used to attest quorum.
+fn read_metadata_candidates_cached(
+    backend: &dyn StorageBackend,
+    sb: &RawSuperblock,
+    decoded: &mut BTreeMap<String, Metadata>,
+) -> Result<Vec<(Option<Metadata>, MetadataCandidateReport)>> {
     let slot_len = sb.metadata.length / 2;
     let mut out = Vec::new();
     for slot in 0..2u64 {
@@ -1425,7 +1680,20 @@ fn read_metadata_candidates(
         let metadata = match backend.read_at(&sb.disk_id, offset, &mut header) {
             Ok(()) if &header[..16] == METADATA_MAGIC => {
                 report.present = true;
-                match read_metadata_candidate(backend, sb, offset, slot_len, &header) {
+                // A matching header is not evidence of valid physical data.
+                // read_metadata_payload checks its stored checksum and every
+                // page checksum before a member can vote for this checkpoint.
+                let candidate = (|| -> Result<Metadata> {
+                    let bytes = read_metadata_payload(backend, sb, offset, slot_len, &header)?;
+                    let key = sha256_hex(&header);
+                    if let Some(metadata) = decoded.get(&key) {
+                        return Ok(metadata.clone());
+                    }
+                    let metadata = decode_metadata_payload(&header, &bytes)?;
+                    decoded.insert(key, metadata.clone());
+                    Ok(metadata)
+                })();
+                match candidate {
                     Ok(metadata) => {
                         report.valid = true;
                         report.txid = metadata.txid;
@@ -1450,6 +1718,7 @@ fn read_metadata_candidates(
     Ok(out)
 }
 
+#[cfg(test)]
 fn read_metadata_candidate(
     backend: &dyn StorageBackend,
     sb: &RawSuperblock,
@@ -1457,15 +1726,68 @@ fn read_metadata_candidate(
     slot_len: u64,
     header: &[u8],
 ) -> Result<Metadata> {
+    let bytes = read_metadata_payload(backend, sb, offset, slot_len, header)?;
+    decode_metadata_payload(header, &bytes)
+}
+
+fn read_metadata_payload(
+    backend: &dyn StorageBackend,
+    sb: &RawSuperblock,
+    offset: u64,
+    slot_len: u64,
+    header: &[u8],
+) -> Result<Vec<u8>> {
     match get_u32(header, 20)? {
         METADATA_FORMAT_LEGACY => {
             read_legacy_metadata_candidate(backend, sb, offset, slot_len, header)
         }
-        METADATA_FORMAT_TREE => read_tree_metadata_candidate(backend, sb, offset, slot_len, header),
+        METADATA_FORMAT_TREE | METADATA_FORMAT_TREE_ZSTD => {
+            read_tree_metadata_candidate(backend, sb, offset, slot_len, header)
+        }
         format => Err(ArgosError::IncompatibleFormat(format!(
             "unsupported raw metadata checkpoint format {format}"
         ))),
     }
+}
+
+fn decode_metadata_payload(header: &[u8], bytes: &[u8]) -> Result<Metadata> {
+    if get_u32(header, 20)? != METADATA_FORMAT_TREE_ZSTD {
+        return Ok(serde_json::from_slice(bytes)?);
+    }
+    let expanded_len = get_u64(header, 232)?;
+    if expanded_len == 0 || expanded_len > METADATA_DECOMPRESSED_MAX {
+        return Err(ArgosError::CorruptedMetadata(
+            "invalid compressed checkpoint expanded length".to_string(),
+        ));
+    }
+    let expanded_hash = get_fixed_hex(header, 240, HASH_HEX_LEN)?;
+    // Verify the expanded data *before* interpreting it. Stream the digest
+    // rather than retaining the entire expanded JSON alongside the inode
+    // table. Keep the legacy checksum-before-parse error ordering.
+    let decoder = zstd::stream::read::Decoder::new(bytes)?;
+    let mut bounded = decoder.take(expanded_len + 1);
+    let mut digest = Sha256::new();
+    let mut total = 0u64;
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let read = bounded.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        total += read as u64;
+        digest.update(&chunk[..read]);
+    }
+    if total != expanded_len || hex::encode(digest.finalize()) != expanded_hash {
+        return Err(ArgosError::Checksum(
+            "compressed metadata checkpoint content mismatch".to_string(),
+        ));
+    }
+    // A second bounded decompression uses a fixed-size input buffer and
+    // deserializes directly into the persistent inode map. It avoids a
+    // potentially multi-GiB expanded Vec at recovery time.
+    let decoder = zstd::stream::read::Decoder::new(bytes)?;
+    let input = std::io::BufReader::new(decoder.take(expanded_len + 1));
+    Ok(serde_json::from_reader::<_, Metadata>(input)?)
 }
 
 fn read_legacy_metadata_candidate(
@@ -1474,7 +1796,7 @@ fn read_legacy_metadata_candidate(
     offset: u64,
     slot_len: u64,
     header: &[u8],
-) -> Result<Metadata> {
+) -> Result<Vec<u8>> {
     let len = checked_usize(get_u64(header, 32)?, "raw metadata length")?;
     let stored_hash = get_fixed_hex(header, 64, HASH_HEX_LEN)?;
     if len == 0 || len as u64 > slot_len.saturating_sub(RAW_HEADER_SIZE as u64) {
@@ -1489,7 +1811,7 @@ fn read_legacy_metadata_candidate(
             "raw metadata checksum mismatch".to_string(),
         ));
     }
-    Ok(serde_json::from_slice::<Metadata>(&bytes)?)
+    Ok(bytes)
 }
 
 fn read_tree_metadata_candidate(
@@ -1498,7 +1820,7 @@ fn read_tree_metadata_candidate(
     offset: u64,
     slot_len: u64,
     header: &[u8],
-) -> Result<Metadata> {
+) -> Result<Vec<u8>> {
     let len = checked_usize(get_u64(header, 32)?, "raw metadata length")?;
     let stored_hash = get_fixed_hex(header, 64, HASH_HEX_LEN)?;
     let page_size = checked_usize(get_u64(header, 144)?, "raw metadata page size")?;
@@ -1581,7 +1903,7 @@ fn read_tree_metadata_candidate(
             "raw metadata checksum mismatch".to_string(),
         ));
     }
-    Ok(serde_json::from_slice::<Metadata>(&bytes)?)
+    Ok(bytes)
 }
 
 fn read_latest_journal_metadata(
@@ -1589,6 +1911,7 @@ fn read_latest_journal_metadata(
     superblocks: &[RawSuperblock],
     report: &mut TransactionReport,
     base_metadata: Option<&Metadata>,
+    checkpoint_catalog: &[(String, Option<Metadata>, MetadataCandidateReport)],
 ) -> Result<Option<Metadata>> {
     let mut supported =
         BTreeMap::<(u64, u64, String), (Metadata, std::collections::BTreeSet<String>)>::new();
@@ -1606,9 +1929,13 @@ fn read_latest_journal_metadata(
         let mut member_candidates = BTreeMap::<(u64, u64, String), Metadata>::new();
         let mut record_candidates = BTreeMap::<String, Metadata>::new();
         let mut checkpoint_candidates = BTreeMap::<String, Metadata>::new();
-        for (candidate, _) in read_metadata_candidates(backend, sb)? {
+        for (_, candidate, _) in checkpoint_catalog
+            .iter()
+            .filter(|(disk_id, _, _)| disk_id == &sb.disk_id)
+        {
             if let Some(candidate) = candidate {
-                checkpoint_candidates.insert(metadata_hash_for_replay(&candidate)?, candidate);
+                checkpoint_candidates
+                    .insert(metadata_hash_for_replay(candidate)?, candidate.clone());
             }
         }
         let mut header = vec![0u8; RAW_HEADER_SIZE];
@@ -1737,6 +2064,14 @@ fn read_latest_journal_metadata(
                         continue;
                     }
                     let candidate = if let Some(metadata) = record.metadata {
+                        if metadata.integrity.hash_scheme == Some(journal::DELTA_INTEGRITY_SCHEME) {
+                            report.invalid_entries += 1;
+                            report.errors.push(format!(
+                                "raw journal {}:{} contains an unverified v2 full metadata snapshot",
+                                sb.disk_id, cursor
+                            ));
+                            break;
+                        }
                         let metadata_hash = journal::canonical_metadata_hash(&metadata)?;
                         if metadata_hash != record.meta_hash {
                             report.invalid_entries += 1;
@@ -1793,7 +2128,13 @@ fn read_latest_journal_metadata(
                         }
                         match journal::apply_metadata_delta(base, delta) {
                             Ok(metadata) => {
-                                let metadata_hash = journal::canonical_metadata_hash(&metadata)?;
+                                let metadata_hash = if metadata.integrity.hash_scheme
+                                    == Some(journal::DELTA_INTEGRITY_SCHEME)
+                                {
+                                    metadata.integrity.meta_hash.clone()
+                                } else {
+                                    journal::canonical_metadata_hash(&metadata)?
+                                };
                                 if metadata_hash != record.meta_hash {
                                     report.invalid_entries += 1;
                                     report.errors.push(format!(
@@ -1975,8 +2316,10 @@ fn metadata_hash_for_replay(metadata: &Metadata) -> Result<String> {
 struct MetadataTreeCheckpoint {
     header: [u8; RAW_HEADER_SIZE],
     body_writes: Vec<(u64, Vec<u8>)>,
+    required_len: u64,
 }
 
+#[cfg(test)]
 fn metadata_tree_checkpoint(
     disk_id: &str,
     txid: u64,
@@ -1984,6 +2327,18 @@ fn metadata_tree_checkpoint(
     bytes: &[u8],
     hash: &str,
     slot_len: u64,
+) -> Result<MetadataTreeCheckpoint> {
+    metadata_tree_checkpoint_encoded(disk_id, txid, generation, bytes, hash, slot_len, None)
+}
+
+fn metadata_tree_checkpoint_encoded(
+    disk_id: &str,
+    txid: u64,
+    generation: u64,
+    bytes: &[u8],
+    hash: &str,
+    slot_len: u64,
+    original: Option<&(u64, String)>,
 ) -> Result<MetadataTreeCheckpoint> {
     let page_count = bytes.len().div_ceil(METADATA_PAGE_SIZE);
     let index_len = page_count
@@ -2029,14 +2384,7 @@ fn metadata_tree_checkpoint(
         let start = page_index * METADATA_PAGE_SIZE;
         let end = (start + METADATA_PAGE_SIZE).min(bytes.len());
         let page = bytes[start..end].to_vec();
-        let page_hash = hex::decode(sha256_hex(&page)).map_err(|err| {
-            ArgosError::Invalid(format!("raw metadata page hash encode failed: {err}"))
-        })?;
-        if page_hash.len() != HASH_BYTES_LEN {
-            return Err(ArgosError::Invalid(
-                "raw metadata page hash has invalid length".to_string(),
-            ));
-        }
+        let page_hash = Sha256::digest(&page);
         let entry_start = page_index * METADATA_INDEX_ENTRY_SIZE;
         let entry = &mut index[entry_start..entry_start + METADATA_INDEX_ENTRY_SIZE];
         entry[..HASH_BYTES_LEN].copy_from_slice(&page_hash);
@@ -2058,7 +2406,19 @@ fn metadata_tree_checkpoint(
     let mut out = [0u8; RAW_HEADER_SIZE];
     out[..16].copy_from_slice(METADATA_MAGIC);
     put_u32(&mut out, 16, RAW_STORE_VERSION);
-    put_u32(&mut out, 20, METADATA_FORMAT_TREE);
+    put_u32(
+        &mut out,
+        20,
+        if original.is_some() {
+            METADATA_FORMAT_TREE_ZSTD
+        } else {
+            METADATA_FORMAT_TREE
+        },
+    );
+    if let Some((expanded_len, expanded_hash)) = original {
+        put_u64(&mut out, 232, *expanded_len);
+        put_fixed_str(&mut out, 240, HASH_HEX_LEN, expanded_hash);
+    }
     put_u64(&mut out, 24, txid);
     put_u64(&mut out, 32, bytes.len() as u64);
     put_fixed_str(&mut out, 64, 64, hash);
@@ -2070,6 +2430,7 @@ fn metadata_tree_checkpoint(
     Ok(MetadataTreeCheckpoint {
         header: out,
         body_writes,
+        required_len: data_end,
     })
 }
 

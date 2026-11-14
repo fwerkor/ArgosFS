@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import ctypes
+import concurrent.futures
 import errno
 import multiprocessing
 import mmap
@@ -8,6 +9,7 @@ import socket
 import pwd
 import stat
 import sys
+import threading
 import time
 
 
@@ -621,6 +623,59 @@ def check_concurrency(root):
     log("passed", "concurrent-readers-writers")
 
 
+def check_statfs_during_concurrent_sync_writes(root):
+    daemon_pid = os.environ.get("ARGOSFS_COMPAT_DAEMON_PID")
+    if sys.platform.startswith("linux") and daemon_pid:
+        task_dir = f"/proc/{int(daemon_pid)}/task"
+        workers = set()
+        for tid in os.listdir(task_dir):
+            with open(f"{task_dir}/{tid}/comm", encoding="utf-8") as comm:
+                name = comm.read().strip()
+            if name.startswith("fuser-"):
+                workers.add(name)
+        require(
+            len(workers) >= 4,
+            f"FUSE dispatched only {len(workers)} event loops: {sorted(workers)}",
+        )
+
+    payload = b"fuse-concurrency" * (256 * 1024 // len(b"fuse-concurrency"))
+    start_gate = threading.Barrier(3)
+    deadline = time.monotonic() + 3
+
+    def sync_writer(index):
+        filename = path(root, f"statfs-concurrent-{index}.bin".encode())
+        fd = os.open(filename, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_SYNC, 0o600)
+        try:
+            start_gate.wait(timeout=5)
+            while time.monotonic() < deadline:
+                require(os.pwrite(fd, payload, 0) == len(payload), "short concurrent sync write")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        return filename
+
+    latencies = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        writes = [executor.submit(sync_writer, i) for i in range(2)]
+        start_gate.wait(timeout=5)
+        require(not all(write.done() for write in writes), "writers stopped before statfs test")
+        while time.monotonic() < deadline:
+            stat_started = time.monotonic()
+            stat_result = os.statvfs(root)
+            latency = time.monotonic() - stat_started
+            latencies.append(latency)
+            require(stat_result.f_blocks > 0, "statvfs returned no blocks during writes")
+            require(latency < 5, f"statvfs stalled {latency:.2f}s behind concurrent writes")
+            time.sleep(0.02)
+        for write in writes:
+            filename = write.result(timeout=45)
+            require(os.stat(filename).st_size == len(payload), "concurrent file size mismatch")
+            with open(filename, "rb") as f:
+                require(f.read() == payload, "concurrent file content mismatch")
+    require(len(latencies) >= 5, f"too few overlapping statfs requests: {len(latencies)}")
+    log("passed", "statfs-under-parallel-sync-write", f"max_latency_sec={max(latencies):.3f}")
+
+
 def main():
     if len(sys.argv) != 2:
         raise SystemExit(f"usage: {sys.argv[0]} MOUNTPOINT")
@@ -642,6 +697,7 @@ def main():
         check_permission_enforcement,
         check_sticky,
         check_concurrency,
+        check_statfs_during_concurrent_sync_writes,
     ]
     requested_check = os.environ.get("ARGOSFS_COMPAT_CHECK")
     if requested_check:

@@ -57,6 +57,26 @@ fn allow_other_wins_over_allow_root() {
 }
 
 #[test]
+fn mounts_dispatch_multiple_requests_with_independent_linux_fuse_channels() {
+    let config = mount_config(vec![MountOption::CUSTOM("ro".to_string())]);
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(
+            config.n_threads,
+            Some(fuse_thread_count("ARGOSFS_FUSE_REQUEST_THREADS", 2, 8))
+        );
+        assert!(config.n_threads.unwrap() >= 2);
+        assert!(config.clone_fd);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        assert_eq!(config.n_threads, None);
+        assert!(!config.clone_fd);
+    }
+    assert!(config.mount_options.contains(&MountOption::RO));
+}
+
+#[test]
 fn proc_status_group_parser_reads_supplementary_groups() {
     let status =
         "Name:\ttest\nUid:\t1000 1000 1000 1000\nGid:\t2000 2000 2000 2000\nGroups:\t10 20 30 \n";
@@ -944,4 +964,74 @@ fn regular_file_and_handle_validation_report_expected_errors() {
         fuse.require_writable_handle(INodeNo(ino), FileHandle(999)),
         Err(ArgosError::Invalid(_))
     ));
+}
+
+#[test]
+fn statfs_returns_published_snapshot_during_metadata_write_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let volume = ArgosFs::create(
+        dir.path(),
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            ..VolumeConfig::default()
+        },
+        1,
+        false,
+    )
+    .unwrap();
+    let fuse = ArgosFuse::new(volume.clone());
+    let original = fuse.statfs_snapshot();
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        volume.test_with_metadata_write_lock(|| {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+    });
+    started_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    let started = std::time::Instant::now();
+    let cached = fuse.statfs_snapshot();
+    let elapsed = started.elapsed();
+    release_tx.send(()).unwrap();
+    writer.join().unwrap();
+    assert_eq!(cached.usable_bytes, original.usable_bytes);
+    assert_eq!(cached.free_bytes, original.free_bytes);
+    assert_eq!(cached.inode_count, original.inode_count);
+    assert!(
+        elapsed < Duration::from_millis(200),
+        "statfs blocked: {elapsed:?}"
+    );
+}
+
+#[test]
+fn sequential_writeback_merges_four_mib_without_cross_inode_growth() {
+    let dir = tempfile::tempdir().unwrap();
+    let volume = ArgosFs::create(
+        dir.path(),
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            ..VolumeConfig::default()
+        },
+        1,
+        false,
+    )
+    .unwrap();
+    let fuse = ArgosFuse::new(volume);
+    let one_mib = vec![0x51; 1024 * 1024];
+    for i in 0..4 {
+        assert!(fuse.queue_writeback(17, i * one_mib.len() as u64, &one_mib));
+    }
+    let state = fuse.writeback.lock();
+    let extent = state.dirty.get(&17).unwrap();
+    assert_eq!(extent.offset, 0);
+    assert_eq!(extent.data.len(), 4 * 1024 * 1024);
+    assert!(extent.data.iter().all(|&b| b == 0x51));
+    drop(state);
+    assert!(!fuse.queue_writeback(17, 4 * one_mib.len() as u64, &one_mib));
+    assert!(fuse.queue_writeback(19, 0, &one_mib));
+    let state = fuse.writeback.lock();
+    assert_eq!(state.dirty.get(&19).unwrap().data.len(), 1024 * 1024);
 }

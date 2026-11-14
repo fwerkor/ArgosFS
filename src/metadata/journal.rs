@@ -1,13 +1,16 @@
 use crate::error::{ArgosError, Result};
+use crate::metadata::store::MetadataHeaderPage;
 use crate::types::{
     Metadata, MetadataCandidateReport, MetadataIntegrity, TransactionReport, FORMAT_VERSION,
 };
 use crate::util::{append_json_line, atomic_write, now_f64, read_to_vec, sha256_hex, FileLock};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 const JOURNAL_VERSION: u32 = 1;
@@ -419,13 +422,41 @@ pub fn write_metadata_copies(root: &Path, meta: &Metadata) -> Result<()> {
     Ok(())
 }
 
+/// Stream a canonical metadata image into SHA-256. Serializing into a giant
+/// temporary Vec, deserializing it, and serializing it again previously cost
+/// multiple whole-namespace passes and gigabytes of transient allocations.
+///
+/// The serde round-trip is retained for floating-point normalization, and
+/// the final digest is calculated over exactly the legacy pretty JSON bytes.
 pub fn canonical_metadata_hash(meta: &Metadata) -> Result<String> {
     let mut clone = meta.clone();
     clone.integrity = MetadataIntegrity::default();
-    let persisted = serde_json::to_vec_pretty(&clone)?;
-    let mut round_trip = serde_json::from_slice::<Metadata>(&persisted)?;
-    round_trip.integrity = MetadataIntegrity::default();
-    Ok(sha256_hex(&serde_json::to_vec_pretty(&round_trip)?))
+    // A serde round-trip normalizes floating-point representations. This is
+    // part of the historical integrity hash and cannot be omitted without
+    // invalidating checkpoints written by prior ArgosFS versions.
+    let compact = serde_json::to_vec(&clone)?;
+    let round_trip = serde_json::from_slice::<Metadata>(&compact)?;
+    drop(compact);
+    let mut sink = Sha256Sink(Sha256::new());
+    {
+        let mut buffered = BufWriter::with_capacity(256 * 1024, &mut sink);
+        serde_json::to_writer_pretty(&mut buffered, &round_trip)?;
+        buffered.flush()?;
+    }
+    Ok(hex::encode(sink.0.finalize()))
+}
+
+struct Sha256Sink(Sha256);
+
+impl Write for Sha256Sink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 pub fn prepare_metadata_integrity_for_external_store(meta: &mut Metadata) -> Result<()> {
@@ -437,6 +468,92 @@ pub fn prepare_metadata_integrity_with_previous(
     previous_meta_hash: String,
 ) -> Result<()> {
     prepare_metadata_integrity(meta, previous_meta_hash)
+}
+
+/// Raw journal v2 hashes authenticate the *ordered delta* and the preceding
+/// verified metadata identity, rather than serializing the whole inode table.
+/// The domain separator and length-prefixing rule out cross-protocol replay.
+/// Integrity-field operations are excluded to avoid a circular digest; their
+/// expected values are independently checked after applying the delta.
+pub const DELTA_INTEGRITY_SCHEME: u32 = 2;
+const DELTA_INTEGRITY_DOMAIN: &[u8] = b"ArgosFS/raw-delta-integrity/v2\0";
+
+fn delta_integrity_hash(
+    base: &Metadata,
+    next: &Metadata,
+    ops: &[MetadataDeltaOp],
+) -> Result<String> {
+    if base.integrity.meta_hash.len() != 64 {
+        return Err(ArgosError::CorruptedMetadata(
+            "delta integrity has no authenticated previous metadata hash".to_string(),
+        ));
+    }
+    if next.integrity.previous_meta_hash != base.integrity.meta_hash
+        || next.integrity.generation != next.txid
+        || next.integrity.hash_scheme != Some(DELTA_INTEGRITY_SCHEME)
+        || next.uuid != base.uuid
+        || next.txid <= base.txid
+    {
+        return Err(ArgosError::CorruptedMetadata(
+            "delta integrity transaction does not chain from its base".to_string(),
+        ));
+    }
+    let mut digest = Sha256::new();
+    digest.update(DELTA_INTEGRITY_DOMAIN);
+    digest.update(hex::decode(&base.integrity.meta_hash).map_err(|_| {
+        ArgosError::CorruptedMetadata("invalid previous metadata hash encoding".to_string())
+    })?);
+    digest.update(next.uuid.as_bytes());
+    digest.update(next.txid.to_le_bytes());
+    digest.update(next.integrity.generation.to_le_bytes());
+    let covered = ops
+        .iter()
+        .filter(|op| {
+            let path = delta_path(op);
+            path != "/integrity" && !path.starts_with("/integrity/")
+        })
+        .collect::<Vec<_>>();
+    // The journal parses its JSON before validating its delta. serde_json's
+    // legacy float parser can drift on *multiple* successive parse/serialize
+    // passes (e.g. 2.7876436713919087e-8). Normalize until the serialized
+    // delta is a fixed point. A stable canonical form is independent of how
+    // many times it was parsed, including the parse at journal replay. If it
+    // does not stabilize, reject the transaction *before* writing anything.
+    // Do not enable float_roundtrip globally: that would break the persisted
+    // canonical hashes of older pools.
+    let mut payload = serde_json::to_vec(&covered)?;
+    const MAX_WIRE_NORMALIZATION_PASSES: usize = 64;
+    let mut stable = false;
+    for _ in 0..MAX_WIRE_NORMALIZATION_PASSES {
+        let decoded: Vec<MetadataDeltaOp> = serde_json::from_slice(&payload)?;
+        let serialized = serde_json::to_vec(&decoded)?;
+        if serialized == payload {
+            stable = true;
+            break;
+        }
+        payload = serialized;
+    }
+    if !stable {
+        return Err(ArgosError::IncompatibleFormat(
+            "raw delta floating-point JSON could not reach a stable wire representation"
+                .to_string(),
+        ));
+    }
+    digest.update((payload.len() as u64).to_le_bytes());
+    digest.update(payload);
+    Ok(hex::encode(digest.finalize()))
+}
+
+/// Build a v2 transaction using only changed inode keys, disk metadata, and
+/// a bounded header, leveraging the existing COW mutation tracker.
+pub fn prepare_delta_integrity(meta: &mut Metadata, previous: &Metadata) -> Result<()> {
+    meta.integrity.generation = meta.txid;
+    meta.integrity.previous_meta_hash = previous.integrity.meta_hash.clone();
+    meta.integrity.hash_scheme = Some(DELTA_INTEGRITY_SCHEME);
+    meta.integrity.meta_hash.clear();
+    let delta = metadata_delta(previous, meta)?;
+    meta.integrity.meta_hash = delta_integrity_hash(previous, meta, &delta)?;
+    Ok(())
 }
 
 pub fn inject_crash(point: &str) -> Result<()> {
@@ -497,6 +614,7 @@ fn write_metadata_copies_with_injection(root: &Path, meta: &Metadata) -> Result<
 fn prepare_metadata_integrity(meta: &mut Metadata, previous_meta_hash: String) -> Result<()> {
     meta.integrity.generation = meta.txid;
     meta.integrity.previous_meta_hash = previous_meta_hash;
+    meta.integrity.hash_scheme = None;
     meta.integrity.meta_hash = canonical_metadata_hash(meta)?;
     Ok(())
 }
@@ -905,20 +1023,330 @@ fn has_valid_checkpoint(root: &Path) -> Result<bool> {
     Ok(false)
 }
 
+/// Build a JSON-compatible journal delta without materializing the full
+/// previous/next metadata trees. Existing journal records remain readable.
 pub fn metadata_delta(previous: &Metadata, next: &Metadata) -> Result<Vec<MetadataDeltaOp>> {
-    let previous = serde_json::to_value(previous)?;
-    let next = serde_json::to_value(next)?;
     let mut ops = Vec::new();
-    diff_json("", &previous, &next, &mut ops);
+    // HeaderPage contains all Metadata fields except disks/inodes. Its size
+    // is bounded independently of the namespace (allocator lists excluded).
+    let previous_header = serde_json::to_value(MetadataHeaderPage::from(previous))?;
+    let next_header = serde_json::to_value(MetadataHeaderPage::from(next))?;
+    diff_json("", &previous_header, &next_header, &mut ops);
+
+    diff_metadata_map("/disks", &previous.disks, &next.disks, &mut ops)?;
+    diff_inodes(&previous.inodes, &next.inodes, &mut ops)?;
     Ok(ops)
 }
 
+/// Committed baselines and mutation tracking bound normal group commits to
+/// modified inode keys; independent images fall back to exhaustive scans. The
+/// operation order is independent of the full-tree implementation but replay
+/// produces the identical JSON metadata.
+fn diff_inodes(
+    previous: &crate::model::inodes::TrackedInodes,
+    next: &crate::model::inodes::TrackedInodes,
+    ops: &mut Vec<MetadataDeltaOp>,
+) -> Result<()> {
+    for ino in previous.changed_candidates(next) {
+        let path = push_json_pointer("/inodes", &ino.to_string());
+        match (previous.get(&ino), next.get(&ino)) {
+            (None, Some(inode)) => ops.push(MetadataDeltaOp::Add {
+                path,
+                value: serde_json::to_value(inode)?,
+            }),
+            (Some(_), None) => ops.push(MetadataDeltaOp::Remove { path }),
+            (Some(old), Some(updated)) => {
+                let old_value = serde_json::to_value(old)?;
+                let new_value = serde_json::to_value(updated)?;
+                diff_json(&path, &old_value, &new_value, ops);
+            }
+            (None, None) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Iterating B-tree keys is O(total inodes); transient JSON memory is limited
+/// to a single changed inode rather than two copies of the entire namespace.
+/// Full changed-record tracking can later avoid scanning unchanged keys.
+fn diff_metadata_map<K, V>(
+    prefix: &str,
+    previous: &BTreeMap<K, V>,
+    next: &BTreeMap<K, V>,
+    ops: &mut Vec<MetadataDeltaOp>,
+) -> Result<()>
+where
+    K: Ord + ToString,
+    V: Serialize,
+{
+    for key in previous.keys() {
+        if !next.contains_key(key) {
+            ops.push(MetadataDeltaOp::Remove {
+                path: push_json_pointer(prefix, &key.to_string()),
+            });
+        }
+    }
+    for (key, next_item) in next {
+        let path = push_json_pointer(prefix, &key.to_string());
+        if let Some(previous_item) = previous.get(key) {
+            // Serialize a single inode before allocating its JSON tree. This
+            // also avoids adding any new PartialEq requirements to metadata.
+            if serde_json::to_vec(previous_item)? != serde_json::to_vec(next_item)? {
+                let old = serde_json::to_value(previous_item)?;
+                let new = serde_json::to_value(next_item)?;
+                diff_json(&path, &old, &new, ops);
+            }
+        } else {
+            ops.push(MetadataDeltaOp::Add {
+                path,
+                value: serde_json::to_value(next_item)?,
+            });
+        }
+    }
+    Ok(())
+}
+
 pub fn apply_metadata_delta(previous: &Metadata, delta: &[MetadataDeltaOp]) -> Result<Metadata> {
+    // An entire-map replacement (or a root replacement) is legal in the v1
+    // journal protocol. Preserve its old semantics; ordinary journal diffs
+    // operate on individual inode/disk keys and never need this fallback.
+    if delta.iter().any(|op| {
+        let path = delta_path(op);
+        path.is_empty() || path == "/inodes" || path == "/disks"
+    }) {
+        return apply_metadata_delta_legacy(previous, delta);
+    }
+
+    // Clone the persistent HAMT, not its inode values. The previous JSON
+    // implementation expanded every inode into serde_json::Value, mutated a
+    // handful of entries, then built an entirely new HAMT on every record.
+    let mut metadata = previous.clone();
+    let mut header: Option<serde_json::Value> = None;
+    // The delta writer groups changes to a given inode. Keep at most one
+    // expanded inode (and disk) while applying successive nested operations;
+    // caching every changed inode would reintroduce unbounded replay memory.
+    let mut pending_inode: Option<(crate::types::InodeId, serde_json::Value)> = None;
+    let mut pending_disk: Option<(String, serde_json::Value)> = None;
+    for op in delta {
+        let tokens = json_pointer_tokens(delta_path(op))?;
+        match tokens.as_slice() {
+            [root, key, tail @ ..] if root == "inodes" => {
+                flush_pending_disk(&mut metadata, &mut pending_disk)?;
+                let ino = key.parse::<crate::types::InodeId>().map_err(|_| {
+                    ArgosError::Invalid(format!("invalid inode key in metadata delta: {key}"))
+                })?;
+                if tail.is_empty() {
+                    flush_pending_inode(&mut metadata, &mut pending_inode)?;
+                    match op {
+                        MetadataDeltaOp::Add { value, .. } => {
+                            metadata
+                                .inodes
+                                .insert(ino, serde_json::from_value(value.clone())?);
+                        }
+                        MetadataDeltaOp::Replace { value, .. } => {
+                            if !metadata.inodes.contains_key(&ino) {
+                                return Err(ArgosError::Invalid(format!(
+                                    "metadata delta replace target does not exist: {}",
+                                    delta_path(op)
+                                )));
+                            }
+                            metadata
+                                .inodes
+                                .insert(ino, serde_json::from_value(value.clone())?);
+                        }
+                        MetadataDeltaOp::Remove { .. } => {
+                            if metadata.inodes.remove(&ino).is_none() {
+                                return Err(ArgosError::Invalid(format!(
+                                    "metadata delta remove target does not exist: {}",
+                                    delta_path(op)
+                                )));
+                            }
+                        }
+                    }
+                } else {
+                    if pending_inode.as_ref().is_some_and(|(id, _)| *id != ino) {
+                        flush_pending_inode(&mut metadata, &mut pending_inode)?;
+                    }
+                    if pending_inode.is_none() {
+                        let inode = metadata.inodes.get(&ino).ok_or_else(|| {
+                            ArgosError::Invalid(format!(
+                                "metadata delta parent does not exist: /inodes/{key}"
+                            ))
+                        })?;
+                        pending_inode = Some((ino, serde_json::to_value(inode)?));
+                    }
+                    apply_delta_op(
+                        &mut pending_inode.as_mut().expect("pending inode exists").1,
+                        &scoped_delta(op, tail),
+                    )?;
+                }
+            }
+            [root, key, tail @ ..] if root == "disks" => {
+                flush_pending_inode(&mut metadata, &mut pending_inode)?;
+                if tail.is_empty() {
+                    flush_pending_disk(&mut metadata, &mut pending_disk)?;
+                    match op {
+                        MetadataDeltaOp::Add { value, .. } => {
+                            metadata
+                                .disks
+                                .insert(key.clone(), serde_json::from_value(value.clone())?);
+                        }
+                        MetadataDeltaOp::Replace { value, .. } => {
+                            if !metadata.disks.contains_key(key) {
+                                return Err(ArgosError::Invalid(format!(
+                                    "metadata delta replace target does not exist: {}",
+                                    delta_path(op)
+                                )));
+                            }
+                            metadata
+                                .disks
+                                .insert(key.clone(), serde_json::from_value(value.clone())?);
+                        }
+                        MetadataDeltaOp::Remove { .. } => {
+                            if metadata.disks.remove(key).is_none() {
+                                return Err(ArgosError::Invalid(format!(
+                                    "metadata delta remove target does not exist: {}",
+                                    delta_path(op)
+                                )));
+                            }
+                        }
+                    }
+                } else {
+                    if pending_disk.as_ref().is_some_and(|(id, _)| id != key) {
+                        flush_pending_disk(&mut metadata, &mut pending_disk)?;
+                    }
+                    if pending_disk.is_none() {
+                        let disk = metadata.disks.get(key).ok_or_else(|| {
+                            ArgosError::Invalid(format!(
+                                "metadata delta parent does not exist: /disks/{key}"
+                            ))
+                        })?;
+                        pending_disk = Some((key.clone(), serde_json::to_value(disk)?));
+                    }
+                    apply_delta_op(
+                        &mut pending_disk.as_mut().expect("pending disk exists").1,
+                        &scoped_delta(op, tail),
+                    )?;
+                }
+            }
+            _ => {
+                flush_pending_inode(&mut metadata, &mut pending_inode)?;
+                flush_pending_disk(&mut metadata, &mut pending_disk)?;
+                let value = match header.as_mut() {
+                    Some(value) => value,
+                    None => {
+                        header.insert(serde_json::to_value(MetadataHeaderPage::from(&metadata))?)
+                    }
+                };
+                apply_delta_op(value, op)?;
+            }
+        }
+    }
+    flush_pending_inode(&mut metadata, &mut pending_inode)?;
+    flush_pending_disk(&mut metadata, &mut pending_disk)?;
+
+    if let Some(value) = header {
+        // HeaderPage contains all Metadata fields except disks/inodes. The
+        // explicit assignment ensures additions to Metadata cannot silently
+        // turn recovery into a partial/invalid reconstruction.
+        let h: MetadataHeaderPage = serde_json::from_value(value)?;
+        metadata.format = h.format;
+        metadata.uuid = h.uuid;
+        metadata.backend = h.backend;
+        metadata.raw_pool = h.raw_pool;
+        metadata.created_at = h.created_at;
+        metadata.updated_at = h.updated_at;
+        metadata.txid = h.txid;
+        metadata.next_inode = h.next_inode;
+        metadata.next_stripe = h.next_stripe;
+        metadata.config = h.config;
+        metadata.layouts = h.layouts;
+        metadata.current_write_layout = h.current_write_layout;
+        metadata.reshape = h.reshape;
+        metadata.encryption = h.encryption;
+        metadata.integrity = h.integrity;
+    }
+    if metadata.integrity.hash_scheme == Some(DELTA_INTEGRITY_SCHEME) {
+        let hash = delta_integrity_hash(previous, &metadata, delta)?;
+        if metadata.integrity.meta_hash != hash {
+            return Err(ArgosError::Checksum(
+                "raw delta integrity chain digest mismatch".to_string(),
+            ));
+        }
+    } else if metadata.integrity.hash_scheme.is_none() {
+        let hash = canonical_metadata_hash(&metadata)?;
+        // Legacy v1 journal records can contain floats whose persisted JSON
+        // representation changes on a second serde_json parse. Use the same
+        // backwards-compatible decoded-hash check as whole-map v1 replay;
+        // the fast COW delta path must not reject a valid older record.
+        if validate_metadata(&mut metadata, &hash).is_err() {
+            let decoded_hash = canonical_metadata_hash_decoded(&metadata)?;
+            validate_metadata(&mut metadata, &decoded_hash)?;
+        }
+    } else {
+        return Err(ArgosError::IncompatibleFormat(
+            "unsupported raw delta integrity hash scheme".to_string(),
+        ));
+    }
+    // The old JSON round-trip restored a fresh, clean tracking baseline.
+    metadata.inodes.mark_committed();
+    Ok(metadata)
+}
+
+fn flush_pending_inode(
+    metadata: &mut Metadata,
+    pending: &mut Option<(crate::types::InodeId, serde_json::Value)>,
+) -> Result<()> {
+    if let Some((ino, value)) = pending.take() {
+        metadata.inodes.insert(ino, serde_json::from_value(value)?);
+    }
+    Ok(())
+}
+
+fn flush_pending_disk(
+    metadata: &mut Metadata,
+    pending: &mut Option<(String, serde_json::Value)>,
+) -> Result<()> {
+    if let Some((id, value)) = pending.take() {
+        metadata.disks.insert(id, serde_json::from_value(value)?);
+    }
+    Ok(())
+}
+
+fn delta_path(op: &MetadataDeltaOp) -> &str {
+    match op {
+        MetadataDeltaOp::Add { path, .. }
+        | MetadataDeltaOp::Remove { path }
+        | MetadataDeltaOp::Replace { path, .. } => path,
+    }
+}
+
+fn scoped_delta(op: &MetadataDeltaOp, tail: &[String]) -> MetadataDeltaOp {
+    let path = json_pointer_from_tokens(tail);
+    match op {
+        MetadataDeltaOp::Add { value, .. } => MetadataDeltaOp::Add {
+            path,
+            value: value.clone(),
+        },
+        MetadataDeltaOp::Remove { .. } => MetadataDeltaOp::Remove { path },
+        MetadataDeltaOp::Replace { value, .. } => MetadataDeltaOp::Replace {
+            path,
+            value: value.clone(),
+        },
+    }
+}
+
+fn apply_metadata_delta_legacy(previous: &Metadata, delta: &[MetadataDeltaOp]) -> Result<Metadata> {
     let mut value = serde_json::to_value(previous)?;
     for op in delta {
         apply_delta_op(&mut value, op)?;
     }
     let mut metadata = serde_json::from_value::<Metadata>(value)?;
+    if metadata.integrity.hash_scheme.is_some() {
+        return Err(ArgosError::IncompatibleFormat(
+            "whole-map raw delta is unsupported with versioned integrity".to_string(),
+        ));
+    }
     let hash = canonical_metadata_hash(&metadata)?;
     if validate_metadata(&mut metadata, &hash).is_err() {
         let decoded_hash = canonical_metadata_hash_decoded(&metadata)?;
@@ -952,11 +1380,33 @@ fn diff_json(
                 }
             }
         }
-        _ if previous != next => ops.push(MetadataDeltaOp::Replace {
+        // Value::PartialEq treats -0.0 and +0.0 as equal, although those
+        // serialize to distinct bytes and therefore change the metadata hash.
+        _ if !json_values_identical(previous, next) => ops.push(MetadataDeltaOp::Replace {
             path: path.to_string(),
             value: next.clone(),
         }),
         _ => {}
+    }
+}
+
+// Value's numeric equality ignores the sign bit of zero, but a journal
+// delta must reproduce exact serialized bytes to validate integrity hashes.
+fn json_values_identical(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    match (a, b) {
+        (serde_json::Value::Number(left), serde_json::Value::Number(right))
+            if left.is_f64() && right.is_f64() =>
+        {
+            left.as_f64().map(f64::to_bits) == right.as_f64().map(f64::to_bits)
+        }
+        (serde_json::Value::Array(left), serde_json::Value::Array(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(a, b)| json_values_identical(a, b))
+        }
+        _ => a == b,
     }
 }
 

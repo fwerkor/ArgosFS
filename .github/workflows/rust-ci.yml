@@ -278,6 +278,7 @@ jobs:
         env:
           ARGOSFS_QEMU_TEST_DIAGNOSTICS_DIR: ${{ runner.temp }}/argosfs-qemu-test-diagnostics
         run: |
+          scripts/tests/host/initramfs_dev_handoff.sh
           scripts/tests/host/qemu_helper_logic.sh
           scripts/tests/host/qemu_reboot_persistence_console_logic.sh
           scripts/tests/host/qemu_phase1_retry_logic.sh

@@ -358,8 +358,11 @@ create_dev_node() {
 	major="$3"
 	minor="$4"
 	mode="$5"
-	[ -e "$node" ] || mknod "$node" "$node_type" "$major" "$minor" 2>/dev/null || true
-	chmod "$mode" "$node" 2>/dev/null || true
+	if [ ! -c "$node" ]; then
+		rm -f "$node" || return 1
+		mknod "$node" "$node_type" "$major" "$minor" || return 1
+	fi
+	chmod "$mode" "$node" || return 1
 }
 
 populate_block_device_nodes() {
@@ -390,30 +393,35 @@ populate_block_device_nodes() {
 
 populate_minimal_dev_nodes() {
 	root="$1"
-	mkdir -p "$root"
-	create_dev_node "$root/console" c 5 1 0600
-	create_dev_node "$root/tty" c 5 0 0666
-	create_dev_node "$root/ttyS0" c 4 64 0660
-	create_dev_node "$root/null" c 1 3 0666
-	create_dev_node "$root/zero" c 1 5 0666
-	create_dev_node "$root/random" c 1 8 0666
-	create_dev_node "$root/urandom" c 1 9 0666
-	create_dev_node "$root/fuse" c 10 229 0666
+	mkdir -p "$root" || return 1
+	create_dev_node "$root/console" c 5 1 0600 || return 1
+	create_dev_node "$root/tty" c 5 0 0666 || return 1
+	create_dev_node "$root/ttyS0" c 4 64 0660 || return 1
+	create_dev_node "$root/null" c 1 3 0666 || return 1
+	create_dev_node "$root/zero" c 1 5 0666 || return 1
+	create_dev_node "$root/random" c 1 8 0666 || return 1
+	create_dev_node "$root/urandom" c 1 9 0666 || return 1
+	create_dev_node "$root/fuse" c 10 229 0666 || return 1
 	populate_block_device_nodes "$root"
 }
 
 prepare_new_root_dev() {
+	mkdir -p "$sysroot/dev" || return 1
 	if is_mounted /dev; then
 		move_mount_or_mount /dev "$sysroot/dev" devtmpfs devtmpfs || return 1
-		return 0
 	fi
-	mkdir -p "$sysroot/dev"
-	is_mounted "$sysroot/dev" ||
+	if ! is_mounted "$sysroot/dev"; then
+		# Many OpenWrt kernels do not enable devtmpfs. Never continue with
+		# an unmounted /dev on the persistent ArgosFS root: procd may lose
+		# /dev/console after reboot and silently fail to start a serial login.
 		mount -t devtmpfs devtmpfs "$sysroot/dev" 2>/dev/null ||
-		mount -t tmpfs tmpfs "$sysroot/dev" 2>/dev/null ||
-		true
-	populate_minimal_dev_nodes "$sysroot/dev"
-	[ -d "$sysroot/dev" ]
+			mount -t tmpfs tmpfs "$sysroot/dev" 2>/dev/null || return 1
+	fi
+	is_mounted "$sysroot/dev" || return 1
+	populate_minimal_dev_nodes "$sysroot/dev" || return 1
+	for node in console tty ttyS0 null zero random urandom fuse; do
+		[ -c "$sysroot/dev/$node" ] || return 1
+	done
 }
 
 prepare_new_root_runtime_dirs() {

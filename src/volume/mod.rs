@@ -22,13 +22,14 @@ use verify_after_write::VerifyAfterWrite;
 
 mod verify_after_write;
 use crate::util::{
-    append_json_line, atomic_write, clean_path, configured_read_retries, content_hash_hex,
-    content_hash_matches, ensure_dir, ensure_private_dir, now_f64, parent_name,
-    relative_or_absolute, retry_verified, split_path, stable_u01,
+    append_json_line, atomic_write, clean_path, configured_offline_grace_ms,
+    configured_read_retries, content_hash_hex, content_hash_matches, ensure_dir,
+    ensure_private_dir, now_f64, parent_name, relative_or_absolute, retry_verified, split_path,
+    stable_u01,
 };
 use parking_lot::{Mutex, RwLock};
 use serde_json::json;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
@@ -39,6 +40,55 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+/// Physical verification must never accept or populate a reconstructed block cache entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlockCachePolicy {
+    Normal,
+    Bypass,
+}
+
+/// Read-side samples collected while an immutable metadata read guard is held.
+/// This avoids taking the namespace write lock for each individual shard I/O.
+struct ReadLatencySample {
+    disk_id: String,
+    bytes: u64,
+    elapsed_seconds: f64,
+}
+
+thread_local! {
+    static READ_LATENCY_SAMPLES: RefCell<Option<Vec<ReadLatencySample>>> = const { RefCell::new(None) };
+}
+
+struct ReadLatencyCapture {
+    previous: Option<Vec<ReadLatencySample>>,
+    active: bool,
+}
+
+impl ReadLatencyCapture {
+    fn start() -> Self {
+        let previous = READ_LATENCY_SAMPLES.with(|slot| slot.replace(Some(Vec::new())));
+        Self {
+            previous,
+            active: true,
+        }
+    }
+
+    fn finish(mut self) -> Vec<ReadLatencySample> {
+        self.active = false;
+        READ_LATENCY_SAMPLES.with(|slot| slot.replace(self.previous.take()).unwrap_or_default())
+    }
+}
+
+impl Drop for ReadLatencyCapture {
+    fn drop(&mut self) {
+        if self.active {
+            READ_LATENCY_SAMPLES.with(|slot| {
+                slot.replace(self.previous.take());
+            });
+        }
+    }
+}
 
 thread_local! {
     static THREAD_BULK_IMPORT_MODE: Cell<Option<bool>> = const { Cell::new(None) };
@@ -80,6 +130,7 @@ mod autopilot;
 mod data_plane;
 mod helpers;
 mod maintenance;
+mod metadata_budget;
 mod namespace;
 #[cfg(test)]
 mod tests;
@@ -90,12 +141,30 @@ use namespace::*;
 
 #[derive(Clone, Debug)]
 struct DeferredCommitState {
-    durable_metadata: Option<Metadata>,
+    durable_metadata: Option<Arc<Metadata>>,
+    durability_cache: Option<DurabilityValidationCache>,
     raw_uncommitted_metadata_dirty: bool,
+    // Recovery normalization requires a full one-time checkpoint before
+    // establishing a trusted v2 delta baseline.
+    raw_checkpoint_required: bool,
     dirty_transactions: u64,
     dirty_since: Option<Instant>,
     pending_reclaims: Vec<FileBlock>,
     last_error: Option<String>,
+}
+
+/// A checked data-durability image. Its copy-on-write inode baseline lets
+/// subsequent group commits inspect only modified inodes, provided the disk
+/// availability and layout definitions are unchanged. A changed condition
+/// forces a full validation, never a speculative fast path.
+#[derive(Clone, Debug)]
+struct DurabilityValidationCache {
+    inodes: crate::model::inodes::TrackedInodes,
+    disk_statuses: BTreeMap<String, DiskStatus>,
+    layouts: Vec<u8>,
+    unavailable: BTreeSet<String>,
+    #[cfg(test)]
+    last_scanned_blocks: usize,
 }
 
 impl DeferredCommitState {
@@ -105,8 +174,10 @@ impl DeferredCommitState {
 
     fn new_with_raw_dirty(meta: &Metadata, raw_uncommitted_metadata_dirty: bool) -> Self {
         Self {
-            durable_metadata: (meta.backend != BackendKind::Host).then(|| meta.clone()),
+            durable_metadata: (meta.backend != BackendKind::Host).then(|| Arc::new(meta.clone())),
+            durability_cache: None,
             raw_uncommitted_metadata_dirty,
+            raw_checkpoint_required: raw_uncommitted_metadata_dirty,
             dirty_transactions: 0,
             dirty_since: None,
             pending_reclaims: Vec::new(),
@@ -187,6 +258,7 @@ pub struct ArgosFs {
     quota_runtime: Arc<RwLock<QuotaRuntime>>,
     deferred_commit: Arc<Mutex<DeferredCommitState>>,
     quarantined_devices: Arc<Mutex<BTreeSet<String>>>,
+    quarantine_since: Arc<Mutex<BTreeMap<String, f64>>>,
     write_fence: Arc<Mutex<Option<String>>>,
     dirty_host_shards: Arc<Mutex<BTreeSet<PathBuf>>>,
     inode_locks: Arc<Mutex<BTreeMap<InodeId, Arc<Mutex<()>>>>>,
@@ -210,6 +282,7 @@ impl Clone for ArgosFs {
             quota_runtime: self.quota_runtime.clone(),
             deferred_commit: self.deferred_commit.clone(),
             quarantined_devices: self.quarantined_devices.clone(),
+            quarantine_since: self.quarantine_since.clone(),
             write_fence: self.write_fence.clone(),
             dirty_host_shards: self.dirty_host_shards.clone(),
             inode_locks: self.inode_locks.clone(),
@@ -324,6 +397,7 @@ impl ArgosFs {
                     weight: probe.recommended_weight,
                     status: DiskStatus::Online,
                     manually_offline: false,
+                    offline_since: None,
                     capacity_bytes: probe.capacity_bytes,
                     capacity_source: CapacitySource::AutoProbe,
                     used_bytes: 0,
@@ -404,7 +478,7 @@ impl ArgosFs {
             encryption: EncryptionConfig::default(),
             integrity: MetadataIntegrity::default(),
             disks,
-            inodes,
+            inodes: inodes.into_iter().collect(),
         };
         let mut meta = meta;
         normalize_metadata_layouts(&mut meta);
@@ -439,6 +513,7 @@ impl ArgosFs {
             root: Arc::new(root),
             deferred_commit: Arc::new(Mutex::new(DeferredCommitState::new(&meta))),
             quarantined_devices: Arc::new(Mutex::new(BTreeSet::new())),
+            quarantine_since: Arc::new(Mutex::new(BTreeMap::new())),
             write_fence: Arc::new(Mutex::new(None)),
             quota_runtime: Arc::new(RwLock::new(QuotaRuntime::from_metadata(&meta)?)),
             meta: Arc::new(RwLock::new(meta)),
@@ -543,6 +618,7 @@ impl ArgosFs {
                     weight: 1.0,
                     status: DiskStatus::Online,
                     manually_offline: false,
+                    offline_since: None,
                     capacity_bytes: info.capacity,
                     capacity_source: CapacitySource::UserOverride,
                     used_bytes: 0,
@@ -595,7 +671,7 @@ impl ArgosFs {
             encryption: EncryptionConfig::default(),
             integrity: MetadataIntegrity::default(),
             disks,
-            inodes,
+            inodes: inodes.into_iter().collect(),
         };
         normalize_metadata_layouts(&mut meta);
         journal::prepare_metadata_integrity_for_external_store(&mut meta)?;
@@ -637,7 +713,9 @@ impl ArgosFs {
             .unwrap_or_else(std::env::temp_dir);
         let raw_uncommitted_metadata_dirty = meta.backend != BackendKind::Host
             && (meta.integrity.meta_hash.is_empty()
-                || journal::canonical_metadata_hash(&meta)? != meta.integrity.meta_hash);
+                || meta.integrity.hash_scheme == Some(journal::DELTA_INTEGRITY_SCHEME)
+                || (meta.integrity.hash_scheme.is_none()
+                    && journal::canonical_metadata_hash(&meta)? != meta.integrity.meta_hash));
         let quarantined_devices = Arc::new(Mutex::new(BTreeSet::new()));
         let write_fence = Arc::new(Mutex::new(None));
         let meta = Arc::new(RwLock::new(meta));
@@ -667,6 +745,7 @@ impl ArgosFs {
             raw_superblocks: Arc::new(superblocks),
             deferred_commit,
             quarantined_devices,
+            quarantine_since: Arc::new(Mutex::new(BTreeMap::new())),
             write_fence,
             quota_runtime,
             meta,
@@ -701,6 +780,49 @@ impl ArgosFs {
 
     pub fn metadata_snapshot(&self) -> Metadata {
         self.meta.read().clone()
+    }
+
+    /// Nonblocking metadata observation for advisory queries such as statfs.
+    /// A checkpoint may hold the writer lock for slow device I/O.
+    pub(crate) fn try_metadata_snapshot(&self) -> Option<Metadata> {
+        self.meta.try_read().map(|meta| meta.clone())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_with_metadata_write_lock(&self, action: impl FnOnce()) {
+        let _guard = self.meta.write();
+        action();
+    }
+
+    /// Explicit, offline-only, one-way upgrade of every active raw/loop
+    /// member. Call only after unmounting all other processes using this pool;
+    /// this API cannot fence an unrelated legacy daemon already mounted.
+    pub fn upgrade_delta_integrity(&mut self) -> Result<()> {
+        if self.mount_owners.load(Ordering::Acquire) != 1 {
+            return Err(ArgosError::Conflict(
+                "raw integrity upgrade requires a unique volume handle".to_string(),
+            ));
+        }
+        self.sync()?;
+        let meta = self.meta.read();
+        self.ensure_block_backend_writable_locked(&meta)?;
+        if meta.backend == BackendKind::Host {
+            return Err(ArgosError::Unsupported(
+                "delta integrity upgrade requires raw/loop backend".to_string(),
+            ));
+        }
+        let superblocks = self.metadata_superblocks_locked(&meta)?;
+        let upgraded = if self.open_backend_covers_superblocks(&superblocks) {
+            raw_store::upgrade_delta_integrity_members(&*self.backend, &superblocks, &meta)?
+        } else {
+            let backend = self.metadata_block_backend_locked(&meta, &superblocks, true)?;
+            raw_store::upgrade_delta_integrity_members(&*backend, &superblocks, &meta)?
+        };
+        // Only activate new group commits when both copies on ALL active
+        // members have been durably upgraded. A partially failed migration
+        // leaves the old canonical integrity scheme in use and is retryable.
+        self.raw_superblocks = Arc::new(upgraded);
+        Ok(())
     }
 
     pub fn transaction_report(&self) -> Result<TransactionReport> {
@@ -798,7 +920,22 @@ impl ArgosFs {
     }
 
     fn quarantine_device(&self, disk_id: &str) {
+        self.quarantine_since
+            .lock()
+            .entry(disk_id.to_string())
+            .or_insert_with(now_f64);
         self.quarantined_devices.lock().insert(disk_id.to_string());
+    }
+
+    fn quarantined_member_due_for_repair(&self, disk_id: &str) -> bool {
+        let grace_ms = configured_offline_grace_ms();
+        if grace_ms == 0 {
+            return true;
+        }
+        self.quarantine_since
+            .lock()
+            .get(disk_id)
+            .is_some_and(|since| now_f64() - since >= grace_ms as f64 / 1000.0)
     }
 
     fn apply_quorum_write_report(
@@ -809,9 +946,8 @@ impl ArgosFs {
         if report.unavailable_devices.is_empty() {
             return Ok(());
         }
-        {
-            let mut quarantined = self.quarantined_devices.lock();
-            quarantined.extend(report.unavailable_devices);
+        for disk_id in &report.unavailable_devices {
+            self.quarantine_device(disk_id);
         }
         let unavailable = self.quarantined_devices.lock().clone();
         match self.validate_data_durability_locked(meta, &unavailable) {
@@ -873,9 +1009,13 @@ impl ArgosFs {
                     return Err(err);
                 }
             };
+            // A successful metadata checkpoint is durable even when a
+            // subsequent device-loss fence reports CommittedDurabilityLoss.
+            meta.inodes.mark_committed();
             let mut state = self.deferred_commit.lock();
-            state.durable_metadata = Some(meta.clone());
+            state.durable_metadata = Some(Arc::new(meta.clone()));
             state.raw_uncommitted_metadata_dirty = false;
+            state.raw_checkpoint_required = false;
             durability?;
             return Ok(());
         }
@@ -1049,29 +1189,31 @@ impl ArgosFs {
     }
 
     fn file_window(&self, cursor: Option<InodeId>, max_files: usize) -> Vec<(InodeId, Inode)> {
-        let meta = self.meta.read();
-        let files = meta
-            .inodes
-            .iter()
-            .filter_map(|(ino, inode)| {
-                (inode.kind == NodeKind::File).then_some((*ino, inode.clone()))
-            })
-            .collect::<Vec<_>>();
-        if files.is_empty() || max_files == 0 {
+        if max_files == 0 {
             return Vec::new();
         }
-        if max_files == usize::MAX {
-            return files;
-        }
-        let start = cursor
-            .and_then(|cursor| files.iter().position(|(ino, _)| *ino > cursor))
-            .unwrap_or(0);
-        files
+        let meta = self.meta.read();
+        // HashMap iteration is deliberately unordered. Scrub/rebalance cursors
+        // must advance in numeric inode order, and cloning every file's shard
+        // records merely to select 128 entries can exceed the memory budget.
+        let mut ids = meta
+            .inodes
             .iter()
+            .filter_map(|(ino, inode)| (inode.kind == NodeKind::File).then_some(*ino))
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        ids.sort_unstable();
+        let start = cursor
+            .map(|value| ids.partition_point(|ino| *ino <= value))
+            .filter(|start| *start < ids.len())
+            .unwrap_or(0);
+        ids.iter()
             .cycle()
             .skip(start)
-            .take(max_files.min(files.len()))
-            .cloned()
+            .take(max_files.min(ids.len()))
+            .filter_map(|ino| meta.inodes.get(ino).map(|inode| (*ino, inode.clone())))
             .collect()
     }
 
@@ -1094,7 +1236,7 @@ impl ArgosFs {
             return Err(ArgosError::AlreadyExists(name.to_string()));
         }
         let now = now_f64();
-        let ino = self.alloc_inode_locked(meta);
+        let ino = self.alloc_inode_locked(meta)?;
         let (gid, inherit_setgid) = {
             let parent_inode = self.dir_inode_locked(meta, parent)?;
             (
@@ -1216,7 +1358,7 @@ impl ArgosFs {
             )));
         };
         let now = now_f64();
-        let ino = self.alloc_inode_locked(meta);
+        let ino = self.alloc_inode_locked(meta)?;
         let gid = {
             let parent_inode = self.dir_inode_locked(meta, parent)?;
             if parent_inode.mode & libc::S_ISGID != 0 {
@@ -1859,10 +2001,11 @@ impl ArgosFs {
         }
     }
 
-    fn alloc_inode_locked(&self, meta: &mut Metadata) -> InodeId {
+    fn alloc_inode_locked(&self, meta: &mut Metadata) -> Result<InodeId> {
+        metadata_budget::check_new_inode(meta)?;
         let ino = meta.next_inode;
         meta.next_inode += 1;
-        ino
+        Ok(ino)
     }
 
     fn shard_path_locked(&self, meta: &Metadata, disk_id: &str, relpath: &Path) -> PathBuf {
@@ -1932,6 +2075,7 @@ impl ArgosFs {
         meta: &Metadata,
         backend: &dyn StorageBackend,
         superblocks: &[RawSuperblock],
+        durability_cache: &mut Option<DurabilityValidationCache>,
     ) -> Result<()> {
         let mut unavailable = self.quarantined_devices.lock().clone();
         for sb in superblocks {
@@ -1943,11 +2087,59 @@ impl ArgosFs {
                 }
             }
         }
-        self.quarantined_devices
-            .lock()
-            .extend(unavailable.iter().cloned());
+        for disk_id in &unavailable {
+            self.quarantine_device(disk_id);
+        }
 
-        self.validate_data_durability_locked(meta, &unavailable)
+        Self::validate_deferred_data_durability(meta, &unavailable, durability_cache)
+    }
+
+    fn validate_deferred_data_durability(
+        meta: &Metadata,
+        unavailable: &BTreeSet<String>,
+        cache: &mut Option<DurabilityValidationCache>,
+    ) -> Result<()> {
+        let disk_statuses = meta
+            .disks
+            .iter()
+            .map(|(disk_id, disk)| (disk_id.clone(), disk.status))
+            .collect::<BTreeMap<_, _>>();
+        let layouts = serde_json::to_vec(&meta.layouts)?;
+        let can_reuse = cache.as_ref().is_some_and(|previous| {
+            previous.unavailable == *unavailable
+                && previous.disk_statuses == disk_statuses
+                && previous.layouts == layouts
+        });
+        let checked = if can_reuse {
+            let changed = meta
+                .inodes
+                .changed_candidates(&cache.as_ref().expect("validated cache exists").inodes);
+            Self::validate_data_durability_blocks(
+                meta,
+                unavailable,
+                changed
+                    .iter()
+                    .filter_map(|ino| meta.inodes.get(ino))
+                    .flat_map(|inode| inode.blocks.iter()),
+            )?
+        } else {
+            Self::validate_data_durability_blocks(
+                meta,
+                unavailable,
+                meta.inodes.values().flat_map(|inode| inode.blocks.iter()),
+            )?
+        };
+        *cache = Some(DurabilityValidationCache {
+            inodes: meta.inodes.clone(),
+            disk_statuses,
+            layouts,
+            unavailable: unavailable.clone(),
+            #[cfg(test)]
+            last_scanned_blocks: checked,
+        });
+        #[cfg(not(test))]
+        let _ = checked;
+        Ok(())
     }
 
     fn validate_data_durability_locked(
@@ -1962,7 +2154,22 @@ impl ArgosFs {
         meta: &Metadata,
         unavailable: &BTreeSet<String>,
     ) -> Result<()> {
-        for block in meta.inodes.values().flat_map(|inode| inode.blocks.iter()) {
+        Self::validate_data_durability_blocks(
+            meta,
+            unavailable,
+            meta.inodes.values().flat_map(|inode| inode.blocks.iter()),
+        )
+        .map(|_| ())
+    }
+
+    fn validate_data_durability_blocks<'a>(
+        meta: &Metadata,
+        unavailable: &BTreeSet<String>,
+        blocks: impl Iterator<Item = &'a FileBlock>,
+    ) -> Result<usize> {
+        let mut checked = 0;
+        for block in blocks {
+            checked += 1;
             let layout = layout_by_id(meta, block_layout_id(block))?;
             let missing = block
                 .shards
@@ -1986,7 +2193,7 @@ impl ArgosFs {
                 });
             }
         }
-        Ok(())
+        Ok(checked)
     }
 
     fn note_deferred_transaction_locked(&self, meta: &mut Metadata) -> Result<()> {
@@ -2018,16 +2225,37 @@ impl ArgosFs {
         {
             return Ok(false);
         }
-        let checkpoint = checkpoint || state.raw_uncommitted_metadata_dirty;
+        // A pool can grow after mount. Never decide the integrity scheme from
+        // the superblocks cached at open: dynamically added voting members
+        // must also carry the mandatory downgrade-prevention feature.
+        let current_members = self.metadata_superblocks_locked(meta)?;
+        let active_members = meta
+            .disks
+            .values()
+            .filter(|disk| disk.status != DiskStatus::Removed)
+            .count();
+        let incremental_integrity_enabled = state.dirty_transactions > 0
+            && current_members.len() == active_members
+            && active_members > 0
+            && current_members.iter().all(|sb| {
+                sb.required_feature_flags & raw_format::REQUIRED_FEATURE_DELTA_INTEGRITY != 0
+            });
+        let checkpoint = checkpoint
+            || state.raw_checkpoint_required
+            || (state.raw_uncommitted_metadata_dirty && !incremental_integrity_enabled);
 
+        // The committed image is shared rather than cloned for every group commit.
+        // A full rollback image is only needed if reclaiming old extents changes
+        // allocator counters during the commit attempt.
         let previous = state
             .durable_metadata
             .clone()
-            .unwrap_or_else(|| meta.clone());
-        let before_commit = meta.clone();
+            .unwrap_or_else(|| Arc::new(meta.clone()));
+        let before_commit = (!state.pending_reclaims.is_empty()).then(|| meta.clone());
+        let before_integrity = meta.integrity.clone();
         let dirty_transactions = state.dirty_transactions;
         let previous_meta_hash = if previous.integrity.meta_hash.is_empty() {
-            journal::canonical_metadata_hash(&previous)?
+            journal::canonical_metadata_hash(previous.as_ref())?
         } else {
             previous.integrity.meta_hash.clone()
         };
@@ -2037,34 +2265,54 @@ impl ArgosFs {
                 self.account_blocks_locked(meta, std::slice::from_ref(block), false);
                 self.delete_blocks_locked(meta, std::slice::from_ref(block));
             }
-            journal::prepare_metadata_integrity_with_previous(meta, previous_meta_hash.clone())?;
+            if incremental_integrity_enabled && !checkpoint {
+                journal::prepare_delta_integrity(meta, &previous)?;
+            } else {
+                journal::prepare_metadata_integrity_with_previous(
+                    meta,
+                    previous_meta_hash.clone(),
+                )?;
+            }
             let superblocks = self.metadata_superblocks_locked(meta)?;
             let unavailable = self.quarantined_devices.lock().clone();
-            self.validate_data_durability_locked(meta, &unavailable)?;
-            let commit = |backend: &dyn StorageBackend| -> Result<raw_store::QuorumWriteReport> {
-                if dirty_transactions > 0 && (meta.config.defer_data_flush || bulk_import_enabled())
-                {
-                    self.flush_deferred_data_locked(meta, backend, &superblocks)?;
-                    journal::inject_crash(FaultPoint::AfterDataFlushBeforeJournalCommit.as_str())?;
-                }
-                if checkpoint {
-                    raw_store::write_metadata_copies_quorum(backend, &superblocks, meta)
-                } else {
-                    raw_store::append_transaction_with_trusted_integrity_quorum(
-                        backend,
-                        &superblocks,
-                        meta,
-                        Some(&previous),
-                        "group-commit",
-                        json!({
-                            "transactions": dirty_transactions,
-                            "previous_txid": previous.txid,
-                            "previous_meta_hash": previous_meta_hash,
-                            "txid": meta.txid,
-                        }),
-                    )
-                }
-            };
+            Self::validate_deferred_data_durability(
+                meta,
+                &unavailable,
+                &mut state.durability_cache,
+            )?;
+            let mut commit =
+                |backend: &dyn StorageBackend| -> Result<raw_store::QuorumWriteReport> {
+                    if dirty_transactions > 0
+                        && (meta.config.defer_data_flush || bulk_import_enabled())
+                    {
+                        self.flush_deferred_data_locked(
+                            meta,
+                            backend,
+                            &superblocks,
+                            &mut state.durability_cache,
+                        )?;
+                        journal::inject_crash(
+                            FaultPoint::AfterDataFlushBeforeJournalCommit.as_str(),
+                        )?;
+                    }
+                    if checkpoint {
+                        raw_store::write_metadata_copies_quorum(backend, &superblocks, meta)
+                    } else {
+                        raw_store::append_transaction_with_trusted_integrity_quorum(
+                            backend,
+                            &superblocks,
+                            meta,
+                            Some(&previous),
+                            "group-commit",
+                            json!({
+                                "transactions": dirty_transactions,
+                                "previous_txid": previous.txid,
+                                "previous_meta_hash": previous_meta_hash,
+                                "txid": meta.txid,
+                            }),
+                        )
+                    }
+                };
             if self.open_backend_covers_superblocks(&superblocks) {
                 commit(&*self.backend)
             } else {
@@ -2076,8 +2324,18 @@ impl ArgosFs {
         match result {
             Ok(report) => {
                 let durability = self.apply_quorum_write_report(meta, report);
-                state.durable_metadata = Some(meta.clone());
+                meta.inodes.mark_committed();
+                if let Some(cache) = &mut state.durability_cache {
+                    // Reset the tracked baseline with the committed inode map.
+                    cache.inodes = meta.inodes.clone();
+                }
+                drop(before_commit);
+                // The former durable Arc is no longer required after a durable commit.
+                state.durable_metadata = None;
+                drop(previous);
+                state.durable_metadata = Some(Arc::new(meta.clone()));
                 state.raw_uncommitted_metadata_dirty = false;
+                state.raw_checkpoint_required = false;
                 state.dirty_transactions = 0;
                 state.dirty_since = None;
                 state.pending_reclaims.clear();
@@ -2093,8 +2351,17 @@ impl ArgosFs {
                 }
             }
             Err(err) if Self::transaction_error_is_committed(&err) => {
-                state.durable_metadata = Some(meta.clone());
+                meta.inodes.mark_committed();
+                if let Some(cache) = &mut state.durability_cache {
+                    // Reset the tracked baseline with the committed inode map.
+                    cache.inodes = meta.inodes.clone();
+                }
+                drop(before_commit);
+                state.durable_metadata = None;
+                drop(previous);
+                state.durable_metadata = Some(Arc::new(meta.clone()));
                 state.raw_uncommitted_metadata_dirty = false;
+                state.raw_checkpoint_required = false;
                 state.dirty_transactions = 0;
                 state.dirty_since = None;
                 state.pending_reclaims.clear();
@@ -2102,7 +2369,14 @@ impl ArgosFs {
                 Err(err)
             }
             Err(err) => {
-                *meta = before_commit;
+                if let Some(snapshot) = before_commit {
+                    *meta = snapshot;
+                } else {
+                    // No pending reclamation touched the inode/allocator graph.
+                    // Integrity is the only metadata field changed during the
+                    // failed commit attempt.
+                    meta.integrity = before_integrity;
+                }
                 self.rebuild_quota_runtime_locked(meta)?;
                 self.fence_on_quorum_loss(&err);
                 state.last_error = Some(err.to_string());
@@ -2209,8 +2483,9 @@ impl ArgosFs {
                         // Keep the live metadata at that durable state, but fail the
                         // mutation and fence further writes because referenced data is
                         // no longer reconstructable from runtime-available members.
+                        meta.inodes.mark_committed();
                         let mut state = self.deferred_commit.lock();
-                        state.durable_metadata = Some(meta.clone());
+                        state.durable_metadata = Some(Arc::new(meta.clone()));
                         state.raw_uncommitted_metadata_dirty = false;
                         state.last_error = Some(err.to_string());
                         drop(state);
@@ -2221,6 +2496,7 @@ impl ArgosFs {
                 Err(commit_err) => {
                     self.fence_on_quorum_loss(&commit_err);
                     if Self::transaction_error_is_committed(&commit_err) {
+                        meta.inodes.mark_committed();
                         self.deferred_commit.lock().raw_uncommitted_metadata_dirty = false;
                         self.rebuild_quota_runtime_locked(meta)?;
                     }
@@ -2239,6 +2515,7 @@ impl ArgosFs {
                     return Err(commit_err);
                 }
             }
+            meta.inodes.mark_committed();
             self.deferred_commit.lock().raw_uncommitted_metadata_dirty = false;
             return Ok(());
         }
@@ -2261,10 +2538,14 @@ impl ArgosFs {
                 recompute_disk_usage_from_metadata(meta);
                 self.rebuild_quota_runtime_locked(meta)?;
             } else {
+                meta.inodes.mark_committed();
                 self.rebuild_quota_runtime_locked(meta)?;
             }
         }
 
+        if result.is_ok() {
+            meta.inodes.mark_committed();
+        }
         result
     }
 
@@ -2283,10 +2564,11 @@ impl ArgosFs {
         recompute_disk_usage_from_metadata(meta);
         self.rebuild_quota_runtime_locked(meta)?;
         let mut state = self.deferred_commit.lock();
-        state.durable_metadata = Some(meta.clone());
+        state.durable_metadata = Some(Arc::new(meta.clone()));
         // Recovery may normalize/recompute fields after validating the persisted hash.
         // Re-establish a full durable checkpoint before trusting a delta base again.
         state.raw_uncommitted_metadata_dirty = true;
+        state.raw_checkpoint_required = true;
         Ok(())
     }
 
@@ -2336,6 +2618,19 @@ impl ArgosFs {
             return match result {
                 Ok(report) => {
                     self.apply_quorum_write_report(&journal_meta, report)?;
+                    // An event may roll over to a canonical checkpoint using
+                    // a different digest from the cached durable baseline.
+                    // This also applies to an upgraded pool still carrying
+                    // the legacy scheme with post-read telemetry changes.
+                    // Re-anchor before the next delta even if the event did
+                    // not actually roll over: its tip is not a safe ancestor.
+                    if journal_meta.integrity.meta_hash != meta.integrity.meta_hash
+                        || meta.integrity.hash_scheme == Some(journal::DELTA_INTEGRITY_SCHEME)
+                    {
+                        let mut state = self.deferred_commit.lock();
+                        state.raw_uncommitted_metadata_dirty = true;
+                        state.raw_checkpoint_required = true;
+                    }
                     Ok(())
                 }
                 Err(err) => {

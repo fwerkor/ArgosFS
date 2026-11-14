@@ -159,6 +159,23 @@ impl ArgosFs {
         start: usize,
         end: usize,
     ) -> Result<(Vec<u8>, Vec<String>)> {
+        self.decode_inode_range_with_cache_policy_locked(
+            meta,
+            inode,
+            start,
+            end,
+            BlockCachePolicy::Normal,
+        )
+    }
+
+    pub(super) fn decode_inode_range_with_cache_policy_locked(
+        &self,
+        meta: &mut Metadata,
+        inode: &Inode,
+        start: usize,
+        end: usize,
+        cache_policy: BlockCachePolicy,
+    ) -> Result<(Vec<u8>, Vec<String>)> {
         if end <= start {
             return Ok((Vec::new(), Vec::new()));
         }
@@ -202,8 +219,13 @@ impl ArgosFs {
                 )? {
                     out[dst_start..dst_start + len].copy_from_slice(&raw);
                 } else {
-                    let raw =
-                        self.decode_block_locked(meta, block, decrypt_key.as_ref(), &mut damaged)?;
+                    let raw = self.decode_block_with_cache_policy_locked(
+                        meta,
+                        block,
+                        decrypt_key.as_ref(),
+                        &mut damaged,
+                        cache_policy,
+                    )?;
                     let src_start = copy_start - block_start;
                     out[dst_start..dst_start + len]
                         .copy_from_slice(&raw[src_start..src_start + len]);
@@ -224,6 +246,7 @@ impl ArgosFs {
         window: &[u8],
         logical_write_bytes: u64,
         clear_setid: bool,
+        preserve_mtime: bool,
         action: &str,
         details: serde_json::Value,
     ) -> Result<()> {
@@ -295,7 +318,9 @@ impl ArgosFs {
         inode.write_bytes = inode.write_bytes.saturating_add(logical_write_bytes);
         inode.last_written_at = now;
         inode.workload_score = inode.workload_score * 0.90 + 2.0;
-        inode.mtime = now;
+        if !preserve_mtime {
+            inode.mtime = now;
+        }
         inode.ctime = now;
         if clear_setid {
             inode.mode &= !(libc::S_ISUID | libc::S_ISGID);
@@ -323,10 +348,20 @@ impl ArgosFs {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn decode_inode_data_locked(
         &self,
         meta: &mut Metadata,
         inode: &Inode,
+    ) -> Result<(Vec<u8>, Vec<String>)> {
+        self.decode_inode_data_with_cache_policy_locked(meta, inode, BlockCachePolicy::Normal)
+    }
+
+    pub(super) fn decode_inode_data_with_cache_policy_locked(
+        &self,
+        meta: &mut Metadata,
+        inode: &Inode,
+        cache_policy: BlockCachePolicy,
     ) -> Result<(Vec<u8>, Vec<String>)> {
         let logical_size = usize::try_from(inode.size)
             .map_err(|_| ArgosError::Invalid("inode logical size is too large".to_string()))?;
@@ -347,7 +382,13 @@ impl ArgosFs {
             None
         };
         for block in &inode.blocks {
-            let raw = self.decode_block_locked(meta, block, decrypt_key.as_ref(), &mut damaged)?;
+            let raw = self.decode_block_with_cache_policy_locked(
+                meta,
+                block,
+                decrypt_key.as_ref(),
+                &mut damaged,
+                cache_policy,
+            )?;
             let block_start = usize::try_from(block.raw_offset).map_err(|_| {
                 ArgosError::Invalid(format!("block {} raw offset is too large", block.stripe_id))
             })?;
@@ -372,18 +413,43 @@ impl ArgosFs {
         decrypt_key: Option<&[u8; 32]>,
         damaged: &mut Vec<String>,
     ) -> Result<Vec<u8>> {
+        self.decode_block_with_cache_policy_locked(
+            meta,
+            block,
+            decrypt_key,
+            damaged,
+            BlockCachePolicy::Normal,
+        )
+    }
+
+    fn decode_block_with_cache_policy_locked(
+        &self,
+        meta: &mut Metadata,
+        block: &FileBlock,
+        decrypt_key: Option<&[u8; 32]>,
+        damaged: &mut Vec<String>,
+        cache_policy: BlockCachePolicy,
+    ) -> Result<Vec<u8>> {
         let cache_key = format!("{}:{}:{}", meta.uuid, block.stripe_id, block.raw_sha256);
         if block.encrypted {
             self.cache.remove(&cache_key);
-        } else if let Some(raw) = self.cache.get(&cache_key, Some(&block.raw_sha256)) {
-            if raw.len() == block.raw_size {
-                return Ok(raw);
+        } else if cache_policy == BlockCachePolicy::Normal {
+            if let Some(raw) = self.cache.get(&cache_key, Some(&block.raw_sha256)) {
+                if raw.len() == block.raw_size {
+                    return Ok(raw);
+                }
+                self.cache.remove(&cache_key);
             }
-            self.cache.remove(&cache_key);
         }
         let layout = layout_by_id(meta, block_layout_id(block))?;
         if layout.k == 1 && layout.m == 0 && !block.encrypted && block.codec == Compression::None {
-            return self.decode_single_shard_block_locked(meta, block, damaged, &cache_key);
+            return self.decode_single_shard_block_with_cache_policy_locked(
+                meta,
+                block,
+                damaged,
+                &cache_key,
+                cache_policy,
+            );
         }
         let codec = RsCodec::new(layout.k, layout.m)?;
         let mut shards: Vec<Option<Vec<u8>>> = vec![None; layout_total(&layout)?];
@@ -452,7 +518,7 @@ impl ArgosFs {
                 reason: "raw checksum mismatch".to_string(),
             });
         }
-        if !block.encrypted {
+        if !block.encrypted && cache_policy == BlockCachePolicy::Normal {
             self.cache.put(&cache_key, &raw)?;
         }
         Ok(raw)
@@ -573,12 +639,30 @@ impl ArgosFs {
         Ok(Some(data[local_start..local_end].to_vec()))
     }
 
+    #[cfg(test)]
     pub(super) fn decode_single_shard_block_locked(
         &self,
         meta: &mut Metadata,
         block: &FileBlock,
         damaged: &mut Vec<String>,
         cache_key: &str,
+    ) -> Result<Vec<u8>> {
+        self.decode_single_shard_block_with_cache_policy_locked(
+            meta,
+            block,
+            damaged,
+            cache_key,
+            BlockCachePolicy::Normal,
+        )
+    }
+
+    fn decode_single_shard_block_with_cache_policy_locked(
+        &self,
+        meta: &mut Metadata,
+        block: &FileBlock,
+        damaged: &mut Vec<String>,
+        cache_key: &str,
+        cache_policy: BlockCachePolicy,
     ) -> Result<Vec<u8>> {
         let Some(shard) = block.shards.iter().find(|shard| shard.slot == 0) else {
             damaged.push("single-shard:missing-slot-0".to_string());
@@ -625,7 +709,9 @@ impl ArgosFs {
                 reason: "single-device raw checksum mismatch".to_string(),
             });
         }
-        self.cache.put(cache_key, &data)?;
+        if cache_policy == BlockCachePolicy::Normal {
+            self.cache.put(cache_key, &data)?;
+        }
         Ok(data)
     }
 
@@ -1179,6 +1265,22 @@ impl ArgosFs {
         bytes: u64,
         seconds: f64,
     ) {
+        let captured = READ_LATENCY_SAMPLES.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if let Some(samples) = slot.as_mut() {
+                samples.push(ReadLatencySample {
+                    disk_id: disk_id.to_owned(),
+                    bytes,
+                    elapsed_seconds: seconds,
+                });
+                true
+            } else {
+                false
+            }
+        });
+        if captured {
+            return;
+        }
         if meta.backend != BackendKind::Host {
             self.deferred_commit.lock().raw_uncommitted_metadata_dirty = true;
         }
@@ -1540,6 +1642,45 @@ impl ArgosFs {
             .map(|candidate| candidate.used_bytes)
             .sum()
     }
+}
+
+/// True when an unavailable damage marker should be left for a member that
+/// may still return.
+///
+/// `decode_block_locked` records `"<disk>:unavailable"` for a shard whose
+/// member is Offline, Failed or Removed and reconstructs the block from the
+/// remaining shards.  An `Offline` member may simply be missing from this
+/// scan (a reader was power-cycled, a card is out of its slot) and can return
+/// on the next open.  `repair_offline` is false for ordinary reads, which
+/// must never rewrite a file for it.  Scrub passes true and waits for the
+/// configured grace period before rebuilding the shards.  A `Failed` or
+/// `Removed` member is a different case: the device is present but failed, or
+/// the operator has explicitly retired it, so the normal repair path still
+/// rebuilds the file.
+pub(super) fn damage_is_transient_offline_member(
+    fs: &ArgosFs,
+    meta: &Metadata,
+    entry: &str,
+    repair_offline: bool,
+) -> bool {
+    let disk_id = entry
+        .strip_suffix(":unavailable")
+        .or_else(|| entry.split_once(":missing:").map(|(disk_id, _)| disk_id));
+    disk_id.is_some_and(|disk_id| {
+        meta.disks.get(disk_id).is_some_and(|disk| {
+            if disk.status == DiskStatus::Offline {
+                return !(repair_offline && offline_member_due_for_repair(disk));
+            }
+            // During an active mount a disappearing USB device is quarantined
+            // before the next open scan can mark it Offline. The first fatal
+            // I/O failure starts the same grace period for scrub and reads.
+            meta.backend != BackendKind::Host
+                && disk.status != DiskStatus::Failed
+                && disk.status != DiskStatus::Removed
+                && fs.is_device_quarantined(disk_id)
+                && !(repair_offline && fs.quarantined_member_due_for_repair(disk_id))
+        })
+    })
 }
 
 #[cfg(test)]

@@ -90,6 +90,7 @@ fn sample_metadata() -> Metadata {
             weight: 1.0,
             status: DiskStatus::Online,
             manually_offline: false,
+            offline_since: None,
             capacity_bytes: 1024 * 1024 * 1024,
             capacity_source: CapacitySource::UserOverride,
             used_bytes: 4096,
@@ -249,7 +250,7 @@ fn sample_metadata() -> Metadata {
         last_written_at: created_at,
     };
 
-    let mut inodes = BTreeMap::new();
+    let mut inodes: BTreeMap<InodeId, Inode> = BTreeMap::new();
     inodes.insert(1, root);
     inodes.insert(2, file);
     inodes.insert(3, symlink);
@@ -287,7 +288,7 @@ fn sample_metadata() -> Metadata {
         encryption: EncryptionConfig::default(),
         integrity: MetadataIntegrity::default(),
         disks,
-        inodes,
+        inodes: inodes.into_iter().collect(),
     }
 }
 

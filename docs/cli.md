@@ -106,3 +106,19 @@ Nested quotas are enforced independently. A hard-linked inode is counted once
 within each quota subtree that contains at least one link to it. Growth through
 writes or `truncate`, hard-link insertion, and rename/move operations that would
 exceed a quota fail with `EDQUOT`.
+
+## Offline raw/loop integrity upgrade
+
+A one-way opt-in to the raw journal's changed-record integrity chain:
+
+```sh
+# Unmount the pool in every process, supply all active members, and back up data first.
+argosfs upgrade-integrity --pool-config /etc/argosfs/root-pool.json --offline-confirmed
+```
+
+The command uses the mandatory superblock feature bit so pre-upgrade ArgosFS
+binaries reject the upgraded pool. It is idempotent across interrupted upgrades
+provided all original active members are accessible. **Never run while any
+other mount still uses these disks.** See
+[`incremental-journal-delta.md`](incremental-journal-delta.md) for recovery and
+compatibility details.

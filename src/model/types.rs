@@ -1,3 +1,4 @@
+use super::inodes::TrackedInodes;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -423,6 +424,10 @@ pub struct Disk {
     // Older metadata cannot distinguish scan- and manually-offline states.
     #[serde(default, skip_serializing_if = "is_false")]
     pub manually_offline: bool,
+    // Unix time when this member was first seen absent from the scan.  Scrub
+    // gives it a short grace period before rebuilding its shards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline_since: Option<f64>,
     pub capacity_bytes: u64,
     #[serde(default)]
     pub capacity_source: CapacitySource,
@@ -619,7 +624,7 @@ pub struct Metadata {
     #[serde(default)]
     pub integrity: MetadataIntegrity,
     pub disks: BTreeMap<String, Disk>,
-    pub inodes: BTreeMap<InodeId, Inode>,
+    pub inodes: TrackedInodes,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -658,6 +663,10 @@ pub struct MetadataIntegrity {
     pub generation: u64,
     pub previous_meta_hash: String,
     pub meta_hash: String,
+    /// Only present on versioned raw delta-chain transactions. Legacy
+    /// checkpoints retain their exact JSON encoding and hash identities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash_scheme: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -743,6 +752,12 @@ pub struct HealthReport {
     pub cache: BTreeMap<String, serde_json::Value>,
     pub io_mode: IoMode,
     pub encryption_enabled: bool,
+    #[serde(default)]
+    pub metadata_inodes: usize,
+    #[serde(default)]
+    pub metadata_estimated_rss_bytes: u64,
+    #[serde(default)]
+    pub metadata_inode_limit: Option<usize>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

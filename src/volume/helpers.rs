@@ -1,6 +1,23 @@
 use super::*;
 use std::os::unix::fs::PermissionsExt;
 
+/// True when an Offline member has been absent long enough for scrub to
+/// rebuild its shards.  Manually isolated members never become repairable.
+pub(super) fn offline_member_due_for_repair(disk: &Disk) -> bool {
+    if disk.status != DiskStatus::Offline {
+        return true;
+    }
+    if disk.manually_offline {
+        return false;
+    }
+    let grace_ms = configured_offline_grace_ms();
+    if grace_ms == 0 {
+        return true;
+    }
+    disk.offline_since
+        .is_some_and(|since| now_f64() - since >= grace_ms as f64 / 1000.0)
+}
+
 pub(super) fn canonical_or_self(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
@@ -193,10 +210,23 @@ pub(super) fn normalize_metadata_layouts(meta: &mut Metadata) {
     {
         meta.current_write_layout = DEFAULT_LAYOUT_ID.to_string();
     }
-    for inode in meta.inodes.values_mut() {
-        for block in &mut inode.blocks {
-            if block.layout_id.is_empty() {
-                block.layout_id = DEFAULT_LAYOUT_ID.to_string();
+    let missing_layout = meta
+        .inodes
+        .iter()
+        .filter_map(|(ino, inode)| {
+            inode
+                .blocks
+                .iter()
+                .any(|block| block.layout_id.is_empty())
+                .then_some(*ino)
+        })
+        .collect::<Vec<_>>();
+    for ino in missing_layout {
+        if let Some(inode) = meta.inodes.get_mut(&ino) {
+            for block in &mut inode.blocks {
+                if block.layout_id.is_empty() {
+                    block.layout_id = DEFAULT_LAYOUT_ID.to_string();
+                }
             }
         }
     }

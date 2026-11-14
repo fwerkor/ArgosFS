@@ -1,3 +1,4 @@
+use super::fuse_queue::FuseRequestExecutor;
 use crate::acl;
 use crate::error::{ArgosError, Result};
 use crate::types::{CapacitySource, DiskStatus, InodeId, NodeKind};
@@ -13,21 +14,141 @@ use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CString, OsStr};
 use std::io::Read;
+use std::ops::Deref;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const TTL: Duration = Duration::from_secs(5);
-const FUSE_WRITEBACK_MAX_BYTES: usize = 1024 * 1024;
+// The kernel still sends at most 1 MiB per request. Accumulating up to four
+// adjacent requests amortizes one partially-covered stripe at each boundary
+// across a larger sequential write, without unbounded per-inode buffering.
+const FUSE_WRITEBACK_MAX_BYTES: usize = 4 * 1024 * 1024;
+// The small FUSE reader pool does not run blocking I/O. The execution pool
+// follows available CPU parallelism and both pools are independently tunable.
+fn fuse_thread_count(variable: &str, min: usize, max: usize) -> usize {
+    std::env::var(variable)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|count| (min..=128).contains(count))
+        .unwrap_or_else(|| {
+            thread::available_parallelism()
+                .map_or(min, |parallelism| parallelism.get())
+                .clamp(min, max)
+        })
+}
 
 pub struct ArgosFuse {
-    volume: ArgosFs,
+    shared: Arc<ArgosFuseShared>,
     commit_worker: Option<DeferredCommitWorker>,
+    io_tasks: OnceLock<std::result::Result<FuseRequestExecutor, String>>,
+}
+
+/// Shared state held by in-flight requests until their asynchronous replies
+/// have been sent. The mount's Drop joins workers before syncing this state.
+#[doc(hidden)]
+pub struct ArgosFuseShared {
+    volume: ArgosFs,
     writeback: Mutex<FuseWriteback>,
     handles: Mutex<FuseHandles>,
+    statfs_cache: Mutex<StatfsSnapshot>,
+}
+
+impl Deref for ArgosFuse {
+    type Target = ArgosFuseShared;
+
+    fn deref(&self) -> &Self::Target {
+        &self.shared
+    }
+}
+
+/// Advisory space accounting, independent of the metadata checkpoint I/O lock.
+/// The last published value remains usable while a slow checkpoint is written.
+#[derive(Clone, Debug)]
+struct StatfsSnapshot {
+    usable_bytes: u64,
+    free_bytes: u64,
+    inode_count: u64,
+    block_size: u64,
+    unavailable: BTreeSet<String>,
+}
+
+impl StatfsSnapshot {
+    fn from_metadata(
+        volume: &ArgosFs,
+        meta: &crate::types::Metadata,
+        unavailable: BTreeSet<String>,
+    ) -> Self {
+        let (usable_bytes, free_bytes) = statfs_bytes(meta, volume.root(), &unavailable);
+        Self {
+            usable_bytes,
+            free_bytes,
+            inode_count: meta.inodes.len() as u64,
+            block_size: (meta.config.chunk_size as u64).max(4096),
+            unavailable,
+        }
+    }
+}
+
+/// Copy credentials before releasing the kernel request buffer. In particular,
+/// supplementary groups must not be looked up after a queued process exits.
+struct RequestIdentity {
+    uid: u32,
+    gid: u32,
+    groups: Vec<u32>,
+}
+
+impl RequestIdentity {
+    fn from_request(req: &Request) -> Self {
+        Self {
+            uid: req.uid(),
+            gid: req.gid(),
+            groups: request_groups(req),
+        }
+    }
+
+    fn uid(&self) -> u32 {
+        self.uid
+    }
+    fn gid(&self) -> u32 {
+        self.gid
+    }
+}
+
+trait Credentials {
+    fn uid(&self) -> u32;
+    fn gid(&self) -> u32;
+    fn groups(&self) -> Vec<u32>;
+}
+
+impl Credentials for Request {
+    fn uid(&self) -> u32 {
+        Request::uid(self)
+    }
+    fn gid(&self) -> u32 {
+        Request::gid(self)
+    }
+    fn groups(&self) -> Vec<u32> {
+        read_proc_status(self.pid())
+            .and_then(|status| parse_status_groups_for_identity(&status, self.uid(), self.gid()))
+            .unwrap_or_default()
+    }
+}
+
+impl Credentials for RequestIdentity {
+    fn uid(&self) -> u32 {
+        self.uid
+    }
+    fn gid(&self) -> u32 {
+        self.gid
+    }
+    fn groups(&self) -> Vec<u32> {
+        self.groups.clone()
+    }
 }
 
 struct DeferredCommitWorker {
@@ -188,16 +309,63 @@ impl ArgosFuse {
     }
 
     fn try_new(volume: ArgosFs) -> Result<Self> {
+        // Seed the snapshot before the first FUSE request, so statfs never
+        // needs to block on a metadata write lock even during the first commit.
+        let unavailable = volume.runtime_unavailable_devices();
+        let snapshot =
+            StatfsSnapshot::from_metadata(&volume, &volume.metadata_snapshot(), unavailable);
         let commit_worker = DeferredCommitWorker::start(&volume)?;
         Ok(Self {
-            volume,
+            shared: Arc::new(ArgosFuseShared {
+                volume,
+                writeback: Mutex::new(FuseWriteback::default()),
+                handles: Mutex::new(FuseHandles::default()),
+                statfs_cache: Mutex::new(snapshot),
+            }),
             commit_worker,
-            writeback: Mutex::new(FuseWriteback::default()),
-            handles: Mutex::new(FuseHandles::default()),
+            io_tasks: OnceLock::new(),
         })
     }
 
-    fn require_access(&self, req: &Request, ino: INodeNo, mask: i32) -> Result<()> {
+    fn submit_io(&self, ino: InodeId, job: impl FnOnce(Arc<ArgosFuseShared>) + Send + 'static) {
+        let shared = Arc::clone(&self.shared);
+        let executor = self.io_tasks.get_or_init(|| {
+            FuseRequestExecutor::start(fuse_thread_count("ARGOSFS_FUSE_IO_WORKERS", 2, 16))
+                .map_err(|err| err.to_string())
+        });
+        match executor {
+            Ok(executor) => {
+                if !executor.submit(ino, move || job(shared)) {
+                    eprintln!("argosfs: rejecting FUSE request during shutdown");
+                }
+            }
+            Err(err) => {
+                eprintln!("argosfs: unable to dispatch FUSE I/O: {err}");
+                // Dropping an unfulfilled reply inside job sends EIO to FUSE.
+            }
+        }
+    }
+}
+
+impl ArgosFuseShared {
+    fn statfs_snapshot(&self) -> StatfsSnapshot {
+        let unavailable = self.volume.runtime_unavailable_devices();
+        if let Some(meta) = self.volume.try_metadata_snapshot() {
+            let snapshot = StatfsSnapshot::from_metadata(&self.volume, &meta, unavailable);
+            *self.statfs_cache.lock() = snapshot.clone();
+            return snapshot;
+        }
+        // A checkpoint is holding the metadata writer lock. Do not wait, and
+        // never advertise cached free capacity when additional members have
+        // been quarantined since the last observation.
+        let mut cached = self.statfs_cache.lock().clone();
+        if !unavailable.is_subset(&cached.unavailable) {
+            cached.free_bytes = 0;
+        }
+        cached
+    }
+
+    fn require_access(&self, req: &impl Credentials, ino: INodeNo, mask: i32) -> Result<()> {
         let groups = request_groups(req);
         self.volume
             .check_access_inode_with_groups(ino.0, req.uid(), &groups, mask)
@@ -216,7 +384,12 @@ impl ArgosFuse {
         flags
     }
 
-    fn require_xattr_write_access(&self, req: &Request, ino: INodeNo, name: &str) -> Result<()> {
+    fn require_xattr_write_access(
+        &self,
+        req: &impl Credentials,
+        ino: INodeNo,
+        name: &str,
+    ) -> Result<()> {
         if name.starts_with("user.") {
             return self.require_access(req, ino, libc::W_OK);
         }
@@ -404,6 +577,11 @@ impl ArgosFuse {
 
 impl Drop for ArgosFuse {
     fn drop(&mut self) {
+        // Accepted requests may still own dirty writeback and file handles.
+        // Drain them before stopping group commit and doing final sync.
+        if let Some(Ok(executor)) = self.io_tasks.get_mut() {
+            executor.shutdown();
+        }
         if let Some(worker) = self.commit_worker.as_mut() {
             worker.stop();
         }
@@ -446,6 +624,14 @@ pub fn mount_volume(
 
 fn mount_config(options: Vec<MountOption>) -> Config {
     let mut config = Config::default();
+    // Linux FUSE can dispatch requests on separate channels. In particular,
+    // statfs must be able to reach its lock-free cached snapshot while a
+    // different request is blocked on writeback or metadata persistence.
+    #[cfg(target_os = "linux")]
+    {
+        config.n_threads = Some(fuse_thread_count("ARGOSFS_FUSE_REQUEST_THREADS", 2, 8));
+        config.clone_fd = true;
+    }
     for option in options {
         match option {
             MountOption::CUSTOM(ref value) if value == "allow_other" => {
@@ -504,24 +690,32 @@ impl Filesystem for ArgosFuse {
     }
 
     fn lookup(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
-        match self
-            .require_access(req, parent, libc::X_OK)
-            .and_then(|()| self.lookup_after_access(parent.0, name))
-        {
-            Ok(attr) => reply.entry(&TTL, &to_file_attr(&attr), Generation(0)),
-            Err(err) => reply.error(errno(&err)),
-        }
+        let req = RequestIdentity::from_request(req);
+        let name = name.to_owned();
+        self.submit_io(parent.0, move |shared| {
+            let req = &req;
+            let name = name.as_os_str();
+            match shared
+                .require_access(req, parent, libc::X_OK)
+                .and_then(|()| shared.lookup_after_access(parent.0, name))
+            {
+                Ok(attr) => reply.entry(&TTL, &to_file_attr(&attr), Generation(0)),
+                Err(err) => reply.error(errno(&err)),
+            }
+        });
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        if let Err(err) = self.flush_inode_writeback(ino.0) {
-            reply.error(errno(&err));
-            return;
-        }
-        match self.volume.attr_inode(ino.0) {
-            Ok(attr) => reply.attr(&TTL, &to_file_attr(&attr)),
-            Err(err) => reply.error(errno(&err)),
-        }
+        self.submit_io(ino.0, move |shared| {
+            if let Err(err) = shared.flush_inode_writeback(ino.0) {
+                reply.error(errno(&err));
+                return;
+            }
+            match shared.volume.attr_inode(ino.0) {
+                Ok(attr) => reply.attr(&TTL, &to_file_attr(&attr)),
+                Err(err) => reply.error(errno(&err)),
+            }
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -543,100 +737,109 @@ impl Filesystem for ArgosFuse {
         _flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
-        if let Err(err) = self.flush_inode_writeback(ino.0) {
-            reply.error(errno(&err));
-            return;
-        }
-        let result = (|| -> Result<NodeAttr> {
-            let current = self.volume.attr_inode(ino.0)?;
-            let groups = request_groups(req);
-            let kernel_killpriv = mode.is_some_and(|requested_mode| {
-                req.uid() != 0
-                    && req.uid() != current.uid
-                    && is_setid_clear_only(current.mode, requested_mode)
-            });
-            if mode.is_some() && req.uid() != 0 && req.uid() != current.uid && !kernel_killpriv {
-                return Err(ArgosError::PermissionDenied(
-                    "chmod requires file ownership or root".to_string(),
-                ));
+        let req = RequestIdentity::from_request(req);
+        self.submit_io(ino.0, move |shared| {
+            let req = &req;
+            if let Err(err) = shared.flush_inode_writeback(ino.0) {
+                reply.error(errno(&err));
+                return;
             }
-            if (uid.is_some() || gid.is_some()) && req.uid() != 0 {
-                if req.uid() != current.uid {
+            let result = (|| -> Result<NodeAttr> {
+                let current = shared.volume.attr_inode(ino.0)?;
+                let groups = request_groups(req);
+                let kernel_killpriv = mode.is_some_and(|requested_mode| {
+                    req.uid() != 0
+                        && req.uid() != current.uid
+                        && is_setid_clear_only(current.mode, requested_mode)
+                });
+                if mode.is_some() && req.uid() != 0 && req.uid() != current.uid && !kernel_killpriv
+                {
                     return Err(ArgosError::PermissionDenied(
-                        "chown requires file ownership or root".to_string(),
+                        "chmod requires file ownership or root".to_string(),
                     ));
                 }
-                if uid.is_some_and(|requested_uid| requested_uid != current.uid) {
-                    return Err(ArgosError::PermissionDenied(
-                        "non-root chown cannot change file owner".to_string(),
-                    ));
+                if (uid.is_some() || gid.is_some()) && req.uid() != 0 {
+                    if req.uid() != current.uid {
+                        return Err(ArgosError::PermissionDenied(
+                            "chown requires file ownership or root".to_string(),
+                        ));
+                    }
+                    if uid.is_some_and(|requested_uid| requested_uid != current.uid) {
+                        return Err(ArgosError::PermissionDenied(
+                            "non-root chown cannot change file owner".to_string(),
+                        ));
+                    }
+                    if gid.is_some_and(|requested_gid| !groups.contains(&requested_gid)) {
+                        return Err(ArgosError::PermissionDenied(
+                            "non-root chown requires the requested group to be supplementary"
+                                .to_string(),
+                        ));
+                    }
                 }
-                if gid.is_some_and(|requested_gid| !groups.contains(&requested_gid)) {
-                    return Err(ArgosError::PermissionDenied(
-                        "non-root chown requires the requested group to be supplementary"
-                            .to_string(),
-                    ));
+                if size.is_some() {
+                    if let Some(fh) = fh {
+                        shared.require_writable_handle(ino, fh)?;
+                    } else {
+                        shared.require_access(req, ino, libc::W_OK)?;
+                    }
                 }
-            }
-            if size.is_some() {
-                if let Some(fh) = fh {
-                    self.require_writable_handle(ino, fh)?;
-                } else {
-                    self.require_access(req, ino, libc::W_OK)?;
+                if atime.is_some() || mtime.is_some() {
+                    let owner_or_root = req.uid() == 0 || req.uid() == current.uid;
+                    if !owner_or_root && (is_specific_time(&atime) || is_specific_time(&mtime)) {
+                        return Err(ArgosError::PermissionDenied(
+                            "setting explicit timestamps requires ownership or root".to_string(),
+                        ));
+                    }
+                    if !owner_or_root {
+                        shared.require_access(req, ino, libc::W_OK)?;
+                    }
                 }
-            }
-            if atime.is_some() || mtime.is_some() {
-                let owner_or_root = req.uid() == 0 || req.uid() == current.uid;
-                if !owner_or_root && (is_specific_time(&atime) || is_specific_time(&mtime)) {
-                    return Err(ArgosError::PermissionDenied(
-                        "setting explicit timestamps requires ownership or root".to_string(),
-                    ));
+                let ino = ino.0;
+                let mut attr = current;
+                if let Some(mode) = mode {
+                    attr = if kernel_killpriv {
+                        shared.volume.chmod_inode(ino, mode)?
+                    } else {
+                        shared
+                            .volume
+                            .chmod_inode_as(ino, mode, req.uid(), &groups)?
+                    };
                 }
-                if !owner_or_root {
-                    self.require_access(req, ino, libc::W_OK)?;
+                if uid.is_some() || gid.is_some() {
+                    attr = shared
+                        .volume
+                        .chown_inode_as(ino, uid, gid, req.uid(), &groups)?;
                 }
+                if let Some(size) = size {
+                    shared.volume.truncate_inode_as(ino, size)?;
+                    attr = shared.volume.attr_inode(ino)?;
+                }
+                if atime.is_some() || mtime.is_some() {
+                    let current = shared.volume.attr_inode(ino)?;
+                    let atime = atime.map(time_or_now).unwrap_or(current.atime);
+                    let mtime = mtime.map(time_or_now).unwrap_or(current.mtime);
+                    attr = shared.volume.utimens_inode(ino, atime, mtime)?;
+                }
+                Ok(attr)
+            })();
+            match result {
+                Ok(attr) => reply.attr(&TTL, &to_file_attr(&attr)),
+                Err(err) => reply.error(errno(&err)),
             }
-            let ino = ino.0;
-            let mut attr = current;
-            if let Some(mode) = mode {
-                attr = if kernel_killpriv {
-                    self.volume.chmod_inode(ino, mode)?
-                } else {
-                    self.volume.chmod_inode_as(ino, mode, req.uid(), &groups)?
-                };
-            }
-            if uid.is_some() || gid.is_some() {
-                attr = self
-                    .volume
-                    .chown_inode_as(ino, uid, gid, req.uid(), &groups)?;
-            }
-            if let Some(size) = size {
-                self.volume.truncate_inode_as(ino, size)?;
-                attr = self.volume.attr_inode(ino)?;
-            }
-            if atime.is_some() || mtime.is_some() {
-                let current = self.volume.attr_inode(ino)?;
-                let atime = atime.map(time_or_now).unwrap_or(current.atime);
-                let mtime = mtime.map(time_or_now).unwrap_or(current.mtime);
-                attr = self.volume.utimens_inode(ino, atime, mtime)?;
-            }
-            Ok(attr)
-        })();
-        match result {
-            Ok(attr) => reply.attr(&TTL, &to_file_attr(&attr)),
-            Err(err) => reply.error(errno(&err)),
-        }
+        });
     }
 
     fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
-        if let Err(err) = self.flush_inode_writeback(ino.0) {
-            reply.error(errno(&err));
-            return;
-        }
-        match self.volume.readlink_inode_bytes(ino.0) {
-            Ok(target) => reply.data(&target),
-            Err(err) => reply.error(errno(&err)),
-        }
+        self.submit_io(ino.0, move |shared| {
+            if let Err(err) = shared.flush_inode_writeback(ino.0) {
+                reply.error(errno(&err));
+                return;
+            }
+            match shared.volume.readlink_inode_bytes(ino.0) {
+                Ok(target) => reply.data(&target),
+                Err(err) => reply.error(errno(&err)),
+            }
+        });
     }
 
     fn mknod(
@@ -649,32 +852,38 @@ impl Filesystem for ArgosFuse {
         rdev: u32,
         reply: ReplyEntry,
     ) {
-        if let Err(err) = self.flush_all_writeback() {
-            reply.error(errno(&err));
-            return;
-        }
-        let file_type = mode & libc::S_IFMT;
-        if matches!(file_type, value if value == libc::S_IFCHR || value == libc::S_IFBLK)
-            && req.uid() != 0
-        {
-            reply.error(Errno::EACCES);
-            return;
-        }
-        match self
-            .require_access(req, parent, libc::W_OK | libc::X_OK)
-            .and_then(|()| {
-                self.volume.mknod_at_with_owner(
-                    parent.0,
-                    name,
-                    mode & !umask,
-                    rdev as u64,
-                    req.uid(),
-                    req.gid(),
-                )
-            }) {
-            Ok(attr) => reply.entry(&TTL, &to_file_attr(&attr), Generation(0)),
-            Err(err) => reply.error(errno(&err)),
-        }
+        let req = RequestIdentity::from_request(req);
+        let name = name.to_owned();
+        self.submit_io(parent.0, move |shared| {
+            let req = &req;
+            let name = name.as_os_str();
+            if let Err(err) = shared.flush_all_writeback() {
+                reply.error(errno(&err));
+                return;
+            }
+            let file_type = mode & libc::S_IFMT;
+            if matches!(file_type, value if value == libc::S_IFCHR || value == libc::S_IFBLK)
+                && req.uid() != 0
+            {
+                reply.error(Errno::EACCES);
+                return;
+            }
+            match shared
+                .require_access(req, parent, libc::W_OK | libc::X_OK)
+                .and_then(|()| {
+                    shared.volume.mknod_at_with_owner(
+                        parent.0,
+                        name,
+                        mode & !umask,
+                        rdev as u64,
+                        req.uid(),
+                        req.gid(),
+                    )
+                }) {
+                Ok(attr) => reply.entry(&TTL, &to_file_attr(&attr), Generation(0)),
+                Err(err) => reply.error(errno(&err)),
+            }
+        });
     }
 
     fn mkdir(
@@ -686,43 +895,66 @@ impl Filesystem for ArgosFuse {
         umask: u32,
         reply: ReplyEntry,
     ) {
-        if let Err(err) = self.flush_all_writeback() {
-            reply.error(errno(&err));
-            return;
-        }
-        match self
-            .require_access(req, parent, libc::W_OK | libc::X_OK)
-            .and_then(|()| {
-                self.volume
-                    .mkdir_at_with_owner(parent.0, name, mode & !umask, req.uid(), req.gid())
-            }) {
-            Ok(attr) => reply.entry(&TTL, &to_file_attr(&attr), Generation(0)),
-            Err(err) => reply.error(errno(&err)),
-        }
+        let req = RequestIdentity::from_request(req);
+        let name = name.to_owned();
+        self.submit_io(parent.0, move |shared| {
+            let req = &req;
+            let name = name.as_os_str();
+            if let Err(err) = shared.flush_all_writeback() {
+                reply.error(errno(&err));
+                return;
+            }
+            match shared
+                .require_access(req, parent, libc::W_OK | libc::X_OK)
+                .and_then(|()| {
+                    shared.volume.mkdir_at_with_owner(
+                        parent.0,
+                        name,
+                        mode & !umask,
+                        req.uid(),
+                        req.gid(),
+                    )
+                }) {
+                Ok(attr) => reply.entry(&TTL, &to_file_attr(&attr), Generation(0)),
+                Err(err) => reply.error(errno(&err)),
+            }
+        });
     }
 
     fn unlink(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        let result = self
-            .require_access(req, parent, libc::W_OK | libc::X_OK)
-            .and_then(|()| self.unlink_after_access(parent.0, name, req.uid()));
-        match result {
-            Ok(()) => reply.ok(),
-            Err(err) => reply.error(errno(&err)),
-        }
+        let req = RequestIdentity::from_request(req);
+        let name = name.to_owned();
+        self.submit_io(parent.0, move |shared| {
+            let req = &req;
+            let name = name.as_os_str();
+            let result = shared
+                .require_access(req, parent, libc::W_OK | libc::X_OK)
+                .and_then(|()| shared.unlink_after_access(parent.0, name, req.uid()));
+            match result {
+                Ok(()) => reply.ok(),
+                Err(err) => reply.error(errno(&err)),
+            }
+        });
     }
 
     fn rmdir(&self, req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        if let Err(err) = self.flush_all_writeback() {
-            reply.error(errno(&err));
-            return;
-        }
-        match self
-            .require_access(req, parent, libc::W_OK | libc::X_OK)
-            .and_then(|()| self.volume.rmdir_at_as(parent.0, name, req.uid()))
-        {
-            Ok(()) => reply.ok(),
-            Err(err) => reply.error(errno(&err)),
-        }
+        let req = RequestIdentity::from_request(req);
+        let name = name.to_owned();
+        self.submit_io(parent.0, move |shared| {
+            let req = &req;
+            let name = name.as_os_str();
+            if let Err(err) = shared.flush_all_writeback() {
+                reply.error(errno(&err));
+                return;
+            }
+            match shared
+                .require_access(req, parent, libc::W_OK | libc::X_OK)
+                .and_then(|()| shared.volume.rmdir_at_as(parent.0, name, req.uid()))
+            {
+                Ok(()) => reply.ok(),
+                Err(err) => reply.error(errno(&err)),
+            }
+        });
     }
 
     fn symlink(
@@ -733,19 +965,28 @@ impl Filesystem for ArgosFuse {
         link: &Path,
         reply: ReplyEntry,
     ) {
-        if let Err(err) = self.flush_all_writeback() {
-            reply.error(errno(&err));
-            return;
-        }
-        match self
-            .require_access(req, parent, libc::W_OK | libc::X_OK)
-            .and_then(|()| {
-                self.volume
-                    .symlink_at_with_owner(parent.0, name, link, req.uid(), req.gid())
-            }) {
-            Ok(attr) => reply.entry(&TTL, &to_file_attr(&attr), Generation(0)),
-            Err(err) => reply.error(errno(&err)),
-        }
+        let req = RequestIdentity::from_request(req);
+        let name = name.to_owned();
+        let link = link.to_owned();
+        self.submit_io(parent.0, move |shared| {
+            let req = &req;
+            let name = name.as_os_str();
+            let link = link.as_path();
+            if let Err(err) = shared.flush_all_writeback() {
+                reply.error(errno(&err));
+                return;
+            }
+            match shared
+                .require_access(req, parent, libc::W_OK | libc::X_OK)
+                .and_then(|()| {
+                    shared
+                        .volume
+                        .symlink_at_with_owner(parent.0, name, link, req.uid(), req.gid())
+                }) {
+                Ok(attr) => reply.entry(&TTL, &to_file_attr(&attr), Generation(0)),
+                Err(err) => reply.error(errno(&err)),
+            }
+        });
     }
 
     fn rename(
@@ -758,48 +999,62 @@ impl Filesystem for ArgosFuse {
         flags: RenameFlags,
         reply: ReplyEmpty,
     ) {
-        if let Err(err) = self.flush_all_writeback() {
-            reply.error(errno(&err));
-            return;
-        }
-        let supported_flags = RenameFlags::RENAME_NOREPLACE
-            | RenameFlags::RENAME_EXCHANGE
-            | RenameFlags::RENAME_WHITEOUT;
-        if flags.bits() & !supported_flags.bits() != 0
-            || flags.contains(RenameFlags::RENAME_WHITEOUT)
-            || flags.contains(RenameFlags::RENAME_NOREPLACE)
-                && flags.contains(RenameFlags::RENAME_EXCHANGE)
-        {
-            reply.error(Errno::EINVAL);
-            return;
-        }
-        let handles = self.handles.lock();
-        let preserve_replaced_inode = if flags.contains(RenameFlags::RENAME_EXCHANGE) {
-            false
-        } else {
-            self.volume
-                .lookup(newparent.0, newname)
-                .ok()
-                .is_some_and(|attr| handles.refs(attr.ino) > 0)
-        };
-        let policy = RenamePolicy {
-            no_replace: flags.contains(RenameFlags::RENAME_NOREPLACE),
-            exchange: flags.contains(RenameFlags::RENAME_EXCHANGE),
-            uid: Some(req.uid()),
-            preserve_replaced_inode,
-        };
-        let result = self
-            .require_access(req, parent, libc::W_OK | libc::X_OK)
-            .and_then(|()| self.require_access(req, newparent, libc::W_OK | libc::X_OK))
-            .and_then(|()| {
-                self.volume
-                    .rename_at_with_policy(parent.0, name, newparent.0, newname, policy)
-            });
-        drop(handles);
-        match result {
-            Ok(()) => reply.ok(),
-            Err(err) => reply.error(errno(&err)),
-        }
+        let req = RequestIdentity::from_request(req);
+        let name = name.to_owned();
+        let newname = newname.to_owned();
+        self.submit_io(parent.0, move |shared| {
+            let req = &req;
+            let name = name.as_os_str();
+            let newname = newname.as_os_str();
+            if let Err(err) = shared.flush_all_writeback() {
+                reply.error(errno(&err));
+                return;
+            }
+            let supported_flags = RenameFlags::RENAME_NOREPLACE
+                | RenameFlags::RENAME_EXCHANGE
+                | RenameFlags::RENAME_WHITEOUT;
+            if flags.bits() & !supported_flags.bits() != 0
+                || flags.contains(RenameFlags::RENAME_WHITEOUT)
+                || flags.contains(RenameFlags::RENAME_NOREPLACE)
+                    && flags.contains(RenameFlags::RENAME_EXCHANGE)
+            {
+                reply.error(Errno::EINVAL);
+                return;
+            }
+            let handles = shared.handles.lock();
+            let preserve_replaced_inode = if flags.contains(RenameFlags::RENAME_EXCHANGE) {
+                false
+            } else {
+                shared
+                    .volume
+                    .lookup(newparent.0, newname)
+                    .ok()
+                    .is_some_and(|attr| handles.refs(attr.ino) > 0)
+            };
+            let policy = RenamePolicy {
+                no_replace: flags.contains(RenameFlags::RENAME_NOREPLACE),
+                exchange: flags.contains(RenameFlags::RENAME_EXCHANGE),
+                uid: Some(req.uid()),
+                preserve_replaced_inode,
+            };
+            let result = shared
+                .require_access(req, parent, libc::W_OK | libc::X_OK)
+                .and_then(|()| shared.require_access(req, newparent, libc::W_OK | libc::X_OK))
+                .and_then(|()| {
+                    shared.volume.rename_at_with_policy(
+                        parent.0,
+                        name,
+                        newparent.0,
+                        newname,
+                        policy,
+                    )
+                });
+            drop(handles);
+            match result {
+                Ok(()) => reply.ok(),
+                Err(err) => reply.error(errno(&err)),
+            }
+        });
     }
 
     fn link(
@@ -810,50 +1065,60 @@ impl Filesystem for ArgosFuse {
         newname: &OsStr,
         reply: ReplyEntry,
     ) {
-        if let Err(err) = self.flush_all_writeback() {
-            reply.error(errno(&err));
-            return;
-        }
-        match self
-            .require_access(req, newparent, libc::W_OK | libc::X_OK)
-            .and_then(|()| self.volume.link_at(ino.0, newparent.0, newname))
-        {
-            Ok(attr) => reply.entry(&TTL, &to_file_attr(&attr), Generation(0)),
-            Err(err) => reply.error(errno(&err)),
-        }
-    }
-
-    fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        if flags.0 & libc::O_TRUNC != 0 {
-            if let Err(err) = self.flush_inode_writeback(ino.0) {
+        let req = RequestIdentity::from_request(req);
+        let newname = newname.to_owned();
+        self.submit_io(ino.0, move |shared| {
+            let req = &req;
+            let newname = newname.as_os_str();
+            if let Err(err) = shared.flush_all_writeback() {
                 reply.error(errno(&err));
                 return;
             }
-        }
-        let mut handles = self.handles.lock();
-        let result = (|| -> Result<FileHandle> {
-            self.require_access(req, ino, open_mask(flags))?;
-            let mut attr = self.volume.attr_inode(ino.0)?;
-            if attr.kind != NodeKind::File {
-                return Err(ArgosError::IsDirectory(format!("inode {ino}")));
+            match shared
+                .require_access(req, newparent, libc::W_OK | libc::X_OK)
+                .and_then(|()| shared.volume.link_at(ino.0, newparent.0, newname))
+            {
+                Ok(attr) => reply.entry(&TTL, &to_file_attr(&attr), Generation(0)),
+                Err(err) => reply.error(errno(&err)),
             }
+        });
+    }
+
+    fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        let req = RequestIdentity::from_request(req);
+        self.submit_io(ino.0, move |shared| {
+            let req = &req;
             if flags.0 & libc::O_TRUNC != 0 {
-                self.volume.truncate_inode_as(ino.0, 0)?;
-                attr = self.volume.attr_inode(ino.0)?;
+                if let Err(err) = shared.flush_inode_writeback(ino.0) {
+                    reply.error(errno(&err));
+                    return;
+                }
             }
-            Ok(handles.open(OpenFileHandle {
-                ino: attr.ino,
-                flags: flags.0,
-            }))
-        })();
-        drop(handles);
-        match result {
-            Ok(handle) => reply.opened(
-                handle,
-                self.open_reply_flags(flags.0 & (libc::O_WRONLY | libc::O_RDWR) != 0),
-            ),
-            Err(err) => reply.error(errno(&err)),
-        }
+            let mut handles = shared.handles.lock();
+            let result = (|| -> Result<FileHandle> {
+                shared.require_access(req, ino, open_mask(flags))?;
+                let mut attr = shared.volume.attr_inode(ino.0)?;
+                if attr.kind != NodeKind::File {
+                    return Err(ArgosError::IsDirectory(format!("inode {ino}")));
+                }
+                if flags.0 & libc::O_TRUNC != 0 {
+                    shared.volume.truncate_inode_as(ino.0, 0)?;
+                    attr = shared.volume.attr_inode(ino.0)?;
+                }
+                Ok(handles.open(OpenFileHandle {
+                    ino: attr.ino,
+                    flags: flags.0,
+                }))
+            })();
+            drop(handles);
+            match result {
+                Ok(handle) => reply.opened(
+                    handle,
+                    shared.open_reply_flags(flags.0 & (libc::O_WRONLY | libc::O_RDWR) != 0),
+                ),
+                Err(err) => reply.error(errno(&err)),
+            }
+        });
     }
 
     fn read(
@@ -867,30 +1132,32 @@ impl Filesystem for ArgosFuse {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        if let Err(err) = self.flush_inode_writeback(ino.0) {
-            reply.error(errno(&err));
-            return;
-        }
-        let file = self.handles.lock().get(fh).cloned();
-        let result = file
-            .ok_or_else(|| ArgosError::Invalid("invalid FUSE file handle".to_string()))
-            .and_then(|file| {
-                if file.ino != ino.0 {
-                    return Err(ArgosError::Invalid(
-                        "FUSE file handle inode mismatch".to_string(),
-                    ));
-                }
-                if !file.can_read() {
-                    return Err(ArgosError::PermissionDenied(
-                        "FUSE file handle is not open for reading".to_string(),
-                    ));
-                }
-                self.volume.read_inode(ino.0, offset, size as usize, true)
-            });
-        match result {
-            Ok(data) => reply.data(&data),
-            Err(err) => reply.error(errno(&err)),
-        }
+        self.submit_io(ino.0, move |shared| {
+            if let Err(err) = shared.flush_inode_writeback(ino.0) {
+                reply.error(errno(&err));
+                return;
+            }
+            let file = shared.handles.lock().get(fh).cloned();
+            let result = file
+                .ok_or_else(|| ArgosError::Invalid("invalid FUSE file handle".to_string()))
+                .and_then(|file| {
+                    if file.ino != ino.0 {
+                        return Err(ArgosError::Invalid(
+                            "FUSE file handle inode mismatch".to_string(),
+                        ));
+                    }
+                    if !file.can_read() {
+                        return Err(ArgosError::PermissionDenied(
+                            "FUSE file handle is not open for reading".to_string(),
+                        ));
+                    }
+                    shared.volume.read_inode(ino.0, offset, size as usize, true)
+                });
+            match result {
+                Ok(data) => reply.data(&data),
+                Err(err) => reply.error(errno(&err)),
+            }
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -910,52 +1177,58 @@ impl Filesystem for ArgosFuse {
             reply.written(0);
             return;
         }
-        let file = self.handles.lock().get(fh).cloned();
-        let result = file
-            .ok_or_else(|| ArgosError::Invalid("invalid FUSE file handle".to_string()))
-            .and_then(|file| {
-                if file.ino != ino.0 {
-                    return Err(ArgosError::Invalid(
-                        "FUSE file handle inode mismatch".to_string(),
-                    ));
-                }
-                if !file.can_write() {
-                    return Err(ArgosError::PermissionDenied(
-                        "FUSE file handle is not open for writing".to_string(),
-                    ));
-                }
-                let sync_write = file.flags & (libc::O_SYNC | libc::O_DSYNC) != 0;
-                let direct = self.volume.io_policy().direct_io
-                    || data.len() > FUSE_WRITEBACK_MAX_BYTES
-                    || sync_write;
-                let written = if direct {
-                    self.flush_inode_writeback(ino.0).and_then(|()| {
-                        self.volume
-                            .write_inode_range_from_open_handle(ino.0, offset, data)
-                    })?
-                } else {
-                    self.require_regular_file(ino)?;
-                    if self.queue_writeback(ino.0, offset, data) {
-                        data.len()
+        let data = data.to_vec();
+        self.submit_io(ino.0, move |shared| {
+            let data = data.as_slice();
+            let file = shared.handles.lock().get(fh).cloned();
+            let result = file
+                .ok_or_else(|| ArgosError::Invalid("invalid FUSE file handle".to_string()))
+                .and_then(|file| {
+                    if file.ino != ino.0 {
+                        return Err(ArgosError::Invalid(
+                            "FUSE file handle inode mismatch".to_string(),
+                        ));
+                    }
+                    if !file.can_write() {
+                        return Err(ArgosError::PermissionDenied(
+                            "FUSE file handle is not open for writing".to_string(),
+                        ));
+                    }
+                    let sync_write = file.flags & (libc::O_SYNC | libc::O_DSYNC) != 0;
+                    let direct = shared.volume.io_policy().direct_io
+                        || data.len() > FUSE_WRITEBACK_MAX_BYTES
+                        || sync_write;
+                    let written = if direct {
+                        shared.flush_inode_writeback(ino.0).and_then(|()| {
+                            shared
+                                .volume
+                                .write_inode_range_from_open_handle(ino.0, offset, data)
+                        })?
                     } else {
-                        self.flush_inode_writeback(ino.0)?;
-                        if self.queue_writeback(ino.0, offset, data) {
+                        shared.require_regular_file(ino)?;
+                        if shared.queue_writeback(ino.0, offset, data) {
                             data.len()
                         } else {
-                            self.volume
-                                .write_inode_range_from_open_handle(ino.0, offset, data)?
+                            shared.flush_inode_writeback(ino.0)?;
+                            if shared.queue_writeback(ino.0, offset, data) {
+                                data.len()
+                            } else {
+                                shared
+                                    .volume
+                                    .write_inode_range_from_open_handle(ino.0, offset, data)?
+                            }
                         }
+                    };
+                    if sync_write {
+                        shared.volume.sync()?;
                     }
-                };
-                if sync_write {
-                    self.volume.sync()?;
-                }
-                Ok(written)
-            });
-        match result {
-            Ok(written) => reply.written(written as u32),
-            Err(err) => reply.error(errno(&err)),
-        }
+                    Ok(written)
+                });
+            match result {
+                Ok(written) => reply.written(written as u32),
+                Err(err) => reply.error(errno(&err)),
+            }
+        });
     }
 
     fn lseek(
@@ -967,32 +1240,36 @@ impl Filesystem for ArgosFuse {
         whence: i32,
         reply: ReplyLseek,
     ) {
-        if offset < 0 {
-            reply.error(Errno::EINVAL);
-            return;
-        }
-        let result = self
-            .handles
-            .lock()
-            .get(fh)
-            .cloned()
-            .ok_or_else(|| ArgosError::Invalid("invalid FUSE file handle".to_string()))
-            .and_then(|file| {
-                if file.ino != ino.0 {
-                    return Err(ArgosError::Invalid(
-                        "FUSE file handle inode mismatch".to_string(),
-                    ));
-                }
-                self.flush_inode_writeback(ino.0)?;
-                self.volume.seek_data_or_hole(ino.0, offset as u64, whence)
-            });
-        match result {
-            Ok(next) => match i64::try_from(next) {
-                Ok(next) => reply.offset(next),
-                Err(_) => reply.error(Errno::EOVERFLOW),
-            },
-            Err(err) => reply.error(errno(&err)),
-        }
+        self.submit_io(ino.0, move |shared| {
+            if offset < 0 {
+                reply.error(Errno::EINVAL);
+                return;
+            }
+            let result = shared
+                .handles
+                .lock()
+                .get(fh)
+                .cloned()
+                .ok_or_else(|| ArgosError::Invalid("invalid FUSE file handle".to_string()))
+                .and_then(|file| {
+                    if file.ino != ino.0 {
+                        return Err(ArgosError::Invalid(
+                            "FUSE file handle inode mismatch".to_string(),
+                        ));
+                    }
+                    shared.flush_inode_writeback(ino.0)?;
+                    shared
+                        .volume
+                        .seek_data_or_hole(ino.0, offset as u64, whence)
+                });
+            match result {
+                Ok(next) => match i64::try_from(next) {
+                    Ok(next) => reply.offset(next),
+                    Err(_) => reply.error(Errno::EOVERFLOW),
+                },
+                Err(err) => reply.error(errno(&err)),
+            }
+        });
     }
 
     fn fallocate(
@@ -1005,25 +1282,29 @@ impl Filesystem for ArgosFuse {
         mode: i32,
         reply: ReplyEmpty,
     ) {
-        let result = self
-            .handles
-            .lock()
-            .get(fh)
-            .cloned()
-            .ok_or_else(|| ArgosError::Invalid("invalid FUSE file handle".to_string()))
-            .and_then(|file| {
-                if file.ino != ino.0 || !file.can_write() {
-                    return Err(ArgosError::PermissionDenied(
-                        "FUSE file handle is not open for this write".to_string(),
-                    ));
-                }
-                self.flush_inode_writeback(ino.0)?;
-                self.volume.fallocate_inode_as(ino.0, offset, length, mode)
-            });
-        match result {
-            Ok(()) => reply.ok(),
-            Err(err) => reply.error(errno(&err)),
-        }
+        self.submit_io(ino.0, move |shared| {
+            let result = shared
+                .handles
+                .lock()
+                .get(fh)
+                .cloned()
+                .ok_or_else(|| ArgosError::Invalid("invalid FUSE file handle".to_string()))
+                .and_then(|file| {
+                    if file.ino != ino.0 || !file.can_write() {
+                        return Err(ArgosError::PermissionDenied(
+                            "FUSE file handle is not open for this write".to_string(),
+                        ));
+                    }
+                    shared.flush_inode_writeback(ino.0)?;
+                    shared
+                        .volume
+                        .fallocate_inode_as(ino.0, offset, length, mode)
+                });
+            match result {
+                Ok(()) => reply.ok(),
+                Err(err) => reply.error(errno(&err)),
+            }
+        });
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1040,53 +1321,57 @@ impl Filesystem for ArgosFuse {
         flags: CopyFileRangeFlags,
         reply: ReplyWrite,
     ) {
-        if !flags.is_empty() {
-            reply.error(Errno::EINVAL);
-            return;
-        }
-        let result = (|| -> Result<usize> {
-            let handles = self.handles.lock();
-            let input = handles
-                .get(fh_in)
-                .ok_or_else(|| ArgosError::Invalid("invalid input FUSE file handle".to_string()))?;
-            let output = handles.get(fh_out).ok_or_else(|| {
-                ArgosError::Invalid("invalid output FUSE file handle".to_string())
-            })?;
-            if input.ino != ino_in.0 || !input.can_read() {
-                return Err(ArgosError::PermissionDenied(
-                    "input FUSE file handle is not open for reading".to_string(),
-                ));
+        // Serialize with other writes to the destination inode. The source
+        // remains protected by the volume's existing read/data locks.
+        self.submit_io(ino_out.0, move |shared| {
+            if !flags.is_empty() {
+                reply.error(Errno::EINVAL);
+                return;
             }
-            if output.ino != ino_out.0 || !output.can_write() {
-                return Err(ArgosError::PermissionDenied(
-                    "output FUSE file handle is not open for writing".to_string(),
-                ));
+            let result = (|| -> Result<usize> {
+                let handles = shared.handles.lock();
+                let input = handles.get(fh_in).ok_or_else(|| {
+                    ArgosError::Invalid("invalid input FUSE file handle".to_string())
+                })?;
+                let output = handles.get(fh_out).ok_or_else(|| {
+                    ArgosError::Invalid("invalid output FUSE file handle".to_string())
+                })?;
+                if input.ino != ino_in.0 || !input.can_read() {
+                    return Err(ArgosError::PermissionDenied(
+                        "input FUSE file handle is not open for reading".to_string(),
+                    ));
+                }
+                if output.ino != ino_out.0 || !output.can_write() {
+                    return Err(ArgosError::PermissionDenied(
+                        "output FUSE file handle is not open for writing".to_string(),
+                    ));
+                }
+                drop(handles);
+                shared.flush_inode_writeback(ino_in.0)?;
+                if ino_out != ino_in {
+                    shared.flush_inode_writeback(ino_out.0)?;
+                }
+                shared
+                    .volume
+                    .copy_inode_range_as(ino_in.0, offset_in, ino_out.0, offset_out, len)
+            })();
+            match result {
+                Ok(copied) => reply.written(copied as u32),
+                Err(err) => reply.error(errno(&err)),
             }
-            drop(handles);
-            self.flush_inode_writeback(ino_in.0)?;
-            if ino_out != ino_in {
-                self.flush_inode_writeback(ino_out.0)?;
-            }
-            self.volume
-                .copy_inode_range_as(ino_in.0, offset_in, ino_out.0, offset_out, len)
-        })();
-        match result {
-            Ok(copied) => reply.written(copied as u32),
-            Err(err) => reply.error(errno(&err)),
-        }
+        });
     }
 
     fn statfs(&self, _req: &Request, _ino: INodeNo, reply: ReplyStatfs) {
-        self.flush_all_writeback_best_effort();
-        let meta = self.volume.metadata_snapshot();
-        let unavailable = self.volume.runtime_unavailable_devices();
-        let block = (meta.config.chunk_size as u64).max(4096);
-        let (usable, free) = statfs_bytes(&meta, self.volume.root(), &unavailable);
+        // statfs is an observation, not a durability boundary. Flushing every
+        // dirty inode here could itself start a multi-minute checkpoint.
+        let snapshot = self.statfs_snapshot();
+        let block = snapshot.block_size;
         reply.statfs(
-            usable / block,
-            free / block,
-            free / block,
-            meta.inodes.len() as u64 + 1_000_000,
+            snapshot.usable_bytes / block,
+            snapshot.free_bytes / block,
+            snapshot.free_bytes / block,
+            snapshot.inode_count + 1_000_000,
             1_000_000,
             block as u32,
             255,
@@ -1104,33 +1389,35 @@ impl Filesystem for ArgosFuse {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        let flush_result = self.flush_inode_writeback(ino.0);
-        let mut handles = self.handles.lock();
-        let Some((file, last)) = handles.close(fh) else {
-            reply.error(Errno::EBADF);
-            return;
-        };
-        let reap_result = if last {
-            if flush_result.is_ok() {
-                self.volume.reap_unlinked_inode(file.ino)
-            } else {
-                let mut writeback = self.writeback.lock();
-                if writeback.dirty.contains_key(&file.ino) {
-                    writeback.reap_after_flush.insert(file.ino);
-                    Ok(())
+        self.submit_io(ino.0, move |shared| {
+            let flush_result = shared.flush_inode_writeback(ino.0);
+            let mut handles = shared.handles.lock();
+            let Some((file, last)) = handles.close(fh) else {
+                reply.error(Errno::EBADF);
+                return;
+            };
+            let reap_result = if last {
+                if flush_result.is_ok() {
+                    shared.volume.reap_unlinked_inode(file.ino)
                 } else {
-                    drop(writeback);
-                    self.volume.reap_unlinked_inode(file.ino)
+                    let mut writeback = shared.writeback.lock();
+                    if writeback.dirty.contains_key(&file.ino) {
+                        writeback.reap_after_flush.insert(file.ino);
+                        Ok(())
+                    } else {
+                        drop(writeback);
+                        shared.volume.reap_unlinked_inode(file.ino)
+                    }
                 }
+            } else {
+                Ok(())
+            };
+            drop(handles);
+            match flush_result.and(reap_result) {
+                Ok(()) => reply.ok(),
+                Err(err) => reply.error(errno(&err)),
             }
-        } else {
-            Ok(())
-        };
-        drop(handles);
-        match flush_result.and(reap_result) {
-            Ok(()) => reply.ok(),
-            Err(err) => reply.error(errno(&err)),
-        }
+        });
     }
 
     fn fsync(
@@ -1141,25 +1428,27 @@ impl Filesystem for ArgosFuse {
         _datasync: bool,
         reply: ReplyEmpty,
     ) {
-        let result = self
-            .handles
-            .lock()
-            .get(fh)
-            .cloned()
-            .ok_or_else(|| ArgosError::Invalid("invalid FUSE file handle".to_string()))
-            .and_then(|file| {
-                if file.ino != ino.0 {
-                    return Err(ArgosError::Invalid(
-                        "FUSE file handle inode mismatch".to_string(),
-                    ));
-                }
-                self.flush_inode_writeback(ino.0)?;
-                self.volume.sync()
-            });
-        match result {
-            Ok(()) => reply.ok(),
-            Err(err) => reply.error(errno(&err)),
-        }
+        self.submit_io(ino.0, move |shared| {
+            let result = shared
+                .handles
+                .lock()
+                .get(fh)
+                .cloned()
+                .ok_or_else(|| ArgosError::Invalid("invalid FUSE file handle".to_string()))
+                .and_then(|file| {
+                    if file.ino != ino.0 {
+                        return Err(ArgosError::Invalid(
+                            "FUSE file handle inode mismatch".to_string(),
+                        ));
+                    }
+                    shared.flush_inode_writeback(ino.0)?;
+                    shared.volume.sync()
+                });
+            match result {
+                Ok(()) => reply.ok(),
+                Err(err) => reply.error(errno(&err)),
+            }
+        });
     }
 
     fn setxattr(
@@ -1172,113 +1461,141 @@ impl Filesystem for ArgosFuse {
         position: u32,
         reply: ReplyEmpty,
     ) {
-        if let Err(err) = self.flush_inode_writeback(ino.0) {
-            reply.error(errno(&err));
-            return;
-        }
-        let result = (|| -> Result<()> {
-            if position != 0 {
-                return Err(ArgosError::Invalid(format!(
-                    "unsupported setxattr position {position}"
-                )));
+        let req = RequestIdentity::from_request(req);
+        let name = name.to_owned();
+        let value = value.to_owned();
+        self.submit_io(ino.0, move |shared| {
+            let req = &req;
+            let name = name.as_os_str();
+            let value = value.as_slice();
+            if let Err(err) = shared.flush_inode_writeback(ino.0) {
+                reply.error(errno(&err));
+                return;
             }
+            let result = (|| -> Result<()> {
+                if position != 0 {
+                    return Err(ArgosError::Invalid(format!(
+                        "unsupported setxattr position {position}"
+                    )));
+                }
 
-            let supported = libc::XATTR_CREATE | libc::XATTR_REPLACE;
-            if flags & !supported != 0
-                || flags & libc::XATTR_CREATE != 0 && flags & libc::XATTR_REPLACE != 0
-            {
-                return Err(ArgosError::Invalid(format!(
-                    "unsupported setxattr flags {flags:#x}"
-                )));
+                let supported = libc::XATTR_CREATE | libc::XATTR_REPLACE;
+                if flags & !supported != 0
+                    || flags & libc::XATTR_CREATE != 0 && flags & libc::XATTR_REPLACE != 0
+                {
+                    return Err(ArgosError::Invalid(format!(
+                        "unsupported setxattr flags {flags:#x}"
+                    )));
+                }
+
+                let name = xattr_name(name)?;
+                shared.require_xattr_write_access(req, ino, name)?;
+                let exists = xattr_exists(shared.volume.getxattr_inode(ino.0, name))?;
+
+                if flags & libc::XATTR_CREATE != 0 && exists {
+                    return Err(ArgosError::AlreadyExists(format!("xattr {name}")));
+                }
+                if flags & libc::XATTR_REPLACE != 0 && !exists {
+                    return Err(ArgosError::NotFound(format!("xattr {name}")));
+                }
+
+                shared.volume.setxattr_inode(ino.0, name, value)
+            })();
+
+            match result {
+                Ok(()) => reply.ok(),
+                Err(err) => reply.error(xattr_errno(&err)),
             }
-
-            let name = xattr_name(name)?;
-            self.require_xattr_write_access(req, ino, name)?;
-            let exists = xattr_exists(self.volume.getxattr_inode(ino.0, name))?;
-
-            if flags & libc::XATTR_CREATE != 0 && exists {
-                return Err(ArgosError::AlreadyExists(format!("xattr {name}")));
-            }
-            if flags & libc::XATTR_REPLACE != 0 && !exists {
-                return Err(ArgosError::NotFound(format!("xattr {name}")));
-            }
-
-            self.volume.setxattr_inode(ino.0, name, value)
-        })();
-
-        match result {
-            Ok(()) => reply.ok(),
-            Err(err) => reply.error(xattr_errno(&err)),
-        }
+        });
     }
 
     fn getxattr(&self, req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
-        if let Err(err) = self.flush_inode_writeback(ino.0) {
-            reply.error(errno(&err));
-            return;
-        }
-        let result = self
-            .require_access(req, ino, libc::R_OK)
-            .and_then(|()| self.volume.getxattr_inode(ino.0, xattr_name(name)?));
-        match result {
-            Ok(value) if size == 0 => reply.size(value.len() as u32),
-            Ok(value) if value.len() <= size as usize => reply.data(&value),
-            Ok(_) => reply.error(Errno::ERANGE),
-            Err(err) => reply.error(xattr_errno(&err)),
-        }
+        let req = RequestIdentity::from_request(req);
+        let name = name.to_owned();
+        self.submit_io(ino.0, move |shared| {
+            let req = &req;
+            let name = name.as_os_str();
+            if let Err(err) = shared.flush_inode_writeback(ino.0) {
+                reply.error(errno(&err));
+                return;
+            }
+            let result = shared
+                .require_access(req, ino, libc::R_OK)
+                .and_then(|()| shared.volume.getxattr_inode(ino.0, xattr_name(name)?));
+            match result {
+                Ok(value) if size == 0 => reply.size(value.len() as u32),
+                Ok(value) if value.len() <= size as usize => reply.data(&value),
+                Ok(_) => reply.error(Errno::ERANGE),
+                Err(err) => reply.error(xattr_errno(&err)),
+            }
+        });
     }
 
     fn listxattr(&self, req: &Request, ino: INodeNo, size: u32, reply: ReplyXattr) {
-        if let Err(err) = self.flush_inode_writeback(ino.0) {
-            reply.error(errno(&err));
-            return;
-        }
-        match self
-            .require_access(req, ino, libc::R_OK)
-            .and_then(|()| self.volume.listxattr_inode(ino.0))
-        {
-            Ok(names) => {
-                let data = names
-                    .into_iter()
-                    .flat_map(|name| {
-                        let mut bytes = name.into_bytes();
-                        bytes.push(0);
-                        bytes
-                    })
-                    .collect::<Vec<_>>();
-                if size == 0 {
-                    reply.size(data.len() as u32);
-                } else if data.len() <= size as usize {
-                    reply.data(&data);
-                } else {
-                    reply.error(Errno::ERANGE);
-                }
+        let req = RequestIdentity::from_request(req);
+        self.submit_io(ino.0, move |shared| {
+            let req = &req;
+            if let Err(err) = shared.flush_inode_writeback(ino.0) {
+                reply.error(errno(&err));
+                return;
             }
-            Err(err) => reply.error(errno(&err)),
-        }
+            match shared
+                .require_access(req, ino, libc::R_OK)
+                .and_then(|()| shared.volume.listxattr_inode(ino.0))
+            {
+                Ok(names) => {
+                    let data = names
+                        .into_iter()
+                        .flat_map(|name| {
+                            let mut bytes = name.into_bytes();
+                            bytes.push(0);
+                            bytes
+                        })
+                        .collect::<Vec<_>>();
+                    if size == 0 {
+                        reply.size(data.len() as u32);
+                    } else if data.len() <= size as usize {
+                        reply.data(&data);
+                    } else {
+                        reply.error(Errno::ERANGE);
+                    }
+                }
+                Err(err) => reply.error(errno(&err)),
+            }
+        });
     }
 
     fn removexattr(&self, req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
-        if let Err(err) = self.flush_inode_writeback(ino.0) {
-            reply.error(errno(&err));
-            return;
-        }
-        let result = (|| {
-            let name = xattr_name(name)?;
-            self.require_xattr_write_access(req, ino, name)?;
-            self.volume.removexattr_inode(ino.0, name)
-        })();
-        match result {
-            Ok(()) => reply.ok(),
-            Err(err) => reply.error(xattr_errno(&err)),
-        }
+        let req = RequestIdentity::from_request(req);
+        let name = name.to_owned();
+        self.submit_io(ino.0, move |shared| {
+            let req = &req;
+            let name = name.as_os_str();
+            if let Err(err) = shared.flush_inode_writeback(ino.0) {
+                reply.error(errno(&err));
+                return;
+            }
+            let result = (|| {
+                let name = xattr_name(name)?;
+                shared.require_xattr_write_access(req, ino, name)?;
+                shared.volume.removexattr_inode(ino.0, name)
+            })();
+            match result {
+                Ok(()) => reply.ok(),
+                Err(err) => reply.error(xattr_errno(&err)),
+            }
+        });
     }
 
     fn access(&self, req: &Request, ino: INodeNo, mask: AccessFlags, reply: ReplyEmpty) {
-        match self.require_access(req, ino, mask.bits()) {
-            Ok(()) => reply.ok(),
-            Err(err) => reply.error(errno(&err)),
-        }
+        let req = RequestIdentity::from_request(req);
+        self.submit_io(ino.0, move |shared| {
+            let req = &req;
+            match shared.require_access(req, ino, mask.bits()) {
+                Ok(()) => reply.ok(),
+                Err(err) => reply.error(errno(&err)),
+            }
+        });
     }
 
     fn create(
@@ -1291,40 +1608,46 @@ impl Filesystem for ArgosFuse {
         flags: i32,
         reply: ReplyCreate,
     ) {
-        if let Err(err) = self.flush_all_writeback() {
-            reply.error(errno(&err));
-            return;
-        }
-        let mut handles = self.handles.lock();
-        let result = self
-            .require_access(req, parent, libc::W_OK | libc::X_OK)
-            .and_then(|()| {
-                self.volume.create_file_at_with_owner(
-                    parent.0,
-                    name,
-                    mode & !umask,
-                    req.uid(),
-                    req.gid(),
-                )
-            })
-            .map(|attr| {
-                let handle = handles.open(OpenFileHandle {
-                    ino: attr.ino,
-                    flags,
+        let req = RequestIdentity::from_request(req);
+        let name = name.to_owned();
+        self.submit_io(parent.0, move |shared| {
+            let req = &req;
+            let name = name.as_os_str();
+            if let Err(err) = shared.flush_all_writeback() {
+                reply.error(errno(&err));
+                return;
+            }
+            let mut handles = shared.handles.lock();
+            let result = shared
+                .require_access(req, parent, libc::W_OK | libc::X_OK)
+                .and_then(|()| {
+                    shared.volume.create_file_at_with_owner(
+                        parent.0,
+                        name,
+                        mode & !umask,
+                        req.uid(),
+                        req.gid(),
+                    )
+                })
+                .map(|attr| {
+                    let handle = handles.open(OpenFileHandle {
+                        ino: attr.ino,
+                        flags,
+                    });
+                    (attr, handle)
                 });
-                (attr, handle)
-            });
-        drop(handles);
-        match result {
-            Ok((attr, handle)) => reply.created(
-                &TTL,
-                &to_file_attr(&attr),
-                Generation(0),
-                handle,
-                self.open_reply_flags(true),
-            ),
-            Err(err) => reply.error(errno(&err)),
-        }
+            drop(handles);
+            match result {
+                Ok((attr, handle)) => reply.created(
+                    &TTL,
+                    &to_file_attr(&attr),
+                    Generation(0),
+                    handle,
+                    shared.open_reply_flags(true),
+                ),
+                Err(err) => reply.error(errno(&err)),
+            }
+        });
     }
 
     fn readdir(
@@ -1335,27 +1658,31 @@ impl Filesystem for ArgosFuse {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
-        self.flush_all_writeback_best_effort();
-        match self
-            .require_access(req, ino, libc::R_OK)
-            .and_then(|()| self.volume.readdir(ino.0))
-        {
-            Ok(entries) => {
-                for (idx, entry) in entries.into_iter().enumerate().skip(offset as usize) {
-                    let full = reply.add(
-                        INodeNo(entry.attr.ino),
-                        (idx + 1) as u64,
-                        file_type_from_attr(&entry.attr),
-                        entry.os_name(),
-                    );
-                    if full {
-                        break;
+        let req = RequestIdentity::from_request(req);
+        self.submit_io(ino.0, move |shared| {
+            let req = &req;
+            shared.flush_all_writeback_best_effort();
+            match shared
+                .require_access(req, ino, libc::R_OK)
+                .and_then(|()| shared.volume.readdir(ino.0))
+            {
+                Ok(entries) => {
+                    for (idx, entry) in entries.into_iter().enumerate().skip(offset as usize) {
+                        let full = reply.add(
+                            INodeNo(entry.attr.ino),
+                            (idx + 1) as u64,
+                            file_type_from_attr(&entry.attr),
+                            entry.os_name(),
+                        );
+                        if full {
+                            break;
+                        }
                     }
+                    reply.ok();
                 }
-                reply.ok();
+                Err(err) => reply.error(errno(&err)),
             }
-            Err(err) => reply.error(errno(&err)),
-        }
+        });
     }
 
     fn readdirplus(
@@ -1366,30 +1693,34 @@ impl Filesystem for ArgosFuse {
         offset: u64,
         mut reply: ReplyDirectoryPlus,
     ) {
-        self.flush_all_writeback_best_effort();
-        match self
-            .require_access(req, ino, libc::R_OK | libc::X_OK)
-            .and_then(|()| self.volume.readdir(ino.0))
-        {
-            Ok(entries) => {
-                for (idx, entry) in entries.into_iter().enumerate().skip(offset as usize) {
-                    let attr = to_file_attr(&entry.attr);
-                    let full = reply.add(
-                        INodeNo(entry.attr.ino),
-                        (idx + 1) as u64,
-                        entry.os_name(),
-                        &TTL,
-                        &attr,
-                        Generation(0),
-                    );
-                    if full {
-                        break;
+        let req = RequestIdentity::from_request(req);
+        self.submit_io(ino.0, move |shared| {
+            let req = &req;
+            shared.flush_all_writeback_best_effort();
+            match shared
+                .require_access(req, ino, libc::R_OK | libc::X_OK)
+                .and_then(|()| shared.volume.readdir(ino.0))
+            {
+                Ok(entries) => {
+                    for (idx, entry) in entries.into_iter().enumerate().skip(offset as usize) {
+                        let attr = to_file_attr(&entry.attr);
+                        let full = reply.add(
+                            INodeNo(entry.attr.ino),
+                            (idx + 1) as u64,
+                            entry.os_name(),
+                            &TTL,
+                            &attr,
+                            Generation(0),
+                        );
+                        if full {
+                            break;
+                        }
                     }
+                    reply.ok();
                 }
-                reply.ok();
+                Err(err) => reply.error(errno(&err)),
             }
-            Err(err) => reply.error(errno(&err)),
-        }
+        });
     }
 }
 
@@ -1631,10 +1962,8 @@ fn time_or_now(value: TimeOrNow) -> f64 {
     }
 }
 
-fn request_groups(req: &Request) -> Vec<u32> {
-    let mut groups = read_proc_status(req.pid())
-        .and_then(|status| parse_status_groups_for_identity(&status, req.uid(), req.gid()))
-        .unwrap_or_default();
+fn request_groups(req: &impl Credentials) -> Vec<u32> {
+    let mut groups = req.groups();
     if !groups.contains(&req.gid()) {
         groups.push(req.gid());
     }

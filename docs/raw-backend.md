@@ -64,8 +64,9 @@ for existing images.
 
 The raw journal region stores length-prefixed JSON transaction records with an
 entry checksum and an internal record hash. Records normally carry metadata
-deltas and periodic full snapshots, so open can replay a newer committed state
-when checkpoint copies are stale. Rw open marks member superblocks dirty. A
+deltas and a full snapshot when a validated delta base is unavailable. The
+journal rolls over to a per-member checkpoint only when its space is exhausted,
+so open can replay a newer committed state when checkpoint copies are stale. Rw open marks member superblocks dirty. A
 clean unmount writes fresh metadata checkpoint copies before marking the member
 superblocks clean. A pool counts as cleanly unmounted when at least a metadata
 quorum of its members is clean, not only when every member is clean: a card
@@ -112,6 +113,19 @@ the last durable checkpoint. A crash can therefore lose at most the configured
 group window, while recovery continues to use checksum-valid, quorum-supported
 metadata and journal records. Strict mode remains available as an explicit
 compatibility and diagnostic mode.
+
+## Optional incremental integrity upgrade
+
+New raw/loop pools and existing pools use the established canonical metadata
+SHA-256 unless explicitly upgraded. Large pools can enable authenticated,
+changed-record delta hashes on the normal deferred group-commit path using the
+one-way `argosfs upgrade-integrity --pool-config FILE --offline-confirmed`
+command. The upgrade requires **all active members** and an unmounted pool,
+changes a mandatory feature bit in both superblocks, and prevents older
+ArgosFS binaries from mounting. The v2 change does not alter region offsets,
+the journal envelope, or existing payload checksums. See
+[`incremental-journal-delta.md`](incremental-journal-delta.md) for upgrade,
+crash-recovery and downgrade precautions.
 
 ## Device I/O deadline
 
@@ -199,6 +213,7 @@ wins):
 | `ARGOSFS_READ_RETRIES` | 0 | 1 |
 | `ARGOSFS_VERIFY_WRITE_AFTER_MS` | 0 (off) | 60 000 |
 | `ARGOS_VERIFY_WRITE_RETRIES` | 3 | 3 |
+| `ARGOSFS_OFFLINE_GRACE_MS` | 0 | 60 000 |
 
 For example, to mount a raw pool with all USB-friendly defaults:
 
@@ -210,6 +225,36 @@ The read-after-write verifier costs an extra flush per checked shard, so USB
 mode is not a free speed-up; it trades some throughput for more tolerance of
 transient card/controller errors.  Scrub still performs the full check and
 repair.
+
+## Unavailable members and self-healing
+
+A shard whose member is `Offline` is unavailable because the member was absent
+from the open scan.  The remaining shards reconstruct the block, and the
+member may return on the next open, so `fsck`/scrub report such shards in
+`missing_shards` without counting the file as damaged or rewriting it.
+Ordinary reads do not self-heal it for the same reason.
+
+A member that is `Failed` (present but failed) or `Removed` (explicitly
+retired by the operator) is repaired by the normal scrub/self-heal path, as is
+real damage (a checksum mismatch, a missing extent on an online member, an
+invalid slot, ...).  `remove-device` already drains and rewrites the member
+before marking it `Removed`.
+
+`ARGOSFS_OFFLINE_GRACE_MS` sets how long an `Offline` member is given to
+return before scrub rebuilds its shards; `0` disables the grace.  `ARGOSFS_USB=1`
+defaults it to 60,000 ms (one minute), so a reader that is briefly
+power-cycled or reset can come back before the pool is rewritten.  Without
+USB mode the default is 0, which preserves the old immediate-repair behavior.
+
+This keeps a pool with one temporarily missing card readable without rewriting
+every file that is read, while a genuinely failed or retired card still
+restores redundancy automatically.
+
+If a USB member disappears *during* a mount, a fatal I/O error can quarantine it
+before the next open scan changes its state to `Offline`. The same grace period
+applies to its quarantined shards for reads and scrub, which still report them
+as missing. Quarantined devices require a new open scan to be considered for
+reuse after reconnection.
 
 ## Data Extents
 

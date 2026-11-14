@@ -43,6 +43,9 @@ fn health_report(latency: f64, read_rate: f64, write_rate: f64) -> HealthReport 
         cache: BTreeMap::new(),
         io_mode: IoMode::Buffered,
         encryption_enabled: false,
+        metadata_inodes: 1,
+        metadata_estimated_rss_bytes: 160 * 1024,
+        metadata_inode_limit: None,
     }
 }
 
