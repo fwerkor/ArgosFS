@@ -1738,3 +1738,35 @@ fn recovery_validates_each_slot_but_decodes_identical_checkpoints_once() {
     let recovered = recover_metadata(&backend, &superblocks).unwrap();
     assert_eq!(recovered.txid, metadata.txid);
 }
+
+#[test]
+fn journal_rollover_checkpoints_shared_state_and_recovers_after_reset() {
+    let (_dir, images, previous, mut superblocks) = quorum_fixture();
+    let backend = block_backend_for(&images);
+    let next = next_metadata(&previous, "rollover-shared-checkpoint");
+    // Force rollover without allocating huge real images. This keeps the
+    // existing journal readable but leaves too little room for the new entry.
+    for sb in &mut superblocks {
+        let used = raw_journal_end(&backend, sb);
+        sb.journal.length = (used + 2048).max(RAW_HEADER_SIZE as u64 + 4096);
+    }
+    append_transaction_with_trusted_integrity_quorum(
+        &backend,
+        &superblocks,
+        &next,
+        Some(&previous),
+        "rollover-test",
+        serde_json::json!({"payload": "x".repeat(64 * 1024)}),
+    )
+    .unwrap();
+
+    for sb in &superblocks {
+        let tip = journal_tip_identity(&backend, sb).unwrap().unwrap();
+        assert_eq!(tip.0, next.txid);
+        assert_eq!(tip.1, next.integrity.meta_hash);
+        assert!(raw_journal_end(&backend, sb) < sb.journal.length);
+    }
+    let recovered = recover_metadata(&backend, &superblocks).unwrap();
+    assert_eq!(recovered.txid, next.txid);
+    assert_eq!(recovered.raw_pool.pool_name, "rollover-shared-checkpoint");
+}
