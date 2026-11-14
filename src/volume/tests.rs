@@ -1111,6 +1111,383 @@ fn quota_rejected_rename_does_not_stage_deferred_reclaims() {
     assert_eq!(fs.read_file("/src/file", false).unwrap(), vec![b's'; 800]);
 }
 
+struct OverlapProbeBackend {
+    inner: Arc<dyn StorageBackend>,
+    data_offset: u64,
+    active: AtomicUsize,
+    max_active: AtomicUsize,
+}
+
+impl StorageBackend for OverlapProbeBackend {
+    fn backend_kind(&self) -> BackendKind {
+        self.inner.backend_kind()
+    }
+    fn list_devices(&self) -> Result<Vec<crate::backend::BackendDeviceInfo>> {
+        self.inner.list_devices()
+    }
+    fn read_at(&self, device_id: &String, offset: u64, buf: &mut [u8]) -> Result<()> {
+        if offset != self.data_offset {
+            return self.inner.read_at(device_id, offset, buf);
+        }
+        let n = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_active.fetch_max(n, Ordering::SeqCst);
+        // Long enough for a second reader to reach the backend, with a
+        // bounded duration if an exclusive metadata lock serializes them.
+        std::thread::sleep(Duration::from_millis(250));
+        let result = self.inner.read_at(device_id, offset, buf);
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        result
+    }
+    fn write_at(&self, device_id: &String, offset: u64, data: &[u8]) -> Result<()> {
+        self.inner.write_at(device_id, offset, data)
+    }
+    fn flush_device(&self, device_id: &String) -> Result<()> {
+        self.inner.flush_device(device_id)
+    }
+    fn flush_all(&self) -> Result<()> {
+        self.inner.flush_all()
+    }
+    fn drop_cache(&self, device_id: &String, offset: u64, length: u64) -> Result<()> {
+        self.inner.drop_cache(device_id, offset, length)
+    }
+    fn capacity(&self, device_id: &String) -> Result<u64> {
+        self.inner.capacity(device_id)
+    }
+    fn device_status(&self, device_id: &String) -> Result<DiskStatus> {
+        self.inner.device_status(device_id)
+    }
+    fn capabilities(&self) -> crate::backend::BackendCapabilities {
+        self.inner.capabilities()
+    }
+}
+
+#[test]
+fn concurrent_readers_share_metadata_guard_and_merge_telemetry() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = dir.path().join("parallel-read.img");
+    let mut fs = ArgosFs::create_loop(
+        std::slice::from_ref(&image),
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            chunk_size: 4096,
+            compression: Compression::None,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "parallel-read",
+        false,
+    )
+    .unwrap();
+    let payload = vec![0x59u8; 8192];
+    fs.write_file("/data", &payload, 0o600).unwrap();
+    fs.sync().unwrap();
+    let ino = fs.resolve_path("/data", true).unwrap();
+    let original = fs.metadata_snapshot();
+    let block = &original.inodes[&ino].blocks[0];
+    let offset = match block.shards[0].location.as_ref().unwrap() {
+        ShardLocation::RawExtent(extent) => extent.offset,
+        _ => panic!("expected raw extent"),
+    };
+    fs.cache.remove(&format!(
+        "{}:{}:{}",
+        original.uuid, block.stripe_id, block.raw_sha256
+    ));
+    let backend = Arc::new(OverlapProbeBackend {
+        inner: fs.backend.clone(),
+        data_offset: offset,
+        active: AtomicUsize::new(0),
+        max_active: AtomicUsize::new(0),
+    });
+    fs.backend = backend.clone();
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let handles: Vec<_> = (0..2)
+        .map(|_| {
+            let fs = fs.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                fs.read_inode(ino, 0, 8192, true).unwrap()
+            })
+        })
+        .collect();
+    barrier.wait();
+    for handle in handles {
+        assert_eq!(handle.join().unwrap(), payload);
+    }
+    assert_eq!(
+        backend.max_active.load(Ordering::SeqCst),
+        2,
+        "parallel read requests must reach the raw backend concurrently"
+    );
+    let latest = fs.metadata_snapshot();
+    assert_eq!(
+        latest.inodes[&ino].read_bytes,
+        original.inodes[&ino].read_bytes + 2 * 8192
+    );
+    assert!(
+        latest.disks.values().next().unwrap().io_samples
+            >= original.disks.values().next().unwrap().io_samples + 2
+    );
+}
+
+#[test]
+fn read_decoder_snapshot_excludes_allocator_and_dirty_inode_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = dir.path().join("snapshot.img");
+    let fs = ArgosFs::create_loop(
+        std::slice::from_ref(&image),
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            chunk_size: 4096,
+            compression: Compression::None,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "read-snapshot",
+        false,
+    )
+    .unwrap();
+    fs.write_file("/data", &[0x41; 8192], 0o600).unwrap();
+    let ino = fs.resolve_path("/data", true).unwrap();
+    let live = fs.meta.read();
+    assert!(!live.raw_pool.allocators.is_empty());
+    assert!(!live.inodes.is_empty());
+    let decoder = ArgosFs::read_decoder_metadata(&live);
+    assert!(decoder.raw_pool.allocators.is_empty());
+    assert!(decoder.inodes.is_empty());
+    assert_eq!(decoder.uuid, live.uuid);
+    assert_eq!(decoder.disks.len(), live.disks.len());
+    assert_eq!(decoder.layouts.len(), live.layouts.len());
+    drop(live);
+    assert_eq!(
+        fs.read_inode(ino, 0, 8192, false).unwrap(),
+        vec![0x41; 8192]
+    );
+}
+
+/// Freeze scrub after it starts decoding its first physical stripe, so a
+/// concurrent read can cache a reconstructed *later* stripe before scrub
+/// reaches it. Scrub must still discover the later stripe's damage.
+struct ScrubPauseBackend {
+    inner: Arc<dyn StorageBackend>,
+    pause_offset: u64,
+    pause_once: std::sync::atomic::AtomicBool,
+    paused: std::sync::mpsc::Sender<()>,
+    resume: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl StorageBackend for ScrubPauseBackend {
+    fn backend_kind(&self) -> BackendKind {
+        self.inner.backend_kind()
+    }
+    fn list_devices(&self) -> Result<Vec<crate::backend::BackendDeviceInfo>> {
+        self.inner.list_devices()
+    }
+    fn read_at(&self, device_id: &String, offset: u64, buf: &mut [u8]) -> Result<()> {
+        if offset == self.pause_offset && self.pause_once.swap(false, Ordering::SeqCst) {
+            self.paused.send(()).unwrap();
+            self.resume.lock().unwrap().recv().unwrap();
+        }
+        self.inner.read_at(device_id, offset, buf)
+    }
+    fn write_at(&self, device_id: &String, offset: u64, data: &[u8]) -> Result<()> {
+        self.inner.write_at(device_id, offset, data)
+    }
+    fn flush_device(&self, device_id: &String) -> Result<()> {
+        self.inner.flush_device(device_id)
+    }
+    fn flush_all(&self) -> Result<()> {
+        self.inner.flush_all()
+    }
+    fn drop_cache(&self, device_id: &String, offset: u64, length: u64) -> Result<()> {
+        self.inner.drop_cache(device_id, offset, length)
+    }
+    fn capacity(&self, device_id: &String) -> Result<u64> {
+        self.inner.capacity(device_id)
+    }
+    fn device_status(&self, device_id: &String) -> Result<DiskStatus> {
+        self.inner.device_status(device_id)
+    }
+    fn capabilities(&self) -> crate::backend::BackendCapabilities {
+        self.inner.capabilities()
+    }
+}
+
+#[test]
+fn scrub_checks_physical_shards_despite_concurrent_reconstruction_cache_insert() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|i| dir.path().join(format!("scrub-race-{i}.img")))
+        .collect::<Vec<_>>();
+    let mut fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            compression: Compression::None,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "scrub-cache-race",
+        false,
+    )
+    .unwrap();
+    let payload = (0..64 * 1024).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+    fs.write_file("/data", &payload, 0o600).unwrap();
+    fs.sync().unwrap();
+    let ino = fs.resolve_path("/data", true).unwrap();
+    let meta = fs.metadata_snapshot();
+    let blocks = &meta.inodes[&ino].blocks;
+    assert!(blocks.len() >= 2);
+    let first_extent = match blocks[0].shards[0].location.as_ref().unwrap() {
+        ShardLocation::RawExtent(extent) => extent,
+        _ => panic!("expected raw extent"),
+    };
+    let corrupt = &blocks[1];
+    let corrupt_shard = &corrupt.shards[0];
+    let damaged_extent = match corrupt_shard.location.as_ref().unwrap() {
+        ShardLocation::RawExtent(extent) => extent,
+        _ => panic!("expected raw extent"),
+    };
+    let path = &images[corrupt_shard
+        .disk_id
+        .trim_start_matches("disk-")
+        .parse::<usize>()
+        .unwrap()];
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    std::os::unix::fs::FileExt::write_at(&file, &[0x42; 128], damaged_extent.offset).unwrap();
+    file.sync_all().unwrap();
+    let cache_key = format!("{}:{}:{}", meta.uuid, corrupt.stripe_id, corrupt.raw_sha256);
+    fs.cache.remove(&cache_key);
+
+    let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    fs.backend = Arc::new(ScrubPauseBackend {
+        inner: fs.backend.clone(),
+        pause_offset: first_extent.offset,
+        pause_once: std::sync::atomic::AtomicBool::new(true),
+        paused: paused_tx,
+        resume: std::sync::Mutex::new(resume_rx),
+    });
+    let scrub_fs = fs.clone();
+    let read_len = payload.len();
+    let handle = std::thread::spawn(move || {
+        scrub_fs.read_inode_with_damage_report_for_scrub(ino, 0, read_len, false)
+    });
+    paused_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("scrub must reach first stripe");
+    let start = corrupt.raw_offset;
+    let reader_fs = fs.clone();
+    let read_size = corrupt.raw_size;
+    let reader = std::thread::spawn(move || reader_fs.read_inode(ino, start, read_size, false));
+    // The reader cannot finish merging telemetry while scrub holds its
+    // shared metadata guard. Observe cache publication instead of waiting
+    // for the entire read, or the test itself would deadlock.
+    let mut cached = false;
+    for _ in 0..500 {
+        if fs
+            .cache
+            .get(&cache_key, Some(&corrupt.raw_sha256))
+            .is_some()
+        {
+            cached = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    resume_tx.send(()).unwrap();
+    let read = reader.join().unwrap().unwrap();
+    assert_eq!(
+        read,
+        payload[start as usize..start as usize + corrupt.raw_size]
+    );
+    assert!(
+        cached,
+        "ordinary read should reconstruct and cache damaged stripe"
+    );
+    let (scrub_read, damaged, repaired) = handle.join().unwrap().unwrap();
+    assert_eq!(scrub_read, payload);
+    assert!(!repaired);
+    assert!(
+        damaged.iter().any(|entry| entry.contains(&corrupt_shard.disk_id)),
+        "scrub must report physical shard damage despite the concurrent cache insertion: {damaged:?}"
+    );
+}
+
+#[test]
+fn concurrent_read_rechecks_corrupt_shard_before_self_heal() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|i| dir.path().join(format!("repair-shard-{i}.img")))
+        .collect::<Vec<_>>();
+    let fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            compression: Compression::None,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "self-heal-cache",
+        false,
+    )
+    .unwrap();
+    let payload = (0..64 * 1024).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+    fs.write_file("/damage", &payload, 0o600).unwrap();
+    fs.sync().unwrap();
+    let ino = fs.resolve_path("/damage", true).unwrap();
+    let metadata = fs.metadata_snapshot();
+    let block = &metadata.inodes[&ino].blocks[0];
+    let shard = &block.shards[0];
+    let extent = match shard.location.as_ref().unwrap() {
+        ShardLocation::RawExtent(extent) => extent,
+        _ => panic!("expected raw extent"),
+    };
+    let path = &images[shard
+        .disk_id
+        .trim_start_matches("disk-")
+        .parse::<usize>()
+        .unwrap()];
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    std::os::unix::fs::FileExt::write_at(&file, &[0x4F; 128], extent.offset).unwrap();
+    file.sync_all().unwrap();
+    fs.cache.remove(&format!(
+        "{}:{}:{}",
+        metadata.uuid, block.stripe_id, block.raw_sha256
+    ));
+    let txid = metadata.txid;
+    let (read, damaged, repaired) = fs
+        .read_inode_with_damage_report(ino, 0, payload.len(), true)
+        .unwrap();
+    assert_eq!(read, payload);
+    assert!(
+        repaired,
+        "the exclusive reread must ignore cached reconstructed data"
+    );
+    assert!(
+        !damaged.is_empty(),
+        "physical shard damage must be reported"
+    );
+    assert!(
+        fs.metadata_snapshot().txid > txid,
+        "self-heal writes a new valid stripe"
+    );
+    let (second, damage_after, repaired_again) = fs
+        .read_inode_with_damage_report(ino, 0, payload.len(), true)
+        .unwrap();
+    assert_eq!(second, payload);
+    assert!(
+        damage_after.is_empty(),
+        "the recovered stripes must be healthy"
+    );
+    assert!(!repaired_again);
+}
 #[test]
 fn offline_delta_integrity_upgrade_replays_transactions_and_fences_downgrade() {
     let dir = tempfile::tempdir().unwrap();
