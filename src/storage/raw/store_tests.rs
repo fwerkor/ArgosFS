@@ -1770,3 +1770,163 @@ fn journal_rollover_checkpoints_shared_state_and_recovers_after_reset() {
     assert_eq!(recovered.txid, next.txid);
     assert_eq!(recovered.raw_pool.pool_name, "rollover-shared-checkpoint");
 }
+
+#[test]
+fn delta_integrity_v2_journal_quorum_replays_without_checkpoint() {
+    let (_dir, images, previous, superblocks) = quorum_fixture();
+    let backend = block_backend_for(&images);
+    let upgraded = upgrade_delta_integrity_members(&backend, &superblocks, &previous).unwrap();
+    let mut next = previous.clone();
+    next.raw_pool.pool_name = "journal-delta-v2".to_string();
+    next.txid += 1;
+    next.updated_at += 1.0;
+    journal::prepare_delta_integrity(&mut next, &previous).unwrap();
+    append_transaction_with_trusted_integrity_quorum(
+        &backend,
+        &upgraded,
+        &next,
+        Some(&previous),
+        "v2-journal-quorum",
+        serde_json::json!({"previous_meta_hash": previous.integrity.meta_hash}),
+    )
+    .unwrap();
+    let (recovered, report) = load_or_recover(&backend, &upgraded, false).unwrap();
+    assert!(report.replayed);
+    assert_eq!(recovered.txid, next.txid);
+    assert_eq!(recovered.integrity.meta_hash, next.integrity.meta_hash);
+    assert_eq!(recovered.raw_pool.pool_name, "journal-delta-v2");
+    assert_eq!(report.invalid_entries, 0, "{:?}", report.errors);
+
+    // Without a quorum of downgrade-fencing feature flags, v2 metadata must
+    // never be selected for use (nor trusted as a crash-recovery base).
+    let error = load_or_recover(&backend, &superblocks, false).unwrap_err();
+    assert!(matches!(error, ArgosError::IncompatibleFormat(_)));
+}
+
+#[test]
+fn interrupted_integrity_feature_upgrade_is_retryable_without_v2_records() {
+    let (_dir, images, previous, superblocks) = quorum_fixture();
+    let failed = WriteFailBackend {
+        inner: block_backend_for(&images),
+        failed: BTreeSet::from(["disk-0002".to_string()]),
+    };
+    assert!(upgrade_delta_integrity_members(&failed, &superblocks, &previous).is_err());
+    drop(failed);
+    let backend = block_backend_for(&images);
+    // A half-finished feature upgrade does not alter the v1 checkpoint or
+    // journal, so no metadata changes are lost. Repeating finishes all copies.
+    assert_eq!(
+        recover_metadata(&backend, &superblocks).unwrap().txid,
+        previous.txid
+    );
+    let upgraded = upgrade_delta_integrity_members(&backend, &superblocks, &previous).unwrap();
+    for sb in &upgraded {
+        assert_ne!(
+            sb.required_feature_flags & REQUIRED_FEATURE_DELTA_INTEGRITY,
+            0
+        );
+    }
+    assert_eq!(
+        recover_metadata(&backend, &upgraded).unwrap().txid,
+        previous.txid
+    );
+}
+
+#[test]
+fn v2_journal_wire_roundtrip_preserves_signed_zero_and_float_hashes() {
+    let (_dir, images, previous, superblocks) = quorum_fixture();
+    let backend = block_backend_for(&images);
+    let upgraded = upgrade_delta_integrity_members(&backend, &superblocks, &previous).unwrap();
+    let mut next = previous.clone();
+    next.txid += 1;
+    next.updated_at = 1.2345678901234567e19;
+    let ino = next.inodes.keys().copied().find(|id| *id != 1).unwrap();
+    let inode = next.inodes.get_mut(&ino).unwrap();
+    inode.mtime = -0.0;
+    inode.ctime = 1e-10;
+    inode.last_accessed_at = -1e19;
+    let disk = next.disks.values_mut().next().unwrap();
+    disk.read_latency_ewma_ms = 505.33894584583004;
+    // Reproduce the review finding: the locked default parser drifts at
+    // least twice, not merely during the first serialization round trip.
+    let input = 2.7876436713919087e-8f64;
+    let once: f64 = serde_json::from_str(&serde_json::to_string(&input).unwrap()).unwrap();
+    let twice: f64 = serde_json::from_str(&serde_json::to_string(&once).unwrap()).unwrap();
+    assert_ne!(input.to_bits(), once.to_bits());
+    assert_ne!(once.to_bits(), twice.to_bits());
+    disk.observed_read_mib_s = input;
+    journal::prepare_delta_integrity(&mut next, &previous).unwrap();
+    append_transaction_with_trusted_integrity_quorum(
+        &backend,
+        &upgraded,
+        &next,
+        Some(&previous),
+        "v2-float-wire",
+        serde_json::json!({"previous_meta_hash": previous.integrity.meta_hash}),
+    )
+    .unwrap();
+    let recovered = recover_metadata(&backend, &upgraded).unwrap();
+    assert_eq!(recovered.integrity.meta_hash, next.integrity.meta_hash);
+    assert_eq!(recovered.inodes[&ino].mtime.to_bits(), (-0.0f64).to_bits());
+    assert_eq!(recovered.inodes[&ino].ctime, next.inodes[&ino].ctime);
+    assert_eq!(
+        recovered.inodes[&ino].last_accessed_at,
+        next.inodes[&ino].last_accessed_at
+    );
+}
+
+#[test]
+fn v2_partial_fanout_crash_does_not_commit_unacknowledged_delta() {
+    let (_dir, images, previous, superblocks) = quorum_fixture();
+    let backend = block_backend_for(&images);
+    let upgraded = upgrade_delta_integrity_members(&backend, &superblocks, &previous).unwrap();
+    let mut next = previous.clone();
+    next.txid += 1;
+    next.updated_at += 1.0;
+    next.raw_pool.pool_name = "v2-orphan".to_string();
+    journal::prepare_delta_integrity(&mut next, &previous).unwrap();
+    let guard = journal::thread_crash_point(FaultPoint::AfterPartialJournalFanout.as_str());
+    let err = append_transaction_with_trusted_integrity_quorum(
+        &backend,
+        &upgraded,
+        &next,
+        Some(&previous),
+        "v2-partial-crash",
+        serde_json::json!({}),
+    )
+    .unwrap_err();
+    drop(guard);
+    assert!(matches!(err, ArgosError::InjectedCrash(_)));
+    let recovered = recover_metadata(&backend, &upgraded).unwrap();
+    assert_eq!(recovered.txid, previous.txid);
+    assert_ne!(recovered.raw_pool.pool_name, "v2-orphan");
+}
+
+#[test]
+fn v2_crash_after_quorum_commit_recovers_authenticated_delta() {
+    let (_dir, images, previous, superblocks) = quorum_fixture();
+    let backend = block_backend_for(&images);
+    let upgraded = upgrade_delta_integrity_members(&backend, &superblocks, &previous).unwrap();
+    let mut next = previous.clone();
+    next.txid += 1;
+    next.updated_at += 1.0;
+    next.raw_pool.pool_name = "v2-committed".to_string();
+    journal::prepare_delta_integrity(&mut next, &previous).unwrap();
+    let guard =
+        journal::thread_crash_point(FaultPoint::AfterJournalCommitBeforeMetadataCommit.as_str());
+    let err = append_transaction_with_trusted_integrity_quorum(
+        &backend,
+        &upgraded,
+        &next,
+        Some(&previous),
+        "v2-committed-crash",
+        serde_json::json!({}),
+    )
+    .unwrap_err();
+    drop(guard);
+    assert!(matches!(err, ArgosError::InjectedCrash(_)));
+    let recovered = recover_metadata(&backend, &upgraded).unwrap();
+    assert_eq!(recovered.txid, next.txid);
+    assert_eq!(recovered.integrity.meta_hash, next.integrity.meta_hash);
+    assert_eq!(recovered.raw_pool.pool_name, "v2-committed");
+}

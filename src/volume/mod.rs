@@ -137,6 +137,9 @@ struct DeferredCommitState {
     durable_metadata: Option<Arc<Metadata>>,
     durability_cache: Option<DurabilityValidationCache>,
     raw_uncommitted_metadata_dirty: bool,
+    // Recovery normalization requires a full one-time checkpoint before
+    // establishing a trusted v2 delta baseline.
+    raw_checkpoint_required: bool,
     dirty_transactions: u64,
     dirty_since: Option<Instant>,
     pending_reclaims: Vec<FileBlock>,
@@ -167,6 +170,7 @@ impl DeferredCommitState {
             durable_metadata: (meta.backend != BackendKind::Host).then(|| Arc::new(meta.clone())),
             durability_cache: None,
             raw_uncommitted_metadata_dirty,
+            raw_checkpoint_required: raw_uncommitted_metadata_dirty,
             dirty_transactions: 0,
             dirty_since: None,
             pending_reclaims: Vec::new(),
@@ -702,7 +706,9 @@ impl ArgosFs {
             .unwrap_or_else(std::env::temp_dir);
         let raw_uncommitted_metadata_dirty = meta.backend != BackendKind::Host
             && (meta.integrity.meta_hash.is_empty()
-                || journal::canonical_metadata_hash(&meta)? != meta.integrity.meta_hash);
+                || meta.integrity.hash_scheme == Some(journal::DELTA_INTEGRITY_SCHEME)
+                || (meta.integrity.hash_scheme.is_none()
+                    && journal::canonical_metadata_hash(&meta)? != meta.integrity.meta_hash));
         let quarantined_devices = Arc::new(Mutex::new(BTreeSet::new()));
         let write_fence = Arc::new(Mutex::new(None));
         let meta = Arc::new(RwLock::new(meta));
@@ -779,6 +785,37 @@ impl ArgosFs {
     pub(crate) fn test_with_metadata_write_lock(&self, action: impl FnOnce()) {
         let _guard = self.meta.write();
         action();
+    }
+
+    /// Explicit, offline-only, one-way upgrade of every active raw/loop
+    /// member. Call only after unmounting all other processes using this pool;
+    /// this API cannot fence an unrelated legacy daemon already mounted.
+    pub fn upgrade_delta_integrity(&mut self) -> Result<()> {
+        if self.mount_owners.load(Ordering::Acquire) != 1 {
+            return Err(ArgosError::Conflict(
+                "raw integrity upgrade requires a unique volume handle".to_string(),
+            ));
+        }
+        self.sync()?;
+        let meta = self.meta.read();
+        self.ensure_block_backend_writable_locked(&meta)?;
+        if meta.backend == BackendKind::Host {
+            return Err(ArgosError::Unsupported(
+                "delta integrity upgrade requires raw/loop backend".to_string(),
+            ));
+        }
+        let superblocks = self.metadata_superblocks_locked(&meta)?;
+        let upgraded = if self.open_backend_covers_superblocks(&superblocks) {
+            raw_store::upgrade_delta_integrity_members(&*self.backend, &superblocks, &meta)?
+        } else {
+            let backend = self.metadata_block_backend_locked(&meta, &superblocks, true)?;
+            raw_store::upgrade_delta_integrity_members(&*backend, &superblocks, &meta)?
+        };
+        // Only activate new group commits when both copies on ALL active
+        // members have been durably upgraded. A partially failed migration
+        // leaves the old canonical integrity scheme in use and is retryable.
+        self.raw_superblocks = Arc::new(upgraded);
+        Ok(())
     }
 
     pub fn transaction_report(&self) -> Result<TransactionReport> {
@@ -971,6 +1008,7 @@ impl ArgosFs {
             let mut state = self.deferred_commit.lock();
             state.durable_metadata = Some(Arc::new(meta.clone()));
             state.raw_uncommitted_metadata_dirty = false;
+            state.raw_checkpoint_required = false;
             durability?;
             return Ok(());
         }
@@ -2180,7 +2218,24 @@ impl ArgosFs {
         {
             return Ok(false);
         }
-        let checkpoint = checkpoint || state.raw_uncommitted_metadata_dirty;
+        // A pool can grow after mount. Never decide the integrity scheme from
+        // the superblocks cached at open: dynamically added voting members
+        // must also carry the mandatory downgrade-prevention feature.
+        let current_members = self.metadata_superblocks_locked(meta)?;
+        let active_members = meta
+            .disks
+            .values()
+            .filter(|disk| disk.status != DiskStatus::Removed)
+            .count();
+        let incremental_integrity_enabled = state.dirty_transactions > 0
+            && current_members.len() == active_members
+            && active_members > 0
+            && current_members.iter().all(|sb| {
+                sb.required_feature_flags & raw_format::REQUIRED_FEATURE_DELTA_INTEGRITY != 0
+            });
+        let checkpoint = checkpoint
+            || state.raw_checkpoint_required
+            || (state.raw_uncommitted_metadata_dirty && !incremental_integrity_enabled);
 
         // The committed image is shared rather than cloned for every group commit.
         // A full rollback image is only needed if reclaiming old extents changes
@@ -2203,7 +2258,14 @@ impl ArgosFs {
                 self.account_blocks_locked(meta, std::slice::from_ref(block), false);
                 self.delete_blocks_locked(meta, std::slice::from_ref(block));
             }
-            journal::prepare_metadata_integrity_with_previous(meta, previous_meta_hash.clone())?;
+            if incremental_integrity_enabled && !checkpoint {
+                journal::prepare_delta_integrity(meta, &previous)?;
+            } else {
+                journal::prepare_metadata_integrity_with_previous(
+                    meta,
+                    previous_meta_hash.clone(),
+                )?;
+            }
             let superblocks = self.metadata_superblocks_locked(meta)?;
             let unavailable = self.quarantined_devices.lock().clone();
             Self::validate_deferred_data_durability(
@@ -2266,6 +2328,7 @@ impl ArgosFs {
                 drop(previous);
                 state.durable_metadata = Some(Arc::new(meta.clone()));
                 state.raw_uncommitted_metadata_dirty = false;
+                state.raw_checkpoint_required = false;
                 state.dirty_transactions = 0;
                 state.dirty_since = None;
                 state.pending_reclaims.clear();
@@ -2291,6 +2354,7 @@ impl ArgosFs {
                 drop(previous);
                 state.durable_metadata = Some(Arc::new(meta.clone()));
                 state.raw_uncommitted_metadata_dirty = false;
+                state.raw_checkpoint_required = false;
                 state.dirty_transactions = 0;
                 state.dirty_since = None;
                 state.pending_reclaims.clear();
@@ -2497,6 +2561,7 @@ impl ArgosFs {
         // Recovery may normalize/recompute fields after validating the persisted hash.
         // Re-establish a full durable checkpoint before trusting a delta base again.
         state.raw_uncommitted_metadata_dirty = true;
+        state.raw_checkpoint_required = true;
         Ok(())
     }
 
@@ -2546,6 +2611,19 @@ impl ArgosFs {
             return match result {
                 Ok(report) => {
                     self.apply_quorum_write_report(&journal_meta, report)?;
+                    // An event may roll over to a canonical checkpoint using
+                    // a different digest from the cached durable baseline.
+                    // This also applies to an upgraded pool still carrying
+                    // the legacy scheme with post-read telemetry changes.
+                    // Re-anchor before the next delta even if the event did
+                    // not actually roll over: its tip is not a safe ancestor.
+                    if journal_meta.integrity.meta_hash != meta.integrity.meta_hash
+                        || meta.integrity.hash_scheme == Some(journal::DELTA_INTEGRITY_SCHEME)
+                    {
+                        let mut state = self.deferred_commit.lock();
+                        state.raw_uncommitted_metadata_dirty = true;
+                        state.raw_checkpoint_required = true;
+                    }
                     Ok(())
                 }
                 Err(err) => {
