@@ -64,8 +64,9 @@ for existing images.
 
 The raw journal region stores length-prefixed JSON transaction records with an
 entry checksum and an internal record hash. Records normally carry metadata
-deltas and periodic full snapshots, so open can replay a newer committed state
-when checkpoint copies are stale. Rw open marks member superblocks dirty. A
+deltas and a full snapshot when a validated delta base is unavailable. The
+journal rolls over to a per-member checkpoint only when its space is exhausted,
+so open can replay a newer committed state when checkpoint copies are stale. Rw open marks member superblocks dirty. A
 clean unmount writes fresh metadata checkpoint copies before marking the member
 superblocks clean. A pool counts as cleanly unmounted when at least a metadata
 quorum of its members is clean, not only when every member is clean: a card
@@ -112,6 +113,19 @@ the last durable checkpoint. A crash can therefore lose at most the configured
 group window, while recovery continues to use checksum-valid, quorum-supported
 metadata and journal records. Strict mode remains available as an explicit
 compatibility and diagnostic mode.
+
+## Optional incremental integrity upgrade
+
+New raw/loop pools and existing pools use the established canonical metadata
+SHA-256 unless explicitly upgraded. Large pools can enable authenticated,
+changed-record delta hashes on the normal deferred group-commit path using the
+one-way `argosfs upgrade-integrity --pool-config FILE --offline-confirmed`
+command. The upgrade requires **all active members** and an unmounted pool,
+changes a mandatory feature bit in both superblocks, and prevents older
+ArgosFS binaries from mounting. The v2 change does not alter region offsets,
+the journal envelope, or existing payload checksums. See
+[`incremental-journal-delta.md`](incremental-journal-delta.md) for upgrade,
+crash-recovery and downgrade precautions.
 
 ## Device I/O deadline
 
