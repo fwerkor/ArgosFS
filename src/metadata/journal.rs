@@ -470,6 +470,92 @@ pub fn prepare_metadata_integrity_with_previous(
     prepare_metadata_integrity(meta, previous_meta_hash)
 }
 
+/// Raw journal v2 hashes authenticate the *ordered delta* and the preceding
+/// verified metadata identity, rather than serializing the whole inode table.
+/// The domain separator and length-prefixing rule out cross-protocol replay.
+/// Integrity-field operations are excluded to avoid a circular digest; their
+/// expected values are independently checked after applying the delta.
+pub const DELTA_INTEGRITY_SCHEME: u32 = 2;
+const DELTA_INTEGRITY_DOMAIN: &[u8] = b"ArgosFS/raw-delta-integrity/v2\0";
+
+fn delta_integrity_hash(
+    base: &Metadata,
+    next: &Metadata,
+    ops: &[MetadataDeltaOp],
+) -> Result<String> {
+    if base.integrity.meta_hash.len() != 64 {
+        return Err(ArgosError::CorruptedMetadata(
+            "delta integrity has no authenticated previous metadata hash".to_string(),
+        ));
+    }
+    if next.integrity.previous_meta_hash != base.integrity.meta_hash
+        || next.integrity.generation != next.txid
+        || next.integrity.hash_scheme != Some(DELTA_INTEGRITY_SCHEME)
+        || next.uuid != base.uuid
+        || next.txid <= base.txid
+    {
+        return Err(ArgosError::CorruptedMetadata(
+            "delta integrity transaction does not chain from its base".to_string(),
+        ));
+    }
+    let mut digest = Sha256::new();
+    digest.update(DELTA_INTEGRITY_DOMAIN);
+    digest.update(hex::decode(&base.integrity.meta_hash).map_err(|_| {
+        ArgosError::CorruptedMetadata("invalid previous metadata hash encoding".to_string())
+    })?);
+    digest.update(next.uuid.as_bytes());
+    digest.update(next.txid.to_le_bytes());
+    digest.update(next.integrity.generation.to_le_bytes());
+    let covered = ops
+        .iter()
+        .filter(|op| {
+            let path = delta_path(op);
+            path != "/integrity" && !path.starts_with("/integrity/")
+        })
+        .collect::<Vec<_>>();
+    // The journal parses its JSON before validating its delta. serde_json's
+    // legacy float parser can drift on *multiple* successive parse/serialize
+    // passes (e.g. 2.7876436713919087e-8). Normalize until the serialized
+    // delta is a fixed point. A stable canonical form is independent of how
+    // many times it was parsed, including the parse at journal replay. If it
+    // does not stabilize, reject the transaction *before* writing anything.
+    // Do not enable float_roundtrip globally: that would break the persisted
+    // canonical hashes of older pools.
+    let mut payload = serde_json::to_vec(&covered)?;
+    const MAX_WIRE_NORMALIZATION_PASSES: usize = 64;
+    let mut stable = false;
+    for _ in 0..MAX_WIRE_NORMALIZATION_PASSES {
+        let decoded: Vec<MetadataDeltaOp> = serde_json::from_slice(&payload)?;
+        let serialized = serde_json::to_vec(&decoded)?;
+        if serialized == payload {
+            stable = true;
+            break;
+        }
+        payload = serialized;
+    }
+    if !stable {
+        return Err(ArgosError::IncompatibleFormat(
+            "raw delta floating-point JSON could not reach a stable wire representation"
+                .to_string(),
+        ));
+    }
+    digest.update((payload.len() as u64).to_le_bytes());
+    digest.update(payload);
+    Ok(hex::encode(digest.finalize()))
+}
+
+/// Build a v2 transaction using only changed inode keys, disk metadata, and
+/// a bounded header, leveraging the existing COW mutation tracker.
+pub fn prepare_delta_integrity(meta: &mut Metadata, previous: &Metadata) -> Result<()> {
+    meta.integrity.generation = meta.txid;
+    meta.integrity.previous_meta_hash = previous.integrity.meta_hash.clone();
+    meta.integrity.hash_scheme = Some(DELTA_INTEGRITY_SCHEME);
+    meta.integrity.meta_hash.clear();
+    let delta = metadata_delta(previous, meta)?;
+    meta.integrity.meta_hash = delta_integrity_hash(previous, meta, &delta)?;
+    Ok(())
+}
+
 pub fn inject_crash(point: &str) -> Result<()> {
     let thread_spec = THREAD_CRASH_POINT.with(|value| value.borrow().clone());
     let spec = match thread_spec {
@@ -528,6 +614,7 @@ fn write_metadata_copies_with_injection(root: &Path, meta: &Metadata) -> Result<
 fn prepare_metadata_integrity(meta: &mut Metadata, previous_meta_hash: String) -> Result<()> {
     meta.integrity.generation = meta.txid;
     meta.integrity.previous_meta_hash = previous_meta_hash;
+    meta.integrity.hash_scheme = None;
     meta.integrity.meta_hash = canonical_metadata_hash(meta)?;
     Ok(())
 }
@@ -1156,8 +1243,21 @@ pub fn apply_metadata_delta(previous: &Metadata, delta: &[MetadataDeltaOp]) -> R
         metadata.encryption = h.encryption;
         metadata.integrity = h.integrity;
     }
-    let hash = canonical_metadata_hash(&metadata)?;
-    validate_metadata(&mut metadata, &hash)?;
+    if metadata.integrity.hash_scheme == Some(DELTA_INTEGRITY_SCHEME) {
+        let hash = delta_integrity_hash(previous, &metadata, delta)?;
+        if metadata.integrity.meta_hash != hash {
+            return Err(ArgosError::Checksum(
+                "raw delta integrity chain digest mismatch".to_string(),
+            ));
+        }
+    } else if metadata.integrity.hash_scheme.is_none() {
+        let hash = canonical_metadata_hash(&metadata)?;
+        validate_metadata(&mut metadata, &hash)?;
+    } else {
+        return Err(ArgosError::IncompatibleFormat(
+            "unsupported raw delta integrity hash scheme".to_string(),
+        ));
+    }
     // The old JSON round-trip restored a fresh, clean tracking baseline.
     metadata.inodes.mark_committed();
     Ok(metadata)
@@ -1212,6 +1312,11 @@ fn apply_metadata_delta_legacy(previous: &Metadata, delta: &[MetadataDeltaOp]) -
         apply_delta_op(&mut value, op)?;
     }
     let mut metadata = serde_json::from_value::<Metadata>(value)?;
+    if metadata.integrity.hash_scheme.is_some() {
+        return Err(ArgosError::IncompatibleFormat(
+            "whole-map raw delta is unsupported with versioned integrity".to_string(),
+        ));
+    }
     let hash = canonical_metadata_hash(&metadata)?;
     validate_metadata(&mut metadata, &hash)?;
     Ok(metadata)

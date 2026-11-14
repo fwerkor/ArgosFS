@@ -663,6 +663,10 @@ pub struct MetadataIntegrity {
     pub generation: u64,
     pub previous_meta_hash: String,
     pub meta_hash: String,
+    /// Only present on versioned raw delta-chain transactions. Legacy
+    /// checkpoints retain their exact JSON encoding and hash identities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash_scheme: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

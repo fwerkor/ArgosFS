@@ -1112,6 +1112,298 @@ fn quota_rejected_rename_does_not_stage_deferred_reclaims() {
 }
 
 #[test]
+fn offline_delta_integrity_upgrade_replays_transactions_and_fences_downgrade() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|index| dir.path().join(format!("v2-{index}.img")))
+        .collect::<Vec<_>>();
+    let mut fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            compression: Compression::None,
+            defer_metadata_commit: true,
+            defer_journal_flush: true,
+            defer_data_flush: true,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "delta-v2-upgrade",
+        false,
+    )
+    .unwrap();
+    fs.write_file("/before", b"legacy snapshot", 0o600).unwrap();
+    fs.sync().unwrap();
+    assert_eq!(fs.metadata_snapshot().integrity.hash_scheme, None);
+    fs.upgrade_delta_integrity().unwrap();
+    for sb in fs.raw_superblocks.iter() {
+        assert_ne!(
+            sb.required_feature_flags & raw_format::REQUIRED_FEATURE_DELTA_INTEGRITY,
+            0
+        );
+        // Both copies have the mandatory feature. A pre-v2 binary with
+        // SUPPORTED_REQUIRED_FEATURE_FLAGS=0 rejects each member.
+        let image = images
+            .iter()
+            .find(|path| {
+                path.to_string_lossy()
+                    .contains(&format!("-{}.img", sb.disk_index))
+            })
+            .unwrap();
+        let image_file = std::fs::File::open(image).unwrap();
+        for offset in [
+            raw_format::PRIMARY_SUPERBLOCK_OFFSET,
+            sb.backup_superblock_offset,
+        ] {
+            let mut data = [0u8; raw_format::SUPERBLOCK_SIZE];
+            std::os::unix::fs::FileExt::read_at(&image_file, &mut data, offset).unwrap();
+            assert_ne!(u64::from_le_bytes(data[48..56].try_into().unwrap()), 0);
+        }
+    }
+    fs.write_file("/after", b"fast and durable", 0o600).unwrap();
+    fs.sync().unwrap();
+    assert_eq!(
+        fs.metadata_snapshot().integrity.hash_scheme,
+        Some(journal::DELTA_INTEGRITY_SCHEME)
+    );
+    let txid = fs.metadata_snapshot().txid;
+    drop(fs);
+    let reopened = ArgosFs::open_loop(&images, false).unwrap();
+    assert_eq!(reopened.metadata_snapshot().txid, txid);
+    assert_eq!(
+        reopened.read_file("/before", false).unwrap(),
+        b"legacy snapshot"
+    );
+    assert_eq!(
+        reopened.read_file("/after", false).unwrap(),
+        b"fast and durable"
+    );
+}
+
+#[test]
+fn v2_recovery_checkpoint_reanchors_normalized_metadata_before_next_delta() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|index| dir.path().join(format!("v2-restart-{index}.img")))
+        .collect::<Vec<_>>();
+    let mut fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            defer_metadata_commit: true,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "v2-restart",
+        false,
+    )
+    .unwrap();
+    fs.upgrade_delta_integrity().unwrap();
+    fs.write_file("/first", b"one", 0o600).unwrap();
+    fs.sync().unwrap();
+    assert_eq!(
+        fs.metadata_snapshot().integrity.hash_scheme,
+        Some(journal::DELTA_INTEGRITY_SCHEME)
+    );
+    drop(fs);
+
+    let fs = ArgosFs::open_loop(&images, true).unwrap();
+    assert!(fs.deferred_commit.lock().raw_checkpoint_required);
+    fs.write_file("/second", b"two", 0o600).unwrap();
+    fs.sync().unwrap();
+    // The first post-recovery checkpoint verifies the normalized current
+    // namespace rather than treating its recovered v2 digest as canonical.
+    assert_eq!(fs.metadata_snapshot().integrity.hash_scheme, None);
+    assert!(!fs.deferred_commit.lock().raw_checkpoint_required);
+    fs.write_file("/third", b"three", 0o600).unwrap();
+    fs.sync().unwrap();
+    assert_eq!(
+        fs.metadata_snapshot().integrity.hash_scheme,
+        Some(journal::DELTA_INTEGRITY_SCHEME)
+    );
+    drop(fs);
+    let recovered = ArgosFs::open_loop(&images, false).unwrap();
+    for (path, contents) in [
+        ("/first", b"one".as_slice()),
+        ("/second", b"two".as_slice()),
+        ("/third", b"three".as_slice()),
+    ] {
+        assert_eq!(recovered.read_file(path, false).unwrap(), contents);
+    }
+}
+
+#[test]
+fn v2_event_rollover_reanchors_deferred_hash_before_next_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|n| dir.path().join(format!("event-rollover-{n}.img")))
+        .collect::<Vec<_>>();
+    let mut fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            defer_metadata_commit: true,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "v2-event-rollover",
+        false,
+    )
+    .unwrap();
+    fs.upgrade_delta_integrity().unwrap();
+    fs.write_file("/base", b"base", 0o600).unwrap();
+    fs.sync().unwrap();
+    assert_eq!(
+        fs.metadata_snapshot().integrity.hash_scheme,
+        Some(journal::DELTA_INTEGRITY_SCHEME)
+    );
+    // >2 MiB entry forces raw journal rollover/checkpoint. The same-txid
+    // event checkpoint has a canonical digest rather than the old v2 digest.
+    {
+        let meta = fs.meta.read();
+        fs.journal_locked(
+            &meta,
+            "autopilot",
+            json!({"audit": "x".repeat(3 * 1024 * 1024)}),
+        )
+        .unwrap();
+    }
+    assert!(fs.deferred_commit.lock().raw_checkpoint_required);
+    fs.write_file("/after-event", b"acknowledged", 0o600)
+        .unwrap();
+    fs.sync().unwrap();
+    assert_eq!(fs.metadata_snapshot().integrity.hash_scheme, None);
+    fs.write_file("/v2-again", b"new-chain", 0o600).unwrap();
+    fs.sync().unwrap();
+    assert_eq!(
+        fs.metadata_snapshot().integrity.hash_scheme,
+        Some(journal::DELTA_INTEGRITY_SCHEME)
+    );
+    drop(fs);
+    let reopened = ArgosFs::open_loop(&images, false).unwrap();
+    assert_eq!(reopened.read_file("/base", false).unwrap(), b"base");
+    assert_eq!(
+        reopened.read_file("/after-event", false).unwrap(),
+        b"acknowledged"
+    );
+    assert_eq!(
+        reopened.read_file("/v2-again", false).unwrap(),
+        b"new-chain"
+    );
+    assert_eq!(reopened.transaction_report().unwrap().invalid_entries, 0);
+}
+
+#[test]
+fn v2_added_block_members_inherit_required_features_and_survive_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut images = (0..3)
+        .map(|n| dir.path().join(format!("grow-{n}.img")))
+        .collect::<Vec<_>>();
+    let mut fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            defer_metadata_commit: true,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "v2-grow",
+        false,
+    )
+    .unwrap();
+    fs.upgrade_delta_integrity().unwrap();
+    for n in 3..6 {
+        let next = dir.path().join(format!("grow-{n}.img"));
+        fs.add_block_device(next.clone(), 32 * 1024 * 1024, false)
+            .unwrap();
+        images.push(next);
+    }
+    fs.write_file("/grown", b"quorum with six upgraded members", 0o600)
+        .unwrap();
+    fs.sync().unwrap();
+    assert_eq!(
+        fs.metadata_snapshot().integrity.hash_scheme,
+        Some(journal::DELTA_INTEGRITY_SCHEME)
+    );
+    for path in &images {
+        let (sb, _) = raw_store::inspect_device(BackendKind::LoopBlock, path.clone()).unwrap();
+        assert_ne!(
+            sb.required_feature_flags & raw_format::REQUIRED_FEATURE_DELTA_INTEGRITY,
+            0
+        );
+    }
+    drop(fs);
+    let recovered = ArgosFs::open_loop(&images, false).unwrap();
+    assert_eq!(
+        recovered.read_file("/grown", false).unwrap(),
+        b"quorum with six upgraded members"
+    );
+}
+
+#[test]
+fn upgraded_legacy_event_rollover_with_read_telemetry_reanchors_before_first_v2_delta() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|n| dir.path().join(format!("event-legacy-{n}.img")))
+        .collect::<Vec<_>>();
+    let mut fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            defer_metadata_commit: true,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "legacy-event-v2",
+        false,
+    )
+    .unwrap();
+    fs.write_file("/old", b"old payload", 0o600).unwrap();
+    fs.sync().unwrap();
+    fs.upgrade_delta_integrity().unwrap();
+    assert_eq!(fs.metadata_snapshot().integrity.hash_scheme, None);
+    assert_eq!(fs.read_file("/old", false).unwrap(), b"old payload");
+    assert!(fs.deferred_commit.lock().raw_uncommitted_metadata_dirty);
+    {
+        let meta = fs.meta.read();
+        fs.journal_locked(
+            &meta,
+            "snapshot",
+            json!({"audit": "x".repeat(3 * 1024 * 1024)}),
+        )
+        .unwrap();
+    }
+    assert!(fs.deferred_commit.lock().raw_checkpoint_required);
+    fs.write_file("/first-new", b"first new", 0o600).unwrap();
+    fs.sync().unwrap();
+    assert_eq!(fs.metadata_snapshot().integrity.hash_scheme, None);
+    fs.write_file("/v2", b"v2 data", 0o600).unwrap();
+    fs.sync().unwrap();
+    assert_eq!(
+        fs.metadata_snapshot().integrity.hash_scheme,
+        Some(journal::DELTA_INTEGRITY_SCHEME)
+    );
+    drop(fs);
+    let reopened = ArgosFs::open_loop(&images, false).unwrap();
+    for (path, bytes) in [
+        ("/old", b"old payload".as_slice()),
+        ("/first-new", b"first new".as_slice()),
+        ("/v2", b"v2 data".as_slice()),
+    ] {
+        assert_eq!(reopened.read_file(path, false).unwrap(), bytes);
+    }
+}
+#[test]
 fn deferred_durability_cache_tracks_changed_inodes_and_device_status() {
     let dir = tempfile::tempdir().unwrap();
     let images = (0..3)

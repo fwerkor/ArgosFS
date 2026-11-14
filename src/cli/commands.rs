@@ -246,6 +246,17 @@ pub(super) enum Command {
         #[arg(long)]
         force: bool,
     },
+    #[command(
+        about = "One-way offline upgrade: enable O(changed) raw journal integrity with downgrade protection"
+    )]
+    UpgradeIntegrity {
+        #[command(flatten)]
+        storage: BackendArgs,
+        /// Acknowledge that ALL other mounts/processes using these raw members
+        /// are stopped, and all active members are supplied.
+        #[arg(long)]
+        offline_confirmed: bool,
+    },
     #[command(about = "Scan loop images or raw devices for ArgosFS signatures")]
     Scan {
         #[command(flatten)]
