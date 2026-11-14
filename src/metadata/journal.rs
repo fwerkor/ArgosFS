@@ -484,7 +484,15 @@ fn delta_integrity_hash(
             path != "/integrity" && !path.starts_with("/integrity/")
         })
         .collect::<Vec<_>>();
-    let payload = serde_json::to_vec(&covered)?;
+    // The journal deserializes its JSON before verifying it. serde_json's
+    // default float parser can slightly change a value on that first parse
+    // (for example 505.33894584583004). Bind the stable wire-decoded delta,
+    // not pre-serialization in-memory float bits. This also preserves v1
+    // canonical-hash compatibility; enabling float_roundtrip globally would
+    // change legacy checkpoint identities.
+    let wire = serde_json::to_vec(&covered)?;
+    let normalized: Vec<MetadataDeltaOp> = serde_json::from_slice(&wire)?;
+    let payload = serde_json::to_vec(&normalized)?;
     digest.update((payload.len() as u64).to_le_bytes());
     digest.update(payload);
     Ok(hex::encode(digest.finalize()))

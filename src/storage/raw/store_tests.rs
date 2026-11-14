@@ -1845,7 +1845,7 @@ fn v2_journal_wire_roundtrip_preserves_signed_zero_and_float_hashes() {
     inode.mtime = -0.0;
     inode.ctime = 1e-10;
     inode.last_accessed_at = -1e19;
-    next.disks.values_mut().next().unwrap().read_latency_ewma_ms = 1.0 / 3.0;
+    next.disks.values_mut().next().unwrap().read_latency_ewma_ms = 505.33894584583004;
     journal::prepare_delta_integrity(&mut next, &previous).unwrap();
     append_transaction_with_trusted_integrity_quorum(
         &backend,
