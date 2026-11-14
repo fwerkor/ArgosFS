@@ -103,7 +103,7 @@ jobs:
       - name: Summarize weekly matrices
         run: |
           {
-            echo "### Weekly four-matrix chaos run"
+            echo "### Weekly five-matrix chaos run"
             echo
             echo "- Schedule: Wednesday 03:00 Asia/Shanghai"
             echo "- Seed source: ${{ steps.seeds.outputs.source }}"
@@ -344,19 +344,89 @@ jobs:
             ${{ runner.temp }}/weekly-raw-cli-baseline
           if-no-files-found: ignore
 
+  coverage-guided-fuzz:
+    name: Coverage fuzz (${{ matrix.target }}, shard ${{ matrix.shard }})
+    needs: prepare-matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        target:
+          - raw_format
+          - journal_record
+          - metadata_delta
+          - paged_metadata
+          - journal_recovery
+          - erasure_codec
+        shard: [1, 2, 3]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install system dependencies
+        run: scripts/ci/install-deps.sh
+
+      - name: Install nightly Rust
+        run: scripts/ci/install-rust.sh nightly
+
+      - name: Cache fuzz build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: weekly-fuzz-${{ matrix.target }}
+          workspaces: |
+            fuzz -> target
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --version 0.13.2 --locked
+
+      - name: Restore evolving corpus
+        uses: actions/cache/restore@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: argosfs-fuzz-corpus-${{ matrix.target }}-${{ matrix.shard }}-${{ github.run_id }}
+          restore-keys: |
+            argosfs-fuzz-corpus-${{ matrix.target }}-${{ matrix.shard }}-
+
+      - name: Run 30-minute coverage fuzz shard
+        env:
+          ARGOSFS_FUZZ_ARTIFACTS: ${{ runner.temp }}/fuzz-artifacts/${{ matrix.target }}-${{ matrix.shard }}
+          ARGOSFS_FUZZ_MAX_LEN: "8192"
+          ARGOSFS_FUZZ_RSS_MB: "4096"
+        run: |
+          seed=$(( ${{ matrix.shard }} * 1000003 + ${{ github.run_number }} ))
+          scripts/ci/run-fuzz.sh "${{ matrix.target }}" 1800 "$seed"
+
+      - name: Save evolved corpus
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: argosfs-fuzz-corpus-${{ matrix.target }}-${{ matrix.shard }}-${{ github.run_id }}
+
+      - name: Upload crash artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: weekly-fuzz-${{ matrix.target }}-${{ matrix.shard }}
+          path: ${{ runner.temp }}/fuzz-artifacts/${{ matrix.target }}-${{ matrix.shard }}
+          if-no-files-found: ignore
+
   full-capos-qemu:
     name: Full CapOS QEMU matrix
     needs: prepare-matrix
     uses: ./.github/workflows/capos-full-qemu.yml
 
   weekly-required:
-    name: Weekly four-matrix gate
+    name: Weekly five-matrix gate
     runs-on: ubuntu-24.04
     needs:
       - prepare-matrix
       - core-randomized-matrix
       - fuse-posix-matrix
       - fuse-block-fault-matrix
+      - coverage-guided-fuzz
       - full-capos-qemu
     if: always()
     steps:
@@ -375,8 +445,8 @@ jobs:
               if result["result"] != "success"
           }
           if failed:
-              raise SystemExit(f"weekly four-matrix gates did not all pass: {failed}")
-          print("weekly core, FUSE, storage-fault, and QEMU matrices passed")
+              raise SystemExit(f"weekly five-matrix gates did not all pass: {failed}")
+          print("weekly core, FUSE, storage-fault, coverage-fuzz, and QEMU matrices passed")
           PY
 
   open-issue-on-failure:
@@ -393,7 +463,7 @@ jobs:
           REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           HEAD_SHA: ${{ github.sha }}
-          TITLE: Weekly four-matrix chaos CI failure
+          TITLE: Weekly five-matrix chaos CI failure
           SEEDS: ${{ needs.prepare-matrix.outputs.seeds }}
           FUSE_SEEDS: ${{ needs.prepare-matrix.outputs.fuse_seeds }}
           FAULT_SEEDS: ${{ needs.prepare-matrix.outputs.fault_seeds }}
@@ -409,7 +479,7 @@ jobs:
           - FUSE seeds: $FUSE_SEEDS
           - FUSE block-fault seeds: $FAULT_SEEDS
 
-          The required gate covers the direct core reference model on x86_64 and arm64, mounted FUSE randomized/POSIX compatibility, FUSE plus real device-mapper faults, and the full CapOS QEMU matrix on x86_64 and arm64. Download the seed manifest and the failing shard artifacts for exact replay parameters and logs.
+          The required gate covers the direct core reference model on x86_64 and arm64, mounted FUSE randomized/POSIX compatibility, FUSE plus real device-mapper faults, sharded coverage-guided libFuzzer campaigns, and the full CapOS QEMU matrix on x86_64 and arm64. Download the seed manifest and the failing shard artifacts for exact replay parameters and logs.
           EOF
           )"
           if [ -n "$existing" ]; then

@@ -7,6 +7,10 @@ __pycache__/
 build/
 dist/
 target/
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/corpus/*/*
+!/fuzz/corpus/*/seed
 *.profraw
 perf.data
 core
