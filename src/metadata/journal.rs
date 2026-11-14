@@ -513,15 +513,32 @@ fn delta_integrity_hash(
             path != "/integrity" && !path.starts_with("/integrity/")
         })
         .collect::<Vec<_>>();
-    // The journal deserializes its JSON before verifying it. serde_json's
-    // default float parser can slightly change a value on that first parse
-    // (for example 505.33894584583004). Bind the stable wire-decoded delta,
-    // not pre-serialization in-memory float bits. This also preserves v1
-    // canonical-hash compatibility; enabling float_roundtrip globally would
-    // change legacy checkpoint identities.
-    let wire = serde_json::to_vec(&covered)?;
-    let normalized: Vec<MetadataDeltaOp> = serde_json::from_slice(&wire)?;
-    let payload = serde_json::to_vec(&normalized)?;
+    // The journal parses its JSON before validating its delta. serde_json's
+    // legacy float parser can drift on *multiple* successive parse/serialize
+    // passes (e.g. 2.7876436713919087e-8). Normalize until the serialized
+    // delta is a fixed point. A stable canonical form is independent of how
+    // many times it was parsed, including the parse at journal replay. If it
+    // does not stabilize, reject the transaction *before* writing anything.
+    // Do not enable float_roundtrip globally: that would break the persisted
+    // canonical hashes of older pools.
+    let mut payload = serde_json::to_vec(&covered)?;
+    const MAX_WIRE_NORMALIZATION_PASSES: usize = 64;
+    let mut stable = false;
+    for _ in 0..MAX_WIRE_NORMALIZATION_PASSES {
+        let decoded: Vec<MetadataDeltaOp> = serde_json::from_slice(&payload)?;
+        let serialized = serde_json::to_vec(&decoded)?;
+        if serialized == payload {
+            stable = true;
+            break;
+        }
+        payload = serialized;
+    }
+    if !stable {
+        return Err(ArgosError::IncompatibleFormat(
+            "raw delta floating-point JSON could not reach a stable wire representation"
+                .to_string(),
+        ));
+    }
     digest.update((payload.len() as u64).to_le_bytes());
     digest.update(payload);
     Ok(hex::encode(digest.finalize()))

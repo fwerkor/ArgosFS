@@ -1845,7 +1845,16 @@ fn v2_journal_wire_roundtrip_preserves_signed_zero_and_float_hashes() {
     inode.mtime = -0.0;
     inode.ctime = 1e-10;
     inode.last_accessed_at = -1e19;
-    next.disks.values_mut().next().unwrap().read_latency_ewma_ms = 505.33894584583004;
+    let disk = next.disks.values_mut().next().unwrap();
+    disk.read_latency_ewma_ms = 505.33894584583004;
+    // Reproduce the review finding: the locked default parser drifts at
+    // least twice, not merely during the first serialization round trip.
+    let input = 2.7876436713919087e-8f64;
+    let once: f64 = serde_json::from_str(&serde_json::to_string(&input).unwrap()).unwrap();
+    let twice: f64 = serde_json::from_str(&serde_json::to_string(&once).unwrap()).unwrap();
+    assert_ne!(input.to_bits(), once.to_bits());
+    assert_ne!(once.to_bits(), twice.to_bits());
+    disk.observed_read_mib_s = input;
     journal::prepare_delta_integrity(&mut next, &previous).unwrap();
     append_transaction_with_trusted_integrity_quorum(
         &backend,
