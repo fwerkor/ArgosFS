@@ -493,3 +493,45 @@ fn backend_validation_image_sizes_and_numeric_parsers_cover_errors() {
         assert!(parse_u64_auto(invalid).is_err());
     }
 }
+
+#[test]
+fn mount_metrics_listener_is_explicit_opt_in() {
+    let host = Cli::try_parse_from([
+        "argosfs",
+        "mount",
+        "/tmp/pool",
+        "/tmp/mnt",
+        "--metrics-listen",
+        "127.0.0.1:9109",
+    ])
+    .unwrap();
+    match host.command {
+        Command::Mount { metrics_listen, .. } => {
+            assert_eq!(metrics_listen.as_deref(), Some("127.0.0.1:9109"));
+        }
+        _ => panic!("unexpected command"),
+    }
+    let root = Cli::try_parse_from([
+        "argosfs",
+        "mount-root",
+        "--images",
+        "/tmp/member.img",
+        "--metrics-listen",
+        "127.0.0.1:9109",
+    ])
+    .unwrap();
+    match root.command {
+        Command::MountRoot { metrics_listen, .. } => {
+            assert_eq!(metrics_listen.as_deref(), Some("127.0.0.1:9109"));
+        }
+        _ => panic!("unexpected command"),
+    }
+    let default = Cli::try_parse_from(["argosfs", "mount", "/tmp/pool", "/tmp/mnt"]).unwrap();
+    assert!(matches!(
+        default.command,
+        Command::Mount {
+            metrics_listen: None,
+            ..
+        }
+    ));
+}
