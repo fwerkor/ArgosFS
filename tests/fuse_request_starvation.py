@@ -19,27 +19,43 @@ import time
 
 
 def exercise(mount: Path, args):
-    start = threading.Barrier(5)
-    rounds = [threading.Barrier(4) for _ in range(args.rounds)]
+    # Do not let a writer's EIO/ENOSPC leave the other participants waiting
+    # forever for a barrier that can no longer reach its expected parties.
+    start = threading.Barrier(5, timeout=30)
+    rounds = [threading.Barrier(4, timeout=120) for _ in range(args.rounds)]
     stop = threading.Event()
     samples = []
     payloads = [bytes([index + 1]) * (1024 * 1024) for index in range(4)]
 
+    def abort_waiters():
+        stop.set()
+        start.abort()
+        for barrier in rounds:
+            barrier.abort()
+
     def writer(index):
-        with (mount / f"writer-{index}").open("wb", buffering=0) as file:
-            start.wait()
-            for barrier in rounds:
-                file.write(payloads[index])
-                barrier.wait()
-                os.fsync(file.fileno())
+        try:
+            with (mount / f"writer-{index}").open("wb", buffering=0) as file:
+                start.wait()
+                for barrier in rounds:
+                    file.write(payloads[index])
+                    barrier.wait()
+                    os.fsync(file.fileno())
+        except BaseException:
+            abort_waiters()
+            raise
 
     def sampler():
-        start.wait()
-        while not stop.is_set():
-            before = time.monotonic()
-            os.statvfs(mount)
-            samples.append((time.monotonic() - before) * 1000)
-            stop.wait(0.02)
+        try:
+            start.wait()
+            while not stop.is_set():
+                before = time.monotonic()
+                os.statvfs(mount)
+                samples.append((time.monotonic() - before) * 1000)
+                stop.wait(0.02)
+        except BaseException:
+            abort_waiters()
+            raise
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
         writer_jobs = [pool.submit(writer, i) for i in range(4)]
