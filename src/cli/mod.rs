@@ -159,6 +159,31 @@ pub fn run() -> Result<()> {
             };
             print_health_report(&fs.health_report(), json, true)?;
         }
+        Command::UpgradeIntegrity {
+            storage,
+            offline_confirmed,
+        } => {
+            if !offline_confirmed {
+                bail!("unmount all other users of this pool, then pass --offline-confirmed");
+            }
+            let storage = storage.resolve(BackendKind::LoopBlock)?;
+            if storage.backend == BackendKind::Host {
+                bail!("upgrade-integrity requires a raw or loop backend");
+            }
+            let mut fs =
+                open_backend(None, storage.backend, storage.images, storage.devices, true)?;
+            validate_requested_pool(&fs, storage.pool.as_deref())?;
+            fs.upgrade_delta_integrity()?;
+            fs.mark_clean_unmount()?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "upgraded": true,
+                    "required_feature": "raw-delta-integrity-v2",
+                    "pool_uuid": fs.metadata_snapshot().uuid
+                })
+            );
+        }
         Command::Scan { storage } => {
             let storage = storage.resolve(BackendKind::LoopBlock)?;
             let paths = backend_paths(storage.backend, storage.images, storage.devices)?;

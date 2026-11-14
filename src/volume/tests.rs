@@ -1110,3 +1110,128 @@ fn quota_rejected_rename_does_not_stage_deferred_reclaims() {
     assert_eq!(fs.read_file("/q/existing", false).unwrap(), vec![b'd'; 600]);
     assert_eq!(fs.read_file("/src/file", false).unwrap(), vec![b's'; 800]);
 }
+
+#[test]
+fn offline_delta_integrity_upgrade_replays_transactions_and_fences_downgrade() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|index| dir.path().join(format!("v2-{index}.img")))
+        .collect::<Vec<_>>();
+    let mut fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            compression: Compression::None,
+            defer_metadata_commit: true,
+            defer_journal_flush: true,
+            defer_data_flush: true,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "delta-v2-upgrade",
+        false,
+    )
+    .unwrap();
+    fs.write_file("/before", b"legacy snapshot", 0o600).unwrap();
+    fs.sync().unwrap();
+    assert_eq!(fs.metadata_snapshot().integrity.hash_scheme, None);
+    fs.upgrade_delta_integrity().unwrap();
+    for sb in fs.raw_superblocks.iter() {
+        assert_ne!(
+            sb.required_feature_flags & raw_format::REQUIRED_FEATURE_DELTA_INTEGRITY,
+            0
+        );
+        // Both copies have the mandatory feature. A pre-v2 binary with
+        // SUPPORTED_REQUIRED_FEATURE_FLAGS=0 rejects each member.
+        let image = images
+            .iter()
+            .find(|path| {
+                path.to_string_lossy()
+                    .contains(&format!("-{}.img", sb.disk_index))
+            })
+            .unwrap();
+        let image_file = std::fs::File::open(image).unwrap();
+        for offset in [
+            raw_format::PRIMARY_SUPERBLOCK_OFFSET,
+            sb.backup_superblock_offset,
+        ] {
+            let mut data = [0u8; raw_format::SUPERBLOCK_SIZE];
+            std::os::unix::fs::FileExt::read_at(&image_file, &mut data, offset).unwrap();
+            assert_ne!(u64::from_le_bytes(data[48..56].try_into().unwrap()), 0);
+        }
+    }
+    fs.write_file("/after", b"fast and durable", 0o600).unwrap();
+    fs.sync().unwrap();
+    assert_eq!(
+        fs.metadata_snapshot().integrity.hash_scheme,
+        Some(journal::DELTA_INTEGRITY_SCHEME)
+    );
+    let txid = fs.metadata_snapshot().txid;
+    drop(fs);
+    let reopened = ArgosFs::open_loop(&images, false).unwrap();
+    assert_eq!(reopened.metadata_snapshot().txid, txid);
+    assert_eq!(
+        reopened.read_file("/before", false).unwrap(),
+        b"legacy snapshot"
+    );
+    assert_eq!(
+        reopened.read_file("/after", false).unwrap(),
+        b"fast and durable"
+    );
+}
+
+#[test]
+fn v2_recovery_checkpoint_reanchors_normalized_metadata_before_next_delta() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|index| dir.path().join(format!("v2-restart-{index}.img")))
+        .collect::<Vec<_>>();
+    let mut fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            defer_metadata_commit: true,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "v2-restart",
+        false,
+    )
+    .unwrap();
+    fs.upgrade_delta_integrity().unwrap();
+    fs.write_file("/first", b"one", 0o600).unwrap();
+    fs.sync().unwrap();
+    assert_eq!(
+        fs.metadata_snapshot().integrity.hash_scheme,
+        Some(journal::DELTA_INTEGRITY_SCHEME)
+    );
+    drop(fs);
+
+    let fs = ArgosFs::open_loop(&images, true).unwrap();
+    assert!(fs.deferred_commit.lock().raw_checkpoint_required);
+    fs.write_file("/second", b"two", 0o600).unwrap();
+    fs.sync().unwrap();
+    // The first post-recovery checkpoint verifies the normalized current
+    // namespace rather than treating its recovered v2 digest as canonical.
+    assert_eq!(fs.metadata_snapshot().integrity.hash_scheme, None);
+    assert!(!fs.deferred_commit.lock().raw_checkpoint_required);
+    fs.write_file("/third", b"three", 0o600).unwrap();
+    fs.sync().unwrap();
+    assert_eq!(
+        fs.metadata_snapshot().integrity.hash_scheme,
+        Some(journal::DELTA_INTEGRITY_SCHEME)
+    );
+    drop(fs);
+    let recovered = ArgosFs::open_loop(&images, false).unwrap();
+    for (path, contents) in [
+        ("/first", b"one".as_slice()),
+        ("/second", b"two".as_slice()),
+        ("/third", b"three".as_slice()),
+    ] {
+        assert_eq!(recovered.read_file(path, false).unwrap(), contents);
+    }
+}
