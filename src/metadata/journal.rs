@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 const JOURNAL_VERSION: u32 = 1;
@@ -421,13 +422,41 @@ pub fn write_metadata_copies(root: &Path, meta: &Metadata) -> Result<()> {
     Ok(())
 }
 
+/// Stream a canonical metadata image into SHA-256. Serializing into a giant
+/// temporary Vec, deserializing it, and serializing it again previously cost
+/// multiple whole-namespace passes and gigabytes of transient allocations.
+///
+/// The serde round-trip is retained for floating-point normalization, and
+/// the final digest is calculated over exactly the legacy pretty JSON bytes.
 pub fn canonical_metadata_hash(meta: &Metadata) -> Result<String> {
     let mut clone = meta.clone();
     clone.integrity = MetadataIntegrity::default();
-    let persisted = serde_json::to_vec_pretty(&clone)?;
-    let mut round_trip = serde_json::from_slice::<Metadata>(&persisted)?;
-    round_trip.integrity = MetadataIntegrity::default();
-    Ok(sha256_hex(&serde_json::to_vec_pretty(&round_trip)?))
+    // A serde round-trip normalizes floating-point representations. This is
+    // part of the historical integrity hash and cannot be omitted without
+    // invalidating checkpoints written by prior ArgosFS versions.
+    let compact = serde_json::to_vec(&clone)?;
+    let round_trip = serde_json::from_slice::<Metadata>(&compact)?;
+    drop(compact);
+    let mut sink = Sha256Sink(Sha256::new());
+    {
+        let mut buffered = BufWriter::with_capacity(256 * 1024, &mut sink);
+        serde_json::to_writer_pretty(&mut buffered, &round_trip)?;
+        buffered.flush()?;
+    }
+    Ok(hex::encode(sink.0.finalize()))
+}
+
+struct Sha256Sink(Sha256);
+
+impl Write for Sha256Sink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.update(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 pub fn prepare_metadata_integrity_for_external_store(meta: &mut Metadata) -> Result<()> {

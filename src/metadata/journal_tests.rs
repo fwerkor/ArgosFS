@@ -1041,3 +1041,40 @@ fn delta_integrity_v2_binds_changes_and_replays_without_full_hash() {
         third.integrity
     );
 }
+
+#[test]
+fn streamed_canonical_hash_preserves_legacy_float_roundtrip_bytes() {
+    let (_dir, fs) = volume();
+    let mut metadata = fs.metadata_snapshot();
+    let template = metadata.inodes.get(&1).unwrap().clone();
+    let values = [
+        0.0,
+        -0.0,
+        0.1,
+        -0.1,
+        f64::EPSILON,
+        1e-10,
+        -1e20,
+        1.2345678901234567,
+        1.0 / 3.0,
+        f64::MAX / 2.0,
+    ];
+    for ino in 10_000..11_000 {
+        let mut inode = template.clone();
+        inode.id = ino;
+        inode.atime = values[(ino as usize) % values.len()];
+        inode.ctime = values[((ino as usize) / 3) % values.len()];
+        inode.workload_score = values[((ino as usize) / 7) % values.len()];
+        metadata.inodes.insert(ino, inode);
+    }
+    for disk in metadata.disks.values_mut() {
+        disk.used_bytes = 17;
+    }
+    let mut old_image = metadata.clone();
+    old_image.integrity = MetadataIntegrity::default();
+    let legacy_pretty = serde_json::to_vec_pretty(&old_image).unwrap();
+    let mut parsed: Metadata = serde_json::from_slice(&legacy_pretty).unwrap();
+    parsed.integrity = MetadataIntegrity::default();
+    let legacy = sha256_hex(&serde_json::to_vec_pretty(&parsed).unwrap());
+    assert_eq!(canonical_metadata_hash(&metadata).unwrap(), legacy);
+}
