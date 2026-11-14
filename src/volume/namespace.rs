@@ -433,6 +433,114 @@ impl ArgosFs {
         repair: bool,
         repair_offline: bool,
     ) -> Result<(Vec<u8>, Vec<String>, bool)> {
+        // Reads hold a shared guard for their entire data I/O so a writer
+        // cannot reclaim extents while a reader is using them. COW cloning
+        // gives the decoder its own mutable telemetry view, without making
+        // unrelated reads wait on a global exclusive namespace lock.
+        let guard = self.meta.read();
+        let mut snapshot = guard.clone();
+        let inode = snapshot
+            .inodes
+            .get(&ino)
+            .ok_or_else(|| ArgosError::NotFound(format!("inode {ino}")))?
+            .clone();
+        match inode.kind {
+            NodeKind::Directory => return Err(ArgosError::IsDirectory(format!("inode {ino}"))),
+            NodeKind::Symlink => {
+                return Ok((
+                    decode_symlink_target_bytes(inode.target.as_deref().unwrap_or_default()),
+                    Vec::new(),
+                    false,
+                ))
+            }
+            NodeKind::Special => {
+                return Err(ArgosError::Unsupported(format!(
+                    "special inode {ino} has no data stream"
+                )))
+            }
+            NodeKind::File => {}
+        }
+        let logical_size = usize::try_from(inode.size)
+            .map_err(|_| ArgosError::Invalid("inode logical size is too large".to_string()))?;
+        let start = offset.min(logical_size as u64) as usize;
+        let end = start.saturating_add(size).min(logical_size);
+        let capture = ReadLatencyCapture::start();
+        // Scrub inspects physical shards rather than trusting cached data.
+        if repair_offline {
+            for block in &inode.blocks {
+                self.cache.remove(&format!(
+                    "{}:{}:{}",
+                    snapshot.uuid, block.stripe_id, block.raw_sha256
+                ));
+            }
+        }
+        let decoded = self.decode_inode_range_from_inode_locked(&mut snapshot, &inode, start, end);
+        let samples = capture.finish();
+        drop(guard);
+        // Merge latency EWMAs into the live copy after all concurrent reads
+        // release their shared guards, preserving every sample and the inode
+        // counters. Never overwrite concurrent metadata with a stale clone.
+        {
+            let mut live = self.meta.write();
+            for sample in samples {
+                self.update_read_latency_locked(
+                    &mut live,
+                    &sample.disk_id,
+                    sample.bytes,
+                    sample.elapsed_seconds,
+                );
+            }
+            if let Ok((ref data, ref damaged)) = decoded {
+                let must_repair = repair
+                    && damaged.iter().any(|entry| {
+                        !super::data_plane::damage_is_transient_offline_member(
+                            self,
+                            &live,
+                            entry,
+                            repair_offline,
+                        )
+                    });
+                if !must_repair {
+                    if live.backend != BackendKind::Host {
+                        self.deferred_commit.lock().raw_uncommitted_metadata_dirty = true;
+                    }
+                    if let Some(inode) = live.inodes.get_mut(&ino) {
+                        inode.access_count = inode.access_count.saturating_add(1);
+                        inode.read_bytes = inode.read_bytes.saturating_add(data.len() as u64);
+                        inode.last_accessed_at = now_f64();
+                        inode.workload_score = inode.workload_score * 0.98 + 1.0;
+                    }
+                    return decoded.map(|(data, damaged)| (data, damaged, false));
+                }
+            }
+        }
+        // Failure requiring repair is rare. Run the previous exclusive path
+        // against the current inode, rather than trying to repair a snapshot
+        // that may have changed while transitioning between locks.
+        if repair
+            && decoded
+                .as_ref()
+                .is_ok_and(|(_, damaged)| !damaged.is_empty())
+        {
+            return self.read_inode_with_damage_report_policy_exclusive(
+                ino,
+                offset,
+                size,
+                repair,
+                repair_offline,
+            );
+        }
+        decoded.map(|(data, damaged)| (data, damaged, false))
+    }
+
+    fn read_inode_with_damage_report_policy_exclusive(
+        &self,
+        ino: InodeId,
+        offset: u64,
+        size: usize,
+        repair: bool,
+        repair_offline: bool,
+    ) -> Result<(Vec<u8>, Vec<String>, bool)> {
         let mut meta = self.meta.write();
         let inode = meta
             .inodes

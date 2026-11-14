@@ -29,7 +29,7 @@ use crate::util::{
 };
 use parking_lot::{Mutex, RwLock};
 use serde_json::json;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
@@ -40,6 +40,48 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
+
+/// Read-side samples collected while an immutable metadata read guard is held.
+/// This avoids taking the namespace write lock for each individual shard I/O.
+struct ReadLatencySample {
+    disk_id: String,
+    bytes: u64,
+    elapsed_seconds: f64,
+}
+
+thread_local! {
+    static READ_LATENCY_SAMPLES: RefCell<Option<Vec<ReadLatencySample>>> = const { RefCell::new(None) };
+}
+
+struct ReadLatencyCapture {
+    previous: Option<Vec<ReadLatencySample>>,
+    active: bool,
+}
+
+impl ReadLatencyCapture {
+    fn start() -> Self {
+        let previous = READ_LATENCY_SAMPLES.with(|slot| slot.replace(Some(Vec::new())));
+        Self {
+            previous,
+            active: true,
+        }
+    }
+
+    fn finish(mut self) -> Vec<ReadLatencySample> {
+        self.active = false;
+        READ_LATENCY_SAMPLES.with(|slot| slot.replace(self.previous.take()).unwrap_or_default())
+    }
+}
+
+impl Drop for ReadLatencyCapture {
+    fn drop(&mut self) {
+        if self.active {
+            READ_LATENCY_SAMPLES.with(|slot| {
+                slot.replace(self.previous.take());
+            });
+        }
+    }
+}
 
 thread_local! {
     static THREAD_BULK_IMPORT_MODE: Cell<Option<bool>> = const { Cell::new(None) };

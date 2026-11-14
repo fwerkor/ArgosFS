@@ -1182,6 +1182,22 @@ impl ArgosFs {
         bytes: u64,
         seconds: f64,
     ) {
+        let captured = READ_LATENCY_SAMPLES.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if let Some(samples) = slot.as_mut() {
+                samples.push(ReadLatencySample {
+                    disk_id: disk_id.to_owned(),
+                    bytes,
+                    elapsed_seconds: seconds,
+                });
+                true
+            } else {
+                false
+            }
+        });
+        if captured {
+            return;
+        }
         if meta.backend != BackendKind::Host {
             self.deferred_commit.lock().raw_uncommitted_metadata_dirty = true;
         }

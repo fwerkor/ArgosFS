@@ -1110,3 +1110,123 @@ fn quota_rejected_rename_does_not_stage_deferred_reclaims() {
     assert_eq!(fs.read_file("/q/existing", false).unwrap(), vec![b'd'; 600]);
     assert_eq!(fs.read_file("/src/file", false).unwrap(), vec![b's'; 800]);
 }
+
+struct OverlapProbeBackend {
+    inner: Arc<dyn StorageBackend>,
+    data_offset: u64,
+    active: AtomicUsize,
+    max_active: AtomicUsize,
+}
+
+impl StorageBackend for OverlapProbeBackend {
+    fn backend_kind(&self) -> BackendKind {
+        self.inner.backend_kind()
+    }
+    fn list_devices(&self) -> Result<Vec<crate::backend::BackendDeviceInfo>> {
+        self.inner.list_devices()
+    }
+    fn read_at(&self, device_id: &String, offset: u64, buf: &mut [u8]) -> Result<()> {
+        if offset != self.data_offset {
+            return self.inner.read_at(device_id, offset, buf);
+        }
+        let n = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_active.fetch_max(n, Ordering::SeqCst);
+        // Long enough for a second reader to reach the backend, with a
+        // bounded duration if an exclusive metadata lock serializes them.
+        std::thread::sleep(Duration::from_millis(250));
+        let result = self.inner.read_at(device_id, offset, buf);
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        result
+    }
+    fn write_at(&self, device_id: &String, offset: u64, data: &[u8]) -> Result<()> {
+        self.inner.write_at(device_id, offset, data)
+    }
+    fn flush_device(&self, device_id: &String) -> Result<()> {
+        self.inner.flush_device(device_id)
+    }
+    fn flush_all(&self) -> Result<()> {
+        self.inner.flush_all()
+    }
+    fn drop_cache(&self, device_id: &String, offset: u64, length: u64) -> Result<()> {
+        self.inner.drop_cache(device_id, offset, length)
+    }
+    fn capacity(&self, device_id: &String) -> Result<u64> {
+        self.inner.capacity(device_id)
+    }
+    fn device_status(&self, device_id: &String) -> Result<DiskStatus> {
+        self.inner.device_status(device_id)
+    }
+    fn capabilities(&self) -> crate::backend::BackendCapabilities {
+        self.inner.capabilities()
+    }
+}
+
+#[test]
+fn concurrent_readers_share_metadata_guard_and_merge_telemetry() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = dir.path().join("parallel-read.img");
+    let mut fs = ArgosFs::create_loop(
+        std::slice::from_ref(&image),
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            chunk_size: 4096,
+            compression: Compression::None,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "parallel-read",
+        false,
+    )
+    .unwrap();
+    let payload = vec![0x59u8; 8192];
+    fs.write_file("/data", &payload, 0o600).unwrap();
+    fs.sync().unwrap();
+    let ino = fs.resolve_path("/data", true).unwrap();
+    let original = fs.metadata_snapshot();
+    let block = &original.inodes[&ino].blocks[0];
+    let offset = match block.shards[0].location.as_ref().unwrap() {
+        ShardLocation::RawExtent(extent) => extent.offset,
+        _ => panic!("expected raw extent"),
+    };
+    fs.cache.remove(&format!(
+        "{}:{}:{}",
+        original.uuid, block.stripe_id, block.raw_sha256
+    ));
+    let backend = Arc::new(OverlapProbeBackend {
+        inner: fs.backend.clone(),
+        data_offset: offset,
+        active: AtomicUsize::new(0),
+        max_active: AtomicUsize::new(0),
+    });
+    fs.backend = backend.clone();
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let handles: Vec<_> = (0..2)
+        .map(|_| {
+            let fs = fs.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                fs.read_inode(ino, 0, 8192, true).unwrap()
+            })
+        })
+        .collect();
+    barrier.wait();
+    for handle in handles {
+        assert_eq!(handle.join().unwrap(), payload);
+    }
+    assert_eq!(
+        backend.max_active.load(Ordering::SeqCst),
+        2,
+        "parallel read requests must reach the raw backend concurrently"
+    );
+    let latest = fs.metadata_snapshot();
+    assert_eq!(
+        latest.inodes[&ino].read_bytes,
+        original.inodes[&ino].read_bytes + 2 * 8192
+    );
+    assert!(
+        latest.disks.values().next().unwrap().io_samples
+            >= original.disks.values().next().unwrap().io_samples + 2
+    );
+}
