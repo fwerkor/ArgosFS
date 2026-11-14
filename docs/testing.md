@@ -86,6 +86,23 @@ create/read/write/truncate, `chmod`, permitted `chown`, `utimensat`/`stat`,
 filenames, rename overwrite, `RENAME_NOREPLACE` when the kernel exposes it,
 sticky directory setup and cross-user enforcement when uid switching is
 available, concurrent readers/writers, `fsync`, and `sync`.
+
+To reproduce the four-concurrent-`fsync` FUSE request starvation reported
+in issue #228, use a Linux system with usable `/dev/fuse`:
+
+```bash
+cargo build --release --bin argosfs
+python3 tests/fuse_request_starvation.py --binary target/release/argosfs
+```
+
+This test uses two independent FUSE request readers and two filesystem
+execution workers, four synchronized file writers, and repeated `statvfs`
+calls. It validates file contents and asserts a 100 ms maximum observed
+`statvfs` latency under the standalone test workload; the threshold is a
+regression signal, not a hard real-time filesystem guarantee. The regular
+mounted-FUSE compatibility suite also runs this test (12 rounds, 500 ms
+threshold to accommodate noisy shared CI runners). Adjust `--rounds` and
+`--max-statfs-ms` when running on slower systems.
 Timestamp checks require sub-millisecond round trips because the current
 metadata format stores times as floating-point seconds.
 

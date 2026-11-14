@@ -186,6 +186,16 @@ operations. It supports the node types needed by a root filesystem: regular
 files, directories, symlinks, hardlinks, character devices, block devices, FIFOs,
 and sockets.
 
+FUSE request readers dispatch potentially blocking operations to an independent
+filesystem executor. Workers execute requests for the same inode in arrival
+order while other inodes can progress concurrently. `statfs` reads a cached
+snapshot directly on a request reader, including while all execution workers
+are waiting for checkpoint I/O. Worker parallelism defaults to available CPUs
+(bounded for small systems) and is independently configurable through
+`ARGOSFS_FUSE_REQUEST_THREADS` and `ARGOSFS_FUSE_IO_WORKERS`; neither knob
+replaces the separation between receiving requests and performing I/O.
+Shutdown drains accepted filesystem operations before flushing metadata.
+
 For CapOS rootfs, initramfs runs `scan`, optional `replay-journal`, optional
 `fsck`, `preflight-root`, then `mount-root` at `/sysroot`, verifies an init
 binary, and uses `switch_root`. The post-switch systemd assets provide health,
