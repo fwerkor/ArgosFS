@@ -567,9 +567,12 @@ impl ArgosFs {
             .map_err(|_| ArgosError::Invalid("inode logical size is too large".to_string()))?;
         let start = offset.min(logical_size as u64) as usize;
         let end = start.saturating_add(size).min(logical_size);
-        // Scrub must inspect the actual shards. A cached reconstructed block
-        // would otherwise hide an offline member even after its grace expires.
-        if repair_offline {
+        // The preceding shared-lock attempt can have cached reconstructed
+        // data after discovering a broken shard. Always recheck physical
+        // shards under the exclusive guard before deciding that self-healing
+        // is unnecessary. Otherwise the cache hides the same damage and the
+        // supposedly repaired read can silently leave redundancy degraded.
+        if repair || repair_offline {
             for block in &inode.blocks {
                 self.cache.remove(&format!(
                     "{}:{}:{}",

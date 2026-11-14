@@ -1230,3 +1230,74 @@ fn concurrent_readers_share_metadata_guard_and_merge_telemetry() {
             >= original.disks.values().next().unwrap().io_samples + 2
     );
 }
+
+#[test]
+fn concurrent_read_rechecks_corrupt_shard_before_self_heal() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|i| dir.path().join(format!("repair-shard-{i}.img")))
+        .collect::<Vec<_>>();
+    let fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            compression: Compression::None,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "self-heal-cache",
+        false,
+    )
+    .unwrap();
+    let payload = (0..64 * 1024).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+    fs.write_file("/damage", &payload, 0o600).unwrap();
+    fs.sync().unwrap();
+    let ino = fs.resolve_path("/damage", true).unwrap();
+    let metadata = fs.metadata_snapshot();
+    let block = &metadata.inodes[&ino].blocks[0];
+    let shard = &block.shards[0];
+    let extent = match shard.location.as_ref().unwrap() {
+        ShardLocation::RawExtent(extent) => extent,
+        _ => panic!("expected raw extent"),
+    };
+    let path = &images[shard
+        .disk_id
+        .trim_start_matches("disk-")
+        .parse::<usize>()
+        .unwrap()];
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    std::os::unix::fs::FileExt::write_at(&file, &[0x4F; 128], extent.offset).unwrap();
+    file.sync_all().unwrap();
+    fs.cache.remove(&format!(
+        "{}:{}:{}",
+        metadata.uuid, block.stripe_id, block.raw_sha256
+    ));
+    let txid = metadata.txid;
+    let (read, damaged, repaired) = fs
+        .read_inode_with_damage_report(ino, 0, payload.len(), true)
+        .unwrap();
+    assert_eq!(read, payload);
+    assert!(
+        repaired,
+        "the exclusive reread must ignore cached reconstructed data"
+    );
+    assert!(
+        !damaged.is_empty(),
+        "physical shard damage must be reported"
+    );
+    assert!(
+        fs.metadata_snapshot().txid > txid,
+        "self-heal writes a new valid stripe"
+    );
+    let (second, damage_after, repaired_again) = fs
+        .read_inode_with_damage_report(ino, 0, payload.len(), true)
+        .unwrap();
+    assert_eq!(second, payload);
+    assert!(
+        damage_after.is_empty(),
+        "the recovered stripes must be healthy"
+    );
+    assert!(!repaired_again);
+}
