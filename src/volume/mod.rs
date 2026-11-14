@@ -41,6 +41,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+/// Physical verification must never accept or populate a reconstructed block cache entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BlockCachePolicy {
+    Normal,
+    Bypass,
+}
+
 /// Read-side samples collected while an immutable metadata read guard is held.
 /// This avoids taking the namespace write lock for each individual shard I/O.
 struct ReadLatencySample {

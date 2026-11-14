@@ -159,6 +159,23 @@ impl ArgosFs {
         start: usize,
         end: usize,
     ) -> Result<(Vec<u8>, Vec<String>)> {
+        self.decode_inode_range_with_cache_policy_locked(
+            meta,
+            inode,
+            start,
+            end,
+            BlockCachePolicy::Normal,
+        )
+    }
+
+    pub(super) fn decode_inode_range_with_cache_policy_locked(
+        &self,
+        meta: &mut Metadata,
+        inode: &Inode,
+        start: usize,
+        end: usize,
+        cache_policy: BlockCachePolicy,
+    ) -> Result<(Vec<u8>, Vec<String>)> {
         if end <= start {
             return Ok((Vec::new(), Vec::new()));
         }
@@ -202,8 +219,13 @@ impl ArgosFs {
                 )? {
                     out[dst_start..dst_start + len].copy_from_slice(&raw);
                 } else {
-                    let raw =
-                        self.decode_block_locked(meta, block, decrypt_key.as_ref(), &mut damaged)?;
+                    let raw = self.decode_block_with_cache_policy_locked(
+                        meta,
+                        block,
+                        decrypt_key.as_ref(),
+                        &mut damaged,
+                        cache_policy,
+                    )?;
                     let src_start = copy_start - block_start;
                     out[dst_start..dst_start + len]
                         .copy_from_slice(&raw[src_start..src_start + len]);
@@ -326,10 +348,20 @@ impl ArgosFs {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn decode_inode_data_locked(
         &self,
         meta: &mut Metadata,
         inode: &Inode,
+    ) -> Result<(Vec<u8>, Vec<String>)> {
+        self.decode_inode_data_with_cache_policy_locked(meta, inode, BlockCachePolicy::Normal)
+    }
+
+    pub(super) fn decode_inode_data_with_cache_policy_locked(
+        &self,
+        meta: &mut Metadata,
+        inode: &Inode,
+        cache_policy: BlockCachePolicy,
     ) -> Result<(Vec<u8>, Vec<String>)> {
         let logical_size = usize::try_from(inode.size)
             .map_err(|_| ArgosError::Invalid("inode logical size is too large".to_string()))?;
@@ -350,7 +382,13 @@ impl ArgosFs {
             None
         };
         for block in &inode.blocks {
-            let raw = self.decode_block_locked(meta, block, decrypt_key.as_ref(), &mut damaged)?;
+            let raw = self.decode_block_with_cache_policy_locked(
+                meta,
+                block,
+                decrypt_key.as_ref(),
+                &mut damaged,
+                cache_policy,
+            )?;
             let block_start = usize::try_from(block.raw_offset).map_err(|_| {
                 ArgosError::Invalid(format!("block {} raw offset is too large", block.stripe_id))
             })?;
@@ -375,18 +413,43 @@ impl ArgosFs {
         decrypt_key: Option<&[u8; 32]>,
         damaged: &mut Vec<String>,
     ) -> Result<Vec<u8>> {
+        self.decode_block_with_cache_policy_locked(
+            meta,
+            block,
+            decrypt_key,
+            damaged,
+            BlockCachePolicy::Normal,
+        )
+    }
+
+    fn decode_block_with_cache_policy_locked(
+        &self,
+        meta: &mut Metadata,
+        block: &FileBlock,
+        decrypt_key: Option<&[u8; 32]>,
+        damaged: &mut Vec<String>,
+        cache_policy: BlockCachePolicy,
+    ) -> Result<Vec<u8>> {
         let cache_key = format!("{}:{}:{}", meta.uuid, block.stripe_id, block.raw_sha256);
         if block.encrypted {
             self.cache.remove(&cache_key);
-        } else if let Some(raw) = self.cache.get(&cache_key, Some(&block.raw_sha256)) {
-            if raw.len() == block.raw_size {
-                return Ok(raw);
+        } else if cache_policy == BlockCachePolicy::Normal {
+            if let Some(raw) = self.cache.get(&cache_key, Some(&block.raw_sha256)) {
+                if raw.len() == block.raw_size {
+                    return Ok(raw);
+                }
+                self.cache.remove(&cache_key);
             }
-            self.cache.remove(&cache_key);
         }
         let layout = layout_by_id(meta, block_layout_id(block))?;
         if layout.k == 1 && layout.m == 0 && !block.encrypted && block.codec == Compression::None {
-            return self.decode_single_shard_block_locked(meta, block, damaged, &cache_key);
+            return self.decode_single_shard_block_with_cache_policy_locked(
+                meta,
+                block,
+                damaged,
+                &cache_key,
+                cache_policy,
+            );
         }
         let codec = RsCodec::new(layout.k, layout.m)?;
         let mut shards: Vec<Option<Vec<u8>>> = vec![None; layout_total(&layout)?];
@@ -455,7 +518,7 @@ impl ArgosFs {
                 reason: "raw checksum mismatch".to_string(),
             });
         }
-        if !block.encrypted {
+        if !block.encrypted && cache_policy == BlockCachePolicy::Normal {
             self.cache.put(&cache_key, &raw)?;
         }
         Ok(raw)
@@ -576,12 +639,30 @@ impl ArgosFs {
         Ok(Some(data[local_start..local_end].to_vec()))
     }
 
+    #[cfg(test)]
     pub(super) fn decode_single_shard_block_locked(
         &self,
         meta: &mut Metadata,
         block: &FileBlock,
         damaged: &mut Vec<String>,
         cache_key: &str,
+    ) -> Result<Vec<u8>> {
+        self.decode_single_shard_block_with_cache_policy_locked(
+            meta,
+            block,
+            damaged,
+            cache_key,
+            BlockCachePolicy::Normal,
+        )
+    }
+
+    fn decode_single_shard_block_with_cache_policy_locked(
+        &self,
+        meta: &mut Metadata,
+        block: &FileBlock,
+        damaged: &mut Vec<String>,
+        cache_key: &str,
+        cache_policy: BlockCachePolicy,
     ) -> Result<Vec<u8>> {
         let Some(shard) = block.shards.iter().find(|shard| shard.slot == 0) else {
             damaged.push("single-shard:missing-slot-0".to_string());
@@ -628,7 +709,9 @@ impl ArgosFs {
                 reason: "single-device raw checksum mismatch".to_string(),
             });
         }
-        self.cache.put(cache_key, &data)?;
+        if cache_policy == BlockCachePolicy::Normal {
+            self.cache.put(cache_key, &data)?;
+        }
         Ok(data)
     }
 

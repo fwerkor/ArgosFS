@@ -433,10 +433,8 @@ impl ArgosFs {
         repair: bool,
         repair_offline: bool,
     ) -> Result<(Vec<u8>, Vec<String>, bool)> {
-        // Reads hold a shared guard for their entire data I/O so a writer
-        // cannot reclaim extents while a reader is using them. COW cloning
-        // gives the decoder its own mutable telemetry view, without making
-        // unrelated reads wait on a global exclusive namespace lock.
+        // Hold the shared metadata guard for the entire physical read, so
+        // concurrent writers cannot reclaim in-flight shard extents.
         let guard = self.meta.read();
         let mut snapshot = guard.clone();
         let inode = snapshot
@@ -464,17 +462,19 @@ impl ArgosFs {
             .map_err(|_| ArgosError::Invalid("inode logical size is too large".to_string()))?;
         let start = offset.min(logical_size as u64) as usize;
         let end = start.saturating_add(size).min(logical_size);
+        let cache_policy = if repair_offline {
+            BlockCachePolicy::Bypass
+        } else {
+            BlockCachePolicy::Normal
+        };
         let capture = ReadLatencyCapture::start();
-        // Scrub inspects physical shards rather than trusting cached data.
-        if repair_offline {
-            for block in &inode.blocks {
-                self.cache.remove(&format!(
-                    "{}:{}:{}",
-                    snapshot.uuid, block.stripe_id, block.raw_sha256
-                ));
-            }
-        }
-        let decoded = self.decode_inode_range_from_inode_locked(&mut snapshot, &inode, start, end);
+        let decoded = self.decode_inode_range_with_cache_policy_locked(
+            &mut snapshot,
+            &inode,
+            start,
+            end,
+            cache_policy,
+        );
         let samples = capture.finish();
         drop(guard);
         // Merge latency EWMAs into the live copy after all concurrent reads
@@ -567,21 +567,21 @@ impl ArgosFs {
             .map_err(|_| ArgosError::Invalid("inode logical size is too large".to_string()))?;
         let start = offset.min(logical_size as u64) as usize;
         let end = start.saturating_add(size).min(logical_size);
-        // The preceding shared-lock attempt can have cached reconstructed
-        // data after discovering a broken shard. Always recheck physical
-        // shards under the exclusive guard before deciding that self-healing
-        // is unnecessary. Otherwise the cache hides the same damage and the
-        // supposedly repaired read can silently leave redundancy degraded.
-        if repair || repair_offline {
-            for block in &inode.blocks {
-                self.cache.remove(&format!(
-                    "{}:{}:{}",
-                    meta.uuid, block.stripe_id, block.raw_sha256
-                ));
-            }
-        }
-        let (mut data, mut damaged) =
-            self.decode_inode_range_from_inode_locked(&mut meta, &inode, start, end)?;
+        // Recheck the current inode's actual shards after dropping the shared
+        // guard. Bypassing the cache is stronger than evicting it: a concurrent
+        // reader cannot reinsert reconstructed data between eviction and read.
+        let cache_policy = if repair || repair_offline {
+            BlockCachePolicy::Bypass
+        } else {
+            BlockCachePolicy::Normal
+        };
+        let (mut data, mut damaged) = self.decode_inode_range_with_cache_policy_locked(
+            &mut meta,
+            &inode,
+            start,
+            end,
+            cache_policy,
+        )?;
         let mut repaired = false;
         // An absent member is not data damage: the block was rebuilt from the
         // remaining shards and the member may return.  Failed or removed
@@ -598,7 +598,11 @@ impl ArgosFs {
         });
         if repair && has_repairable_damage {
             let mut repair_damaged = damaged.clone();
-            let (full, full_damaged) = self.decode_inode_data_locked(&mut meta, &inode)?;
+            let (full, full_damaged) = self.decode_inode_data_with_cache_policy_locked(
+                &mut meta,
+                &inode,
+                BlockCachePolicy::Bypass,
+            )?;
             for entry in full_damaged {
                 if !repair_damaged.contains(&entry) {
                     repair_damaged.push(entry);

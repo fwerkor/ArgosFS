@@ -1231,6 +1231,157 @@ fn concurrent_readers_share_metadata_guard_and_merge_telemetry() {
     );
 }
 
+/// Freeze scrub after it starts decoding its first physical stripe, so a
+/// concurrent read can cache a reconstructed *later* stripe before scrub
+/// reaches it. Scrub must still discover the later stripe's damage.
+struct ScrubPauseBackend {
+    inner: Arc<dyn StorageBackend>,
+    pause_offset: u64,
+    pause_once: std::sync::atomic::AtomicBool,
+    paused: std::sync::mpsc::Sender<()>,
+    resume: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl StorageBackend for ScrubPauseBackend {
+    fn backend_kind(&self) -> BackendKind {
+        self.inner.backend_kind()
+    }
+    fn list_devices(&self) -> Result<Vec<crate::backend::BackendDeviceInfo>> {
+        self.inner.list_devices()
+    }
+    fn read_at(&self, device_id: &String, offset: u64, buf: &mut [u8]) -> Result<()> {
+        if offset == self.pause_offset && self.pause_once.swap(false, Ordering::SeqCst) {
+            self.paused.send(()).unwrap();
+            self.resume.lock().unwrap().recv().unwrap();
+        }
+        self.inner.read_at(device_id, offset, buf)
+    }
+    fn write_at(&self, device_id: &String, offset: u64, data: &[u8]) -> Result<()> {
+        self.inner.write_at(device_id, offset, data)
+    }
+    fn flush_device(&self, device_id: &String) -> Result<()> {
+        self.inner.flush_device(device_id)
+    }
+    fn flush_all(&self) -> Result<()> {
+        self.inner.flush_all()
+    }
+    fn drop_cache(&self, device_id: &String, offset: u64, length: u64) -> Result<()> {
+        self.inner.drop_cache(device_id, offset, length)
+    }
+    fn capacity(&self, device_id: &String) -> Result<u64> {
+        self.inner.capacity(device_id)
+    }
+    fn device_status(&self, device_id: &String) -> Result<DiskStatus> {
+        self.inner.device_status(device_id)
+    }
+    fn capabilities(&self) -> crate::backend::BackendCapabilities {
+        self.inner.capabilities()
+    }
+}
+
+#[test]
+fn scrub_checks_physical_shards_despite_concurrent_reconstruction_cache_insert() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|i| dir.path().join(format!("scrub-race-{i}.img")))
+        .collect::<Vec<_>>();
+    let mut fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            compression: Compression::None,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "scrub-cache-race",
+        false,
+    )
+    .unwrap();
+    let payload = (0..64 * 1024).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+    fs.write_file("/data", &payload, 0o600).unwrap();
+    fs.sync().unwrap();
+    let ino = fs.resolve_path("/data", true).unwrap();
+    let meta = fs.metadata_snapshot();
+    let blocks = &meta.inodes[&ino].blocks;
+    assert!(blocks.len() >= 2);
+    let first_extent = match blocks[0].shards[0].location.as_ref().unwrap() {
+        ShardLocation::RawExtent(extent) => extent,
+        _ => panic!("expected raw extent"),
+    };
+    let corrupt = &blocks[1];
+    let corrupt_shard = &corrupt.shards[0];
+    let damaged_extent = match corrupt_shard.location.as_ref().unwrap() {
+        ShardLocation::RawExtent(extent) => extent,
+        _ => panic!("expected raw extent"),
+    };
+    let path = &images[corrupt_shard
+        .disk_id
+        .trim_start_matches("disk-")
+        .parse::<usize>()
+        .unwrap()];
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    std::os::unix::fs::FileExt::write_at(&file, &[0x42; 128], damaged_extent.offset).unwrap();
+    file.sync_all().unwrap();
+    let cache_key = format!("{}:{}:{}", meta.uuid, corrupt.stripe_id, corrupt.raw_sha256);
+    fs.cache.remove(&cache_key);
+
+    let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    fs.backend = Arc::new(ScrubPauseBackend {
+        inner: fs.backend.clone(),
+        pause_offset: first_extent.offset,
+        pause_once: std::sync::atomic::AtomicBool::new(true),
+        paused: paused_tx,
+        resume: std::sync::Mutex::new(resume_rx),
+    });
+    let scrub_fs = fs.clone();
+    let read_len = payload.len();
+    let handle = std::thread::spawn(move || {
+        scrub_fs.read_inode_with_damage_report_for_scrub(ino, 0, read_len, false)
+    });
+    paused_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("scrub must reach first stripe");
+    let start = corrupt.raw_offset;
+    let reader_fs = fs.clone();
+    let read_size = corrupt.raw_size;
+    let reader = std::thread::spawn(move || reader_fs.read_inode(ino, start, read_size, false));
+    // The reader cannot finish merging telemetry while scrub holds its
+    // shared metadata guard. Observe cache publication instead of waiting
+    // for the entire read, or the test itself would deadlock.
+    let mut cached = false;
+    for _ in 0..500 {
+        if fs
+            .cache
+            .get(&cache_key, Some(&corrupt.raw_sha256))
+            .is_some()
+        {
+            cached = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    resume_tx.send(()).unwrap();
+    let read = reader.join().unwrap().unwrap();
+    assert_eq!(
+        read,
+        payload[start as usize..start as usize + corrupt.raw_size]
+    );
+    assert!(
+        cached,
+        "ordinary read should reconstruct and cache damaged stripe"
+    );
+    let (scrub_read, damaged, repaired) = handle.join().unwrap().unwrap();
+    assert_eq!(scrub_read, payload);
+    assert!(!repaired);
+    assert!(
+        damaged.iter().any(|entry| entry.contains(&corrupt_shard.disk_id)),
+        "scrub must report physical shard damage despite the concurrent cache insertion: {damaged:?}"
+    );
+}
+
 #[test]
 fn concurrent_read_rechecks_corrupt_shard_before_self_heal() {
     let dir = tempfile::tempdir().unwrap();
