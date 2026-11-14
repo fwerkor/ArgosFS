@@ -1,4 +1,5 @@
 use super::fuse_queue::FuseRequestExecutor;
+use super::metrics;
 use crate::acl;
 use crate::error::{ArgosError, Result};
 use crate::types::{CapacitySource, DiskStatus, InodeId, NodeKind};
@@ -596,8 +597,18 @@ pub fn mount(
     foreground: bool,
     options: Vec<String>,
 ) -> Result<()> {
+    mount_with_metrics(volume_root, mountpoint, foreground, options, None)
+}
+
+pub fn mount_with_metrics(
+    volume_root: impl AsRef<Path>,
+    mountpoint: impl AsRef<Path>,
+    foreground: bool,
+    options: Vec<String>,
+    metrics_listen: Option<&str>,
+) -> Result<()> {
     let volume = ArgosFs::open(volume_root)?;
-    mount_volume(volume, mountpoint, foreground, options)
+    mount_volume_with_metrics(volume, mountpoint, foreground, options, metrics_listen)
 }
 
 pub fn mount_volume(
@@ -605,6 +616,16 @@ pub fn mount_volume(
     mountpoint: impl AsRef<Path>,
     foreground: bool,
     options: Vec<String>,
+) -> Result<()> {
+    mount_volume_with_metrics(volume, mountpoint, foreground, options, None)
+}
+
+pub fn mount_volume_with_metrics(
+    volume: ArgosFs,
+    mountpoint: impl AsRef<Path>,
+    foreground: bool,
+    options: Vec<String>,
+    metrics_listen: Option<&str>,
 ) -> Result<()> {
     let mut mount_options = vec![
         MountOption::FSName("argosfs".to_string()),
@@ -619,6 +640,12 @@ pub fn mount_volume(
         );
     }
     let config = mount_config(mount_options);
+    // This server sees the same atomic counters as FUSE and the commit worker.
+    // Keep it scoped to the blocking mount so it cannot keep the volume alive
+    // after the FUSE filesystem performs its final sync.
+    let _metrics_server = metrics_listen
+        .map(|address| metrics::MountedMetricsServer::start(&volume, address))
+        .transpose()?;
     fuser::mount2(ArgosFuse::try_new(volume)?, mountpoint, &config).map_err(ArgosError::Io)
 }
 

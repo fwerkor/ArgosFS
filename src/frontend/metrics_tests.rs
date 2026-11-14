@@ -93,3 +93,69 @@ fn metrics_server_reports_bind_errors() {
     let error = serve(volume(), &address.to_string()).unwrap_err();
     assert!(matches!(error, crate::error::ArgosError::Io(_)));
 }
+
+#[test]
+fn commit_only_metrics_are_available_during_metadata_write_lock() {
+    let volume = volume();
+    let snapshot = volume.commit_metrics().snapshots().collect::<Vec<_>>();
+    assert!(snapshot.iter().all(|(_, counters)| counters.count == 0));
+    volume.test_with_metadata_write_lock(|| {
+        let output = render_commit_metrics(&volume);
+        assert!(output
+            .contains("argosfs_commit_phase_duration_seconds_count{phase=\"group_commit\"} 0"));
+        assert!(output.contains("# TYPE argosfs_commit_phase_duration_seconds_sum counter"));
+        assert!(!output.contains("argosfs_files"));
+        let response = request(
+            &volume,
+            b"GET /commit-metrics HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("phase=\"sync_lock_hold\""));
+    });
+}
+
+#[test]
+fn commit_metrics_are_shared_across_cloned_handles() {
+    let volume = volume();
+    volume.commit_metrics().observe(
+        crate::commit_metrics::CommitPhase::GroupCommit,
+        Duration::from_millis(25),
+    );
+    let clone = volume.clone();
+    let output = render_commit_metrics(&clone);
+    assert!(
+        output.contains("argosfs_commit_phase_duration_seconds_count{phase=\"group_commit\"} 1")
+    );
+    assert!(
+        output.contains("argosfs_commit_phase_duration_seconds_sum{phase=\"group_commit\"} 0.025")
+    );
+}
+
+#[test]
+fn mounted_metrics_server_shares_live_counters_and_releases_listener() {
+    let volume = volume();
+    let server = MountedMetricsServer::start(&volume, "127.0.0.1:0").unwrap();
+    let address = server.local_addr();
+    volume.commit_metrics().observe(
+        crate::commit_metrics::CommitPhase::Journal,
+        Duration::from_millis(42),
+    );
+    volume.test_with_metadata_write_lock(|| {
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream
+            .write_all(b"GET /commit-metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        stream.shutdown(Shutdown::Write).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(
+            response.contains("argosfs_commit_phase_duration_seconds_count{phase=\"journal\"} 1")
+        );
+    });
+    drop(server);
+    assert!(TcpListener::bind(address).is_ok());
+}

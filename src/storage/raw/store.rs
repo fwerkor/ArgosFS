@@ -1,4 +1,5 @@
 use crate::backend::{FileBlockBackend, StorageBackend};
+use crate::commit_metrics::{CommitMetrics, CommitPhase};
 use crate::error::{ArgosError, Result};
 use crate::journal;
 use crate::raw_format::{
@@ -366,7 +367,10 @@ pub(crate) fn append_transaction_quorum(
         previous_metadata,
         action,
         details,
-        JournalQuorumMode::Transaction,
+        JournalQuorumOptions {
+            mode: JournalQuorumMode::Transaction,
+            metrics: None,
+        },
     )?;
     journal::inject_crash(FaultPoint::AfterJournalCommitBeforeMetadataCommit.as_str())?;
     Ok(report)
@@ -386,7 +390,10 @@ pub(crate) fn append_event_quorum(
         None,
         action,
         details,
-        JournalQuorumMode::Event,
+        JournalQuorumOptions {
+            mode: JournalQuorumMode::Event,
+            metrics: None,
+        },
     )?;
     journal::inject_crash(FaultPoint::AfterJournalCommitBeforeMetadataCommit.as_str())?;
     Ok(report)
@@ -407,7 +414,37 @@ pub(crate) fn append_transaction_with_trusted_integrity_quorum(
         previous_metadata,
         action,
         details,
-        JournalQuorumMode::TrustedTransaction,
+        JournalQuorumOptions {
+            mode: JournalQuorumMode::TrustedTransaction,
+            metrics: None,
+        },
+    )?;
+    journal::inject_crash(FaultPoint::AfterJournalCommitBeforeMetadataCommit.as_str())?;
+    Ok(report)
+}
+
+/// Timed group commit; the original entry point is retained for uninstrumented
+/// repair, recovery and test callers.
+pub(crate) fn append_transaction_with_trusted_integrity_quorum_measured(
+    backend: &dyn StorageBackend,
+    superblocks: &[RawSuperblock],
+    metadata: &Metadata,
+    previous_metadata: Option<&Metadata>,
+    metrics: &CommitMetrics,
+    action: &str,
+    details: serde_json::Value,
+) -> Result<QuorumWriteReport> {
+    let report = append_journal_quorum(
+        backend,
+        superblocks,
+        metadata,
+        previous_metadata,
+        action,
+        details,
+        JournalQuorumOptions {
+            mode: JournalQuorumMode::TrustedTransaction,
+            metrics: Some(metrics),
+        },
     )?;
     journal::inject_crash(FaultPoint::AfterJournalCommitBeforeMetadataCommit.as_str())?;
     Ok(report)
@@ -421,7 +458,7 @@ pub fn write_metadata_copies(
     // Store compact JSON: the metadata checkpoint has half the fixed metadata
     // region, and pretty-printing wastes about a third of that space.
     let checkpoint = prepare_checkpoint_writes(metadata, superblocks)?;
-    let writes = write_metadata_members_parallel(backend, superblocks, metadata, &checkpoint);
+    let writes = write_metadata_members_parallel(backend, superblocks, metadata, &checkpoint, None);
     // Join all in-flight writes even when one member fails.
     for (_, result) in writes {
         result?;
@@ -436,12 +473,15 @@ fn write_metadata_members_parallel(
     superblocks: &[RawSuperblock],
     metadata: &Metadata,
     checkpoint: &MetadataTreeCheckpoint,
+    metrics: Option<&CommitMetrics>,
 ) -> Vec<(String, Result<()>)> {
     std::thread::scope(|scope| {
         let jobs: Vec<_> = superblocks
             .iter()
             .map(|sb| {
                 scope.spawn(move || {
+                    let _member_timer =
+                        metrics.map(|metrics| metrics.timer(CommitPhase::CheckpointMemberIo));
                     (
                         sb.disk_id.clone(),
                         write_metadata_member(backend, sb, metadata, checkpoint),
@@ -460,6 +500,24 @@ pub(crate) fn write_metadata_copies_quorum(
     superblocks: &[RawSuperblock],
     metadata: &Metadata,
 ) -> Result<QuorumWriteReport> {
+    write_metadata_copies_quorum_impl(backend, superblocks, metadata, None)
+}
+
+pub(crate) fn write_metadata_copies_quorum_measured(
+    backend: &dyn StorageBackend,
+    superblocks: &[RawSuperblock],
+    metadata: &Metadata,
+    metrics: &CommitMetrics,
+) -> Result<QuorumWriteReport> {
+    write_metadata_copies_quorum_impl(backend, superblocks, metadata, Some(metrics))
+}
+
+fn write_metadata_copies_quorum_impl(
+    backend: &dyn StorageBackend,
+    superblocks: &[RawSuperblock],
+    metadata: &Metadata,
+    metrics: Option<&CommitMetrics>,
+) -> Result<QuorumWriteReport> {
     let need = metadata_quorum_requirement(metadata);
     if superblocks.len() < need {
         return Err(quorum_unavailable(
@@ -468,12 +526,15 @@ pub(crate) fn write_metadata_copies_quorum(
             superblocks.len(),
         ));
     }
-    let checkpoint = prepare_checkpoint_writes(metadata, superblocks)?;
+    let checkpoint = {
+        let _encode_timer = metrics.map(|metrics| metrics.timer(CommitPhase::CheckpointEncode));
+        prepare_checkpoint_writes(metadata, superblocks)?
+    };
     let mut report = QuorumWriteReport::default();
     let mut durable = 0usize;
     let mut uncertain_write = false;
     for (disk_id, result) in
-        write_metadata_members_parallel(backend, superblocks, metadata, &checkpoint)
+        write_metadata_members_parallel(backend, superblocks, metadata, &checkpoint, metrics)
     {
         match result {
             Ok(()) => durable += 1,
@@ -926,6 +987,24 @@ fn build_journal_entry(
     details: serde_json::Value,
     trust_integrity: bool,
 ) -> Result<(Vec<u8>, String)> {
+    build_journal_entry_measured(
+        metadata,
+        previous_metadata,
+        action,
+        details,
+        trust_integrity,
+        None,
+    )
+}
+
+fn build_journal_entry_measured(
+    metadata: &Metadata,
+    previous_metadata: Option<&Metadata>,
+    action: &str,
+    details: serde_json::Value,
+    trust_integrity: bool,
+    metrics: Option<&CommitMetrics>,
+) -> Result<(Vec<u8>, String)> {
     let delta_base = match previous_metadata {
         Some(previous)
             if previous.integrity.meta_hash == metadata.integrity.previous_meta_hash
@@ -952,6 +1031,7 @@ fn build_journal_entry(
     let metadata_delta = if write_checkpoint {
         None
     } else {
+        let _delta_timer = metrics.map(|metrics| metrics.timer(CommitPhase::JournalDelta));
         Some(journal::metadata_delta(
             delta_base.expect("checked above"),
             metadata,
@@ -1200,7 +1280,7 @@ fn append_journal_with_previous_validation(
     if rollover {
         let checkpoint = prepare_checkpoint_writes(metadata, superblocks)?;
         for (_, result) in
-            checkpoint_members_and_reset_parallel(backend, superblocks, metadata, &checkpoint)
+            checkpoint_members_and_reset_parallel(backend, superblocks, metadata, &checkpoint, None)
         {
             result?;
         }
@@ -1247,6 +1327,11 @@ enum JournalQuorumMode {
     Event,
 }
 
+struct JournalQuorumOptions<'a> {
+    mode: JournalQuorumMode,
+    metrics: Option<&'a CommitMetrics>,
+}
+
 fn append_journal_quorum(
     backend: &dyn StorageBackend,
     superblocks: &[RawSuperblock],
@@ -1254,8 +1339,9 @@ fn append_journal_quorum(
     previous_metadata: Option<&Metadata>,
     action: &str,
     details: serde_json::Value,
-    mode: JournalQuorumMode,
+    options: JournalQuorumOptions<'_>,
 ) -> Result<QuorumWriteReport> {
+    let JournalQuorumOptions { mode, metrics } = options;
     let trust_integrity = matches!(mode, JournalQuorumMode::TrustedTransaction);
     let allow_same_txid = matches!(mode, JournalQuorumMode::Event);
     let need = metadata_quorum_requirement(metadata);
@@ -1266,12 +1352,13 @@ fn append_journal_quorum(
             superblocks.len(),
         ));
     }
-    let (entry, target_record_hash) = build_journal_entry(
+    let (entry, target_record_hash) = build_journal_entry_measured(
         metadata,
         previous_metadata,
         action,
         details,
         trust_integrity,
+        metrics,
     )?;
     let journal_certificate =
         build_quorum_commit_entry(metadata, Some(target_record_hash.as_str()))?;
@@ -1314,10 +1401,18 @@ fn append_journal_quorum(
         let eligible: Vec<_> = positions.into_iter().map(|(sb, _)| sb.clone()).collect();
         // All members receive the exact same checkpoint bytes and hash.
         // Prepare once before touching any journal or metadata slot.
-        let checkpoint = prepare_checkpoint_writes(metadata, &eligible)?;
-        for (disk_id, result) in
-            checkpoint_members_and_reset_parallel(backend, &eligible, metadata, &checkpoint)
-        {
+        let checkpoint = {
+            let _encode_timer = metrics.map(|metrics| metrics.timer(CommitPhase::CheckpointEncode));
+            prepare_checkpoint_writes(metadata, &eligible)?
+        };
+        let _rollover_timer = metrics.map(|metrics| metrics.timer(CommitPhase::JournalRollover));
+        for (disk_id, result) in checkpoint_members_and_reset_parallel(
+            backend,
+            &eligible,
+            metadata,
+            &checkpoint,
+            metrics,
+        ) {
             match result {
                 Ok(()) => {
                     durable.insert(disk_id);
@@ -1355,15 +1450,19 @@ fn append_journal_quorum(
     let position_count = positions.len();
     let mut appended = BTreeSet::new();
     for (index, (sb, (header, write_offset, end, _))) in positions.into_iter().enumerate() {
-        match append_journal_member(
-            backend,
-            sb,
-            header,
-            write_offset,
-            end,
-            &entry,
-            !metadata.config.defer_journal_flush,
-        ) {
+        let member_result = {
+            let _member_timer = metrics.map(|metrics| metrics.timer(CommitPhase::JournalMemberIo));
+            append_journal_member(
+                backend,
+                sb,
+                header,
+                write_offset,
+                end,
+                &entry,
+                !metadata.config.defer_journal_flush,
+            )
+        };
+        match member_result {
             Ok(()) => {
                 appended.insert(sb.disk_id.clone());
                 if appended.len() < need && index + 1 < position_count {
@@ -1415,12 +1514,15 @@ fn checkpoint_members_and_reset_parallel(
     superblocks: &[RawSuperblock],
     metadata: &Metadata,
     checkpoint: &MetadataTreeCheckpoint,
+    metrics: Option<&CommitMetrics>,
 ) -> Vec<(String, Result<()>)> {
     std::thread::scope(|scope| {
         let jobs: Vec<_> = superblocks
             .iter()
             .map(|sb| {
                 scope.spawn(move || {
+                    let _member_timer =
+                        metrics.map(|metrics| metrics.timer(CommitPhase::CheckpointMemberIo));
                     let result = (|| {
                         write_metadata_member(backend, sb, metadata, checkpoint)?;
                         // Never discard the old journal before both checkpoint
