@@ -480,8 +480,9 @@ fn write_metadata_members_parallel(
             .iter()
             .map(|sb| {
                 scope.spawn(move || {
-                    let _member_timer =
-                        metrics.map(|metrics| metrics.timer(CommitPhase::CheckpointMemberIo));
+                    let _member_timer = metrics.map(|metrics| {
+                        metrics.member_timer(CommitPhase::CheckpointMemberIo, &sb.disk_id)
+                    });
                     (
                         sb.disk_id.clone(),
                         write_metadata_member(backend, sb, metadata, checkpoint),
@@ -1366,7 +1367,11 @@ fn append_journal_quorum(
     let mut positions = Vec::with_capacity(superblocks.len());
     let mut rollover = false;
     for sb in superblocks {
-        match journal_tip_accepts_transaction(backend, sb, metadata, allow_same_txid) {
+        let tip_accepts = {
+            let _tip_timer = metrics.map(|metrics| metrics.timer(CommitPhase::JournalTip));
+            journal_tip_accepts_transaction(backend, sb, metadata, allow_same_txid)
+        };
+        match tip_accepts {
             Ok(true) => match journal_append_position(backend, sb, entry.len()) {
                 Ok(position) => {
                     let certificate_end = position.2.checked_add(journal_certificate.len() as u64);
@@ -1436,14 +1441,17 @@ fn append_journal_quorum(
             });
         }
         let checkpoint_certificate = build_quorum_commit_entry(metadata, None)?;
-        append_quorum_commit_certificate(
-            backend,
-            superblocks,
-            &durable,
-            &checkpoint_certificate,
-            need,
-            &mut report,
-        )?;
+        {
+            let _quorum_timer = metrics.map(|metrics| metrics.timer(CommitPhase::JournalQuorum));
+            append_quorum_commit_certificate(
+                backend,
+                superblocks,
+                &durable,
+                &checkpoint_certificate,
+                need,
+                &mut report,
+            )?;
+        }
         return Ok(report);
     }
 
@@ -1451,7 +1459,8 @@ fn append_journal_quorum(
     let mut appended = BTreeSet::new();
     for (index, (sb, (header, write_offset, end, _))) in positions.into_iter().enumerate() {
         let member_result = {
-            let _member_timer = metrics.map(|metrics| metrics.timer(CommitPhase::JournalMemberIo));
+            let _member_timer = metrics
+                .map(|metrics| metrics.member_timer(CommitPhase::JournalMemberIo, &sb.disk_id));
             append_journal_member(
                 backend,
                 sb,
@@ -1476,7 +1485,11 @@ fn append_journal_quorum(
     let durable = if metadata.config.defer_journal_flush {
         let mut durable = BTreeSet::new();
         for disk_id in appended {
-            match backend.flush_device(&disk_id) {
+            let flush_result = {
+                let _flush_timer = metrics.map(|metrics| metrics.timer(CommitPhase::JournalFlush));
+                backend.flush_device(&disk_id)
+            };
+            match flush_result {
                 Ok(()) => {
                     durable.insert(disk_id);
                 }
@@ -1498,14 +1511,17 @@ fn append_journal_quorum(
             durable.len(),
         ));
     }
-    append_quorum_commit_certificate(
-        backend,
-        superblocks,
-        &durable,
-        &journal_certificate,
-        need,
-        &mut report,
-    )?;
+    {
+        let _quorum_timer = metrics.map(|metrics| metrics.timer(CommitPhase::JournalQuorum));
+        append_quorum_commit_certificate(
+            backend,
+            superblocks,
+            &durable,
+            &journal_certificate,
+            need,
+            &mut report,
+        )?;
+    }
     Ok(report)
 }
 
@@ -1521,8 +1537,9 @@ fn checkpoint_members_and_reset_parallel(
             .iter()
             .map(|sb| {
                 scope.spawn(move || {
-                    let _member_timer =
-                        metrics.map(|metrics| metrics.timer(CommitPhase::CheckpointMemberIo));
+                    let _member_timer = metrics.map(|metrics| {
+                        metrics.member_timer(CommitPhase::CheckpointMemberIo, &sb.disk_id)
+                    });
                     let result = (|| {
                         write_metadata_member(backend, sb, metadata, checkpoint)?;
                         // Never discard the old journal before both checkpoint

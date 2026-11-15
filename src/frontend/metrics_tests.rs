@@ -159,3 +159,27 @@ fn mounted_metrics_server_shares_live_counters_and_releases_listener() {
     drop(server);
     assert!(TcpListener::bind(address).is_ok());
 }
+
+#[test]
+fn commit_metrics_expose_member_labels_during_global_writer_stalls() {
+    let volume = volume();
+    {
+        let _checkpoint = volume.commit_metrics().member_timer(
+            crate::commit_metrics::CommitPhase::CheckpointMemberIo,
+            "disk-0009",
+        );
+    }
+    volume.test_with_metadata_write_lock(|| {
+        let output = render_commit_metrics(&volume);
+        assert!(output.contains(
+            "argosfs_commit_phase_duration_seconds_count{phase=\"checkpoint_member_io\",disk=\"disk-0009\"} 1"
+        ));
+        assert!(output.contains(
+            "argosfs_commit_phase_duration_seconds_count{phase=\"checkpoint_member_io\"} 1"
+        ));
+        assert!(output.contains("phase=\"journal_quorum\""));
+        assert!(output.contains("phase=\"journal_flush\""));
+        assert!(output.contains("phase=\"journal_tip\""));
+        assert_eq!(output.matches("# HELP argosfs_commit_phase_duration_seconds_count").count(), 1);
+    });
+}
