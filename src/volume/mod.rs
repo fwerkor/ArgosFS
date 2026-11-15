@@ -128,6 +128,8 @@ const MAX_IN_MEMORY_IO_BYTES: usize = 256 * 1024 * 1024;
 
 mod autopilot;
 mod data_plane;
+#[cfg(test)]
+mod deferred_flush_tests;
 mod helpers;
 mod maintenance;
 mod metadata_budget;
@@ -2078,10 +2080,27 @@ impl ArgosFs {
         durability_cache: &mut Option<DurabilityValidationCache>,
     ) -> Result<()> {
         let mut unavailable = self.quarantined_devices.lock().clone();
-        for sb in superblocks {
-            if let Err(err) = backend.flush_device(&sb.disk_id) {
+        // Every member has an independent flush barrier. Issue them together
+        // and join all workers before checking durability or committing the
+        // metadata journal. The quorum rule and per-device ordering stay the
+        // same, while a slow USB member no longer serializes every other
+        // member's data flush.
+        let flushes = std::thread::scope(|scope| {
+            let workers = superblocks
+                .iter()
+                .map(|sb| {
+                    scope.spawn(move || (sb.disk_id.clone(), backend.flush_device(&sb.disk_id)))
+                })
+                .collect::<Vec<_>>();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().expect("data flush worker panicked"))
+                .collect::<Vec<_>>()
+        });
+        for (disk_id, result) in flushes {
+            if let Err(err) = result {
                 if Self::device_error_should_quarantine(&err) {
-                    unavailable.insert(sb.disk_id.clone());
+                    unavailable.insert(disk_id);
                 } else {
                     return Err(err);
                 }
