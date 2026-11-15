@@ -18,8 +18,10 @@ fuzz_target!(|data: &[u8]| {
     current.txid = 1;
     current.integrity = Default::default();
     journal::initialize_volume(root, &mut current, 1.0).expect("initialize fuzz journal");
-    let initial_txid = current.txid;
-    let mut highest_attempted = current.txid;
+    // The oracle tracks committed states independently of recovered output:
+    // a silently rolled-back transaction must not become the next baseline.
+    let mut committed_states = vec![current.clone()];
+    let mut last_metadata_copy = current.clone();
 
     let crash_points = [
         "",
@@ -36,8 +38,6 @@ fuzz_target!(|data: &[u8]| {
         next.updated_at += 1.0 + step as f64;
         next.next_stripe = common::u64_at(data, 520 + step * 8);
         next.raw_pool.pool_name = common::text_at(data, 600 + step * 40, 32, "recovery-pool");
-        highest_attempted = highest_attempted.max(next.txid);
-
         let point = crash_points[common::byte(data, 900 + step) as usize % crash_points.len()];
         let result = if point.is_empty() {
             journal::append_transaction(
@@ -56,19 +56,50 @@ fuzz_target!(|data: &[u8]| {
             )
         };
 
-        if result.is_ok() {
-            current = next;
+        if point.is_empty() {
+            result.expect("uninterrupted journal append must commit");
         } else {
-            let recovered = journal::load_or_recover(root)
-                .expect("injected journal crash must leave a recoverable state");
-            assert!(recovered.metadata.txid >= initial_txid);
-            assert!(recovered.metadata.txid <= highest_attempted);
-            current = recovered.metadata;
+            assert!(
+                result.is_err(),
+                "injected point {point} must interrupt the transaction"
+            );
         }
+
+        // BeforeJournal is precommit; all later fault points happen after
+        // the journal append is durable. The expected state is derived only
+        // from the transaction and fault point, never from recovery output.
+        let expected = if point == "before-journal" {
+            current.clone()
+        } else {
+            next
+        };
+        if point != "before-journal" {
+            committed_states.push(expected.clone());
+        }
+        if point.is_empty()
+            || matches!(
+                point,
+                "after-primary-metadata"
+                    | "after-secondary-metadata"
+                    | "after-compatible-metadata"
+            )
+        {
+            last_metadata_copy = expected.clone();
+        }
+        let recovered = journal::load_or_recover(root)
+            .expect("every injected journal crash must retain the durable state");
+        assert_eq!(recovered.metadata.txid, expected.txid, "lost committed transaction at {point}");
+        assert_eq!(
+            serde_json::to_value(&recovered.metadata).unwrap(),
+            serde_json::to_value(&expected).unwrap(),
+            "recovered metadata content differs at {point}"
+        );
+        current = expected;
     }
 
     let system = root.join(".argosfs");
-    match common::byte(data, 1024) % 6 {
+    let corruption = common::byte(data, 1024) % 6;
+    match corruption {
         0 => {
             let mut file = OpenOptions::new()
                 .append(true)
@@ -104,7 +135,30 @@ fuzz_target!(|data: &[u8]| {
 
     let recovered = journal::load_or_recover(root)
         .expect("single-copy/tail corruption must remain recoverable");
-    assert!(recovered.metadata.txid >= initial_txid);
-    assert!(recovered.metadata.txid <= highest_attempted);
+    if corruption != 3 {
+        // A malformed tail or one missing/corrupt metadata copy leaves the
+        // valid journal and therefore the newest committed state intact.
+        assert_eq!(recovered.metadata.txid, current.txid);
+        assert_eq!(
+            serde_json::to_value(&recovered.metadata).unwrap(),
+            serde_json::to_value(&current).unwrap(),
+            "single-copy damage must not roll back a committed transaction"
+        );
+    } else {
+        // Deliberately truncating the journal may destroy the sole durable
+        // copy of the last append (after-journal crash). An older authenticated
+        // committed state is permitted, but not arbitrary partial metadata,
+        // and it cannot be older than the last persisted metadata copy.
+        assert!(recovered.metadata.txid >= last_metadata_copy.txid);
+        assert!(recovered.metadata.txid <= current.txid);
+        assert!(
+            committed_states.iter().any(|state| {
+                state.txid == recovered.metadata.txid
+                    && serde_json::to_value(state).unwrap()
+                        == serde_json::to_value(&recovered.metadata).unwrap()
+            }),
+            "truncation recovered a state that was never committed"
+        );
+    }
     journal::scan(root).expect("recovered journal must remain scannable");
 });
