@@ -12,13 +12,16 @@ use std::time::Duration;
 pub fn serve(volume: ArgosFs, listen: &str) -> Result<()> {
     let listener = TcpListener::bind(listen)?;
     for stream in listener.incoming() {
-        spawn_client(&volume, stream?);
+        // Standalone serving is intentionally long-lived; mounted servers
+        // track and drain their request workers during unmount.
+        let _ = spawn_client(&volume, stream?);
     }
     Ok(())
 }
 
 /// Optional HTTP server sharing the mounted volume's counters. Dropping it
-/// stops its listener before the last mount handle is released.
+/// stops the listener and drains accepted request workers before releasing the
+/// final mounted-volume handle, so clean-unmount cannot race a live scrape.
 pub struct MountedMetricsServer {
     stop: Sender<()>,
     join: Option<thread::JoinHandle<()>>,
@@ -35,20 +38,40 @@ impl MountedMetricsServer {
         let volume = volume.clone();
         let join = thread::Builder::new()
             .name("argosfs-metrics".to_string())
-            .spawn(move || loop {
-                match listener.accept() {
-                    Ok((stream, _)) => spawn_client(&volume, stream),
-                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                        match receiver.recv_timeout(Duration::from_millis(50)) {
-                            Err(RecvTimeoutError::Timeout) => continue,
-                            Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+            .spawn(move || {
+                let mut clients: Vec<thread::JoinHandle<()>> = Vec::new();
+                loop {
+                    // Check the stop signal even under a continuous stream
+                    // of requests. Otherwise shutdown could starve in accept.
+                    match receiver.try_recv() {
+                        Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break,
+                        Err(mpsc::TryRecvError::Empty) => {}
+                    }
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            clients.push(spawn_client(&volume, stream));
+                            // Reap completed workers during long mounts. Never
+                            // let the owned JoinHandle list grow forever.
+                            clients.retain(|client| !client.is_finished());
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            match receiver.recv_timeout(Duration::from_millis(50)) {
+                                Err(RecvTimeoutError::Timeout) => continue,
+                                Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!("argosfs: metrics listener failed: {err}");
+                            break;
                         }
                     }
-                    Err(err) => {
-                        eprintln!("argosfs: metrics listener failed: {err}");
-                        break;
-                    }
+                }
+                // An accepted client's ArgosFs clone must be dropped before
+                // the mount can finish its final clean-unmount checkpoint.
+                // Read/write timeouts bound requests stalled on network I/O.
+                for client in clients {
+                    let _ = client.join();
                 }
             })?;
         Ok(Self {
@@ -72,14 +95,14 @@ impl Drop for MountedMetricsServer {
     }
 }
 
-fn spawn_client(volume: &ArgosFs, stream: TcpStream) {
+fn spawn_client(volume: &ArgosFs, stream: TcpStream) -> thread::JoinHandle<()> {
     let volume = volume.clone();
     thread::spawn(move || {
         let mut stream = stream;
         let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
         let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
         let _ = handle_client(&volume, &mut stream);
-    });
+    })
 }
 
 pub fn render(volume: &ArgosFs) -> String {

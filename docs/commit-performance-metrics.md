@@ -10,7 +10,11 @@ Both paths are Prometheus text exposition; do not expose the server to
 untrusted networks without access control. The separate `argosfs prometheus`
 command creates its own volume handle and cannot observe counters in an
 independently running FUSE mount. The optional `--metrics-listen` listener
-binds before mounting and stops when the mount exits.
+binds before mounting. During unmount it stops accepting clients and waits
+for already-accepted request threads to finish before releasing the mounted
+volume handle and marking the pool clean. Read and write socket timeouts are
+2 seconds; a request already inside the volume may wait for an existing
+metadata operation to release its lock.
 
 The three series, labeled by `phase` (and additionally by `disk` for
 per-member journal/checkpoint I/O), are:

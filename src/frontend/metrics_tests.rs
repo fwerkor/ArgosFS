@@ -183,3 +183,33 @@ fn commit_metrics_expose_member_labels_during_global_writer_stalls() {
         assert_eq!(output.matches("# HELP argosfs_commit_phase_duration_seconds_count").count(), 1);
     });
 }
+
+#[test]
+fn mounted_server_drains_inflight_clients_before_unmount_returns() {
+    let volume = volume();
+    let server = MountedMetricsServer::start(&volume, "127.0.0.1:0").unwrap();
+    let address = server.local_addr();
+    let mut client = TcpStream::connect(address).unwrap();
+    // Leave a connected client blocked in its request read. The listener
+    // accepts independently and shutdown must wait for that worker.
+    thread::sleep(Duration::from_millis(100));
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let shutdown = thread::spawn(move || {
+        drop(server);
+        finished_tx.send(()).unwrap();
+    });
+    assert!(matches!(
+        finished_rx.recv_timeout(Duration::from_millis(100)),
+        Err(RecvTimeoutError::Timeout)
+    ));
+    client
+        .write_all(b"GET /commit-metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    let mut response = String::new();
+    client.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(finished_rx.recv_timeout(Duration::from_secs(3)).is_ok());
+    shutdown.join().unwrap();
+    assert!(TcpListener::bind(address).is_ok());
+}
