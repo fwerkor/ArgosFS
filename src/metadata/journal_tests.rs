@@ -1243,3 +1243,83 @@ fn recovery_replays_delta_with_non_idempotent_json_float() {
     assert_eq!(recovered.txid, next.txid);
     assert_eq!(recovered.config.fsname, "after-delta");
 }
+
+#[test]
+fn compaction_preserves_recoverable_delta_with_drifting_float() {
+    let (_volume_dir, fs) = volume();
+    let mut base = fs.metadata_snapshot();
+    base.created_at = 1.0;
+    prepare_metadata_integrity_for_external_store(&mut base).unwrap();
+    let mut next = base.clone();
+    next.txid += 1;
+    next.created_at = -7.138720035721163e-76;
+    prepare_metadata_integrity_with_previous(&mut next, base.integrity.meta_hash.clone()).unwrap();
+    let checkpoint = build_record(
+        &base,
+        BuildRecordOptions {
+            record_type: JournalRecordKind::Checkpoint,
+            action: "checkpoint".into(),
+            details: json!({}),
+            previous_record_hash: String::new(),
+            time: 0.0,
+            metadata: Some(base.clone()),
+            metadata_delta: None,
+        },
+    )
+    .unwrap();
+    let transaction = build_record(
+        &next,
+        BuildRecordOptions {
+            record_type: JournalRecordKind::Transaction,
+            action: "delta".into(),
+            details: json!({}),
+            previous_record_hash: checkpoint.record_hash.clone(),
+            time: 0.0,
+            metadata: None,
+            metadata_delta: Some(metadata_delta(&base, &next).unwrap()),
+        },
+    )
+    .unwrap();
+    let dir = tempdir().unwrap();
+    fs::create_dir_all(dir.path().join(".argosfs")).unwrap();
+    append_record(dir.path(), &checkpoint).unwrap();
+    append_record(dir.path(), &transaction).unwrap();
+    let before = report_latest_recoverable_metadata(dir.path())
+        .unwrap()
+        .unwrap();
+    assert_eq!(before.txid, next.txid);
+    compact_journal_unlocked(dir.path()).unwrap();
+    let after = report_latest_recoverable_metadata(dir.path())
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.txid, next.txid);
+    assert_eq!(after.integrity.meta_hash, before.integrity.meta_hash);
+    assert_eq!(scan(dir.path()).unwrap().invalid_entries, 0);
+}
+
+#[test]
+fn copy_repair_preserves_verified_float_wire_bytes_across_remounts() {
+    let (_volume_dir, fs) = volume();
+    let mut metadata = fs.metadata_snapshot();
+    metadata.created_at = -7.138720035721163e-76;
+    prepare_metadata_integrity_for_external_store(&mut metadata).unwrap();
+    let dir = tempdir().unwrap();
+    let system = dir.path().join(".argosfs");
+    fs::create_dir_all(&system).unwrap();
+    write_metadata_copies(dir.path(), &metadata).unwrap();
+    let original = fs::read(system.join(PRIMARY_META)).unwrap();
+    fs::remove_file(system.join(SECONDARY_META)).unwrap();
+    load_or_recover(dir.path()).unwrap();
+    for (_, path) in metadata_paths(dir.path()) {
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(read_candidate("copy".into(), path).report.valid);
+    }
+    // A second recovery must not depend on the journal or the original copy.
+    fs::remove_file(system.join(PRIMARY_META)).unwrap();
+    fs::remove_file(system.join(COMPAT_META)).unwrap();
+    let again = load_or_recover(dir.path()).unwrap();
+    assert_eq!(again.metadata.txid, metadata.txid);
+    for (_, path) in metadata_paths(dir.path()) {
+        assert!(read_candidate("copy".into(), path).report.valid);
+    }
+}

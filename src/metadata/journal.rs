@@ -69,6 +69,8 @@ pub struct RecoveredMetadata {
 struct MetadataCandidate {
     source: String,
     metadata: Option<Metadata>,
+    // Keep verified wire bytes: a decoded f64 can serialize differently.
+    serialized: Option<Vec<u8>>,
     report: MetadataCandidateReport,
 }
 
@@ -182,10 +184,13 @@ pub fn load_or_recover(root: &Path) -> Result<RecoveredMetadata> {
     let mut best = candidates
         .iter_mut()
         .filter_map(|candidate| {
-            candidate
-                .metadata
-                .take()
-                .map(|metadata| (candidate.source.clone(), metadata))
+            candidate.metadata.take().map(|metadata| {
+                (
+                    candidate.source.clone(),
+                    metadata,
+                    candidate.serialized.take(),
+                )
+            })
         })
         .max_by(|left, right| metadata_order(&left.1).cmp(&metadata_order(&right.1)));
 
@@ -193,15 +198,15 @@ pub fn load_or_recover(root: &Path) -> Result<RecoveredMetadata> {
         let snapshot_order = metadata_order(&replayed);
         if best
             .as_ref()
-            .map(|(_, metadata)| snapshot_order > metadata_order(metadata))
+            .map(|(_, metadata, _)| snapshot_order > metadata_order(metadata))
             .unwrap_or(true)
         {
             report.replayed = true;
-            best = Some(("journal-replay".to_string(), replayed));
+            best = Some(("journal-replay".to_string(), replayed, None));
         }
     }
 
-    let Some((source, mut metadata)) = best else {
+    let Some((source, mut metadata, serialized)) = best else {
         return Err(ArgosError::Invalid(format!(
             "no valid metadata copy or replayable journal snapshot found: {}",
             serde_json::to_string(&report.metadata_candidates)?
@@ -219,7 +224,26 @@ pub fn load_or_recover(root: &Path) -> Result<RecoveredMetadata> {
     let needs_repair =
         report.replayed || report.double_write_mismatches > 0 || missing_or_invalid_copy(&report);
     if needs_repair {
-        write_metadata_copies(root, &metadata)?;
+        // Reuse the *verified bytes* of a surviving copy. Re-encoding a
+        // deserialized floating-point value can change its representation and
+        // make every repaired copy fail hash verification on the next mount.
+        let bytes = match serialized {
+            Some(bytes) => bytes,
+            None => {
+                let bytes = serde_json::to_vec_pretty(&metadata)?;
+                if canonical_metadata_hash_bytes(&bytes)? != metadata.integrity.meta_hash {
+                    // A journal-only recovery is still useful. Do not replace
+                    // intact copies with bytes that fail their own checksum.
+                    report.errors.push(
+                        "replayed metadata cannot be safely re-serialized; left copies unchanged"
+                            .to_string(),
+                    );
+                    return Ok(RecoveredMetadata { metadata, report });
+                }
+                bytes
+            }
+        };
+        write_metadata_copies_bytes(root, &bytes)?;
     }
 
     Ok(RecoveredMetadata { metadata, report })
@@ -414,11 +438,15 @@ pub fn compact_journal(root: &Path) -> Result<()> {
 }
 
 pub fn write_metadata_copies(root: &Path, meta: &Metadata) -> Result<()> {
-    let system = root.join(".argosfs");
     let bytes = serde_json::to_vec_pretty(meta)?;
-    atomic_write(&system.join(PRIMARY_META), &bytes)?;
-    atomic_write(&system.join(SECONDARY_META), &bytes)?;
-    atomic_write(&system.join(COMPAT_META), &bytes)?;
+    write_metadata_copies_bytes(root, &bytes)
+}
+
+fn write_metadata_copies_bytes(root: &Path, bytes: &[u8]) -> Result<()> {
+    let system = root.join(".argosfs");
+    atomic_write(&system.join(PRIMARY_META), bytes)?;
+    atomic_write(&system.join(SECONDARY_META), bytes)?;
+    atomic_write(&system.join(COMPAT_META), bytes)?;
     Ok(())
 }
 
@@ -746,6 +774,7 @@ fn compact_journal_unlocked(root: &Path) -> Result<()> {
         return Ok(());
     };
     let mut compacted = records[checkpoint_index..].to_vec();
+    let before = report_latest_recoverable_metadata_from_text(&text)?;
     for record in &compacted {
         if let Some(metadata) = &record.metadata {
             // Rewriting a decoded float must not invalidate the stored snapshot hash.
@@ -766,6 +795,26 @@ fn compact_journal_unlocked(root: &Path) -> Result<()> {
     for record in &compacted {
         serde_json::to_writer(&mut bytes, record)?;
         bytes.push(b'\n');
+    }
+    // Compaction rewrites the journal hash chain. Verify the exact bytes we
+    // plan to persist can replay to the *same* authenticated state. This also
+    // protects deltas containing non-idempotent JSON floats: a decoded delta
+    // that drifts on re-encoding must never cause a durable transaction to
+    // disappear silently during recovery.
+    let candidate = std::str::from_utf8(&bytes)
+        .map_err(|err| ArgosError::Invalid(format!("compacted journal is not UTF-8: {err}")))?;
+    let after = report_latest_recoverable_metadata_from_text(candidate)?;
+    let same_state = match (before, after) {
+        (Some(before), Some(after)) => {
+            before.txid == after.txid
+                && before.integrity.meta_hash == after.integrity.meta_hash
+                && serde_json::to_vec(&before)? == serde_json::to_vec(&after)?
+        }
+        (None, None) => true,
+        _ => false,
+    };
+    if !same_state || valid_journal_chain_records(candidate)?.len() != compacted.len() {
+        return Ok(());
     }
     atomic_write(&journal, &bytes)
 }
@@ -825,14 +874,17 @@ fn read_candidate(source: String, path: PathBuf) -> MetadataCandidate {
         return MetadataCandidate {
             source,
             metadata: None,
+            serialized: None,
             report,
         };
     }
     report.present = true;
+    let mut serialized = None;
     let metadata = match read_to_vec(&path).and_then(|bytes| {
         let hash = canonical_metadata_hash_bytes(&bytes)?;
         let mut metadata = serde_json::from_slice::<Metadata>(&bytes).map_err(ArgosError::Json)?;
         validate_metadata(&mut metadata, &hash)?;
+        serialized = Some(bytes);
         Ok(metadata)
     }) {
         Ok(metadata) => {
@@ -850,6 +902,7 @@ fn read_candidate(source: String, path: PathBuf) -> MetadataCandidate {
     MetadataCandidate {
         source,
         metadata,
+        serialized,
         report,
     }
 }
@@ -880,6 +933,10 @@ fn report_latest_recoverable_metadata(root: &Path) -> Result<Option<Metadata>> {
     let Ok(text) = fs::read_to_string(&journal) else {
         return Ok(None);
     };
+    report_latest_recoverable_metadata_from_text(&text)
+}
+
+fn report_latest_recoverable_metadata_from_text(text: &str) -> Result<Option<Metadata>> {
     let mut previous_hash = String::new();
     let mut latest: Option<Metadata> = None;
     let mut replay_failed = false;
