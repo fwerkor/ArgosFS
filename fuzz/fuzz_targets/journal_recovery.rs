@@ -2,6 +2,7 @@
 
 mod common;
 
+use argosfs::error::ArgosError;
 use argosfs::journal;
 use libfuzzer_sys::fuzz_target;
 use serde_json::json;
@@ -59,10 +60,10 @@ fuzz_target!(|data: &[u8]| {
         if point.is_empty() {
             result.expect("uninterrupted journal append must commit");
         } else {
-            assert!(
-                result.is_err(),
-                "injected point {point} must interrupt the transaction"
-            );
+            match result {
+                Err(ArgosError::InjectedCrash(actual)) => assert_eq!(actual, point),
+                other => panic!("expected injected crash at {point}, got {other:?}"),
+            }
         }
 
         // BeforeJournal is precommit; all later fault points happen after
