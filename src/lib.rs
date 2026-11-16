@@ -18,6 +18,7 @@ pub fn mount2<FS: fuser_crate::Filesystem, P: AsRef<std::path::Path>>(
 }
 
 pub mod cli;
+pub(crate) mod commit_metrics;
 pub mod control;
 pub mod data;
 pub mod error;

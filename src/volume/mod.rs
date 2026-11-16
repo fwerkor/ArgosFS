@@ -4,6 +4,7 @@ use crate::allocator;
 use crate::autopilot::{plan_background_io, AutopilotMode, AutopilotPolicy, BackgroundIoPolicy};
 use crate::backend::{FileBlockBackend, HostFsBackend, StorageBackend};
 use crate::cache::BlockCache;
+use crate::commit_metrics::{CommitMetrics, CommitPhase};
 use crate::compression::{compress, decompress};
 use crate::crypto;
 use crate::erasure::RsCodec;
@@ -281,6 +282,7 @@ pub struct ArgosFs {
     meta: Arc<RwLock<Metadata>>,
     quota_runtime: Arc<RwLock<QuotaRuntime>>,
     deferred_commit: Arc<Mutex<DeferredCommitState>>,
+    commit_metrics: Arc<CommitMetrics>,
     quarantined_devices: Arc<Mutex<BTreeSet<String>>>,
     quarantine_since: Arc<Mutex<BTreeMap<String, f64>>>,
     write_fence: Arc<Mutex<Option<String>>>,
@@ -305,6 +307,7 @@ impl Clone for ArgosFs {
             meta: self.meta.clone(),
             quota_runtime: self.quota_runtime.clone(),
             deferred_commit: self.deferred_commit.clone(),
+            commit_metrics: self.commit_metrics.clone(),
             quarantined_devices: self.quarantined_devices.clone(),
             quarantine_since: self.quarantine_since.clone(),
             write_fence: self.write_fence.clone(),
@@ -536,6 +539,7 @@ impl ArgosFs {
             raw_superblocks: Arc::new(Vec::new()),
             root: Arc::new(root),
             deferred_commit: Arc::new(Mutex::new(DeferredCommitState::new(&meta))),
+            commit_metrics: Arc::new(CommitMetrics::default()),
             quarantined_devices: Arc::new(Mutex::new(BTreeSet::new())),
             quarantine_since: Arc::new(Mutex::new(BTreeMap::new())),
             write_fence: Arc::new(Mutex::new(None)),
@@ -768,6 +772,7 @@ impl ArgosFs {
             backend_writable,
             raw_superblocks: Arc::new(superblocks),
             deferred_commit,
+            commit_metrics: Arc::new(CommitMetrics::default()),
             quarantined_devices,
             quarantine_since: Arc::new(Mutex::new(BTreeMap::new())),
             write_fence,
@@ -800,6 +805,10 @@ impl ArgosFs {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    pub(crate) fn commit_metrics(&self) -> &CommitMetrics {
+        &self.commit_metrics
     }
 
     pub fn metadata_snapshot(&self) -> Metadata {
@@ -1006,7 +1015,11 @@ impl ArgosFs {
     }
 
     pub fn sync(&self) -> Result<()> {
+        let waiting = Instant::now();
         let mut meta = self.meta.write();
+        self.commit_metrics
+            .observe(CommitPhase::SyncLockWait, waiting.elapsed());
+        let _lock_hold = self.commit_metrics.timer(CommitPhase::SyncLockHold);
         if meta.backend != BackendKind::Host {
             self.ensure_block_backend_writable_locked(&meta)?;
             if bulk_import_enabled() || meta.config.defer_metadata_commit {
@@ -2266,6 +2279,7 @@ impl ArgosFs {
         {
             return Ok(false);
         }
+        let _group_commit_timer = self.commit_metrics.timer(CommitPhase::GroupCommit);
         // A pool can grow after mount. Never decide the integrity scheme from
         // the superblocks cached at open: dynamically added voting members
         // must also carry the mandatory downgrade-prevention feature.
@@ -2306,26 +2320,34 @@ impl ArgosFs {
                 self.account_blocks_locked(meta, std::slice::from_ref(block), false);
                 self.delete_blocks_locked(meta, std::slice::from_ref(block));
             }
-            if incremental_integrity_enabled && !checkpoint {
-                journal::prepare_delta_integrity(meta, &previous)?;
-            } else {
-                journal::prepare_metadata_integrity_with_previous(
-                    meta,
-                    previous_meta_hash.clone(),
-                )?;
+            {
+                let _integrity_timer = self.commit_metrics.timer(CommitPhase::Integrity);
+                if incremental_integrity_enabled && !checkpoint {
+                    journal::prepare_delta_integrity(meta, &previous)?;
+                } else {
+                    journal::prepare_metadata_integrity_with_previous(
+                        meta,
+                        previous_meta_hash.clone(),
+                    )?;
+                }
             }
             let superblocks = self.metadata_superblocks_locked(meta)?;
             let unavailable = self.quarantined_devices.lock().clone();
-            Self::validate_deferred_data_durability(
-                meta,
-                &unavailable,
-                &mut state.durability_cache,
-            )?;
+            {
+                let _validation_timer =
+                    self.commit_metrics.timer(CommitPhase::DurabilityValidation);
+                Self::validate_deferred_data_durability(
+                    meta,
+                    &unavailable,
+                    &mut state.durability_cache,
+                )?;
+            }
             let mut commit =
                 |backend: &dyn StorageBackend| -> Result<raw_store::QuorumWriteReport> {
                     if dirty_transactions > 0
                         && (meta.config.defer_data_flush || bulk_import_enabled())
                     {
+                        let _flush_timer = self.commit_metrics.timer(CommitPhase::DataFlush);
                         self.flush_deferred_data_locked(
                             meta,
                             backend,
@@ -2337,13 +2359,21 @@ impl ArgosFs {
                         )?;
                     }
                     if checkpoint {
-                        raw_store::write_metadata_copies_quorum(backend, &superblocks, meta)
+                        let _checkpoint_timer = self.commit_metrics.timer(CommitPhase::Checkpoint);
+                        raw_store::write_metadata_copies_quorum_measured(
+                            backend,
+                            &superblocks,
+                            meta,
+                            &self.commit_metrics,
+                        )
                     } else {
-                        raw_store::append_transaction_with_trusted_integrity_quorum(
+                        let _journal_timer = self.commit_metrics.timer(CommitPhase::Journal);
+                        raw_store::append_transaction_with_trusted_integrity_quorum_measured(
                             backend,
                             &superblocks,
                             meta,
                             Some(&previous),
+                            &self.commit_metrics,
                             "group-commit",
                             json!({
                                 "transactions": dirty_transactions,
