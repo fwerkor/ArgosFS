@@ -4,7 +4,7 @@ use crate::allocator;
 use crate::autopilot::{plan_background_io, AutopilotMode, AutopilotPolicy, BackgroundIoPolicy};
 use crate::backend::{FileBlockBackend, HostFsBackend, StorageBackend};
 use crate::cache::BlockCache;
-use crate::commit_metrics::{CommitMetrics, CommitPhase};
+use crate::commit_metrics::{CommitMetrics, CommitPhase, DataPlaneByteKind};
 use crate::compression::{compress, decompress};
 use crate::crypto;
 use crate::erasure::RsCodec;

@@ -1007,6 +1007,8 @@ impl ArgosFs {
                 data.len() as u64,
                 start.elapsed().as_secs_f64(),
             );
+            self.commit_metrics
+                .add_data_plane_bytes(DataPlaneByteKind::ShardPayloadWritten, data.len());
             if let Some(verify) = &self.verify_written {
                 verify.enqueue(
                     disk_id,
@@ -1056,6 +1058,8 @@ impl ArgosFs {
             data.len() as u64,
             start.elapsed().as_secs_f64(),
         );
+        self.commit_metrics
+            .add_data_plane_bytes(DataPlaneByteKind::ShardPayloadWritten, data.len());
         Ok(Shard {
             slot,
             disk_id: disk_id.to_string(),
