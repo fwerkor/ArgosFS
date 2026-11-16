@@ -815,3 +815,111 @@ fn placement_scoring_covers_tiers_boot_critical_numa_and_shared_capacity_reserva
         .unwrap();
     assert_eq!(cold.len(), 2);
 }
+
+#[test]
+fn amplification_counters_distinguish_aligned_append_from_tail_rewrite() {
+    let dir = tempdir().unwrap();
+    let fs = ArgosFs::create(
+        dir.path(),
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            compression: Compression::None,
+            chunk_size: 4096,
+            ..VolumeConfig::default()
+        },
+        3,
+        false,
+    )
+    .unwrap();
+    let ino = fs.create_file_path("/stream", 0o600).unwrap();
+    let samples = || {
+        fs.commit_metrics()
+            .data_plane_byte_snapshots()
+            .collect::<BTreeMap<_, _>>()
+    };
+    assert!(samples().values().all(|&bytes| bytes == 0));
+
+    let full_stripe = vec![1u8; 8192];
+    fs.write_inode_range(ino, 0, &full_stripe).unwrap();
+    let first = samples();
+    assert_eq!(first["range_accepted"], 8192);
+    assert_eq!(first["range_aligned_append"], 8192);
+    assert_eq!(first["range_rewrite_input"], 0);
+    assert_eq!(first["shard_payload_written"], 12288);
+
+    fs.write_inode_range(ino, 8192, &vec![2u8; 1024]).unwrap();
+    let second = samples();
+    assert_eq!(second["range_accepted"], 9216);
+    assert_eq!(second["range_aligned_append"], 9216);
+    assert_eq!(second["range_rewrite_input"], 0);
+    assert_eq!(second["shard_payload_written"], 13824);
+
+    // The third append to the same incomplete stripe reencodes its old tail.
+    fs.write_inode_range(ino, 9216, &vec![3u8; 1024]).unwrap();
+    let third = samples();
+    assert_eq!(third["range_accepted"], 10240);
+    assert_eq!(third["range_aligned_append"], 9216);
+    assert_eq!(third["range_rewrite_input"], 2048);
+    assert_eq!(third["shard_payload_written"], 16896);
+
+    // Rejected writes never count as accepted range operations.
+    assert!(fs.write_inode_range(ino, u64::MAX, b"bad").is_err());
+    assert_eq!(samples(), third);
+    assert_eq!(fs.read_inode(ino, 0, 10240, false).unwrap().len(), 10240);
+}
+
+#[test]
+fn raw_vs_range_accounting_excludes_whole_file_background_rewrites() {
+    let (_dir, fs) = host_volume(1);
+    fs.write_file("/replaced", &vec![8u8; 4096], 0o600).unwrap();
+    let samples = fs
+        .commit_metrics()
+        .data_plane_byte_snapshots()
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(samples["range_accepted"], 0);
+    assert_eq!(samples["range_rewrite_input"], 0);
+    assert_eq!(samples["shard_payload_written"], 4096);
+}
+
+#[test]
+fn inline_only_range_updates_do_not_count_stripe_reencoding() {
+    // Only 1+0 raw/file-block volumes support inline payloads; host does not.
+    let dir = tempdir().unwrap();
+    let image = dir.path().join("inline-meter.img");
+    let fs = ArgosFs::create_loop(
+        std::slice::from_ref(&image),
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            compression: Compression::None,
+            chunk_size: 4096,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "inline-meter",
+        false,
+    )
+    .unwrap();
+    let ino = fs.create_file_path("/inline", 0o600).unwrap();
+    fs.write_inode_range(ino, 0, b"a").unwrap();
+    fs.write_inode_range(ino, 1, b"b").unwrap();
+    fs.write_inode_range(ino, 0, b"c").unwrap();
+    let samples = || {
+        fs.commit_metrics()
+            .data_plane_byte_snapshots()
+            .collect::<BTreeMap<_, _>>()
+    };
+    let inline = samples();
+    assert_eq!(inline["range_accepted"], 3);
+    assert_eq!(inline["range_rewrite_input"], 0);
+    assert_eq!(inline["shard_payload_written"], 0);
+    assert_eq!(fs.read_inode(ino, 0, 2, false).unwrap(), b"cb");
+
+    // Crossing the inline threshold is a real encoder invocation.
+    fs.write_inode_range(ino, 2, &vec![0x42; 600]).unwrap();
+    let encoded = samples();
+    assert_eq!(encoded["range_accepted"], 603);
+    assert_eq!(encoded["range_rewrite_input"], 602);
+    assert_eq!(encoded["shard_payload_written"], 602);
+}

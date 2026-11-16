@@ -772,6 +772,10 @@ impl ArgosFs {
         }
         if start == old_size && start % stripe_raw_size == 0 {
             self.append_inode_data_locked(&mut meta, ino, start, data, clear_setid, write_time)?;
+            self.commit_metrics
+                .add_data_plane_bytes(DataPlaneByteKind::RangeAccepted, data.len());
+            self.commit_metrics
+                .add_data_plane_bytes(DataPlaneByteKind::RangeAlignedAppend, data.len());
             return Ok(data.len());
         }
         let new_size = old_size.max(end);
@@ -824,6 +828,8 @@ impl ArgosFs {
             json!({"inode": ino, "offset": offset, "bytes": data.len(), "rewrite": "stripe-window-local"}),
             write_time,
         )?;
+        self.commit_metrics
+            .add_data_plane_bytes(DataPlaneByteKind::RangeAccepted, data.len());
         Ok(data.len())
     }
 

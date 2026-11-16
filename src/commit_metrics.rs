@@ -67,6 +67,36 @@ impl CommitPhase {
     }
 }
 
+/// In-memory payload byte counters for diagnosing FUSE write amplification.
+/// These are successful-operation totals, reset on each volume open. They
+/// intentionally exclude metadata writes, journal/checkpoint bytes and host
+/// filesystem allocation overhead. Compare their deltas over a quiet run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DataPlaneByteKind {
+    RangeAccepted,
+    RangeAlignedAppend,
+    RangeRewriteInput,
+    ShardPayloadWritten,
+}
+
+impl DataPlaneByteKind {
+    const ALL: [Self; 4] = [
+        Self::RangeAccepted,
+        Self::RangeAlignedAppend,
+        Self::RangeRewriteInput,
+        Self::ShardPayloadWritten,
+    ];
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::RangeAccepted => "range_accepted",
+            Self::RangeAlignedAppend => "range_aligned_append",
+            Self::RangeRewriteInput => "range_rewrite_input",
+            Self::ShardPayloadWritten => "shard_payload_written",
+        }
+    }
+}
+
 #[derive(Default)]
 struct PhaseCounters {
     count: AtomicU64,
@@ -102,12 +132,41 @@ pub(crate) struct PhaseSnapshot {
 #[derive(Default)]
 pub(crate) struct CommitMetrics {
     phases: [PhaseCounters; CommitPhase::ALL.len()],
+    data_plane_bytes: [AtomicU64; DataPlaneByteKind::ALL.len()],
     // Member IDs are bounded by the volume's device set. The map lock is
     // independent of the global namespace lock and never spans device I/O.
     per_member: RwLock<BTreeMap<String, [PhaseCounters; 2]>>,
 }
 
 impl CommitMetrics {
+    pub(crate) fn add_data_plane_bytes(&self, kind: DataPlaneByteKind, bytes: usize) {
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        let counter = &self.data_plane_bytes[kind as usize];
+        // Use the pre-1.99 atomic API, since CapOS still targets Rust 1.94.
+        // The compare-exchange loop saturates without rollover and remains
+        // compatible with current Rust where `fetch_update` is deprecated.
+        let mut current = counter.load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_add(bytes);
+            match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    pub(crate) fn data_plane_byte_snapshots(
+        &self,
+    ) -> impl Iterator<Item = (&'static str, u64)> + '_ {
+        DataPlaneByteKind::ALL.into_iter().map(|kind| {
+            (
+                kind.name(),
+                self.data_plane_bytes[kind as usize].load(Ordering::Relaxed),
+            )
+        })
+    }
+
     pub(crate) fn timer(&self, phase: CommitPhase) -> PhaseTimer<'_> {
         PhaseTimer {
             metrics: self,

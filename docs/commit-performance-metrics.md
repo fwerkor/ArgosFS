@@ -124,3 +124,64 @@ fixture and same operation ordering on baseline and candidate builds. Sample
 per-request p50/p95/p99 and wall time separately from counters above, and
 repeat across 10k, 100k and 500k inodes. Mixed-version recovery, degraded
 members and crash injection must pass before marking #231 complete.
+
+
+### Write-amplification counters for Issue #241
+
+The lock-independent `/commit-metrics` endpoint (and the ordinary `/metrics`
+endpoint) exposes `argosfs_data_plane_bytes_total{kind="..."}`. All four
+counter series are cumulative since the volume was opened and require a
+**before/after delta** around an isolated workload:
+
+| `kind` | What is counted | Caveats |
+|---|---|---|
+| `range_accepted` | Successful `write_inode_range*` logical bytes | Does not include `write_file`/whole-file replacement, repair, or rebalance |
+| `range_aligned_append` | Successful range writes on the stripe-aligned EOF fast path | Subset of `range_accepted`, not an independent numerator |
+| `range_rewrite_input` | Successfully committed stripe-window input bytes re-encoded due to a non-aligned/overwriting range write | Includes old bytes carried forward and sparse zeros; multiple partial writes may re-encode the same window |
+| `shard_payload_written` | Bytes of member shard payload successfully written by data-plane operations | Includes *all* writers, including repair/import/rebalance and failed transactions with successfully written but later unreferenced shards; excludes journal, flush metadata, device alignment, filesystem block allocation and host OS overhead |
+
+In a **quiet foreground range-write-only** test, the ratio
+`Δshard_payload_written / Δrange_accepted` is a lower-bound *payload-level*
+write-amplification approximation. It does **not** capture total USB/device
+physical bytes, raw metadata/checkpoint traffic, filesystem block allocation,
+or retries that fail before a complete write. Use `/proc/diskstats` or direct
+hardware counters for end-to-end physical write amplification. To find
+incomplete-stripe churn, examine `Δrange_rewrite_input / Δrange_accepted`
+and whether `Δrange_aligned_append` is low relative to accepted writes.
+
+An unchanged 2+1, uncompressed, single 8192-byte full-stripe append writes
+12,288 shard bytes, corresponding to 1.5x data payload redundancy. Appending
+1,024 bytes to a new aligned stripe appends 1,024 raw bytes (1,536 shard
+bytes), while the next 1,024-byte append to the same partial stripe re-encodes
+its 2,048-byte window and adds another 3,072 shard bytes. The 4+4
+pool used for #231 should approach a 2.0x shard-payload ratio for complete,
+uncompressed stripes, but field totals depend on workload, encryption,
+compression, and recovery activity. Do not interpret these counters as a
+measured throughput speedup.
+
+For a matched Borg run on an unshared set of physical members, the optional
+sampler `scripts/experiments/measure_write_amplification.py` captures both
+ArgosFS's new byte counters and Linux `/proc/diskstats` before and after a
+single explicitly supplied command:
+
+```bash
+python3 scripts/experiments/measure_write_amplification.py \
+  --endpoint http://127.0.0.1:9100/commit-metrics \
+  --device sdX --device sdY --output /tmp/argosfs-write-amp.json \
+  -- <your-borg-workload-command-and-arguments>
+```
+
+Replace `sdX`/`sdY` with **all** actual backing devices (and use the real
+endpoint). The example placeholders are not executable as written. The
+workload must complete its file fsync/close (and any deferred durability
+boundary) before returning. Only run on scratch/test storage or with a
+validated backup, and never combine a parent disk and its partitions because
+that counts the same traffic twice. `diskstats` writes are 512-byte sectors,
+not necessarily hardware NAND flash writes. The script exits with the
+workload exit code, emits JSON including both byte-amplification estimates,
+and never silently suppresses missing/negative counters. Workload stdout is
+forwarded to stderr so stdout remains a single parseable JSON report. If the workload
+terminates on a signal, its raw negative subprocess return code is retained in
+JSON and the script returns the conventional shell status `128 + signal`.
+It doesn't mount,
+format or repair a volume itself.
