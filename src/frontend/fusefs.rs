@@ -535,6 +535,7 @@ impl ArgosFuseShared {
         let logical_end = dirty.end().unwrap();
         let read_end = offset.saturating_add(size as u64).min(logical_end);
         if offset >= read_end {
+            self.volume.account_buffered_read(ino, 0, false);
             return Ok(Vec::new());
         }
 

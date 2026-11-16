@@ -163,4 +163,9 @@ fn buffered_read_accounting_counts_visible_bytes_once_and_not_partial_flushes() 
     assert_eq!(after_buffered.read_bytes, before.read_bytes + 21);
     assert_eq!(volume.attr_inode(ino).unwrap().size, 9);
     assert_eq!(fuse.writeback.lock().dirty[&ino].data, b"buffer");
+    assert_eq!(fuse.read_visible_inode(ino, 15, 8).unwrap(), b"");
+    assert_eq!(fuse.read_visible_inode(ino, 0, 0).unwrap(), b"");
+    let after_eof = volume.metadata_snapshot().inodes[&ino].clone();
+    assert_eq!(after_eof.access_count, before.access_count + 4);
+    assert_eq!(after_eof.read_bytes, before.read_bytes + 21);
 }

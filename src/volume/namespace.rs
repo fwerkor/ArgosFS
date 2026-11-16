@@ -255,7 +255,10 @@ impl ArgosFs {
     /// already accounted for by `read_inode`, so do not double-count that
     /// access event. No data or inode timestamps are changed.
     pub(crate) fn account_buffered_read(&self, ino: InodeId, tail_bytes: usize, prefix_read: bool) {
-        if tail_bytes == 0 {
+        // An EOF/zero-length read is still an observable successful access,
+        // as in the existing volume read path. Only a persisted-prefix read
+        // has already accounted for its access event.
+        if tail_bytes == 0 && prefix_read {
             return;
         }
         let mut meta = self.meta.write();
