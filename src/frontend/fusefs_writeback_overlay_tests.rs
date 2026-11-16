@@ -153,3 +153,61 @@ fn partial_stripe_rewrite_keeps_acknowledged_write_time_through_flush() {
     assert_eq!(persisted.ctime, staged.ctime);
     assert_eq!(volume.read_file("/stream", true).unwrap(), b"originaltail");
 }
+
+#[test]
+fn unlink_open_file_keeps_later_ctime_through_buffered_append_flush() {
+    let (_dir, volume, ino) = make_volume(1, 0, 4096);
+    let fuse = ArgosFuse::new(volume.clone());
+    let open_handle = fuse.handles.lock().open(OpenFileHandle {
+        ino,
+        flags: libc::O_RDWR,
+    });
+    assert!(fuse.queue_writeback(ino, 0, b"unlinked-open"));
+    let staged_before_unlink = fuse.visible_inode_attr(ino).unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    fuse.unlink_after_access(1, OsStr::new("stream"), 0)
+        .unwrap();
+    let unlinked = volume.attr_inode(ino).unwrap();
+    assert_eq!(unlinked.nlink, 0);
+    assert!(unlinked.ctime > staged_before_unlink.ctime);
+
+    let staged_after_unlink = fuse.visible_inode_attr(ino).unwrap();
+    assert_eq!(staged_after_unlink.size, 13);
+    assert_eq!(staged_after_unlink.ctime, unlinked.ctime);
+    assert_eq!(staged_after_unlink.mtime, staged_before_unlink.mtime);
+    std::thread::sleep(Duration::from_millis(20));
+    fuse.flush_inode_writeback(ino).unwrap();
+    let persisted = volume.attr_inode(ino).unwrap();
+    assert_eq!(persisted.ctime, unlinked.ctime);
+    assert_eq!(persisted.mtime, staged_before_unlink.mtime);
+    assert_eq!(
+        volume.read_inode(ino, 0, 30, true).unwrap(),
+        b"unlinked-open"
+    );
+    assert!(fuse.handles.lock().close(open_handle).unwrap().1);
+}
+
+#[test]
+fn append_after_unlink_supersedes_unlink_ctime_before_final_flush() {
+    let (_dir, volume, ino) = make_volume(1, 0, 4096);
+    let fuse = ArgosFuse::new(volume.clone());
+    let fh = fuse.handles.lock().open(OpenFileHandle {
+        ino,
+        flags: libc::O_RDWR,
+    });
+    assert!(fuse.queue_writeback(ino, 0, b"before"));
+    std::thread::sleep(Duration::from_millis(15));
+    fuse.unlink_after_access(1, OsStr::new("stream"), 0)
+        .unwrap();
+    let unlink_ctime = volume.attr_inode(ino).unwrap().ctime;
+    std::thread::sleep(Duration::from_millis(15));
+    assert!(fuse.queue_writeback(ino, 6, b"after"));
+    let staged = fuse.visible_inode_attr(ino).unwrap();
+    assert!(staged.ctime > unlink_ctime);
+    fuse.flush_inode_writeback(ino).unwrap();
+    let persisted = volume.attr_inode(ino).unwrap();
+    assert_eq!(persisted.ctime, staged.ctime);
+    assert_eq!(persisted.mtime, staged.mtime);
+    assert_eq!(volume.read_inode(ino, 0, 30, true).unwrap(), b"beforeafter");
+    assert!(fuse.handles.lock().close(fh).unwrap().1);
+}
