@@ -213,3 +213,32 @@ fn mounted_server_drains_inflight_clients_before_unmount_returns() {
     shutdown.join().unwrap();
     assert!(TcpListener::bind(address).is_ok());
 }
+
+#[test]
+fn data_plane_byte_counters_are_live_and_scrapable_without_metadata_lock() {
+    let volume = volume();
+    volume.commit_metrics().add_data_plane_bytes(
+        crate::commit_metrics::DataPlaneByteKind::RangeAccepted,
+        1024,
+    );
+    volume.commit_metrics().add_data_plane_bytes(
+        crate::commit_metrics::DataPlaneByteKind::ShardPayloadWritten,
+        2048,
+    );
+    volume.test_with_metadata_write_lock(|| {
+        let output = render_commit_metrics(&volume);
+        assert!(output.contains("argosfs_data_plane_bytes_total{kind=\"range_accepted\"} 1024"));
+        assert!(output.contains("argosfs_data_plane_bytes_total{kind=\"range_aligned_append\"} 0"));
+        assert!(
+            output.contains("argosfs_data_plane_bytes_total{kind=\"shard_payload_written\"} 2048")
+        );
+        assert_eq!(
+            output
+                .matches("# TYPE argosfs_data_plane_bytes_total counter")
+                .count(),
+            1
+        );
+        let clone = volume.clone();
+        assert!(render_commit_metrics(&clone).contains("kind=\"range_accepted\"} 1024"));
+    });
+}
