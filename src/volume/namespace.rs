@@ -792,8 +792,6 @@ impl ArgosFs {
         )?;
         self.commit_metrics
             .add_data_plane_bytes(DataPlaneByteKind::RangeAccepted, data.len());
-        self.commit_metrics
-            .add_data_plane_bytes(DataPlaneByteKind::RangeRewriteInput, window.len());
         Ok(data.len())
     }
 

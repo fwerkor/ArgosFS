@@ -344,6 +344,13 @@ impl ArgosFs {
             return Err(err);
         }
         self.finish_block_reclamation_locked(meta, &replaced);
+        // Inline-only updates write no physical shard. Account only for
+        // successful range-write windows that actually reached the encoder;
+        // truncate and fsck-repair are not foreground range writes.
+        if action == "write-range" && !written_blocks.is_empty() {
+            self.commit_metrics
+                .add_data_plane_bytes(DataPlaneByteKind::RangeRewriteInput, window.len());
+        }
         self.adjust_quota_usage_for_resize(ino, old_size, new_size as u64);
         Ok(())
     }

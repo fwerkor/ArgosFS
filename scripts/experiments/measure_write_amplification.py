@@ -135,7 +135,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.output:
         Path(args.output).write_text(output)
     print(output, end="")
-    return result.returncode
+    # subprocess uses negative values for signals; sys.exit(-15) is 241,
+    # which hides SIGTERM from shell-based benchmark automation. Preserve
+    # the signal number in JSON, but use conventional shell status 128+signal.
+    return 128 - result.returncode if result.returncode < 0 else result.returncode
 
 
 if __name__ == "__main__":
