@@ -249,6 +249,7 @@ impl ArgosFs {
         preserve_mtime: bool,
         action: &str,
         details: serde_json::Value,
+        write_time: Option<f64>,
     ) -> Result<()> {
         let rollback = commit_previous_snapshot(meta);
         let (storage_class, boot_critical, old_size, old_blocks) = {
@@ -309,7 +310,7 @@ impl ArgosFs {
         merged.extend(written_blocks.clone());
         merged.sort_by_key(|block| block.raw_offset);
 
-        let now = now_f64();
+        let now = write_time.unwrap_or_else(now_f64);
         let inode = meta.inodes.get_mut(&ino).unwrap();
         inode.blocks = merged;
         set_inline_payload(inode, inline_payload);

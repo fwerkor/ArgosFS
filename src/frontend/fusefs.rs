@@ -488,8 +488,8 @@ impl ArgosFuseShared {
             if let Some(end) = dirty.end() {
                 attr.size = end;
                 attr.blocks = end.div_ceil(512);
-                attr.mtime = attr.mtime.max(dirty.written_at);
-                attr.ctime = attr.ctime.max(dirty.written_at);
+                attr.mtime = dirty.written_at;
+                attr.ctime = dirty.written_at;
                 attr.mode &= !(libc::S_ISUID | libc::S_ISGID);
                 return Ok(attr);
             }
@@ -512,10 +512,11 @@ impl ArgosFuseShared {
             }
             return Ok(());
         };
-        let reap_after_flush = match self.volume.write_inode_range_from_open_handle(
+        let reap_after_flush = match self.volume.write_inode_range_from_open_handle_at(
             ino,
             dirty.offset,
             dirty.data.as_slice(),
+            dirty.written_at,
         ) {
             Ok(written) if written == dirty.data.len() => writeback.reap_after_flush.remove(&ino),
             Ok(written) => {
