@@ -142,9 +142,18 @@ impl CommitMetrics {
     pub(crate) fn add_data_plane_bytes(&self, kind: DataPlaneByteKind, bytes: usize) {
         let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
         let counter = &self.data_plane_bytes[kind as usize];
-        let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            Some(current.saturating_add(bytes))
-        });
+        // Use the pre-1.99 atomic API, since CapOS still targets Rust 1.94.
+        // The compare-exchange loop saturates without rollover and remains
+        // compatible with current Rust where `fetch_update` is deprecated.
+        let mut current = counter.load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_add(bytes);
+            match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
     }
 
     pub(crate) fn data_plane_byte_snapshots(
