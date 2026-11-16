@@ -3,6 +3,7 @@ use super::metrics;
 use crate::acl;
 use crate::error::{ArgosError, Result};
 use crate::types::{CapacitySource, DiskStatus, InodeId, NodeKind};
+use crate::util::now_f64;
 use crate::volume::{ArgosFs, NodeAttr, RenamePolicy};
 use fuser::{
     AccessFlags, BsdFileFlags, Config, CopyFileRangeFlags, Errno, FileAttr, FileHandle, FileType,
@@ -264,6 +265,12 @@ impl FuseHandles {
 struct DirtyExtent {
     offset: u64,
     data: Vec<u8>,
+    // Time of the last acknowledged buffered write, not the later disk flush.
+    written_at: f64,
+    // Actual persisted ctime when the latest buffered write was acknowledged.
+    // Later metadata mutations (e.g., unlink of an open handle) win over the
+    // earlier buffered data write's ctime at both stat and final commit.
+    seen_ctime: Option<f64>,
 }
 
 impl DirtyExtent {
@@ -294,6 +301,7 @@ impl DirtyExtent {
         merged[new_start..new_start + data.len()].copy_from_slice(data);
         self.offset = merged_start;
         self.data = merged;
+        self.written_at = now_f64();
         true
     }
 }
@@ -451,17 +459,57 @@ impl ArgosFuseShared {
             return false;
         }
         let mut writeback = self.writeback.lock();
+        let seen_ctime = self.volume.attr_inode(ino).ok().map(|attr| attr.ctime);
         if let Some(dirty) = writeback.dirty.get_mut(&ino) {
-            return dirty.try_merge(offset, data, FUSE_WRITEBACK_MAX_BYTES);
+            let merged = dirty.try_merge(offset, data, FUSE_WRITEBACK_MAX_BYTES);
+            if merged {
+                dirty.seen_ctime = seen_ctime;
+            }
+            return merged;
         }
         writeback.dirty.insert(
             ino,
             DirtyExtent {
                 offset,
                 data: data.to_vec(),
+                written_at: now_f64(),
+                seen_ctime,
             },
         );
         true
+    }
+
+    /// A plain stat/lookup does not require the append tail to hit the
+    /// devices. As long as buffered bytes are a *contiguous EOF append*,
+    /// expose their logical size and write time without materializing a
+    /// partial stripe. Any other write (overwrite, gap, invalid extent) uses
+    /// the existing flush path, which is also used for reads/fsync/close.
+    ///
+    /// Hold the writeback guard across the metadata lookup: flushes publish
+    /// the new persisted inode while holding this same guard. Otherwise
+    /// getattr may race between observing an old inode size and a completed
+    /// writeback, incorrectly reporting the previous size.
+    fn visible_inode_attr(&self, ino: InodeId) -> Result<NodeAttr> {
+        let writeback = self.writeback.lock();
+        let mut attr = self.volume.attr_inode(ino)?;
+        let Some(dirty) = writeback.dirty.get(&ino) else {
+            return Ok(attr);
+        };
+        if attr.kind == NodeKind::File && dirty.offset == attr.size {
+            if let Some(end) = dirty.end() {
+                attr.size = end;
+                attr.blocks = end.div_ceil(512);
+                attr.mtime = dirty.written_at;
+                if !dirty.seen_ctime.is_some_and(|seen| seen != attr.ctime) {
+                    attr.ctime = dirty.written_at;
+                }
+                attr.mode &= !(libc::S_ISUID | libc::S_ISGID);
+                return Ok(attr);
+            }
+        }
+        drop(writeback);
+        self.flush_inode_writeback(ino)?;
+        self.volume.attr_inode(ino)
     }
 
     fn flush_inode_writeback(&self, ino: InodeId) -> Result<()> {
@@ -477,10 +525,12 @@ impl ArgosFuseShared {
             }
             return Ok(());
         };
-        let reap_after_flush = match self.volume.write_inode_range_from_open_handle(
+        let reap_after_flush = match self.volume.write_inode_range_from_open_handle_at(
             ino,
             dirty.offset,
             dirty.data.as_slice(),
+            dirty.written_at,
+            dirty.seen_ctime,
         ) {
             Ok(written) if written == dirty.data.len() => writeback.reap_after_flush.remove(&ino),
             Ok(written) => {
@@ -545,11 +595,11 @@ impl ArgosFuseShared {
 
     fn lookup_after_access(&self, parent: InodeId, name: &OsStr) -> Result<NodeAttr> {
         let attr = self.volume.lookup(parent, name)?;
-        // Lookup is path resolution, not a durability boundary. Retry the target
-        // writeback so successful flushes refresh attributes, but do not make a
-        // failed dirty inode impossible to resolve for unlink/rename cleanup.
-        let _ = self.flush_inode_writeback(attr.ino);
-        self.volume.lookup(parent, name)
+        // A contiguous pending append can supply fresh attributes directly,
+        // without forcing a partial-stripe rewrite for path lookup. Keep the
+        // old best-effort behavior for invalid or failed dirty extents.
+        self.visible_inode_attr(attr.ino)
+            .or_else(|_| self.volume.lookup(parent, name))
     }
 
     fn unlink_after_access(&self, parent: InodeId, name: &OsStr, uid: u32) -> Result<()> {
@@ -734,11 +784,7 @@ impl Filesystem for ArgosFuse {
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
         self.submit_io(ino.0, move |shared| {
-            if let Err(err) = shared.flush_inode_writeback(ino.0) {
-                reply.error(errno(&err));
-                return;
-            }
-            match shared.volume.attr_inode(ino.0) {
+            match shared.visible_inode_attr(ino.0) {
                 Ok(attr) => reply.attr(&TTL, &to_file_attr(&attr)),
                 Err(err) => reply.error(errno(&err)),
             }
@@ -2076,6 +2122,9 @@ fn xattr_name(name: &OsStr) -> Result<&str> {
         .ok_or_else(|| ArgosError::Invalid("non-UTF-8 xattr names are unsupported".to_string()))
 }
 
+#[cfg(test)]
+#[path = "fusefs_writeback_overlay_tests.rs"]
+mod fusefs_writeback_overlay_tests;
 #[cfg(test)]
 #[path = "fusefs_tests.rs"]
 mod tests;
