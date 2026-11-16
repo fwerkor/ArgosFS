@@ -881,3 +881,45 @@ fn raw_vs_range_accounting_excludes_whole_file_background_rewrites() {
     assert_eq!(samples["range_rewrite_input"], 0);
     assert_eq!(samples["shard_payload_written"], 4096);
 }
+
+#[test]
+fn inline_only_range_updates_do_not_count_stripe_reencoding() {
+    // Only 1+0 raw/file-block volumes support inline payloads; host does not.
+    let dir = tempdir().unwrap();
+    let image = dir.path().join("inline-meter.img");
+    let fs = ArgosFs::create_loop(
+        std::slice::from_ref(&image),
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            compression: Compression::None,
+            chunk_size: 4096,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "inline-meter",
+        false,
+    )
+    .unwrap();
+    let ino = fs.create_file_path("/inline", 0o600).unwrap();
+    fs.write_inode_range(ino, 0, b"a").unwrap();
+    fs.write_inode_range(ino, 1, b"b").unwrap();
+    fs.write_inode_range(ino, 0, b"c").unwrap();
+    let samples = || {
+        fs.commit_metrics()
+            .data_plane_byte_snapshots()
+            .collect::<BTreeMap<_, _>>()
+    };
+    let inline = samples();
+    assert_eq!(inline["range_accepted"], 3);
+    assert_eq!(inline["range_rewrite_input"], 0);
+    assert_eq!(inline["shard_payload_written"], 0);
+    assert_eq!(fs.read_inode(ino, 0, 2, false).unwrap(), b"cb");
+
+    // Crossing the inline threshold is a real encoder invocation.
+    fs.write_inode_range(ino, 2, &vec![0x42; 600]).unwrap();
+    let encoded = samples();
+    assert_eq!(encoded["range_accepted"], 603);
+    assert_eq!(encoded["range_rewrite_input"], 602);
+    assert_eq!(encoded["shard_payload_written"], 602);
+}

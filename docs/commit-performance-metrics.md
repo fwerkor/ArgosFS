@@ -179,5 +179,8 @@ validated backup, and never combine a parent disk and its partitions because
 that counts the same traffic twice. `diskstats` writes are 512-byte sectors,
 not necessarily hardware NAND flash writes. The script exits with the
 workload exit code, emits JSON including both byte-amplification estimates,
-and never silently suppresses missing/negative counters. It doesn't mount,
+and never silently suppresses missing/negative counters. If the workload
+terminates on a signal, its raw negative subprocess return code is retained in
+JSON and the script returns the conventional shell status `128 + signal`.
+It doesn't mount,
 format or repair a volume itself.

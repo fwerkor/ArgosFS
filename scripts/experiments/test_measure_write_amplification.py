@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """Pure parser and ratio regression tests for the live write-amplification sampler."""
 
+import io
+import json
+import subprocess
 import unittest
-from measure_write_amplification import deltas, parse_diskstats, parse_metrics
+from unittest.mock import patch
+from measure_write_amplification import deltas, main, parse_diskstats, parse_metrics
 
 
 class SamplerTests(unittest.TestCase):
@@ -24,6 +28,25 @@ class SamplerTests(unittest.TestCase):
         self.assertEqual(parse_diskstats(raw, {"sdb", "sdc"}), {"sdb": 20480, "sdc": 5120})
         with self.assertRaisesRegex(ValueError, "absent"):
             parse_diskstats(raw, {"sda"})
+
+    def test_signal_exit_uses_shell_status_but_reports_original_signal(self):
+        counters = {
+            "range_accepted": 1,
+            "range_aligned_append": 1,
+            "range_rewrite_input": 0,
+            "shard_payload_written": 2,
+        }
+        with (
+            patch("measure_write_amplification.fetch_metrics", side_effect=[counters, counters]),
+            patch("measure_write_amplification.diskstats_snapshot", side_effect=[{"sdx": 1}, {"sdx": 1}]),
+            patch("measure_write_amplification.subprocess.run", return_value=subprocess.CompletedProcess(["fake"], -15)),
+            patch("sys.stdout", new_callable=io.StringIO) as output,
+        ):
+            status = main(["--endpoint", "http://localhost:9100/commit-metrics", "--device", "sdx", "--", "fake"])
+        self.assertEqual(status, 143)
+        report = json.loads(output.getvalue())
+        self.assertEqual(report["exit_code"], -15)
+        self.assertEqual(report["diskstats_written_total_bytes"], 0)
 
     def test_counter_reset_fails_closed(self):
         self.assertEqual(deltas({"x": 10, "y": 20}, {"x": 11, "y": 21}), {"x": 1, "y": 1})
