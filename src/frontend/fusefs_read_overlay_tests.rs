@@ -217,3 +217,39 @@ fn interleaved_reads_reduce_real_four_plus_four_cow_stripes() {
     assert_eq!(baseline.read_file("/stream", true).unwrap(), expected);
     assert_eq!(optimized.read_file("/stream", true).unwrap(), expected);
 }
+
+#[test]
+fn repair_of_corrupted_persisted_prefix_still_counts_full_combined_read() {
+    let (_dir, volume, ino) = fixture(2, 1, 4096);
+    let persisted = b"abcdefgh";
+    volume.write_file("/stream", persisted, 0o600).unwrap();
+    let meta = volume.metadata_snapshot();
+    let shard = meta.inodes[&ino].blocks[0]
+        .shards
+        .iter()
+        .find(|shard| shard.slot == 0)
+        .unwrap();
+    let path = volume
+        .root()
+        .join(&meta.disks[&shard.disk_id].path)
+        .join(&shard.relpath);
+    let mut physical = std::fs::read(&path).unwrap();
+    physical[0] ^= 0x44;
+    std::fs::write(path, physical).unwrap();
+
+    let before = volume.metadata_snapshot().inodes[&ino].clone();
+    let fuse = ArgosFuse::new(volume.clone());
+    assert!(fuse.queue_writeback(ino, 8, b"tail"));
+    // The prefix is repairable using the remaining two members, but the FUSE
+    // read still needs to count the prefix+tail once, without committing tail.
+    assert_eq!(
+        fuse.read_visible_inode(ino, 0, 12).unwrap(),
+        b"abcdefghtail"
+    );
+    let after = volume.metadata_snapshot().inodes[&ino].clone();
+    assert_eq!(after.access_count, before.access_count + 1);
+    assert_eq!(after.read_bytes, before.read_bytes + 12);
+    assert_eq!(volume.attr_inode(ino).unwrap().size, 8);
+    assert_eq!(fuse.writeback.lock().dirty[&ino].data, b"tail");
+    assert_eq!(volume.fsck(false, false).unwrap().missing_shards, 0);
+}
