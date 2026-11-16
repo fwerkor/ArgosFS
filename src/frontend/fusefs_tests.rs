@@ -108,6 +108,7 @@ fn dirty_extent_merges_adjacent_and_overlapping_writes() {
     let mut dirty = DirtyExtent {
         offset: 10,
         data: b"abcd".to_vec(),
+        written_at: 1.0,
     };
 
     assert!(dirty.try_merge(14, b"ef", 16));
@@ -124,6 +125,7 @@ fn dirty_extent_rejects_gaps_and_oversized_merges() {
     let mut dirty = DirtyExtent {
         offset: 10,
         data: b"abcd".to_vec(),
+        written_at: 1.0,
     };
 
     assert!(!dirty.try_merge(15, b"z", 16));
@@ -486,6 +488,7 @@ fn dirty_extent_checked_arithmetic_and_queue_limits_are_enforced() {
     let mut overflowing_existing = DirtyExtent {
         offset: u64::MAX,
         data: vec![1],
+        written_at: 1.0,
     };
     assert!(overflowing_existing.end().is_none());
     assert!(!overflowing_existing.try_merge(0, b"x", usize::MAX));
@@ -493,6 +496,7 @@ fn dirty_extent_checked_arithmetic_and_queue_limits_are_enforced() {
     let mut normal = DirtyExtent {
         offset: 0,
         data: vec![1],
+        written_at: 1.0,
     };
     assert!(!normal.try_merge(u64::MAX, b"xx", usize::MAX));
 
