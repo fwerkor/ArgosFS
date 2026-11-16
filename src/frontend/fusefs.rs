@@ -266,6 +266,10 @@ struct DirtyExtent {
     data: Vec<u8>,
     // Time of the last acknowledged buffered write, not the later disk flush.
     written_at: f64,
+    // Actual persisted ctime when the latest buffered write was acknowledged.
+    // Later metadata mutations (e.g., unlink of an open handle) win over the
+    // earlier buffered data write's ctime at both stat and final commit.
+    seen_ctime: Option<f64>,
 }
 
 impl DirtyExtent {
@@ -454,8 +458,13 @@ impl ArgosFuseShared {
             return false;
         }
         let mut writeback = self.writeback.lock();
+        let seen_ctime = self.volume.attr_inode(ino).ok().map(|attr| attr.ctime);
         if let Some(dirty) = writeback.dirty.get_mut(&ino) {
-            return dirty.try_merge(offset, data, FUSE_WRITEBACK_MAX_BYTES);
+            let merged = dirty.try_merge(offset, data, FUSE_WRITEBACK_MAX_BYTES);
+            if merged {
+                dirty.seen_ctime = seen_ctime;
+            }
+            return merged;
         }
         writeback.dirty.insert(
             ino,
@@ -463,6 +472,7 @@ impl ArgosFuseShared {
                 offset,
                 data: data.to_vec(),
                 written_at: now_f64(),
+                seen_ctime,
             },
         );
         true
@@ -489,7 +499,9 @@ impl ArgosFuseShared {
                 attr.size = end;
                 attr.blocks = end.div_ceil(512);
                 attr.mtime = dirty.written_at;
-                attr.ctime = dirty.written_at;
+                if !dirty.seen_ctime.is_some_and(|seen| seen != attr.ctime) {
+                    attr.ctime = dirty.written_at;
+                }
                 attr.mode &= !(libc::S_ISUID | libc::S_ISGID);
                 return Ok(attr);
             }
@@ -517,6 +529,7 @@ impl ArgosFuseShared {
             dirty.offset,
             dirty.data.as_slice(),
             dirty.written_at,
+            dirty.seen_ctime,
         ) {
             Ok(written) if written == dirty.data.len() => writeback.reap_after_flush.remove(&ino),
             Ok(written) => {

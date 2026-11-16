@@ -716,13 +716,24 @@ impl ArgosFs {
         offset: u64,
         data: &[u8],
         written_at: f64,
+        seen_ctime: Option<f64>,
     ) -> Result<usize> {
         if !written_at.is_finite() {
             return Err(ArgosError::Invalid(
                 "non-finite buffered write time".to_string(),
             ));
         }
-        self.write_inode_range_checked(ino, offset, data, None, true, Some(written_at))
+        self.write_inode_range_checked(
+            ino,
+            offset,
+            data,
+            None,
+            true,
+            Some(BufferedWriteTime {
+                at: written_at,
+                seen_ctime,
+            }),
+        )
     }
 
     pub(super) fn write_inode_range_checked(
@@ -732,7 +743,7 @@ impl ArgosFs {
         data: &[u8],
         access: Option<(u32, u32)>,
         clear_setid: bool,
-        write_time: Option<f64>,
+        write_time: Option<BufferedWriteTime>,
     ) -> Result<usize> {
         let start = usize::try_from(offset)
             .map_err(|_| ArgosError::Invalid("write offset is too large".to_string()))?;
@@ -823,7 +834,7 @@ impl ArgosFs {
         offset: usize,
         data: &[u8],
         clear_setid: bool,
-        write_time: Option<f64>,
+        write_time: Option<BufferedWriteTime>,
     ) -> Result<()> {
         let rollback = commit_previous_snapshot(meta);
         let (storage_class, boot_critical, old_size, existing_inline, had_blocks) = {
@@ -893,7 +904,7 @@ impl ArgosFs {
                     .ok_or_else(|| ArgosError::Invalid("append size overflow".to_string()))?;
                 (blocks, None, new_size)
             };
-        let now = write_time.unwrap_or_else(now_f64);
+        let now = write_time.map_or_else(now_f64, |time| time.at);
         let inode = meta.inodes.get_mut(&ino).unwrap();
         if full_inline_data.is_some() {
             inode.blocks = written_blocks.clone();
@@ -908,7 +919,7 @@ impl ArgosFs {
         inode.last_written_at = now;
         inode.workload_score = inode.workload_score * 0.90 + 2.0;
         inode.mtime = now;
-        inode.ctime = now;
+        inode.ctime = write_time.map_or(now, |time| time.persisted_ctime(inode.ctime));
         if clear_setid {
             inode.mode &= !(libc::S_ISUID | libc::S_ISGID);
         }
