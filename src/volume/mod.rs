@@ -49,6 +49,26 @@ enum BlockCachePolicy {
     Bypass,
 }
 
+/// The time of an acknowledged FUSE buffered write and the inode ctime as
+/// observed when that write entered the buffer. A subsequent unlink or other
+/// metadata mutation must retain its newer ctime even if the data is flushed
+/// later. The snapshot is per acknowledged write, not per disk flush.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BufferedWriteTime {
+    pub(crate) at: f64,
+    pub(crate) seen_ctime: Option<f64>,
+}
+
+impl BufferedWriteTime {
+    fn persisted_ctime(self, current_ctime: f64) -> f64 {
+        if self.seen_ctime.is_some_and(|seen| seen != current_ctime) {
+            current_ctime
+        } else {
+            self.at
+        }
+    }
+}
+
 /// Read-side samples collected while an immutable metadata read guard is held.
 /// This avoids taking the namespace write lock for each individual shard I/O.
 struct ReadLatencySample {
