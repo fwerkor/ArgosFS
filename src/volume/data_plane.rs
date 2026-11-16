@@ -451,50 +451,78 @@ impl ArgosFs {
                 cache_policy,
             );
         }
-        let codec = RsCodec::new(layout.k, layout.m)?;
         let mut shards: Vec<Option<Vec<u8>>> = vec![None; layout_total(&layout)?];
-        for shard in &block.shards {
-            if shard.slot >= shards.len() {
-                damaged.push(format!("{}:invalid-slot:{}", shard.disk_id, shard.slot));
-                continue;
+        // Erasure shards 0..k are systematic data. For normal reads, fetching
+        // their verified bytes is sufficient: neither parity I/O nor an RS
+        // matrix operation is needed when all data members are healthy.
+        // Scrub and repair explicitly bypass the reconstructed cache and
+        // continue to read *every* parity member for physical verification.
+        // If any data shard fails, fetch parity before reconstructing.
+        for parity_pass in [false, true] {
+            if parity_pass
+                && cache_policy == BlockCachePolicy::Normal
+                && shards[..layout.k].iter().all(Option::is_some)
+            {
+                break;
             }
-            let Some(disk) = meta.disks.get(&shard.disk_id) else {
-                damaged.push(format!("{}:missing-disk", shard.disk_id));
-                continue;
-            };
-            if matches!(
-                disk.status,
-                DiskStatus::Failed | DiskStatus::Offline | DiskStatus::Removed
-            ) {
-                damaged.push(format!("{}:unavailable", shard.disk_id));
-                continue;
-            }
-            match self.read_shard_verified_locked(meta, shard) {
-                Ok(Some(data)) => {
-                    shards[shard.slot] = Some(data);
+            for shard in &block.shards {
+                if (shard.slot >= layout.k) != parity_pass {
+                    continue;
                 }
-                Ok(None) => {
-                    damaged.push(format!("{}:checksum:{}", shard.disk_id, shard.slot));
+                if shard.slot >= shards.len() {
+                    damaged.push(format!("{}:invalid-slot:{}", shard.disk_id, shard.slot));
+                    continue;
                 }
-                Err(_) => {
-                    damaged.push(format!("{}:missing:{}", shard.disk_id, shard.slot));
+                let Some(disk) = meta.disks.get(&shard.disk_id) else {
+                    damaged.push(format!("{}:missing-disk", shard.disk_id));
+                    continue;
+                };
+                if matches!(
+                    disk.status,
+                    DiskStatus::Failed | DiskStatus::Offline | DiskStatus::Removed
+                ) {
+                    damaged.push(format!("{}:unavailable", shard.disk_id));
+                    continue;
+                }
+                match self.read_shard_verified_locked(meta, shard) {
+                    Ok(Some(data)) => {
+                        shards[shard.slot] = Some(data);
+                    }
+                    Ok(None) => {
+                        damaged.push(format!("{}:checksum:{}", shard.disk_id, shard.slot));
+                    }
+                    Err(_) => {
+                        damaged.push(format!("{}:missing:{}", shard.disk_id, shard.slot));
+                    }
                 }
             }
         }
-        let present = shards.iter().filter(|shard| shard.is_some()).count();
-        if present < layout.k {
-            return Err(ArgosError::UnrecoverableStripe {
-                stripe_id: block.stripe_id.clone(),
-                reason: format!("only {present} shards available, need {}", layout.k),
-            });
-        }
-        let reconstructed = codec.reconstruct(shards)?;
-        let compressed: Vec<u8> = reconstructed
-            .iter()
-            .take(layout.k)
-            .flat_map(|shard| shard.iter().copied())
-            .take(block.compressed_size)
-            .collect();
+        let compressed: Vec<u8> = if shards[..layout.k].iter().all(Option::is_some) {
+            // Each data shard has already passed its individual hash. The
+            // reconstructed block is checked against raw_sha256 below too.
+            shards
+                .iter()
+                .take(layout.k)
+                .flat_map(|shard| shard.as_ref().unwrap().iter().copied())
+                .take(block.compressed_size)
+                .collect()
+        } else {
+            let present = shards.iter().filter(|shard| shard.is_some()).count();
+            if present < layout.k {
+                return Err(ArgosError::UnrecoverableStripe {
+                    stripe_id: block.stripe_id.clone(),
+                    reason: format!("only {present} shards available, need {}", layout.k),
+                });
+            }
+            let codec = RsCodec::new(layout.k, layout.m)?;
+            let reconstructed = codec.reconstruct(shards)?;
+            reconstructed
+                .iter()
+                .take(layout.k)
+                .flat_map(|shard| shard.iter().copied())
+                .take(block.compressed_size)
+                .collect()
+        };
         let compressed = if block.encrypted {
             let nonce = hex::decode(&block.nonce_hex).map_err(|err| {
                 ArgosError::Invalid(format!("invalid encrypted block nonce: {err}"))

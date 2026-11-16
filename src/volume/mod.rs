@@ -135,6 +135,8 @@ mod maintenance;
 mod metadata_budget;
 mod namespace;
 #[cfg(test)]
+mod read_fast_tests;
+#[cfg(test)]
 mod tests;
 
 pub use autopilot::{AutopilotConfig, ReshapeReport};
