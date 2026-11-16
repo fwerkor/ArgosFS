@@ -169,3 +169,51 @@ fn buffered_read_accounting_counts_visible_bytes_once_and_not_partial_flushes() 
     assert_eq!(after_eof.access_count, before.access_count + 4);
     assert_eq!(after_eof.read_bytes, before.read_bytes + 21);
 }
+
+#[test]
+fn interleaved_reads_reduce_real_four_plus_four_cow_stripes() {
+    let (_baseline_dir, baseline, baseline_ino) = fixture(4, 4, 256 * 1024);
+    let (_optimized_dir, optimized, optimized_ino) = fixture(4, 4, 256 * 1024);
+    let baseline_fuse = ArgosFuse::new(baseline.clone());
+    let optimized_fuse = ArgosFuse::new(optimized.clone());
+    let baseline_start = baseline.metadata_snapshot().next_stripe;
+    let optimized_start = optimized.metadata_snapshot().next_stripe;
+    let mut expected = Vec::new();
+    for i in 0..4 {
+        let chunk = vec![i as u8 + 1; 256 * 1024];
+        assert!(baseline_fuse.queue_writeback(baseline_ino, expected.len() as u64, &chunk));
+        assert!(optimized_fuse.queue_writeback(optimized_ino, expected.len() as u64, &chunk));
+        expected.extend_from_slice(&chunk);
+
+        // This is the original read-before-every-append behavior: each read
+        // forces a partial-stripe COW rewrite, even with a 4 MiB buffer.
+        baseline_fuse.flush_inode_writeback(baseline_ino).unwrap();
+        assert_eq!(
+            baseline
+                .read_inode(baseline_ino, 0, expected.len(), true)
+                .unwrap(),
+            expected
+        );
+        // The new read path is immediately consistent but keeps the 1 MiB
+        // systematic input buffered until the explicit durability boundary.
+        assert_eq!(
+            optimized_fuse
+                .read_visible_inode(optimized_ino, 0, expected.len())
+                .unwrap(),
+            expected
+        );
+    }
+    optimized_fuse.flush_inode_writeback(optimized_ino).unwrap();
+    let baseline_stripes = baseline.metadata_snapshot().next_stripe - baseline_start;
+    let optimized_stripes = optimized.metadata_snapshot().next_stripe - optimized_start;
+    assert_eq!(
+        baseline_stripes, 4,
+        "baseline must actually rewrite incomplete stripes"
+    );
+    assert_eq!(
+        optimized_stripes, 1,
+        "interleaved reads should produce one full-stripe encode"
+    );
+    assert_eq!(baseline.read_file("/stream", true).unwrap(), expected);
+    assert_eq!(optimized.read_file("/stream", true).unwrap(), expected);
+}
