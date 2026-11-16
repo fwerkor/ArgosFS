@@ -50,8 +50,13 @@ fn append_getattr_and_lookup_preserve_stripe_until_required_flush() {
         fuse.writeback.lock().dirty.get(&ino).unwrap().data,
         expected
     );
+    let staged = fuse.visible_inode_attr(ino).unwrap();
+    std::thread::sleep(Duration::from_millis(15));
     fuse.flush_inode_writeback(ino).unwrap();
     volume.sync().unwrap();
+    let persisted = volume.attr_inode(ino).unwrap();
+    assert_eq!(persisted.mtime, staged.mtime);
+    assert_eq!(persisted.ctime, staged.ctime);
     assert_eq!(volume.read_file("/stream", true).unwrap(), expected);
     let inode = volume.metadata_snapshot().inodes[&ino].clone();
     assert_eq!(inode.blocks.len(), 1);
@@ -111,4 +116,40 @@ fn concurrent_stat_and_flush_never_publish_stale_metadata_size() {
     worker.join().unwrap();
     assert_eq!(fuse.visible_inode_attr(ino).unwrap().size, 32 * 1024);
     assert_eq!(volume.read_file("/stream", false).unwrap(), expected);
+}
+
+#[test]
+fn future_mtime_is_replaced_by_acknowledged_append_time_and_remains_stable() {
+    let (_dir, volume, ino) = make_volume(1, 0, 4096);
+    let future = now_f64() + 3600.0;
+    volume.utimens_inode(ino, future, future).unwrap();
+    let fuse = ArgosFuse::new(volume.clone());
+    assert!(fuse.queue_writeback(ino, 0, b"acknowledged"));
+    let staged = fuse.visible_inode_attr(ino).unwrap();
+    assert!(
+        staged.mtime < future,
+        "pending write must replace a future mtime"
+    );
+    std::thread::sleep(Duration::from_millis(20));
+    fuse.flush_inode_writeback(ino).unwrap();
+    let persisted = volume.attr_inode(ino).unwrap();
+    assert_eq!(persisted.mtime, staged.mtime);
+    assert_eq!(persisted.ctime, staged.ctime);
+    assert_eq!(volume.read_file("/stream", true).unwrap(), b"acknowledged");
+}
+
+#[test]
+fn partial_stripe_rewrite_keeps_acknowledged_write_time_through_flush() {
+    let (_dir, volume, ino) = make_volume(2, 1, 4096);
+    volume.write_file("/stream", b"original", 0o644).unwrap();
+    let fuse = ArgosFuse::new(volume.clone());
+    assert!(fuse.queue_writeback(ino, 8, b"tail"));
+    let staged = fuse.visible_inode_attr(ino).unwrap();
+    assert_eq!(staged.size, 12);
+    std::thread::sleep(Duration::from_millis(20));
+    fuse.flush_inode_writeback(ino).unwrap();
+    let persisted = volume.attr_inode(ino).unwrap();
+    assert_eq!(persisted.mtime, staged.mtime);
+    assert_eq!(persisted.ctime, staged.ctime);
+    assert_eq!(volume.read_file("/stream", true).unwrap(), b"originaltail");
 }
