@@ -99,7 +99,10 @@ def main(argv: list[str] | None = None) -> int:
     before_metrics = fetch_metrics(args.endpoint, args.timeout)
     before_disk = diskstats_snapshot(devices)
     started = time.monotonic()
-    result = subprocess.run(command, check=False)
+    # Preserve stdout as a single machine-parseable JSON document. Forward
+    # the workload's normal stdout to the sampler's stderr (where the
+    # workload's own stderr already goes), even when --output is omitted.
+    result = subprocess.run(command, stdout=sys.stderr, check=False)
     if args.settle:
         time.sleep(args.settle)
     elapsed = time.monotonic() - started

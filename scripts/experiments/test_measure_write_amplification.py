@@ -48,6 +48,37 @@ class SamplerTests(unittest.TestCase):
         self.assertEqual(report["exit_code"], -15)
         self.assertEqual(report["diskstats_written_total_bytes"], 0)
 
+    def test_workload_output_cannot_contaminate_json_stdout(self):
+        counters = {
+            "range_accepted": 100,
+            "range_aligned_append": 100,
+            "range_rewrite_input": 0,
+            "shard_payload_written": 200,
+        }
+        captured = {}
+
+        def simulated_workload(command, *, stdout, check):
+            print("workload progress", file=stdout)
+            captured["command"] = command
+            captured["check"] = check
+            return subprocess.CompletedProcess(command, 0)
+
+        with (
+            patch("measure_write_amplification.fetch_metrics", side_effect=[counters, counters]),
+            patch("measure_write_amplification.diskstats_snapshot", side_effect=[{"sdx": 9}, {"sdx": 9}]),
+            patch("measure_write_amplification.subprocess.run", side_effect=simulated_workload),
+            patch("sys.stdout", new_callable=io.StringIO) as report_stdout,
+            patch("sys.stderr", new_callable=io.StringIO) as log_stderr,
+        ):
+            status = main(["--endpoint", "http://localhost:9100/commit-metrics", "--device", "sdx", "--", "echo", "hello"])
+            self.assertEqual(status, 0)
+            self.assertEqual(captured["command"], ["echo", "hello"])
+            self.assertFalse(captured["check"])
+            report = json.loads(report_stdout.getvalue())
+            self.assertEqual(report["exit_code"], 0)
+            self.assertIn("workload progress", log_stderr.getvalue())
+            self.assertNotIn("workload progress", report_stdout.getvalue())
+
     def test_counter_reset_fails_closed(self):
         self.assertEqual(deltas({"x": 10, "y": 20}, {"x": 11, "y": 21}), {"x": 1, "y": 1})
         with self.assertRaisesRegex(ValueError, "decreased"):
