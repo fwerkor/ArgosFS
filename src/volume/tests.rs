@@ -1846,3 +1846,68 @@ fn deferred_durability_cache_tracks_changed_inodes_and_device_status() {
     ));
     assert_eq!(cache.as_ref().unwrap().last_scanned_blocks, 2);
 }
+
+#[test]
+fn deferred_commit_reports_real_journal_and_checkpoint_phases() {
+    use crate::commit_metrics::CommitPhase;
+
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|n| dir.path().join(format!("timed-{n}.img")))
+        .collect::<Vec<_>>();
+    let mut fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            defer_metadata_commit: true,
+            deferred_commit_max_transactions: 1000,
+            deferred_commit_interval_ms: 60_000,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "timed-raw-commit",
+        false,
+    )
+    .unwrap();
+    fs.upgrade_delta_integrity().unwrap();
+    fs.write_file("/journal", b"delta record", 0o600).unwrap();
+    fs.sync().unwrap();
+    let counts = |phase: CommitPhase| -> u64 {
+        fs.commit_metrics()
+            .snapshots()
+            .find(|(name, _)| *name == phase.name())
+            .unwrap()
+            .1
+            .count
+    };
+    assert!(counts(CommitPhase::GroupCommit) >= 1);
+    assert!(counts(CommitPhase::Integrity) >= 1);
+    assert!(counts(CommitPhase::DurabilityValidation) >= 1);
+    assert!(counts(CommitPhase::Journal) >= 1);
+    assert!(counts(CommitPhase::JournalDelta) >= 1);
+    assert!(counts(CommitPhase::JournalMemberIo) >= 2);
+    assert!(counts(CommitPhase::SyncLockHold) >= 2);
+    assert_eq!(counts(CommitPhase::CheckpointEncode), 0);
+
+    fs.write_file("/checkpoint", b"forced checkpoint", 0o600)
+        .unwrap();
+    {
+        let _bulk = bulk_import_scope(true);
+        fs.sync().unwrap();
+    }
+    assert!(counts(CommitPhase::Checkpoint) >= 1);
+    assert!(counts(CommitPhase::CheckpointEncode) >= 1);
+    assert!(counts(CommitPhase::CheckpointMemberIo) >= 2);
+    drop(fs);
+    let reopened = ArgosFs::open_loop(&images, false).unwrap();
+    assert_eq!(
+        reopened.read_file("/journal", false).unwrap(),
+        b"delta record"
+    );
+    assert_eq!(
+        reopened.read_file("/checkpoint", false).unwrap(),
+        b"forced checkpoint"
+    );
+}

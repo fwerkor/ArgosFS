@@ -337,6 +337,9 @@ pub(super) enum Command {
         /// FUSE mount option; repeat for multiple options.
         #[arg(short = 'o', long = "option")]
         option: Vec<String>,
+        /// Expose live mount metrics via HTTP (recommend binding to loopback).
+        #[arg(long, value_name = "ADDR")]
+        metrics_listen: Option<String>,
     },
     #[command(about = "Mount a loop/raw pool as a root filesystem")]
     MountRoot {
@@ -354,6 +357,9 @@ pub(super) enum Command {
         /// FUSE mount option; repeat for multiple options.
         #[arg(short = 'o', long = "option")]
         option: Vec<String>,
+        /// Expose live mount metrics via HTTP (recommend binding to loopback).
+        #[arg(long, value_name = "ADDR")]
+        metrics_listen: Option<String>,
     },
     #[command(about = "Validate whether a loop/raw pool is safe to mount as root")]
     PreflightRoot {

@@ -362,8 +362,15 @@ pub fn run() -> Result<()> {
             mountpoint,
             foreground,
             option,
+            metrics_listen,
         } => {
-            fusefs::mount(root, mountpoint, foreground, option)?;
+            fusefs::mount_with_metrics(
+                root,
+                mountpoint,
+                foreground,
+                option,
+                metrics_listen.as_deref(),
+            )?;
         }
         Command::MountRoot {
             storage,
@@ -371,6 +378,7 @@ pub fn run() -> Result<()> {
             mode,
             foreground,
             option,
+            metrics_listen,
         } => {
             let storage = storage.resolve(BackendKind::LoopBlock)?;
             let backend = storage.backend;
@@ -392,12 +400,24 @@ pub fn run() -> Result<()> {
                 drop(preflight_fs);
                 let fs = open_backend(None, backend, images, devices, true)?;
                 validate_requested_pool(&fs, pool.as_deref())?;
-                fusefs::mount_volume(fs, target, foreground, root_mount_options(option))?;
+                fusefs::mount_volume_with_metrics(
+                    fs,
+                    target,
+                    foreground,
+                    root_mount_options(option),
+                    metrics_listen.as_deref(),
+                )?;
             } else {
                 let fs = open_backend(None, backend, images, devices, false)?;
                 validate_requested_pool(&fs, pool.as_deref())?;
                 rootfs::preflight_volume(&fs, mode)?;
-                fusefs::mount_volume(fs, target, foreground, root_mount_options(option))?;
+                fusefs::mount_volume_with_metrics(
+                    fs,
+                    target,
+                    foreground,
+                    root_mount_options(option),
+                    metrics_listen.as_deref(),
+                )?;
             }
         }
         Command::PreflightRoot { storage, mode } => {

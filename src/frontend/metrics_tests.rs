@@ -93,3 +93,123 @@ fn metrics_server_reports_bind_errors() {
     let error = serve(volume(), &address.to_string()).unwrap_err();
     assert!(matches!(error, crate::error::ArgosError::Io(_)));
 }
+
+#[test]
+fn commit_only_metrics_are_available_during_metadata_write_lock() {
+    let volume = volume();
+    let snapshot = volume.commit_metrics().snapshots().collect::<Vec<_>>();
+    assert!(snapshot.iter().all(|(_, counters)| counters.count == 0));
+    volume.test_with_metadata_write_lock(|| {
+        let output = render_commit_metrics(&volume);
+        assert!(output
+            .contains("argosfs_commit_phase_duration_seconds_count{phase=\"group_commit\"} 0"));
+        assert!(output.contains("# TYPE argosfs_commit_phase_duration_seconds_sum counter"));
+        assert!(!output.contains("argosfs_files"));
+        let response = request(
+            &volume,
+            b"GET /commit-metrics HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        );
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("phase=\"sync_lock_hold\""));
+    });
+}
+
+#[test]
+fn commit_metrics_are_shared_across_cloned_handles() {
+    let volume = volume();
+    volume.commit_metrics().observe(
+        crate::commit_metrics::CommitPhase::GroupCommit,
+        Duration::from_millis(25),
+    );
+    let clone = volume.clone();
+    let output = render_commit_metrics(&clone);
+    assert!(
+        output.contains("argosfs_commit_phase_duration_seconds_count{phase=\"group_commit\"} 1")
+    );
+    assert!(
+        output.contains("argosfs_commit_phase_duration_seconds_sum{phase=\"group_commit\"} 0.025")
+    );
+}
+
+#[test]
+fn mounted_metrics_server_shares_live_counters_and_releases_listener() {
+    let volume = volume();
+    let server = MountedMetricsServer::start(&volume, "127.0.0.1:0").unwrap();
+    let address = server.local_addr();
+    volume.commit_metrics().observe(
+        crate::commit_metrics::CommitPhase::Journal,
+        Duration::from_millis(42),
+    );
+    volume.test_with_metadata_write_lock(|| {
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream
+            .write_all(b"GET /commit-metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        stream.shutdown(Shutdown::Write).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(
+            response.contains("argosfs_commit_phase_duration_seconds_count{phase=\"journal\"} 1")
+        );
+    });
+    drop(server);
+    assert!(TcpListener::bind(address).is_ok());
+}
+
+#[test]
+fn commit_metrics_expose_member_labels_during_global_writer_stalls() {
+    let volume = volume();
+    {
+        let _checkpoint = volume.commit_metrics().member_timer(
+            crate::commit_metrics::CommitPhase::CheckpointMemberIo,
+            "disk-0009",
+        );
+    }
+    volume.test_with_metadata_write_lock(|| {
+        let output = render_commit_metrics(&volume);
+        assert!(output.contains(
+            "argosfs_commit_phase_duration_seconds_count{phase=\"checkpoint_member_io\",disk=\"disk-0009\"} 1"
+        ));
+        assert!(output.contains(
+            "argosfs_commit_phase_duration_seconds_count{phase=\"checkpoint_member_io\"} 1"
+        ));
+        assert!(output.contains("phase=\"journal_quorum\""));
+        assert!(output.contains("phase=\"journal_flush\""));
+        assert!(output.contains("phase=\"journal_tip\""));
+        assert_eq!(output.matches("# HELP argosfs_commit_phase_duration_seconds_count").count(), 1);
+    });
+}
+
+#[test]
+fn mounted_server_drains_inflight_clients_before_unmount_returns() {
+    let volume = volume();
+    let server = MountedMetricsServer::start(&volume, "127.0.0.1:0").unwrap();
+    let address = server.local_addr();
+    let mut client = TcpStream::connect(address).unwrap();
+    // Leave a connected client blocked in its request read. The listener
+    // accepts independently and shutdown must wait for that worker.
+    thread::sleep(Duration::from_millis(100));
+    let (finished_tx, finished_rx) = mpsc::channel();
+    let shutdown = thread::spawn(move || {
+        drop(server);
+        finished_tx.send(()).unwrap();
+    });
+    assert!(matches!(
+        finished_rx.recv_timeout(Duration::from_millis(100)),
+        Err(RecvTimeoutError::Timeout)
+    ));
+    client
+        .write_all(b"GET /commit-metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .unwrap();
+    client.shutdown(Shutdown::Write).unwrap();
+    let mut response = String::new();
+    client.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(finished_rx.recv_timeout(Duration::from_secs(3)).is_ok());
+    shutdown.join().unwrap();
+    assert!(TcpListener::bind(address).is_ok());
+}
