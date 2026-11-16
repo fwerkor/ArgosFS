@@ -158,3 +158,26 @@ pool used for #231 should approach a 2.0x shard-payload ratio for complete,
 uncompressed stripes, but field totals depend on workload, encryption,
 compression, and recovery activity. Do not interpret these counters as a
 measured throughput speedup.
+
+For a matched Borg run on an unshared set of physical members, the optional
+sampler `scripts/experiments/measure_write_amplification.py` captures both
+ArgosFS's new byte counters and Linux `/proc/diskstats` before and after a
+single explicitly supplied command:
+
+```bash
+python3 scripts/experiments/measure_write_amplification.py \
+  --endpoint http://127.0.0.1:9100/commit-metrics \
+  --device sdX --device sdY --output /tmp/argosfs-write-amp.json \
+  -- <your-borg-workload-command-and-arguments>
+```
+
+Replace `sdX`/`sdY` with **all** actual backing devices (and use the real
+endpoint). The example placeholders are not executable as written. The
+workload must complete its file fsync/close (and any deferred durability
+boundary) before returning. Only run on scratch/test storage or with a
+validated backup, and never combine a parent disk and its partitions because
+that counts the same traffic twice. `diskstats` writes are 512-byte sectors,
+not necessarily hardware NAND flash writes. The script exits with the
+workload exit code, emits JSON including both byte-amplification estimates,
+and never silently suppresses missing/negative counters. It doesn't mount,
+format or repair a volume itself.
