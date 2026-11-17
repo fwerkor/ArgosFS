@@ -1322,7 +1322,7 @@ impl ArgosFs {
             return;
         }
         if meta.backend != BackendKind::Host {
-            self.deferred_commit.lock().raw_uncommitted_metadata_dirty = true;
+            self.deferred_commit.lock().raw_advisory_metadata_dirty = true;
         }
         if let Some(disk) = meta.disks.get_mut(disk_id) {
             update_latency_ewma(

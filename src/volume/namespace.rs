@@ -511,7 +511,7 @@ impl ArgosFs {
                     });
                 if !must_repair {
                     if live.backend != BackendKind::Host {
-                        self.deferred_commit.lock().raw_uncommitted_metadata_dirty = true;
+                        self.deferred_commit.lock().raw_advisory_metadata_dirty = true;
                     }
                     if let Some(inode) = live.inodes.get_mut(&ino) {
                         inode.access_count = inode.access_count.saturating_add(1);
@@ -671,7 +671,7 @@ impl ArgosFs {
             }
         } else {
             if meta.backend != BackendKind::Host {
-                self.deferred_commit.lock().raw_uncommitted_metadata_dirty = true;
+                self.deferred_commit.lock().raw_advisory_metadata_dirty = true;
             }
             if let Some(live) = meta.inodes.get_mut(&ino) {
                 live.access_count = live.access_count.saturating_add(1);

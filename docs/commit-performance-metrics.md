@@ -185,3 +185,21 @@ terminates on a signal, its raw negative subprocess return code is retained in
 JSON and the script returns the conventional shell status `128 + signal`.
 It doesn't mount,
 format or repair a volume itself.
+
+### Advisory read telemetry versus durable metadata
+
+On raw/LoopBlock pools, successful file reads and measured device-read
+latencies update live inode `access_count`, `read_bytes`, `last_accessed_at`,
+`workload_score` and disk EWMA counters. These measurements are **advisory**:
+they may revert to their most recent durable values after a crash. They do
+not independently make a read-only workload eligible for periodic deferred
+metadata commits, journal writes or replicated full checkpoints. This avoids
+turning `borg check --verify-data` into a metadata-write workload (#251).
+
+When an actual file/namespace or allocator transaction commits, any live
+advisory counters are included while retaining the last trusted durable
+integrity hash as the previous journal state. Mandatory recovery checkpoints
+and write-fencing remain unchanged. At clean unmount, advisory-only changes
+are rehashed before the final required replicated metadata copies so the
+checkpoint cannot contain stale integrity information. The ordinary
+`/commit-metrics` counters remain runtime diagnostics, not durable storage.
