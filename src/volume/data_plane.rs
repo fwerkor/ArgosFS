@@ -210,7 +210,14 @@ impl ArgosFs {
             if copy_end > copy_start {
                 let dst_start = copy_start - start;
                 let len = copy_end - copy_start;
-                if cache_policy == BlockCachePolicy::Normal && !block.encrypted {
+                // Preserve the 1+0 uncompressed direct-range path: it reads
+                // and validates the physical shard subblocks on *every* read.
+                // A prior full-block cache fill must not bypass that existing
+                // corruption-detection behavior for single-member layouts.
+                if cache_policy == BlockCachePolicy::Normal
+                    && !block.encrypted
+                    && (block.shards.len() > 1 || block.codec != Compression::None)
+                {
                     let cache_key =
                         format!("{}:{}:{}", meta.uuid, block.stripe_id, block.raw_sha256);
                     if let Some(range) = self.cache.get_range(
