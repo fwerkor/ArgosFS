@@ -536,7 +536,7 @@ impl ArgosFs {
                     });
                 if !must_repair {
                     if live.backend != BackendKind::Host {
-                        self.deferred_commit.lock().raw_uncommitted_metadata_dirty = true;
+                        self.deferred_commit.lock().raw_advisory_metadata_dirty = true;
                     }
                     if let Some(inode) = live.inodes.get_mut(&ino) {
                         inode.access_count = inode.access_count.saturating_add(1);
@@ -695,19 +695,18 @@ impl ArgosFs {
                 }
             }
         }
-        // A repaired read is still a successful read. The previous exclusive
-        // self-heal branch skipped these counters entirely, which made FUSE
-        // buffered-tail accounting incorrectly assume the prefix was counted.
-        // Update them once after either repair or ordinary decode; the normal
-        // shared fast path already accounted above and never reaches here.
+        // Successful reads with self-heal must account for their validated
+        // prefix once, just like normal reads. These are advisory updates:
+        // they cannot independently trigger a full replicated checkpoint.
         if meta.backend != BackendKind::Host {
-            self.deferred_commit.lock().raw_uncommitted_metadata_dirty = true;
+            self.deferred_commit.lock().raw_advisory_metadata_dirty = true;
         }
         if let Some(live) = meta.inodes.get_mut(&ino) {
             live.access_count = live.access_count.saturating_add(1);
             live.read_bytes = live.read_bytes.saturating_add(data.len() as u64);
             live.last_accessed_at = now_f64();
             live.workload_score = live.workload_score * 0.98 + 1.0;
+        }
         }
         Ok((data, damaged, repaired))
     }
@@ -801,6 +800,10 @@ impl ArgosFs {
         }
         if start == old_size && start % stripe_raw_size == 0 {
             self.append_inode_data_locked(&mut meta, ino, start, data, clear_setid, write_time)?;
+            self.commit_metrics
+                .add_data_plane_bytes(DataPlaneByteKind::RangeAccepted, data.len());
+            self.commit_metrics
+                .add_data_plane_bytes(DataPlaneByteKind::RangeAlignedAppend, data.len());
             return Ok(data.len());
         }
         let new_size = old_size.max(end);
@@ -853,6 +856,8 @@ impl ArgosFs {
             json!({"inode": ino, "offset": offset, "bytes": data.len(), "rewrite": "stripe-window-local"}),
             write_time,
         )?;
+        self.commit_metrics
+            .add_data_plane_bytes(DataPlaneByteKind::RangeAccepted, data.len());
         Ok(data.len())
     }
 
