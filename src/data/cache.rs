@@ -2,14 +2,56 @@ use crate::error::Result;
 use crate::util::{atomic_write, content_hash_matches, ensure_dir, sha256_hex};
 use parking_lot::Mutex;
 use serde_json::json;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+/// Once admitted, cached block bytes are immutable. Compute their trusted
+/// digest *once* on admission rather than re-hashing every FUSE subrange read.
+struct MemoryItem {
+    data: Arc<[u8]>,
+    blake3: String,
+    legacy_sha256: Option<String>,
+    last_used: u64,
+}
+
+impl MemoryItem {
+    fn new(data: Arc<[u8]>, last_used: u64) -> Self {
+        let blake3 = crate::util::content_hash_hex(&data);
+        Self {
+            data,
+            blake3,
+            legacy_sha256: None,
+            last_used,
+        }
+    }
+
+    fn matches(&mut self, expected: Option<&str>) -> bool {
+        let Some(expected) = expected else {
+            return true;
+        };
+        if self.blake3 == expected {
+            return true;
+        }
+        // Existing pools may use SHA-256 block hashes. Compute the legacy
+        // digest at most once; a mismatched request is still invalidated.
+        self.legacy_sha256
+            .get_or_insert_with(|| sha256_hex(&self.data))
+            == expected
+    }
+}
 
 #[derive(Default)]
 struct CacheInner {
     bytes: usize,
-    items: BTreeMap<String, Vec<u8>>,
-    order: VecDeque<String>,
+    items: BTreeMap<String, MemoryItem>,
+    // Two ordered indices provide O(log N) hits, evictions and invalidation.
+    // A VecDeque::retain scan on every hit used to become O(cache entries).
+    order: BTreeMap<u64, String>,
+    lru_clock: u64,
+    // Blocks an in-flight L2 read from resurrecting a key invalidated or
+    // replaced while the filesystem read was in progress.
+    mutation_epoch: u64,
     l2_loaded: bool,
     l2_bytes: u64,
     l2_index: BTreeMap<PathBuf, L2Entry>,
@@ -19,6 +61,60 @@ struct CacheInner {
     l2_hits: u64,
     l2_writes: u64,
     l2_errors: u64,
+}
+
+impl CacheInner {
+    fn remove_memory(&mut self, key: &str) {
+        if let Some(item) = self.items.remove(key) {
+            self.bytes = self.bytes.saturating_sub(item.data.len());
+            self.order.remove(&item.last_used);
+        }
+    }
+
+    fn next_tick(&mut self) -> u64 {
+        if self.lru_clock == u64::MAX {
+            // Extremely long-running mounts must not alias a prior tick.
+            // Rebase the ordered indices without changing the LRU order.
+            let mut rebased = BTreeMap::new();
+            for (index, (_, key)) in std::mem::take(&mut self.order).into_iter().enumerate() {
+                let tick = index as u64 + 1;
+                if let Some(item) = self.items.get_mut(&key) {
+                    item.last_used = tick;
+                    rebased.insert(tick, key);
+                }
+            }
+            self.order = rebased;
+            self.lru_clock = self.order.len() as u64;
+        }
+        self.lru_clock += 1;
+        self.lru_clock
+    }
+
+    fn touch(&mut self, key: &str) {
+        let old_tick = self.items[key].last_used;
+        self.order.remove(&old_tick);
+        let tick = self.next_tick();
+        self.items.get_mut(key).unwrap().last_used = tick;
+        self.order.insert(tick, key.to_owned());
+    }
+
+    fn insert_memory(&mut self, key: &str, data: Arc<[u8]>, limit: usize) {
+        if limit == 0 {
+            return;
+        }
+        self.remove_memory(key);
+        let tick = self.next_tick();
+        let item = MemoryItem::new(data, tick);
+        self.bytes = self.bytes.saturating_add(item.data.len());
+        self.items.insert(key.to_owned(), item);
+        self.order.insert(tick, key.to_owned());
+        while self.bytes > limit {
+            let Some((_, oldest)) = self.order.pop_first() else {
+                break;
+            };
+            self.remove_memory(&oldest);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -47,22 +143,47 @@ impl BlockCache {
         }
     }
 
+    /// Legacy full-block caller. Most FUSE reads should call `get_range`,
+    /// which avoids allocating/copying a whole decoded stripe on cache hits.
     pub fn get(&self, key: &str, expected_sha: Option<&str>) -> Option<Vec<u8>> {
-        let mut inner = self.inner.lock();
-        if let Some(value) = inner.items.get(key).cloned() {
-            if expected_sha
-                .map(|sha| content_hash_matches(&value, sha))
-                .unwrap_or(true)
-            {
-                inner.hits += 1;
-                inner.order.retain(|candidate| candidate != key);
-                inner.order.push_back(key.to_string());
-                return Some(value);
-            } else if let Some(old) = inner.items.remove(key) {
-                inner.bytes = inner.bytes.saturating_sub(old.len());
-                inner.order.retain(|candidate| candidate != key);
-            }
+        self.get_shared(key, expected_sha).map(|data| data.to_vec())
+    }
+
+    /// Return only a validated contiguous section of an immutable cached
+    /// decoded block. The expected total length prevents returning a truncated
+    /// or outdated block. Bounds are checked even on L2 promotions.
+    pub fn get_range(
+        &self,
+        key: &str,
+        expected_sha: Option<&str>,
+        expected_len: usize,
+        start: usize,
+        end: usize,
+    ) -> Option<Vec<u8>> {
+        if end < start || end > expected_len {
+            return None;
         }
+        let data = self.get_shared(key, expected_sha)?;
+        if data.len() != expected_len {
+            self.remove(key);
+            return None;
+        }
+        Some(data[start..end].to_vec())
+    }
+
+    fn get_shared(&self, key: &str, expected_sha: Option<&str>) -> Option<Arc<[u8]>> {
+        let mut inner = self.inner.lock();
+        if let Some(item) = inner.items.get_mut(key) {
+            if item.matches(expected_sha) {
+                let data = Arc::clone(&item.data);
+                inner.hits = inner.hits.saturating_add(1);
+                inner.touch(key);
+                return Some(data);
+            }
+            inner.remove_memory(key);
+            inner.mutation_epoch = inner.mutation_epoch.wrapping_add(1);
+        }
+        let epoch = inner.mutation_epoch;
         drop(inner);
         if self.l2_limit > 0 {
             let _ = self.load_l2_index();
@@ -72,82 +193,84 @@ impl BlockCache {
                     .map(|sha| content_hash_matches(&value, sha))
                     .unwrap_or(true)
                 {
+                    let data: Arc<[u8]> = value.into();
                     let mut inner = self.inner.lock();
-                    inner.l2_hits += 1;
+                    if inner.mutation_epoch != epoch {
+                        // The L2 copy may predate a concurrent put, remove or
+                        // invalidation; do not return stale bytes to a reader.
+                        inner.misses = inner.misses.saturating_add(1);
+                        return None;
+                    }
+                    if let Some(item) = inner.items.get_mut(key) {
+                        if item.matches(expected_sha) {
+                            let latest = Arc::clone(&item.data);
+                            inner.hits = inner.hits.saturating_add(1);
+                            inner.touch(key);
+                            return Some(latest);
+                        }
+                        inner.remove_memory(key);
+                    }
+                    inner.l2_hits = inner.l2_hits.saturating_add(1);
                     inner.l2_clock = inner.l2_clock.saturating_add(1);
                     let touched = inner.l2_clock;
                     if let Some(entry) = inner.l2_index.get_mut(&path) {
                         entry.touched = touched;
                     }
-                    drop(inner);
-                    self.put_memory_only(key, &value);
-                    return Some(value);
-                } else {
-                    let _ = std::fs::remove_file(&path);
-                    let mut inner = self.inner.lock();
-                    if let Some(entry) = inner.l2_index.remove(&path) {
-                        inner.l2_bytes = inner.l2_bytes.saturating_sub(entry.size);
+                    // A concurrent writer may have replaced this key while
+                    // the L2 file was being read. Avoid overwriting its newer
+                    // in-memory version; immutable Arc references keep any
+                    // in-flight read safely isolated.
+                    if !inner.items.contains_key(key) {
+                        inner.insert_memory(key, Arc::clone(&data), self.memory_limit);
                     }
+                    return Some(data);
+                }
+                let _ = std::fs::remove_file(&path);
+                let mut inner = self.inner.lock();
+                if let Some(entry) = inner.l2_index.remove(&path) {
+                    inner.l2_bytes = inner.l2_bytes.saturating_sub(entry.size);
                 }
             }
         }
         let mut inner = self.inner.lock();
-        inner.misses += 1;
+        inner.misses = inner.misses.saturating_add(1);
         None
     }
 
     pub fn put(&self, key: &str, data: &[u8]) -> Result<()> {
         {
             let mut inner = self.inner.lock();
+            inner.mutation_epoch = inner.mutation_epoch.wrapping_add(1);
             if self.memory_limit > 0 {
-                if let Some(old) = inner.items.remove(key) {
-                    inner.bytes = inner.bytes.saturating_sub(old.len());
-                    inner.order.retain(|candidate| candidate != key);
-                }
-                inner.items.insert(key.to_string(), data.to_vec());
-                inner.order.push_back(key.to_string());
-                inner.bytes += data.len();
-                while inner.bytes > self.memory_limit {
-                    if let Some(oldest) = inner.order.pop_front() {
-                        if let Some(value) = inner.items.remove(&oldest) {
-                            inner.bytes = inner.bytes.saturating_sub(value.len());
-                        }
-                    } else {
-                        break;
-                    }
-                }
+                inner.insert_memory(key, Arc::from(data), self.memory_limit);
             }
         }
         if self.l2_limit > 0 && self.put_l2(key, data).is_err() {
-            let mut inner = self.inner.lock();
-            inner.l2_errors = inner.l2_errors.saturating_add(1);
+            self.inner.lock().l2_errors += 1;
         }
         Ok(())
     }
 
     pub fn invalidate_prefix(&self, prefix: &str) {
         let mut inner = self.inner.lock();
-        let keys: Vec<String> = inner
+        inner.mutation_epoch = inner.mutation_epoch.wrapping_add(1);
+        let keys = inner
             .items
             .keys()
             .filter(|key| key.starts_with(prefix))
             .cloned()
-            .collect();
+            .collect::<Vec<_>>();
         for key in keys {
-            if let Some(value) = inner.items.remove(&key) {
-                inner.bytes = inner.bytes.saturating_sub(value.len());
-            }
-            inner.order.retain(|candidate| candidate != &key);
+            inner.remove_memory(&key);
         }
     }
 
     pub fn remove(&self, key: &str) {
-        let mut inner = self.inner.lock();
-        if let Some(value) = inner.items.remove(key) {
-            inner.bytes = inner.bytes.saturating_sub(value.len());
+        {
+            let mut inner = self.inner.lock();
+            inner.mutation_epoch = inner.mutation_epoch.wrapping_add(1);
+            inner.remove_memory(key);
         }
-        inner.order.retain(|candidate| candidate != key);
-        drop(inner);
         if self.l2_limit > 0 {
             let path = self.l2_path(key);
             let _ = std::fs::remove_file(&path);
@@ -185,33 +308,6 @@ impl BlockCache {
     fn l2_path(&self, key: &str) -> PathBuf {
         let digest = sha256_hex(key.as_bytes());
         self.root.join(&digest[..2]).join(format!("{digest}.blk"))
-    }
-
-    fn put_memory_only(&self, key: &str, data: &[u8]) {
-        let mut inner = self.inner.lock();
-        Self::put_memory_only_locked(&mut inner, self.memory_limit, key, data);
-    }
-
-    fn put_memory_only_locked(inner: &mut CacheInner, memory_limit: usize, key: &str, data: &[u8]) {
-        if memory_limit == 0 {
-            return;
-        }
-        if let Some(old) = inner.items.remove(key) {
-            inner.bytes = inner.bytes.saturating_sub(old.len());
-            inner.order.retain(|candidate| candidate != key);
-        }
-        inner.items.insert(key.to_string(), data.to_vec());
-        inner.order.push_back(key.to_string());
-        inner.bytes += data.len();
-        while inner.bytes > memory_limit {
-            if let Some(oldest) = inner.order.pop_front() {
-                if let Some(value) = inner.items.remove(&oldest) {
-                    inner.bytes = inner.bytes.saturating_sub(value.len());
-                }
-            } else {
-                break;
-            }
-        }
     }
 
     fn put_l2(&self, key: &str, data: &[u8]) -> Result<()> {
