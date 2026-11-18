@@ -253,3 +253,88 @@ fn repair_of_corrupted_persisted_prefix_still_counts_full_combined_read() {
     assert_eq!(fuse.writeback.lock().dirty[&ino].data, b"tail");
     assert_eq!(volume.fsck(false, false).unwrap().missing_shards, 0);
 }
+
+#[test]
+fn raw_buffered_tail_reads_are_advisory_and_never_force_periodic_checkpoint() {
+    use crate::commit_metrics::CommitPhase;
+
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|n| dir.path().join(format!("raw-buffer-read-{n}.img")))
+        .collect::<Vec<_>>();
+    let volume = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            compression: Compression::None,
+            chunk_size: 4096,
+            defer_journal_flush: true,
+            defer_metadata_commit: true,
+            defer_data_flush: true,
+            deferred_commit_interval_ms: 10,
+            deferred_commit_max_transactions: 128,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "buffered-tail-read-telemetry",
+        false,
+    )
+    .unwrap();
+    let ino = volume.create_file_path("/stream", 0o600).unwrap();
+    volume.write_inode_range(ino, 0, b"persisted").unwrap();
+    volume.sync().unwrap();
+    let initial = volume.metadata_snapshot();
+    let count = |phase: CommitPhase| {
+        volume
+            .commit_metrics()
+            .snapshots()
+            .find(|(name, _)| *name == phase.name())
+            .unwrap()
+            .1
+            .count
+    };
+    let checkpoint_before = count(CommitPhase::Checkpoint);
+    let journal_before = count(CommitPhase::Journal);
+    let group_before = count(CommitPhase::GroupCommit);
+    let fuse = ArgosFuse::new(volume.clone());
+    assert!(fuse.queue_writeback(ino, 9, b"buffered"));
+
+    for _ in 0..40 {
+        // The prefix is checked by the raw decoder; only the volatile tail
+        // is served from FUSE's acknowledged append buffer.
+        assert_eq!(
+            fuse.read_visible_inode(ino, 0, 17).unwrap(),
+            b"persistedbuffered"
+        );
+        assert_eq!(fuse.read_visible_inode(ino, 9, 8).unwrap(), b"buffered");
+        assert!(fuse.read_visible_inode(ino, 17, 1).unwrap().is_empty());
+        assert!(fuse.read_visible_inode(ino, 0, 0).unwrap().is_empty());
+        assert!(!volume.sync_deferred_if_dirty().unwrap());
+        volume.sync().unwrap();
+    }
+    assert_eq!(volume.metadata_snapshot().txid, initial.txid);
+    assert_eq!(count(CommitPhase::Checkpoint), checkpoint_before);
+    assert_eq!(count(CommitPhase::Journal), journal_before);
+    assert_eq!(count(CommitPhase::GroupCommit), group_before);
+    assert_eq!(volume.attr_inode(ino).unwrap().size, 9);
+    assert_eq!(fuse.writeback.lock().dirty[&ino].data, b"buffered");
+
+    // An actual writeback remains durable and its metadata/journal must
+    // re-anchor the trusted previous hash despite advisory read counters.
+    fuse.flush_inode_writeback(ino).unwrap();
+    volume.sync().unwrap();
+    assert_eq!(
+        volume.read_inode(ino, 0, 17, false).unwrap(),
+        b"persistedbuffered"
+    );
+    assert_eq!(volume.transaction_report().unwrap().invalid_entries, 0);
+    drop(fuse);
+    drop(volume);
+    let reopened = ArgosFs::open_loop(&images, false).unwrap();
+    assert_eq!(
+        reopened.read_file("/stream", false).unwrap(),
+        b"persistedbuffered"
+    );
+    assert_eq!(reopened.transaction_report().unwrap().invalid_entries, 0);
+}
