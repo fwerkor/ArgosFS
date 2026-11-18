@@ -225,8 +225,14 @@ impl BlockCache {
                     }
                     return Some(data);
                 }
-                let _ = std::fs::remove_file(&path);
                 let mut inner = self.inner.lock();
+                if inner.mutation_epoch != epoch {
+                    // An older failed L2 read must never delete a newly
+                    // replaced on-disk entry from a concurrent put().
+                    inner.misses = inner.misses.saturating_add(1);
+                    return None;
+                }
+                let _ = std::fs::remove_file(&path);
                 if let Some(entry) = inner.l2_index.remove(&path) {
                     inner.l2_bytes = inner.l2_bytes.saturating_sub(entry.size);
                 }
