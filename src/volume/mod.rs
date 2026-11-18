@@ -156,6 +156,8 @@ mod maintenance;
 mod metadata_budget;
 mod namespace;
 #[cfg(test)]
+mod read_cache_range_tests;
+#[cfg(test)]
 mod read_checkpoint_tests;
 #[cfg(test)]
 mod read_fast_tests;
