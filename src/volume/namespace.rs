@@ -250,6 +250,31 @@ impl ArgosFs {
             .map(|(data, _, _)| data)
     }
 
+    /// Account for the portion of a successful FUSE read served directly
+    /// from an acknowledged append buffer. The persisted prefix (if any) is
+    /// already accounted for by `read_inode`, so do not double-count that
+    /// access event. No data or inode timestamps are changed.
+    pub(crate) fn account_buffered_read(&self, ino: InodeId, tail_bytes: usize, prefix_read: bool) {
+        // An EOF/zero-length read is still an observable successful access,
+        // as in the existing volume read path. Only a persisted-prefix read
+        // has already accounted for its access event.
+        if tail_bytes == 0 && prefix_read {
+            return;
+        }
+        let mut meta = self.meta.write();
+        if meta.backend != BackendKind::Host {
+            self.deferred_commit.lock().raw_advisory_metadata_dirty = true;
+        }
+        if let Some(inode) = meta.inodes.get_mut(&ino) {
+            inode.read_bytes = inode.read_bytes.saturating_add(tail_bytes as u64);
+            inode.last_accessed_at = now_f64();
+            if !prefix_read {
+                inode.access_count = inode.access_count.saturating_add(1);
+                inode.workload_score = inode.workload_score * 0.98 + 1.0;
+            }
+        }
+    }
+
     pub fn seek_data_or_hole(&self, ino: InodeId, offset: u64, whence: i32) -> Result<u64> {
         let meta = self.meta.read();
         let inode = meta
@@ -669,16 +694,18 @@ impl ArgosFs {
                     }
                 }
             }
-        } else {
-            if meta.backend != BackendKind::Host {
-                self.deferred_commit.lock().raw_advisory_metadata_dirty = true;
-            }
-            if let Some(live) = meta.inodes.get_mut(&ino) {
-                live.access_count = live.access_count.saturating_add(1);
-                live.read_bytes = live.read_bytes.saturating_add(data.len() as u64);
-                live.last_accessed_at = now_f64();
-                live.workload_score = live.workload_score * 0.98 + 1.0;
-            }
+        }
+        // Successful reads with self-heal must account for their validated
+        // prefix once, just like normal reads. These are advisory updates:
+        // they cannot independently trigger a full replicated checkpoint.
+        if meta.backend != BackendKind::Host {
+            self.deferred_commit.lock().raw_advisory_metadata_dirty = true;
+        }
+        if let Some(live) = meta.inodes.get_mut(&ino) {
+            live.access_count = live.access_count.saturating_add(1);
+            live.read_bytes = live.read_bytes.saturating_add(data.len() as u64);
+            live.last_accessed_at = now_f64();
+            live.workload_score = live.workload_score * 0.98 + 1.0;
         }
         Ok((data, damaged, repaired))
     }

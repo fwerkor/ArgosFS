@@ -512,6 +512,59 @@ impl ArgosFuseShared {
         self.volume.attr_inode(ino)
     }
 
+    /// Serve a read from the persisted prefix plus the acknowledged EOF tail
+    /// without forcing a premature partial-stripe COW write. This applies
+    /// only when the pending extent begins exactly at the *current* on-disk
+    /// EOF; all other dirty writes keep the existing flush-before-read path.
+    ///
+    /// The writeback guard spans metadata validation, persisted-prefix read
+    /// (with the normal checksum/repair path), and overlay. A concurrent FUSE
+    /// flush or append cannot publish a torn combination of old and new data.
+    fn read_visible_inode(&self, ino: InodeId, offset: u64, size: usize) -> Result<Vec<u8>> {
+        let writeback = self.writeback.lock();
+        let Some(dirty) = writeback.dirty.get(&ino) else {
+            drop(writeback);
+            return self.volume.read_inode(ino, offset, size, true);
+        };
+        let attr = self.volume.attr_inode(ino)?;
+        if attr.kind != NodeKind::File || dirty.offset != attr.size || dirty.end().is_none() {
+            drop(writeback);
+            self.flush_inode_writeback(ino)?;
+            return self.volume.read_inode(ino, offset, size, true);
+        }
+        let logical_end = dirty.end().unwrap();
+        let read_end = offset.saturating_add(size as u64).min(logical_end);
+        if offset >= read_end {
+            self.volume.account_buffered_read(ino, 0, false);
+            return Ok(Vec::new());
+        }
+
+        // Read only the persisted prefix through the existing checked decoder.
+        // An unreadable prefix is an error: never silently substitute zeros or
+        // return an apparently successful partial read on a corrupted stripe.
+        let prefix_end = read_end.min(attr.size);
+        let prefix_len = prefix_end.saturating_sub(offset) as usize;
+        let mut output = if prefix_len != 0 {
+            self.volume.read_inode(ino, offset, prefix_len, true)?
+        } else {
+            Vec::new()
+        };
+        if output.len() != prefix_len {
+            return Err(ArgosError::Invalid(format!(
+                "concurrent inode size change during buffered read of inode {ino}"
+            )));
+        }
+        let tail_start = offset.max(attr.size);
+        if read_end > tail_start {
+            let start = (tail_start - attr.size) as usize;
+            let end = (read_end - attr.size) as usize;
+            output.extend_from_slice(&dirty.data[start..end]);
+            self.volume
+                .account_buffered_read(ino, end - start, prefix_len != 0);
+        }
+        Ok(output)
+    }
+
     fn flush_inode_writeback(&self, ino: InodeId) -> Result<()> {
         let mut writeback = self.writeback.lock();
         let Some(dirty) = writeback.dirty.remove(&ino) else {
@@ -1206,10 +1259,6 @@ impl Filesystem for ArgosFuse {
         reply: ReplyData,
     ) {
         self.submit_io(ino.0, move |shared| {
-            if let Err(err) = shared.flush_inode_writeback(ino.0) {
-                reply.error(errno(&err));
-                return;
-            }
             let file = shared.handles.lock().get(fh).cloned();
             let result = file
                 .ok_or_else(|| ArgosError::Invalid("invalid FUSE file handle".to_string()))
@@ -1224,7 +1273,7 @@ impl Filesystem for ArgosFuse {
                             "FUSE file handle is not open for reading".to_string(),
                         ));
                     }
-                    shared.volume.read_inode(ino.0, offset, size as usize, true)
+                    shared.read_visible_inode(ino.0, offset, size as usize)
                 });
             match result {
                 Ok(data) => reply.data(&data),
@@ -2122,6 +2171,9 @@ fn xattr_name(name: &OsStr) -> Result<&str> {
         .ok_or_else(|| ArgosError::Invalid("non-UTF-8 xattr names are unsupported".to_string()))
 }
 
+#[cfg(test)]
+#[path = "fusefs_read_overlay_tests.rs"]
+mod fusefs_read_overlay_tests;
 #[cfg(test)]
 #[path = "fusefs_writeback_overlay_tests.rs"]
 mod fusefs_writeback_overlay_tests;
