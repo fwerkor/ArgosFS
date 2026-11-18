@@ -1,5 +1,5 @@
 use crate::error::Result;
-use crate::util::{atomic_write, content_hash_matches, ensure_dir, sha256_hex};
+use crate::util::{atomic_write, ensure_dir, sha256_hex};
 use parking_lot::Mutex;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -49,9 +49,9 @@ struct CacheInner {
     // A VecDeque::retain scan on every hit used to become O(cache entries).
     order: BTreeMap<u64, String>,
     lru_clock: u64,
-    // Blocks an in-flight L2 read from resurrecting a key invalidated or
-    // replaced while the filesystem read was in progress.
-    mutation_epoch: u64,
+    // Track only in-flight L2 keys. Unrelated admissions must not invalidate
+    // another key's verified L2 read, and tombstones cannot grow unbounded.
+    inflight_l2: BTreeMap<String, InflightL2>,
     l2_loaded: bool,
     l2_bytes: u64,
     l2_index: BTreeMap<PathBuf, L2Entry>,
@@ -64,6 +64,39 @@ struct CacheInner {
 }
 
 impl CacheInner {
+    fn begin_l2_read(&mut self, key: &str) -> u64 {
+        let in_flight = self.inflight_l2.entry(key.to_owned()).or_default();
+        in_flight.readers += 1;
+        in_flight.generation
+    }
+
+    fn finish_l2_read(&mut self, key: &str, generation: u64) -> bool {
+        let in_flight = self
+            .inflight_l2
+            .get_mut(key)
+            .expect("L2 read must be registered");
+        let current = in_flight.generation == generation;
+        in_flight.readers -= 1;
+        if in_flight.readers == 0 {
+            self.inflight_l2.remove(key);
+        }
+        current
+    }
+
+    fn note_key_mutation(&mut self, key: &str) {
+        if let Some(in_flight) = self.inflight_l2.get_mut(key) {
+            in_flight.generation = in_flight.generation.wrapping_add(1);
+        }
+    }
+
+    fn note_prefix_mutation(&mut self, prefix: &str) {
+        for (key, in_flight) in &mut self.inflight_l2 {
+            if key.starts_with(prefix) {
+                in_flight.generation = in_flight.generation.wrapping_add(1);
+            }
+        }
+    }
+
     fn remove_memory(&mut self, key: &str) {
         if let Some(item) = self.items.remove(key) {
             self.bytes = self.bytes.saturating_sub(item.data.len());
@@ -98,13 +131,13 @@ impl CacheInner {
         self.order.insert(tick, key.to_owned());
     }
 
-    fn insert_memory(&mut self, key: &str, data: Arc<[u8]>, limit: usize) {
+    fn insert_memory(&mut self, key: &str, mut item: MemoryItem, limit: usize) {
         if limit == 0 {
             return;
         }
         self.remove_memory(key);
-        let tick = self.next_tick();
-        let item = MemoryItem::new(data, tick);
+        item.last_used = self.next_tick();
+        let tick = item.last_used;
         self.bytes = self.bytes.saturating_add(item.data.len());
         self.items.insert(key.to_owned(), item);
         self.order.insert(tick, key.to_owned());
@@ -115,6 +148,12 @@ impl CacheInner {
             self.remove_memory(&oldest);
         }
     }
+}
+
+#[derive(Default)]
+struct InflightL2 {
+    readers: usize,
+    generation: u64,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -180,75 +219,75 @@ impl BlockCache {
                 inner.touch(key);
                 return Some(data);
             }
+            inner.note_key_mutation(key);
             inner.remove_memory(key);
-            inner.mutation_epoch = inner.mutation_epoch.wrapping_add(1);
         }
-        let epoch = inner.mutation_epoch;
+        if self.l2_limit == 0 {
+            inner.misses = inner.misses.saturating_add(1);
+            return None;
+        }
+        let generation = inner.begin_l2_read(key);
         drop(inner);
-        if self.l2_limit > 0 {
-            let _ = self.load_l2_index();
-            let path = self.l2_path(key);
-            if let Ok(value) = std::fs::read(&path) {
-                if expected_sha
-                    .map(|sha| content_hash_matches(&value, sha))
-                    .unwrap_or(true)
-                {
-                    let data: Arc<[u8]> = value.into();
-                    let mut inner = self.inner.lock();
-                    if inner.mutation_epoch != epoch {
-                        // The L2 copy may predate a concurrent put, remove or
-                        // invalidation; do not return stale bytes to a reader.
-                        inner.misses = inner.misses.saturating_add(1);
-                        return None;
+
+        let _ = self.load_l2_index();
+        let path = self.l2_path(key);
+        // Disk I/O and all cryptographic work are done outside the global
+        // cache lock. Immutable bytes cannot be mutated after admission.
+        let candidate = std::fs::read(&path).ok().map(|data| {
+            let mut item = MemoryItem::new(Arc::from(data), 0);
+            let valid = item.matches(expected_sha);
+            (item, valid)
+        });
+
+        let mut inner = self.inner.lock();
+        if !inner.finish_l2_read(key, generation) {
+            // This exact key was removed, replaced or prefix-invalidated
+            // while its L2 file was read. Other keys do not affect this read.
+            inner.misses = inner.misses.saturating_add(1);
+            return None;
+        }
+        if let Some((item, valid)) = candidate {
+            if valid {
+                if let Some(latest) = inner.items.get_mut(key) {
+                    if latest.matches(expected_sha) {
+                        let data = Arc::clone(&latest.data);
+                        inner.hits = inner.hits.saturating_add(1);
+                        inner.touch(key);
+                        return Some(data);
                     }
-                    if let Some(item) = inner.items.get_mut(key) {
-                        if item.matches(expected_sha) {
-                            let latest = Arc::clone(&item.data);
-                            inner.hits = inner.hits.saturating_add(1);
-                            inner.touch(key);
-                            return Some(latest);
-                        }
-                        inner.remove_memory(key);
-                    }
-                    inner.l2_hits = inner.l2_hits.saturating_add(1);
-                    inner.l2_clock = inner.l2_clock.saturating_add(1);
-                    let touched = inner.l2_clock;
-                    if let Some(entry) = inner.l2_index.get_mut(&path) {
-                        entry.touched = touched;
-                    }
-                    // A concurrent writer may have replaced this key while
-                    // the L2 file was being read. Avoid overwriting its newer
-                    // in-memory version; immutable Arc references keep any
-                    // in-flight read safely isolated.
-                    if !inner.items.contains_key(key) {
-                        inner.insert_memory(key, Arc::clone(&data), self.memory_limit);
-                    }
-                    return Some(data);
+                    inner.remove_memory(key);
                 }
-                let mut inner = self.inner.lock();
-                if inner.mutation_epoch != epoch {
-                    // An older failed L2 read must never delete a newly
-                    // replaced on-disk entry from a concurrent put().
-                    inner.misses = inner.misses.saturating_add(1);
-                    return None;
+                inner.l2_hits = inner.l2_hits.saturating_add(1);
+                inner.l2_clock = inner.l2_clock.saturating_add(1);
+                let touched = inner.l2_clock;
+                if let Some(entry) = inner.l2_index.get_mut(&path) {
+                    entry.touched = touched;
                 }
-                let _ = std::fs::remove_file(&path);
-                if let Some(entry) = inner.l2_index.remove(&path) {
-                    inner.l2_bytes = inner.l2_bytes.saturating_sub(entry.size);
-                }
+                let data = Arc::clone(&item.data);
+                inner.insert_memory(key, item, self.memory_limit);
+                return Some(data);
+            }
+            // A corrupted on-disk L2 entry is never promoted. Keep the
+            // key's mutation lock across deletion, so a concurrent put()
+            // cannot have replaced it with a new key version meanwhile.
+            let _ = std::fs::remove_file(&path);
+            if let Some(entry) = inner.l2_index.remove(&path) {
+                inner.l2_bytes = inner.l2_bytes.saturating_sub(entry.size);
             }
         }
-        let mut inner = self.inner.lock();
         inner.misses = inner.misses.saturating_add(1);
         None
     }
 
     pub fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+        // Hash once before taking the global cache mutex, even on a cold
+        // stripe admission while other FUSE threads are serving warm hits.
+        let admission = (self.memory_limit > 0).then(|| MemoryItem::new(Arc::from(data), 0));
         {
             let mut inner = self.inner.lock();
-            inner.mutation_epoch = inner.mutation_epoch.wrapping_add(1);
-            if self.memory_limit > 0 {
-                inner.insert_memory(key, Arc::from(data), self.memory_limit);
+            inner.note_key_mutation(key);
+            if let Some(item) = admission {
+                inner.insert_memory(key, item, self.memory_limit);
             }
         }
         if self.l2_limit > 0 && self.put_l2(key, data).is_err() {
@@ -259,7 +298,7 @@ impl BlockCache {
 
     pub fn invalidate_prefix(&self, prefix: &str) {
         let mut inner = self.inner.lock();
-        inner.mutation_epoch = inner.mutation_epoch.wrapping_add(1);
+        inner.note_prefix_mutation(prefix);
         let keys = inner
             .items
             .keys()
@@ -274,7 +313,7 @@ impl BlockCache {
     pub fn remove(&self, key: &str) {
         {
             let mut inner = self.inner.lock();
-            inner.mutation_epoch = inner.mutation_epoch.wrapping_add(1);
+            inner.note_key_mutation(key);
             inner.remove_memory(key);
         }
         if self.l2_limit > 0 {
