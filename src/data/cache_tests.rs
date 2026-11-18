@@ -1,4 +1,5 @@
 use super::*;
+use crate::util::content_hash_matches;
 use tempfile::tempdir;
 
 #[test]
@@ -286,4 +287,56 @@ fn cache_subrange_microbench() {
         "whole_block_clone_and_hash={original:?} cached_range_copy={optimized:?} ratio={:.2}x",
         original.as_secs_f64() / optimized.as_secs_f64()
     );
+}
+
+#[test]
+fn in_flight_l2_generation_changes_are_scoped_to_key_and_prefix() {
+    let mut inner = CacheInner::default();
+    let first = inner.begin_l2_read("file-a:block-1");
+    let same_key = inner.begin_l2_read("file-a:block-1");
+    let other = inner.begin_l2_read("file-b:block-2");
+    inner.note_key_mutation("file-b:block-2");
+    assert!(inner.finish_l2_read("file-a:block-1", first));
+    inner.note_prefix_mutation("file-a:");
+    assert!(!inner.finish_l2_read("file-a:block-1", same_key));
+    assert!(!inner.finish_l2_read("file-b:block-2", other));
+    assert!(
+        inner.inflight_l2.is_empty(),
+        "completed L2 reads must free their generation tracking"
+    );
+    let current = inner.begin_l2_read("file-a:block-1");
+    inner.note_key_mutation("unrelated");
+    assert!(inner.finish_l2_read("file-a:block-1", current));
+    assert!(inner.inflight_l2.is_empty());
+}
+
+#[test]
+fn concurrent_unrelated_admissions_preserve_verified_l2_hits() {
+    use std::sync::Arc;
+    let dir = tempdir().unwrap();
+    let cache = Arc::new(BlockCache::new(dir.path(), 0, 8 * 1024 * 1024));
+    let stable = vec![0x4du8; 128 * 1024];
+    let stable_hash = crate::util::content_hash_hex(&stable);
+    cache.put("stable:1", &stable).unwrap();
+    let other = Arc::clone(&cache);
+    let worker = std::thread::spawn(move || {
+        for i in 0..60 {
+            other.put("other:2", &vec![i as u8; 32 * 1024]).unwrap();
+        }
+    });
+    for _ in 0..60 {
+        let slice = cache
+            .get_range(
+                "stable:1",
+                Some(&stable_hash),
+                stable.len(),
+                16 * 1024,
+                20 * 1024,
+            )
+            .expect("an unrelated put must not cancel an L2 read of an immutable key");
+        assert_eq!(slice, stable[16 * 1024..20 * 1024]);
+    }
+    worker.join().unwrap();
+    assert!(cache.stats()["l2_hits"].as_u64().unwrap() >= 60);
+    assert_eq!(cache.stats()["l2_errors"], 0);
 }
