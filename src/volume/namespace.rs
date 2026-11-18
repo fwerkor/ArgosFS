@@ -707,7 +707,6 @@ impl ArgosFs {
             live.last_accessed_at = now_f64();
             live.workload_score = live.workload_score * 0.98 + 1.0;
         }
-        }
         Ok((data, damaged, repaired))
     }
 
