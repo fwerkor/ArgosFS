@@ -261,17 +261,12 @@ impl ArgosFs {
         if tail_bytes == 0 && prefix_read {
             return;
         }
-        let mut meta = self.meta.write();
-        if meta.backend != BackendKind::Host {
-            self.deferred_commit.lock().raw_advisory_metadata_dirty = true;
-        }
-        if let Some(inode) = meta.inodes.get_mut(&ino) {
-            inode.read_bytes = inode.read_bytes.saturating_add(tail_bytes as u64);
-            inode.last_accessed_at = now_f64();
-            if !prefix_read {
-                inode.access_count = inode.access_count.saturating_add(1);
-                inode.workload_score = inode.workload_score * 0.98 + 1.0;
-            }
+        // Preserve lookup/atomicity with unlink or rename while recording the
+        // advisory delta. A shared guard is sufficient: no metadata write
+        // lock is needed for the common FUSE append-overlay read.
+        let meta = self.meta.read();
+        if meta.inodes.contains_key(&ino) {
+            self.read_advisory.inode(ino, tail_bytes, !prefix_read);
         }
     }
 
@@ -495,59 +490,37 @@ impl ArgosFs {
             .map_err(|_| ArgosError::Invalid("inode logical size is too large".to_string()))?;
         let start = offset.min(logical_size as u64) as usize;
         let end = start.saturating_add(size).min(logical_size);
-        let mut snapshot = Self::read_decoder_metadata(&guard);
         let cache_policy = if repair_offline {
             BlockCachePolicy::Bypass
         } else {
             BlockCachePolicy::Normal
         };
-        let capture = ReadLatencyCapture::start();
+        // The physical decoder only observes a stable version of namespace
+        // metadata. It does not need a per-read cloned metadata image, nor
+        // does reporting advisory counters require an exclusive guard.
         let decoded = self.decode_inode_range_with_cache_policy_locked(
-            &mut snapshot,
+            &guard,
             &inode,
             start,
             end,
             cache_policy,
         );
-        let samples = capture.finish();
-        drop(guard);
-        // Merge latency EWMAs into the live copy after all concurrent reads
-        // release their shared guards, preserving every sample and the inode
-        // counters. Never overwrite concurrent metadata with a stale clone.
-        {
-            let mut live = self.meta.write();
-            for sample in samples {
-                self.update_read_latency_locked(
-                    &mut live,
-                    &sample.disk_id,
-                    sample.bytes,
-                    sample.elapsed_seconds,
-                );
-            }
-            if let Ok((ref data, ref damaged)) = decoded {
-                let must_repair = repair
-                    && damaged.iter().any(|entry| {
-                        !super::data_plane::damage_is_transient_offline_member(
-                            self,
-                            &live,
-                            entry,
-                            repair_offline,
-                        )
-                    });
-                if !must_repair {
-                    if live.backend != BackendKind::Host {
-                        self.deferred_commit.lock().raw_advisory_metadata_dirty = true;
-                    }
-                    if let Some(inode) = live.inodes.get_mut(&ino) {
-                        inode.access_count = inode.access_count.saturating_add(1);
-                        inode.read_bytes = inode.read_bytes.saturating_add(data.len() as u64);
-                        inode.last_accessed_at = now_f64();
-                        inode.workload_score = inode.workload_score * 0.98 + 1.0;
-                    }
-                    return decoded.map(|(data, damaged)| (data, damaged, false));
-                }
+        if let Ok((ref data, ref damaged)) = decoded {
+            let must_repair = repair
+                && damaged.iter().any(|entry| {
+                    !super::data_plane::damage_is_transient_offline_member(
+                        self,
+                        &guard,
+                        entry,
+                        repair_offline,
+                    )
+                });
+            if !must_repair {
+                self.read_advisory.inode(ino, data.len(), true);
+                return decoded.map(|(data, damaged)| (data, damaged, false));
             }
         }
+        drop(guard);
         // Failure requiring repair is rare. Run the previous exclusive path
         // against the current inode, rather than trying to repair a snapshot
         // that may have changed while transitioning between locks.
@@ -565,32 +538,6 @@ impl ArgosFs {
             );
         }
         decoded.map(|(data, damaged)| (data, damaged, false))
-    }
-
-    /// Minimal metadata for the legacy mutable decoder. Only fields consulted
-    /// by shard reads are populated; the allocator and inode map are *never*
-    /// accessed by decoding. This stays bounded independently of filesystem
-    /// fragmentation and the number of pending inode changes.
-    pub(super) fn read_decoder_metadata(meta: &Metadata) -> Metadata {
-        Metadata {
-            format: meta.format.clone(),
-            uuid: meta.uuid.clone(),
-            backend: meta.backend,
-            raw_pool: RawPoolMetadata::default(),
-            created_at: meta.created_at,
-            updated_at: meta.updated_at,
-            txid: meta.txid,
-            next_inode: meta.next_inode,
-            next_stripe: meta.next_stripe,
-            config: meta.config.clone(),
-            layouts: meta.layouts.clone(),
-            current_write_layout: meta.current_write_layout.clone(),
-            reshape: None,
-            encryption: meta.encryption.clone(),
-            integrity: MetadataIntegrity::default(),
-            disks: meta.disks.clone(),
-            inodes: Default::default(),
-        }
     }
 
     fn read_inode_with_damage_report_policy_exclusive(
@@ -636,7 +583,7 @@ impl ArgosFs {
             BlockCachePolicy::Normal
         };
         let (mut data, mut damaged) = self.decode_inode_range_with_cache_policy_locked(
-            &mut meta,
+            &meta,
             &inode,
             start,
             end,
@@ -659,7 +606,7 @@ impl ArgosFs {
         if repair && has_repairable_damage {
             let mut repair_damaged = damaged.clone();
             let (full, full_damaged) = self.decode_inode_data_with_cache_policy_locked(
-                &mut meta,
+                &meta,
                 &inode,
                 BlockCachePolicy::Bypass,
             )?;

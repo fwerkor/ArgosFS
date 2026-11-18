@@ -781,6 +781,9 @@ impl ArgosFs {
             let data = self.read_inode(ino, 0, u64::MAX as usize, true)?;
             maintenance_after_read_delay();
             let mut meta = self.meta.write();
+            // Fold queued read traffic into the inode before hot/cold tier
+            // classification. Common reads retain their shared guard.
+            self.drain_read_advisory_locked(&mut meta);
             if let Some(inode) = meta.inodes.get_mut(&ino) {
                 classify_inode(inode);
             }
@@ -1057,7 +1060,7 @@ impl ArgosFs {
                                 report.missing_shards += 1;
                                 continue;
                             }
-                            match self.read_shard_verified_locked(&mut meta, shard) {
+                            match self.read_shard_verified_locked(&meta, shard) {
                                 Ok(Some(_)) => {
                                     if shard.slot < total_slots {
                                         available_slots.insert(shard.slot);

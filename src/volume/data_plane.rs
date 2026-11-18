@@ -170,7 +170,7 @@ impl ArgosFs {
 
     pub(super) fn decode_inode_range_with_cache_policy_locked(
         &self,
-        meta: &mut Metadata,
+        meta: &Metadata,
         inode: &Inode,
         start: usize,
         end: usize,
@@ -388,7 +388,7 @@ impl ArgosFs {
 
     pub(super) fn decode_inode_data_with_cache_policy_locked(
         &self,
-        meta: &mut Metadata,
+        meta: &Metadata,
         inode: &Inode,
         cache_policy: BlockCachePolicy,
     ) -> Result<(Vec<u8>, Vec<String>)> {
@@ -453,7 +453,7 @@ impl ArgosFs {
 
     fn decode_block_with_cache_policy_locked(
         &self,
-        meta: &mut Metadata,
+        meta: &Metadata,
         block: &FileBlock,
         decrypt_key: Option<&[u8; 32]>,
         damaged: &mut Vec<String>,
@@ -583,7 +583,7 @@ impl ArgosFs {
 
     pub(super) fn decode_block_range_locked(
         &self,
-        meta: &mut Metadata,
+        meta: &Metadata,
         block: &FileBlock,
         start: usize,
         end: usize,
@@ -648,18 +648,13 @@ impl ArgosFs {
         ) {
             Ok(data) => data,
             Err(err) => {
-                self.update_read_latency_locked(
-                    meta,
-                    &shard.disk_id,
-                    0,
-                    start_time.elapsed().as_secs_f64(),
-                );
+                self.read_advisory
+                    .disk(&shard.disk_id, 0, start_time.elapsed().as_secs_f64());
                 damaged.push(format!("{}:missing-range:{}", shard.disk_id, shard.slot));
                 return Err(err);
             }
         };
-        self.update_read_latency_locked(
-            meta,
+        self.read_advisory.disk(
             &shard.disk_id,
             data.len() as u64,
             start_time.elapsed().as_secs_f64(),
@@ -715,7 +710,7 @@ impl ArgosFs {
 
     fn decode_single_shard_block_with_cache_policy_locked(
         &self,
-        meta: &mut Metadata,
+        meta: &Metadata,
         block: &FileBlock,
         damaged: &mut Vec<String>,
         cache_key: &str,
@@ -1319,6 +1314,7 @@ impl ArgosFs {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn update_read_latency_locked(
         &self,
         meta: &mut Metadata,
@@ -1326,22 +1322,6 @@ impl ArgosFs {
         bytes: u64,
         seconds: f64,
     ) {
-        let captured = READ_LATENCY_SAMPLES.with(|slot| {
-            let mut slot = slot.borrow_mut();
-            if let Some(samples) = slot.as_mut() {
-                samples.push(ReadLatencySample {
-                    disk_id: disk_id.to_owned(),
-                    bytes,
-                    elapsed_seconds: seconds,
-                });
-                true
-            } else {
-                false
-            }
-        });
-        if captured {
-            return;
-        }
         if meta.backend != BackendKind::Host {
             self.deferred_commit.lock().raw_advisory_metadata_dirty = true;
         }
@@ -1452,7 +1432,7 @@ impl ArgosFs {
     /// already fenced the device for those.
     pub(super) fn read_shard_verified_locked(
         &self,
-        meta: &mut Metadata,
+        meta: &Metadata,
         shard: &Shard,
     ) -> Result<Option<Vec<u8>>> {
         let (result, attempts) = retry_verified(
@@ -1461,8 +1441,7 @@ impl ArgosFs {
                 let start = std::time::Instant::now();
                 match self.read_shard_locked(meta, shard) {
                     Ok(data) => {
-                        self.update_read_latency_locked(
-                            meta,
+                        self.read_advisory.disk(
                             &shard.disk_id,
                             data.len() as u64,
                             start.elapsed().as_secs_f64(),
@@ -1470,12 +1449,8 @@ impl ArgosFs {
                         Ok(data)
                     }
                     Err(err) => {
-                        self.update_read_latency_locked(
-                            meta,
-                            &shard.disk_id,
-                            0,
-                            start.elapsed().as_secs_f64(),
-                        );
+                        self.read_advisory
+                            .disk(&shard.disk_id, 0, start.elapsed().as_secs_f64());
                         Err(err)
                     }
                 }
