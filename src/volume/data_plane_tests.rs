@@ -923,3 +923,16 @@ fn inline_only_range_updates_do_not_count_stripe_reencoding() {
     assert_eq!(encoded["range_rewrite_input"], 602);
     assert_eq!(encoded["shard_payload_written"], 602);
 }
+
+#[test]
+fn verified_shard_assembly_bulk_copies_only_the_logical_payload() {
+    let shards = [vec![1, 2, 3], vec![4, 5, 6], vec![7, 8, 9]];
+    let assemble =
+        |length| data_plane::assemble_data_shards(shards.iter().map(Vec::as_slice), length);
+    assert_eq!(assemble(0), Vec::<u8>::new());
+    assert_eq!(assemble(4), vec![1, 2, 3, 4]);
+    assert_eq!(assemble(9), vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    // A malformed oversized declared length does not reserve or append
+    // more bytes than the member payload actually contains.
+    assert_eq!(assemble(usize::MAX), vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+}
