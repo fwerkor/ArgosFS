@@ -4,7 +4,7 @@ use crate::allocator;
 use crate::autopilot::{plan_background_io, AutopilotMode, AutopilotPolicy, BackgroundIoPolicy};
 use crate::backend::{FileBlockBackend, HostFsBackend, StorageBackend};
 use crate::cache::BlockCache;
-use crate::commit_metrics::{CommitMetrics, CommitPhase};
+use crate::commit_metrics::{CommitMetrics, CommitPhase, DataPlaneByteKind};
 use crate::compression::{compress, decompress};
 use crate::crypto;
 use crate::erasure::RsCodec;
@@ -47,6 +47,26 @@ use uuid::Uuid;
 enum BlockCachePolicy {
     Normal,
     Bypass,
+}
+
+/// The time of an acknowledged FUSE buffered write and the inode ctime as
+/// observed when that write entered the buffer. A subsequent unlink or other
+/// metadata mutation must retain its newer ctime even if the data is flushed
+/// later. The snapshot is per acknowledged write, not per disk flush.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BufferedWriteTime {
+    pub(crate) at: f64,
+    pub(crate) seen_ctime: Option<f64>,
+}
+
+impl BufferedWriteTime {
+    fn persisted_ctime(self, current_ctime: f64) -> f64 {
+        if self.seen_ctime.is_some_and(|seen| seen != current_ctime) {
+            current_ctime
+        } else {
+            self.at
+        }
+    }
 }
 
 /// Read-side samples collected while an immutable metadata read guard is held.
@@ -136,6 +156,10 @@ mod maintenance;
 mod metadata_budget;
 mod namespace;
 #[cfg(test)]
+mod read_cache_range_tests;
+#[cfg(test)]
+mod read_checkpoint_tests;
+#[cfg(test)]
 mod read_fast_tests;
 #[cfg(test)]
 mod tests;
@@ -149,6 +173,11 @@ struct DeferredCommitState {
     durable_metadata: Option<Arc<Metadata>>,
     durability_cache: Option<DurabilityValidationCache>,
     raw_uncommitted_metadata_dirty: bool,
+    // Read/access/latency counters are advisory and may be lost at a crash.
+    // Their live metadata changes must not independently request a full
+    // checkpoint; they still must be included when constructing the trusted
+    // previous hash for any later *real* journal transaction.
+    raw_advisory_metadata_dirty: bool,
     // Recovery normalization requires a full one-time checkpoint before
     // establishing a trusted v2 delta baseline.
     raw_checkpoint_required: bool,
@@ -182,6 +211,7 @@ impl DeferredCommitState {
             durable_metadata: (meta.backend != BackendKind::Host).then(|| Arc::new(meta.clone())),
             durability_cache: None,
             raw_uncommitted_metadata_dirty,
+            raw_advisory_metadata_dirty: false,
             raw_checkpoint_required: raw_uncommitted_metadata_dirty,
             dirty_transactions: 0,
             dirty_since: None,
@@ -1006,8 +1036,10 @@ impl ArgosFs {
                 self.commit_deferred_locked(&mut meta, bulk_import_enabled())?;
                 return Ok(());
             }
-            let raw_uncommitted_metadata_dirty =
-                self.deferred_commit.lock().raw_uncommitted_metadata_dirty;
+            let raw_uncommitted_metadata_dirty = {
+                let state = self.deferred_commit.lock();
+                state.raw_uncommitted_metadata_dirty || state.raw_advisory_metadata_dirty
+            };
             if raw_uncommitted_metadata_dirty {
                 let previous_meta_hash = meta.integrity.meta_hash.clone();
                 journal::prepare_metadata_integrity_with_previous(&mut meta, previous_meta_hash)?;
@@ -1032,6 +1064,7 @@ impl ArgosFs {
             let mut state = self.deferred_commit.lock();
             state.durable_metadata = Some(Arc::new(meta.clone()));
             state.raw_uncommitted_metadata_dirty = false;
+            state.raw_advisory_metadata_dirty = false;
             state.raw_checkpoint_required = false;
             durability?;
             return Ok(());
@@ -1059,6 +1092,19 @@ impl ArgosFs {
     }
 
     pub fn mark_clean_unmount(&self) -> Result<()> {
+        // A clean unmount writes full metadata copies to every voting member.
+        // Advisory-only reads were deliberately skipped by periodic commits,
+        // so their live in-memory hash may differ from the last durable hash.
+        // Before the mandatory final checkpoint, promote that volatile dirt to
+        // a real checkpoint request so sync() re-anchors integrity. Never copy
+        // an in-memory read-stat image with a stale integrity tuple to media.
+        if self.meta.read().backend != BackendKind::Host {
+            let mut state = self.deferred_commit.lock();
+            if state.raw_advisory_metadata_dirty {
+                state.raw_uncommitted_metadata_dirty = true;
+                state.raw_checkpoint_required = true;
+            }
+        }
         self.sync()?;
         let meta = self.meta.read();
         if meta.backend == BackendKind::Host {
@@ -2386,6 +2432,7 @@ impl ArgosFs {
                 drop(previous);
                 state.durable_metadata = Some(Arc::new(meta.clone()));
                 state.raw_uncommitted_metadata_dirty = false;
+                state.raw_advisory_metadata_dirty = false;
                 state.raw_checkpoint_required = false;
                 state.dirty_transactions = 0;
                 state.dirty_since = None;
@@ -2412,6 +2459,7 @@ impl ArgosFs {
                 drop(previous);
                 state.durable_metadata = Some(Arc::new(meta.clone()));
                 state.raw_uncommitted_metadata_dirty = false;
+                state.raw_advisory_metadata_dirty = false;
                 state.raw_checkpoint_required = false;
                 state.dirty_transactions = 0;
                 state.dirty_since = None;
@@ -2461,8 +2509,10 @@ impl ArgosFs {
             self.note_deferred_transaction_locked(meta)?;
             return Ok(());
         }
-        let raw_uncommitted_metadata_dirty = meta.backend != BackendKind::Host
-            && self.deferred_commit.lock().raw_uncommitted_metadata_dirty;
+        let raw_uncommitted_metadata_dirty = meta.backend != BackendKind::Host && {
+            let state = self.deferred_commit.lock();
+            state.raw_uncommitted_metadata_dirty || state.raw_advisory_metadata_dirty
+        };
         let previous_meta_hash = if raw_uncommitted_metadata_dirty {
             // Read-side telemetry can change the live metadata without a transaction.
             // The stored integrity hash still identifies the last journal-durable state.
@@ -2538,6 +2588,7 @@ impl ArgosFs {
                         let mut state = self.deferred_commit.lock();
                         state.durable_metadata = Some(Arc::new(meta.clone()));
                         state.raw_uncommitted_metadata_dirty = false;
+                        state.raw_advisory_metadata_dirty = false;
                         state.last_error = Some(err.to_string());
                         drop(state);
                         self.rebuild_quota_runtime_locked(meta)?;
@@ -2548,7 +2599,10 @@ impl ArgosFs {
                     self.fence_on_quorum_loss(&commit_err);
                     if Self::transaction_error_is_committed(&commit_err) {
                         meta.inodes.mark_committed();
-                        self.deferred_commit.lock().raw_uncommitted_metadata_dirty = false;
+                        let mut state = self.deferred_commit.lock();
+                        state.raw_uncommitted_metadata_dirty = false;
+                        state.raw_advisory_metadata_dirty = false;
+                        drop(state);
                         self.rebuild_quota_runtime_locked(meta)?;
                     }
                     let should_restore = !Self::transaction_error_is_committed(&commit_err)
@@ -2567,7 +2621,9 @@ impl ArgosFs {
                 }
             }
             meta.inodes.mark_committed();
-            self.deferred_commit.lock().raw_uncommitted_metadata_dirty = false;
+            let mut state = self.deferred_commit.lock();
+            state.raw_uncommitted_metadata_dirty = false;
+            state.raw_advisory_metadata_dirty = false;
             return Ok(());
         }
         let result = journal::append_transaction_checked(
@@ -2619,6 +2675,7 @@ impl ArgosFs {
         // Recovery may normalize/recompute fields after validating the persisted hash.
         // Re-establish a full durable checkpoint before trusting a delta base again.
         state.raw_uncommitted_metadata_dirty = true;
+        state.raw_advisory_metadata_dirty = false;
         state.raw_checkpoint_required = true;
         Ok(())
     }
