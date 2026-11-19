@@ -413,7 +413,8 @@ fn raw_journal_events_refresh_stale_read_telemetry_integrity() {
         journal::canonical_metadata_hash(&dirty).unwrap(),
         dirty.integrity.meta_hash
     );
-    assert!(fs.deferred_commit.lock().raw_uncommitted_metadata_dirty);
+    assert!(fs.deferred_commit.lock().raw_advisory_metadata_dirty);
+    assert!(!fs.deferred_commit.lock().raw_uncommitted_metadata_dirty);
 
     {
         let meta = fs.meta.read();
@@ -1750,7 +1751,8 @@ fn upgraded_legacy_event_rollover_with_read_telemetry_reanchors_before_first_v2_
     fs.upgrade_delta_integrity().unwrap();
     assert_eq!(fs.metadata_snapshot().integrity.hash_scheme, None);
     assert_eq!(fs.read_file("/old", false).unwrap(), b"old payload");
-    assert!(fs.deferred_commit.lock().raw_uncommitted_metadata_dirty);
+    assert!(fs.deferred_commit.lock().raw_advisory_metadata_dirty);
+    assert!(!fs.deferred_commit.lock().raw_uncommitted_metadata_dirty);
     {
         let meta = fs.meta.read();
         fs.journal_locked(

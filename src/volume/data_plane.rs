@@ -210,6 +210,27 @@ impl ArgosFs {
             if copy_end > copy_start {
                 let dst_start = copy_start - start;
                 let len = copy_end - copy_start;
+                // Preserve the 1+0 uncompressed direct-range path: it reads
+                // and validates the physical shard subblocks on *every* read.
+                // A prior full-block cache fill must not bypass that existing
+                // corruption-detection behavior for single-member layouts.
+                if cache_policy == BlockCachePolicy::Normal
+                    && !block.encrypted
+                    && (block.shards.len() > 1 || block.codec != Compression::None)
+                {
+                    let cache_key =
+                        format!("{}:{}:{}", meta.uuid, block.stripe_id, block.raw_sha256);
+                    if let Some(range) = self.cache.get_range(
+                        &cache_key,
+                        Some(&block.raw_sha256),
+                        block.raw_size,
+                        copy_start - block_start,
+                        copy_end - block_start,
+                    ) {
+                        out[dst_start..dst_start + len].copy_from_slice(&range);
+                        continue;
+                    }
+                }
                 if let Some(raw) = self.decode_block_range_locked(
                     meta,
                     block,
@@ -249,6 +270,7 @@ impl ArgosFs {
         preserve_mtime: bool,
         action: &str,
         details: serde_json::Value,
+        write_time: Option<BufferedWriteTime>,
     ) -> Result<()> {
         let rollback = commit_previous_snapshot(meta);
         let (storage_class, boot_critical, old_size, old_blocks) = {
@@ -309,7 +331,7 @@ impl ArgosFs {
         merged.extend(written_blocks.clone());
         merged.sort_by_key(|block| block.raw_offset);
 
-        let now = now_f64();
+        let now = write_time.map_or_else(now_f64, |time| time.at);
         let inode = meta.inodes.get_mut(&ino).unwrap();
         inode.blocks = merged;
         set_inline_payload(inode, inline_payload);
@@ -321,7 +343,7 @@ impl ArgosFs {
         if !preserve_mtime {
             inode.mtime = now;
         }
-        inode.ctime = now;
+        inode.ctime = write_time.map_or(now, |time| time.persisted_ctime(inode.ctime));
         if clear_setid {
             inode.mode &= !(libc::S_ISUID | libc::S_ISGID);
         }
@@ -344,6 +366,13 @@ impl ArgosFs {
             return Err(err);
         }
         self.finish_block_reclamation_locked(meta, &replaced);
+        // Inline-only updates write no physical shard. Account only for
+        // successful range-write windows that actually reached the encoder;
+        // truncate and fsck-repair are not foreground range writes.
+        if action == "write-range" && !written_blocks.is_empty() {
+            self.commit_metrics
+                .add_data_plane_bytes(DataPlaneByteKind::RangeRewriteInput, window.len());
+        }
         self.adjust_quota_usage_for_resize(ino, old_size, new_size as u64);
         Ok(())
     }
@@ -1007,6 +1036,8 @@ impl ArgosFs {
                 data.len() as u64,
                 start.elapsed().as_secs_f64(),
             );
+            self.commit_metrics
+                .add_data_plane_bytes(DataPlaneByteKind::ShardPayloadWritten, data.len());
             if let Some(verify) = &self.verify_written {
                 verify.enqueue(
                     disk_id,
@@ -1056,6 +1087,8 @@ impl ArgosFs {
             data.len() as u64,
             start.elapsed().as_secs_f64(),
         );
+        self.commit_metrics
+            .add_data_plane_bytes(DataPlaneByteKind::ShardPayloadWritten, data.len());
         Ok(Shard {
             slot,
             disk_id: disk_id.to_string(),
@@ -1310,7 +1343,7 @@ impl ArgosFs {
             return;
         }
         if meta.backend != BackendKind::Host {
-            self.deferred_commit.lock().raw_uncommitted_metadata_dirty = true;
+            self.deferred_commit.lock().raw_advisory_metadata_dirty = true;
         }
         if let Some(disk) = meta.disks.get_mut(disk_id) {
             update_latency_ewma(
