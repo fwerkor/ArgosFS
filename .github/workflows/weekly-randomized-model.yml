@@ -348,7 +348,9 @@ jobs:
     name: Coverage fuzz (${{ matrix.target }}, shard ${{ matrix.shard }})
     needs: prepare-matrix
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    # Thirty minutes of fuzzing starts after setup and instrumented compilation.
+    # Five shards exhausted the previous 45-minute all-inclusive budget.
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       max-parallel: 8
@@ -471,7 +473,7 @@ jobs:
           set -euo pipefail
           existing="$(gh issue list --repo "$REPO" --state open --search "\"$TITLE\" in:title" --json number --jq '.[0].number // empty')"
           body="$(cat <<EOF
-          Weekly four-matrix chaos CI failed or was cancelled.
+          Weekly five-matrix chaos CI failed or was cancelled.
 
           - Run: $RUN_URL
           - Commit: $HEAD_SHA
