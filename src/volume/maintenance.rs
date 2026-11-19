@@ -1175,6 +1175,7 @@ impl ArgosFs {
                                     true,
                                     "fsck-repair",
                                     json!({"inode": ino, "stripe": block.stripe_id}),
+                                    None,
                                 )?;
                             }
                             report.repaired_files += 1;
