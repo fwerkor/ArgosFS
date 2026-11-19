@@ -132,3 +132,57 @@ fn advisory_runtime_memory_is_bounded_by_distinct_inodes_and_members() {
     let latest = fs.metadata_snapshot();
     assert_eq!(latest.inodes[&ino].access_count, 1500);
 }
+
+#[test]
+fn pending_disk_latency_is_visible_to_health_and_autopilot_without_mutation() {
+    let (_dir, _images, fs, _ino) = fixture();
+    let disk = fs.meta.read().disks.values().next().unwrap().clone();
+    let initial = fs.meta.read().disks[&disk.id].read_latency_ewma_ms;
+    fs.read_advisory.disk(&disk, 4096, 1.0);
+    let health = fs.health_report();
+    let reported = health.disks.iter().find(|d| d.id == disk.id).unwrap();
+    let projected = fs.metadata_snapshot();
+    assert_eq!(
+        reported.read_latency_ewma_ms,
+        projected.disks[&disk.id].read_latency_ewma_ms
+    );
+    assert!(reported.read_latency_ewma_ms > initial);
+    assert_eq!(fs.meta.read().disks[&disk.id].read_latency_ewma_ms, initial);
+    assert!(fs.read_advisory.pending_entries().1 > 0);
+}
+
+#[test]
+fn immediate_commit_rollback_baseline_keeps_preceding_read_telemetry() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|i| dir.path().join(format!("rollback-{i}.img")))
+        .collect::<Vec<_>>();
+    let fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            compression: Compression::None,
+            defer_metadata_commit: false,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "read-rollback",
+        false,
+    )
+    .unwrap();
+    fs.write_file("/file", b"valid", 0o600).unwrap();
+    let ino = fs.resolve_path("/file", true).unwrap();
+    let before = fs.metadata_snapshot().inodes[&ino].read_bytes;
+    fs.read_advisory.inode(ino, 64, true);
+    let mut meta = fs.meta.write();
+    let rollback = fs.commit_previous_with_advisory_locked(&mut meta).unwrap();
+    assert_eq!(rollback.inodes[&ino].read_bytes, before + 64);
+    meta.inodes.get_mut(&ino).unwrap().read_bytes = 0;
+    *meta = rollback;
+    assert_eq!(meta.inodes[&ino].read_bytes, before + 64);
+    drop(meta);
+    assert_eq!(fs.read_advisory.pending_entries().0, 0);
+    assert_eq!(fs.metadata_snapshot().inodes[&ino].read_bytes, before + 64);
+}
