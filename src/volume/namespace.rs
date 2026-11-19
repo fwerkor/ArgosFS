@@ -250,6 +250,31 @@ impl ArgosFs {
             .map(|(data, _, _)| data)
     }
 
+    /// Account for the portion of a successful FUSE read served directly
+    /// from an acknowledged append buffer. The persisted prefix (if any) is
+    /// already accounted for by `read_inode`, so do not double-count that
+    /// access event. No data or inode timestamps are changed.
+    pub(crate) fn account_buffered_read(&self, ino: InodeId, tail_bytes: usize, prefix_read: bool) {
+        // An EOF/zero-length read is still an observable successful access,
+        // as in the existing volume read path. Only a persisted-prefix read
+        // has already accounted for its access event.
+        if tail_bytes == 0 && prefix_read {
+            return;
+        }
+        let mut meta = self.meta.write();
+        if meta.backend != BackendKind::Host {
+            self.deferred_commit.lock().raw_advisory_metadata_dirty = true;
+        }
+        if let Some(inode) = meta.inodes.get_mut(&ino) {
+            inode.read_bytes = inode.read_bytes.saturating_add(tail_bytes as u64);
+            inode.last_accessed_at = now_f64();
+            if !prefix_read {
+                inode.access_count = inode.access_count.saturating_add(1);
+                inode.workload_score = inode.workload_score * 0.98 + 1.0;
+            }
+        }
+    }
+
     pub fn seek_data_or_hole(&self, ino: InodeId, offset: u64, whence: i32) -> Result<u64> {
         let meta = self.meta.read();
         let inode = meta
@@ -334,7 +359,14 @@ impl ArgosFs {
             if data.is_empty() {
                 break;
             }
-            match self.write_inode_range_checked(dst_ino, destination, &data, None, clear_setid) {
+            match self.write_inode_range_checked(
+                dst_ino,
+                destination,
+                &data,
+                None,
+                clear_setid,
+                None,
+            ) {
                 Ok(written) => copied = copied.saturating_add(written),
                 Err(_) if copied > 0 => return Ok(copied),
                 Err(err) => return Err(err),
@@ -504,7 +536,7 @@ impl ArgosFs {
                     });
                 if !must_repair {
                     if live.backend != BackendKind::Host {
-                        self.deferred_commit.lock().raw_uncommitted_metadata_dirty = true;
+                        self.deferred_commit.lock().raw_advisory_metadata_dirty = true;
                     }
                     if let Some(inode) = live.inodes.get_mut(&ino) {
                         inode.access_count = inode.access_count.saturating_add(1);
@@ -662,22 +694,24 @@ impl ArgosFs {
                     }
                 }
             }
-        } else {
-            if meta.backend != BackendKind::Host {
-                self.deferred_commit.lock().raw_uncommitted_metadata_dirty = true;
-            }
-            if let Some(live) = meta.inodes.get_mut(&ino) {
-                live.access_count = live.access_count.saturating_add(1);
-                live.read_bytes = live.read_bytes.saturating_add(data.len() as u64);
-                live.last_accessed_at = now_f64();
-                live.workload_score = live.workload_score * 0.98 + 1.0;
-            }
+        }
+        // Successful reads with self-heal must account for their validated
+        // prefix once, just like normal reads. These are advisory updates:
+        // they cannot independently trigger a full replicated checkpoint.
+        if meta.backend != BackendKind::Host {
+            self.deferred_commit.lock().raw_advisory_metadata_dirty = true;
+        }
+        if let Some(live) = meta.inodes.get_mut(&ino) {
+            live.access_count = live.access_count.saturating_add(1);
+            live.read_bytes = live.read_bytes.saturating_add(data.len() as u64);
+            live.last_accessed_at = now_f64();
+            live.workload_score = live.workload_score * 0.98 + 1.0;
         }
         Ok((data, damaged, repaired))
     }
 
     pub fn write_inode_range(&self, ino: InodeId, offset: u64, data: &[u8]) -> Result<usize> {
-        self.write_inode_range_checked(ino, offset, data, None, false)
+        self.write_inode_range_checked(ino, offset, data, None, false, None)
     }
 
     pub fn write_inode_range_as(
@@ -688,7 +722,7 @@ impl ArgosFs {
         uid: u32,
         gid: u32,
     ) -> Result<usize> {
-        self.write_inode_range_checked(ino, offset, data, Some((uid, gid)), true)
+        self.write_inode_range_checked(ino, offset, data, Some((uid, gid)), true, None)
     }
 
     pub(crate) fn write_inode_range_from_open_handle(
@@ -697,7 +731,36 @@ impl ArgosFs {
         offset: u64,
         data: &[u8],
     ) -> Result<usize> {
-        self.write_inode_range_checked(ino, offset, data, None, true)
+        self.write_inode_range_checked(ino, offset, data, None, true, None)
+    }
+
+    /// Buffered FUSE writes were already acknowledged before this commit.
+    /// Keep the original write time through COW and journal persistence so a
+    /// read/fsync does not appear to modify an otherwise unchanged file.
+    pub(crate) fn write_inode_range_from_open_handle_at(
+        &self,
+        ino: InodeId,
+        offset: u64,
+        data: &[u8],
+        written_at: f64,
+        seen_ctime: Option<f64>,
+    ) -> Result<usize> {
+        if !written_at.is_finite() {
+            return Err(ArgosError::Invalid(
+                "non-finite buffered write time".to_string(),
+            ));
+        }
+        self.write_inode_range_checked(
+            ino,
+            offset,
+            data,
+            None,
+            true,
+            Some(BufferedWriteTime {
+                at: written_at,
+                seen_ctime,
+            }),
+        )
     }
 
     pub(super) fn write_inode_range_checked(
@@ -707,6 +770,7 @@ impl ArgosFs {
         data: &[u8],
         access: Option<(u32, u32)>,
         clear_setid: bool,
+        write_time: Option<BufferedWriteTime>,
     ) -> Result<usize> {
         let start = usize::try_from(offset)
             .map_err(|_| ArgosError::Invalid("write offset is too large".to_string()))?;
@@ -734,7 +798,11 @@ impl ArgosFs {
             return Ok(0);
         }
         if start == old_size && start % stripe_raw_size == 0 {
-            self.append_inode_data_locked(&mut meta, ino, start, data, clear_setid)?;
+            self.append_inode_data_locked(&mut meta, ino, start, data, clear_setid, write_time)?;
+            self.commit_metrics
+                .add_data_plane_bytes(DataPlaneByteKind::RangeAccepted, data.len());
+            self.commit_metrics
+                .add_data_plane_bytes(DataPlaneByteKind::RangeAlignedAppend, data.len());
             return Ok(data.len());
         }
         let new_size = old_size.max(end);
@@ -785,7 +853,10 @@ impl ArgosFs {
             false,
             "write-range",
             json!({"inode": ino, "offset": offset, "bytes": data.len(), "rewrite": "stripe-window-local"}),
+            write_time,
         )?;
+        self.commit_metrics
+            .add_data_plane_bytes(DataPlaneByteKind::RangeAccepted, data.len());
         Ok(data.len())
     }
 
@@ -796,6 +867,7 @@ impl ArgosFs {
         offset: usize,
         data: &[u8],
         clear_setid: bool,
+        write_time: Option<BufferedWriteTime>,
     ) -> Result<()> {
         let rollback = commit_previous_snapshot(meta);
         let (storage_class, boot_critical, old_size, existing_inline, had_blocks) = {
@@ -865,7 +937,7 @@ impl ArgosFs {
                     .ok_or_else(|| ArgosError::Invalid("append size overflow".to_string()))?;
                 (blocks, None, new_size)
             };
-        let now = now_f64();
+        let now = write_time.map_or_else(now_f64, |time| time.at);
         let inode = meta.inodes.get_mut(&ino).unwrap();
         if full_inline_data.is_some() {
             inode.blocks = written_blocks.clone();
@@ -880,7 +952,7 @@ impl ArgosFs {
         inode.last_written_at = now;
         inode.workload_score = inode.workload_score * 0.90 + 2.0;
         inode.mtime = now;
-        inode.ctime = now;
+        inode.ctime = write_time.map_or(now, |time| time.persisted_ctime(inode.ctime));
         if clear_setid {
             inode.mode &= !(libc::S_ISUID | libc::S_ISGID);
         }
@@ -961,6 +1033,7 @@ impl ArgosFs {
                 false,
                 "truncate",
                 json!({"inode": ino, "size": requested_size, "rewrite": "sparse-extend"}),
+                None,
             );
         }
 
@@ -984,6 +1057,7 @@ impl ArgosFs {
             false,
             "truncate",
             json!({"inode": ino, "size": requested_size, "rewrite": "stripe-window-local"}),
+            None,
         )
     }
 

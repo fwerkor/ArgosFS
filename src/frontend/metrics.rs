@@ -187,6 +187,19 @@ pub fn render_commit_metrics(volume: &ArgosFs) -> String {
 }
 
 fn emit_commit_metrics(volume: &ArgosFs, emitter: &mut MetricEmitter<'_>) {
+    // The counter families share the non-blocking commit-only metrics endpoint.
+    // `shard_payload_written` covers all data-plane writers (including
+    // repair/rebalance), while `range_accepted` covers successful range writes.
+    // Their ratio is only meaningful over an isolated foreground benchmark.
+    for (kind, bytes) in volume.commit_metrics().data_plane_byte_snapshots() {
+        emitter.typed_metric(
+            "argosfs_data_plane_bytes_total",
+            "Successful data-plane payload bytes by accounting stage (metadata I/O excluded)",
+            bytes as f64,
+            &[("kind", kind)],
+            "counter",
+        );
+    }
     for (phase, snapshot) in volume.commit_metrics().snapshots() {
         let labels = [("phase", phase)];
         emitter.typed_metric(
