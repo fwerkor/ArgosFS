@@ -100,12 +100,30 @@ struct DiskReads {
     count: u64,
     latency_ms: EwmaSamples,
     throughput_mib_s: EwmaSamples,
+    observed_read_ewma_ms: f64,
+    peak_read_ewma_ms: f64,
+    initial_write_ewma_ms: f64,
 }
 
 impl DiskReads {
-    fn observe(&mut self, bytes: u64, seconds: f64) {
+    fn observe(&mut self, bytes: u64, seconds: f64, read_ewma_ms: f64, write_ewma_ms: f64) {
+        // Health retains the highest observed read/write latency, not only
+        // the final (decayed) EWMA. The first sample's live baseline is
+        // available under the shared namespace guard; retaining the running
+        // peak costs O(1) even for millions of samples.
+        if self.count == 0 {
+            self.observed_read_ewma_ms = read_ewma_ms;
+            self.initial_write_ewma_ms = write_ewma_ms;
+        }
         self.count = self.count.saturating_add(1);
-        self.latency_ms.observe(seconds.max(0.000_001) * 1000.0);
+        let sample_ms = seconds.max(0.000_001) * 1000.0;
+        self.observed_read_ewma_ms = if self.observed_read_ewma_ms <= 0.0 {
+            sample_ms
+        } else {
+            self.observed_read_ewma_ms * 0.80 + sample_ms * 0.20
+        };
+        self.peak_read_ewma_ms = self.peak_read_ewma_ms.max(self.observed_read_ewma_ms);
+        self.latency_ms.observe(sample_ms);
         if bytes > 0 {
             self.throughput_mib_s
                 .observe(bytes as f64 / (1024.0 * 1024.0) / seconds.max(0.000_001));
@@ -116,9 +134,13 @@ impl DiskReads {
         self.latency_ms.apply(&mut disk.read_latency_ewma_ms);
         self.throughput_mib_s.apply(&mut disk.observed_read_mib_s);
         disk.io_samples = disk.io_samples.saturating_add(self.count);
+        let peak = (self.peak_read_ewma_ms
+            + self.initial_write_ewma_ms.max(disk.write_latency_ewma_ms))
+            / 2.0;
         disk.health.latency_ms = disk
             .health
             .latency_ms
+            .max(peak)
             .max((disk.read_latency_ewma_ms + disk.write_latency_ewma_ms) / 2.0);
     }
 }
@@ -141,7 +163,8 @@ impl ReadAdvisory {
             .observe(bytes, access, now_f64());
     }
 
-    pub(super) fn disk(&self, disk_id: &str, bytes: u64, seconds: f64) {
+    pub(super) fn disk(&self, disk: &Disk, bytes: u64, seconds: f64) {
+        let disk_id = disk.id.as_str();
         // Simple stable byte hash: the member set is small, and independent
         // stripes avoid a mount-global telemetry mutex on parallel reads.
         let stripe = disk_id.bytes().fold(0usize, |hash, byte| {
@@ -152,7 +175,12 @@ impl ReadAdvisory {
             .disks
             .entry(disk_id.to_string())
             .or_default()
-            .observe(bytes, seconds);
+            .observe(
+                bytes,
+                seconds,
+                disk.read_latency_ewma_ms,
+                disk.write_latency_ewma_ms,
+            );
     }
 
     fn apply(&self, meta: &mut Metadata, drain: bool) -> bool {
@@ -196,6 +224,19 @@ impl ReadAdvisory {
         self.apply(meta, false);
     }
 
+    /// Health/autopilot probes need fresh device rates and latency without
+    /// cloning or mutating the whole inode namespace.
+    pub(super) fn project_disks(&self, disks: &mut BTreeMap<String, Disk>) {
+        for shard in &self.shards {
+            let guard = shard.lock();
+            for (id, delta) in &guard.disks {
+                if let Some(disk) = disks.get_mut(id) {
+                    delta.apply(disk);
+                }
+            }
+        }
+    }
+
     /// Caller holds the exclusive namespace lock. No reader can append a
     /// sample after the drain and before the transaction captures metadata.
     pub(super) fn drain(&self, meta: &mut Metadata) -> bool {
@@ -208,6 +249,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn latency_health_peak_survives_later_fast_samples() {
+        let mut observed = DiskReads::default();
+        observed.observe(4096, 1.0, 0.0, 0.0);
+        for _ in 0..100 {
+            observed.observe(4096, 0.001, 0.0, 0.0);
+        }
+        let mut final_ms = 0.0;
+        observed.latency_ms.apply(&mut final_ms);
+        assert!(final_ms < 10.0, "the last EWMA should have decayed");
+        assert!(observed.peak_read_ewma_ms >= 1000.0);
+        assert_eq!(observed.count, 101);
+    }
+
+    #[test]
     fn ewma_compaction_matches_each_original_update() {
         let observations = [(1024, 0.1), (0, 0.2), (400, 0.4), (300, 0.3)];
         for baseline in [0.0, 6.0] {
@@ -216,7 +271,7 @@ mod tests {
             let mut aggregated = DiskReads::default();
             for (bytes, seconds) in observations {
                 update_latency_ewma(&mut expected_ms, &mut expected_rate, seconds, bytes);
-                aggregated.observe(bytes, seconds);
+                aggregated.observe(bytes, seconds, baseline, baseline);
             }
             let mut disk_ms = baseline;
             let mut disk_rate = baseline;

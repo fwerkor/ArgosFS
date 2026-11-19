@@ -37,7 +37,7 @@ impl ArgosFs {
         exclude_disks: &BTreeSet<String>,
     ) -> Result<()> {
         self.ensure_block_backend_writable_locked(meta)?;
-        let rollback = commit_previous_snapshot(meta);
+        let rollback = self.commit_previous_with_advisory_locked(meta);
         let (storage_class, boot_critical, old_size) = {
             let inode = meta
                 .inodes
@@ -272,7 +272,7 @@ impl ArgosFs {
         details: serde_json::Value,
         write_time: Option<BufferedWriteTime>,
     ) -> Result<()> {
-        let rollback = commit_previous_snapshot(meta);
+        let rollback = self.commit_previous_with_advisory_locked(meta);
         let (storage_class, boot_critical, old_size, old_blocks) = {
             let inode = meta
                 .inodes
@@ -648,17 +648,18 @@ impl ArgosFs {
         ) {
             Ok(data) => data,
             Err(err) => {
-                self.read_advisory
-                    .disk(&shard.disk_id, 0, start_time.elapsed().as_secs_f64());
+                if let Some(disk) = meta.disks.get(&shard.disk_id) {
+                    self.read_advisory
+                        .disk(disk, 0, start_time.elapsed().as_secs_f64());
+                }
                 damaged.push(format!("{}:missing-range:{}", shard.disk_id, shard.slot));
                 return Err(err);
             }
         };
-        self.read_advisory.disk(
-            &shard.disk_id,
-            data.len() as u64,
-            start_time.elapsed().as_secs_f64(),
-        );
+        if let Some(disk) = meta.disks.get(&shard.disk_id) {
+            self.read_advisory
+                .disk(disk, data.len() as u64, start_time.elapsed().as_secs_f64());
+        }
 
         let first_checksum = verify_start / checksum_block_size;
         let last_checksum = verify_end.div_ceil(checksum_block_size);
@@ -1441,16 +1442,20 @@ impl ArgosFs {
                 let start = std::time::Instant::now();
                 match self.read_shard_locked(meta, shard) {
                     Ok(data) => {
-                        self.read_advisory.disk(
-                            &shard.disk_id,
-                            data.len() as u64,
-                            start.elapsed().as_secs_f64(),
-                        );
+                        if let Some(disk) = meta.disks.get(&shard.disk_id) {
+                            self.read_advisory.disk(
+                                disk,
+                                data.len() as u64,
+                                start.elapsed().as_secs_f64(),
+                            );
+                        }
                         Ok(data)
                     }
                     Err(err) => {
-                        self.read_advisory
-                            .disk(&shard.disk_id, 0, start.elapsed().as_secs_f64());
+                        if let Some(disk) = meta.disks.get(&shard.disk_id) {
+                            self.read_advisory
+                                .disk(disk, 0, start.elapsed().as_secs_f64());
+                        }
                         Err(err)
                     }
                 }

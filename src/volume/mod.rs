@@ -1002,6 +1002,17 @@ impl ArgosFs {
         }
     }
 
+    fn commit_previous_with_advisory_locked(&self, meta: &mut Metadata) -> Option<Metadata> {
+        // Immediate commits restore this snapshot on failure. Merge all
+        // successful *preceding* reads before taking it so a rollback cannot
+        // silently erase their counters. Deferred raw writes have their own
+        // durable commit baseline and must avoid draining on every write.
+        if meta.backend == BackendKind::Host || !meta.config.defer_metadata_commit {
+            self.drain_read_advisory_locked(meta);
+        }
+        commit_previous_snapshot(meta)
+    }
+
     pub fn sync(&self) -> Result<()> {
         let waiting = Instant::now();
         let mut meta = self.meta.write();
@@ -1374,7 +1385,7 @@ impl ArgosFs {
         {
             return Err(ArgosError::AlreadyExists(name.to_string()));
         }
-        let rollback = commit_previous_snapshot(meta);
+        let rollback = self.commit_previous_with_advisory_locked(meta);
         let file_type = mode & libc::S_IFMT;
         let kind = if file_type == libc::S_IFREG || file_type == 0 {
             if rdev != 0 {

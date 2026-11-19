@@ -43,7 +43,7 @@ impl ArgosFs {
                 limit,
             });
         }
-        let rollback = commit_previous_snapshot(&meta);
+        let rollback = self.commit_previous_with_advisory_locked(&mut meta);
         let inode = self.dir_inode_mut_locked(&mut meta, ino)?;
         inode.quota_bytes = Some(limit);
         inode.ctime = now_f64();
@@ -69,7 +69,7 @@ impl ArgosFs {
         self.ensure_block_backend_writable_locked(&meta)?;
         let ino = self.resolve_path_locked(&meta, path, true, 40)?;
         self.dir_inode_locked(&meta, ino)?;
-        let rollback = commit_previous_snapshot(&meta);
+        let rollback = self.commit_previous_with_advisory_locked(&mut meta);
         let inode = self.dir_inode_mut_locked(&mut meta, ino)?;
         inode.quota_bytes = None;
         inode.ctime = now_f64();
@@ -816,7 +816,7 @@ impl ArgosFs {
         clear_setid: bool,
         write_time: Option<BufferedWriteTime>,
     ) -> Result<()> {
-        let rollback = commit_previous_snapshot(meta);
+        let rollback = self.commit_previous_with_advisory_locked(meta);
         let (storage_class, boot_critical, old_size, existing_inline, had_blocks) = {
             let inode = meta
                 .inodes

@@ -883,8 +883,9 @@ impl ArgosFs {
 
     pub fn health_report(&self) -> HealthReport {
         let meta = self.meta.read();
-        let disks = meta
-            .disks
+        let mut live_disks = meta.disks.clone();
+        self.read_advisory.project_disks(&mut live_disks);
+        let disks = live_disks
             .values()
             .map(|disk| risk_report(disk, &relative_or_absolute(&self.root, &disk.path)))
             .collect();
