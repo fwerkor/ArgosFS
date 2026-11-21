@@ -710,6 +710,13 @@ impl ArgosFs {
         )
     }
 
+    /// Use exactly the write layout that the range writer uses when deciding
+    /// which buffered EOF prefix consists of complete logical stripes.
+    pub(crate) fn writeback_stripe_geometry(&self, ino: InodeId) -> Result<(usize, usize)> {
+        let meta = self.meta.read();
+        self.range_update_geometry_locked(&meta, ino)
+    }
+
     pub(super) fn write_inode_range_checked(
         &self,
         ino: InodeId,
