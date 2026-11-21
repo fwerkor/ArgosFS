@@ -7,7 +7,7 @@ license = "Apache-2.0"
 description = "ArgosFS self-driving erasure-coded root filesystem"
 authors = ["FWERKOR"]
 repository = "https://github.com/fwerkor/argosfs"
-homepage = "https://github.com/fwerkor/argosfs"
+homepage = "https://argosfs.org"
 
 [lib]
 name = "argosfs"
