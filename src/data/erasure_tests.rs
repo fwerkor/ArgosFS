@@ -225,6 +225,15 @@ fn parity_layout_retains_legacy_empty_and_invalid_input_contracts() {
     assert!(RsCodec::new(256, 1).is_err());
 
     // No parity is a special layout; no RS library may reject it.
+    // No-parity reconstruction historically accepted uneven shard lengths.
+    assert_eq!(RsCodec::new(300, 0).unwrap().total(), 300);
+    let no_parity_mixed = RsCodec::new(2, 0).unwrap();
+    assert_eq!(
+        no_parity_mixed
+            .reconstruct(vec![Some(vec![1]), Some(vec![2, 3])])
+            .unwrap(),
+        vec![vec![1], vec![2, 3]]
+    );
     let no_parity = RsCodec::new(1, 0).unwrap();
     assert_eq!(
         no_parity.encode(&[Vec::<u8>::new()]).unwrap(),
@@ -263,7 +272,10 @@ fn larger_redundancy_layouts_preserve_legacy_parity_and_repair() {
                 }
                 let mut new = old.clone();
                 legacy.reconstruct(&mut old).unwrap();
-                assert_eq!(codec.reconstruct(std::mem::take(&mut new)).unwrap(), expected);
+                assert_eq!(
+                    codec.reconstruct(std::mem::take(&mut new)).unwrap(),
+                    expected
+                );
             }
         }
     }

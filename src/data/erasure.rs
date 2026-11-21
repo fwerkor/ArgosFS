@@ -42,9 +42,9 @@ impl RsCodec {
         let total = k
             .checked_add(m)
             .ok_or_else(|| ArgosError::Invalid("erasure shard count overflow".to_string()))?;
-        // Reed-Solomon over GF(2^8) can address no more than 256 shards,
-        // including a parity-free layout.
-        if total > reed_solomon_engine::MAX_SHARDS {
+        // Only erasure-coded layouts are bounded by the GF(2^8) field.
+        // The parity-free path historically permits more than 256 shards.
+        if m != 0 && total > reed_solomon_engine::MAX_SHARDS {
             return Err(ArgosError::Invalid(format!(
                 "erasure shard count {total} exceeds GF(2^8) limit"
             )));
@@ -97,10 +97,19 @@ impl RsCodec {
                 shards.len()
             )));
         }
-        if self.m == 0 && shards.iter().any(Option::is_none) {
-            return Err(ArgosError::Erasure(
-                "layout has no parity shards for reconstruction".to_string(),
-            ));
+        if self.m == 0 {
+            // Legacy no-parity layouts return the provided shards unchanged;
+            // they do not impose the parity codec's equal-length requirement.
+            return shards
+                .into_iter()
+                .map(|shard| {
+                    shard.ok_or_else(|| {
+                        ArgosError::Erasure(
+                            "layout has no parity shards for reconstruction".to_string(),
+                        )
+                    })
+                })
+                .collect();
         }
 
         let shard_size = shards.iter().find_map(|shard| shard.as_ref().map(Vec::len));

@@ -1504,8 +1504,8 @@ fn legacy_codec_superblocks_import_write_recover_without_reformatting() {
         compression: Compression::None,
         ..VolumeConfig::default()
     };
-    let fs = ArgosFs::create_loop(&images, config, 32 * 1024 * 1024, "codec-legacy", false)
-        .unwrap();
+    let fs =
+        ArgosFs::create_loop(&images, config, 32 * 1024 * 1024, "codec-legacy", false).unwrap();
     let original = (0..125_000)
         .map(|i| ((i as u64 * 151) ^ (i as u64 >> 9)) as u8)
         .collect::<Vec<_>>();
