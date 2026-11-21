@@ -305,12 +305,7 @@ mod tests {
     fn reference_parity_matrix(data: usize, parity: usize) -> vec::Vec<u8> {
         let mut out = vec![0u8; parity * data];
         let mut scratch = vec![0u8; reference_scratch_len(data)];
-        assert!(build_parity_matrix_by_inversion(
-            data,
-            parity,
-            &mut out,
-            &mut scratch
-        ));
+        assert!(build_parity_matrix_by_inversion(data, parity, &mut out, &mut scratch));
         out
     }
 

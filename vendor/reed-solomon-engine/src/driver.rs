@@ -104,14 +104,8 @@ fn combine_in_place<S: AsRef<[u8]> + AsMut<[u8]>>(
     indices: &[u8],
 ) {
     let (left, rest) = shards.split_at_mut(out_index);
-    let (out, right) = rest
-        .split_first_mut()
-        .expect("out_index is always a valid shard index");
-    let inputs = SplitShards {
-        left: &*left,
-        right: &*right,
-        gap: out_index,
-    };
+    let (out, right) = rest.split_first_mut().expect("out_index is always a valid shard index");
+    let inputs = SplitShards { left: &*left, right: &*right, gap: out_index };
     combine(kernel, coeffs, indices, &inputs, out.as_mut());
 }
 
@@ -153,10 +147,7 @@ pub(crate) const fn check_matrix(
     // both counts by `MAX_SHARDS`.
     let expected = parity_shards * data_shards;
     if parity_matrix.len() != expected {
-        return Err(Error::MatrixSizeMismatch {
-            expected,
-            actual: parity_matrix.len(),
-        });
+        return Err(Error::MatrixSizeMismatch { expected, actual: parity_matrix.len() });
     }
     Ok(())
 }
@@ -185,16 +176,10 @@ where
     check_counts(data_shards, parity_shards)?;
     check_matrix(parity_matrix, data_shards, parity_shards)?;
     if data.len() != data_shards {
-        return Err(Error::ShardCountMismatch {
-            expected: data_shards,
-            actual: data.len(),
-        });
+        return Err(Error::ShardCountMismatch { expected: data_shards, actual: data.len() });
     }
     if parity.len() != parity_shards {
-        return Err(Error::ShardCountMismatch {
-            expected: parity_shards,
-            actual: parity.len(),
-        });
+        return Err(Error::ShardCountMismatch { expected: parity_shards, actual: parity.len() });
     }
 
     let len = uniform_shard_len(data)?;
@@ -227,10 +212,7 @@ pub(crate) fn encode_all_with_kernel<S: AsRef<[u8]> + AsMut<[u8]>>(
     check_matrix(parity_matrix, data_shards, parity_shards)?;
     let total = data_shards + parity_shards;
     if shards.len() != total {
-        return Err(Error::ShardCountMismatch {
-            expected: total,
-            actual: shards.len(),
-        });
+        return Err(Error::ShardCountMismatch { expected: total, actual: shards.len() });
     }
 
     uniform_shard_len(&*shards)?;
@@ -296,18 +278,12 @@ pub(crate) fn reconstruct_impl<S: AsRef<[u8]> + AsMut<[u8]>>(
     check_matrix(parity_matrix, data_shards, parity_shards)?;
     let total = data_shards + parity_shards;
     if shards.len() != total {
-        return Err(Error::ShardCountMismatch {
-            expected: total,
-            actual: shards.len(),
-        });
+        return Err(Error::ShardCountMismatch { expected: total, actual: shards.len() });
     }
 
     let required = workspace_len(data_shards, parity_shards);
     if workspace.len() < required {
-        return Err(Error::WorkspaceTooSmall {
-            required,
-            actual: workspace.len(),
-        });
+        return Err(Error::WorkspaceTooSmall { required, actual: workspace.len() });
     }
     uniform_shard_len(&*shards)?;
 
@@ -343,10 +319,7 @@ pub(crate) fn reconstruct_impl<S: AsRef<[u8]> + AsMut<[u8]>>(
 
     let n_present = n_present_data + n_present_parity;
     if n_present < data_shards {
-        return Err(Error::TooFewShards {
-            present: n_present,
-            required: data_shards,
-        });
+        return Err(Error::TooFewShards { present: n_present, required: data_shards });
     }
 
     let missing = n_missing_data;

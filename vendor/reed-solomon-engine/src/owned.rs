@@ -142,12 +142,7 @@ impl Codec {
             return Err(Error::SingularMatrix);
         }
 
-        Ok(Self {
-            data_shards,
-            parity_shards,
-            parity_matrix,
-            kernel,
-        })
+        Ok(Self { data_shards, parity_shards, parity_matrix, kernel })
     }
 
     /// Writes the parity shards for `data` into `parity`.
@@ -217,8 +212,7 @@ impl Codec {
         present: &ShardMask,
         workspace: &mut [u8],
     ) -> Result<(), Error> {
-        self.as_matrix_ref()
-            .reconstruct_data(shards, present, workspace)
+        self.as_matrix_ref().reconstruct_data(shards, present, workspace)
     }
 
     /// A zeroed workspace of the right size for this codec's
@@ -312,10 +306,7 @@ mod tests {
     fn a_zero_count_or_an_oversized_total_is_refused() {
         assert_eq!(Codec::new(0, 2), Err(Error::NoDataShards));
         assert_eq!(Codec::new(4, 0), Err(Error::NoParityShards));
-        assert_eq!(
-            Codec::new(200, 57),
-            Err(Error::TooManyShards { total: 257 })
-        );
+        assert_eq!(Codec::new(200, 57), Err(Error::TooManyShards { total: 257 }));
     }
 
     #[test]
@@ -342,9 +333,7 @@ mod tests {
             present.remove(1);
             shards[1].fill(0xFF);
             // `&codec`, not `&mut codec`: this is what 0.1.0 could not express.
-            codec
-                .reconstruct(&mut shards, &present, &mut workspace)
-                .unwrap();
+            codec.reconstruct(&mut shards, &present, &mut workspace).unwrap();
             assert_eq!(shards[1], expected);
         };
         decode_once(0);
@@ -405,9 +394,7 @@ mod tests {
         shards[0].fill(0xA5);
         shards[5].fill(0xA5);
 
-        codec
-            .reconstruct_data(&mut shards, &present, &mut workspace)
-            .unwrap();
+        codec.reconstruct_data(&mut shards, &present, &mut workspace).unwrap();
         assert_eq!(shards[0], b"alpha");
         // Parity 5 was not asked for and so was not recomputed.
         assert_eq!(shards[5], vec![0xA5; 5]);
@@ -425,10 +412,7 @@ mod tests {
         present.remove(2);
         assert_eq!(
             codec.reconstruct(&mut shards, &present, &mut workspace),
-            Err(Error::TooFewShards {
-                present: 3,
-                required: 4
-            })
+            Err(Error::TooFewShards { present: 3, required: 4 })
         );
     }
 

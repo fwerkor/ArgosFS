@@ -366,9 +366,7 @@ mod tests {
     }
 
     fn pattern(len: usize, seed: u8) -> std::vec::Vec<u8> {
-        (0..len)
-            .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
-            .collect()
+        (0..len).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)).collect()
     }
 
     /// A pseudo-random coefficient matrix, `rows * cols` bytes, row-major.
@@ -400,9 +398,7 @@ mod tests {
 
     /// `data_shards` distinct source shards of `len` bytes.
     fn sources(data_shards: usize, len: usize) -> std::vec::Vec<std::vec::Vec<u8>> {
-        (0..data_shards)
-            .map(|j| pattern(len, (j as u8).wrapping_mul(53).wrapping_add(3)))
-            .collect()
+        (0..data_shards).map(|j| pattern(len, (j as u8).wrapping_mul(53).wrapping_add(3))).collect()
     }
 
     #[test]
@@ -538,9 +534,8 @@ mod tests {
                     let srcs: std::vec::Vec<&[u8]> =
                         owned.iter().map(std::vec::Vec::as_slice).collect();
 
-                    let mut buffers: std::vec::Vec<std::vec::Vec<u8>> = (0..parity_shards)
-                        .map(|_| std::vec![0xEDu8; len + CANARY])
-                        .collect();
+                    let mut buffers: std::vec::Vec<std::vec::Vec<u8>> =
+                        (0..parity_shards).map(|_| std::vec![0xEDu8; len + CANARY]).collect();
                     {
                         let mut outs: std::vec::Vec<&mut [u8]> =
                             buffers.iter_mut().map(|b| &mut b[..len]).collect();
@@ -572,9 +567,7 @@ mod tests {
     #[test]
     fn the_kernels_the_environment_requires_are_all_supported() {
         // Unset, as on any ordinary machine, this test asserts nothing.
-        let Ok(required) = std::env::var(REQUIRED_KERNELS) else {
-            return;
-        };
+        let Ok(required) = std::env::var(REQUIRED_KERNELS) else { return };
 
         let available: std::vec::Vec<&str> = Kernel::supported().map(|k| k.name()).collect();
         for name in required.split(',').map(str::trim).filter(|s| !s.is_empty()) {

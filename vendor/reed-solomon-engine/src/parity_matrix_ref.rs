@@ -127,12 +127,7 @@ impl<'a> ParityMatrixRef<'a> {
         parity_shards: u16,
         coefficients: &'a [u8],
     ) -> Self {
-        Self {
-            data_shards,
-            parity_shards,
-            kernel: None,
-            coefficients,
-        }
+        Self { data_shards, parity_shards, kernel: None, coefficients }
     }
 
     /// Returns the same matrix with a caller-chosen inner kernel.
@@ -298,9 +293,8 @@ mod tests {
 
     #[test]
     fn the_pinned_kernel_survives_the_builder() {
-        let matrix = ParityMatrixRef::new(4, 2, &COEFFICIENTS_4_2)
-            .unwrap()
-            .with_kernel(Kernel::SCALAR);
+        let matrix =
+            ParityMatrixRef::new(4, 2, &COEFFICIENTS_4_2).unwrap().with_kernel(Kernel::SCALAR);
         assert_eq!(matrix.kernel(), Kernel::SCALAR);
     }
 
@@ -308,10 +302,7 @@ mod tests {
     fn a_zero_count_or_an_oversized_total_is_refused() {
         assert_eq!(ParityMatrixRef::new(0, 2, &[]), Err(Error::NoDataShards));
         assert_eq!(ParityMatrixRef::new(4, 0, &[]), Err(Error::NoParityShards));
-        assert_eq!(
-            ParityMatrixRef::new(200, 57, &[]),
-            Err(Error::TooManyShards { total: 257 })
-        );
+        assert_eq!(ParityMatrixRef::new(200, 57, &[]), Err(Error::TooManyShards { total: 257 }));
         // A sum that would wrap must be reported as oversized, not folded back
         // into the legal range.
         assert_eq!(
@@ -324,17 +315,11 @@ mod tests {
     fn a_coefficient_count_that_does_not_match_the_split_is_refused() {
         assert_eq!(
             ParityMatrixRef::new(4, 2, &COEFFICIENTS_4_2[..7]),
-            Err(Error::MatrixSizeMismatch {
-                expected: 8,
-                actual: 7
-            })
+            Err(Error::MatrixSizeMismatch { expected: 8, actual: 7 })
         );
         assert_eq!(
             ParityMatrixRef::new(4, 3, &COEFFICIENTS_4_2),
-            Err(Error::MatrixSizeMismatch {
-                expected: 12,
-                actual: 8
-            })
+            Err(Error::MatrixSizeMismatch { expected: 12, actual: 8 })
         );
     }
 
@@ -352,10 +337,7 @@ mod tests {
         let mut parity: [&mut [u8]; 2] = parity_buffers.each_mut().map(|b| b.as_mut_slice());
         assert_eq!(
             transposed.encode(&data, &mut parity),
-            Err(Error::ShardCountMismatch {
-                expected: 2,
-                actual: 4
-            })
+            Err(Error::ShardCountMismatch { expected: 2, actual: 4 })
         );
     }
 
@@ -392,20 +374,14 @@ mod tests {
         let mut parity: [&mut [u8]; 2] = parity_buffers.each_mut().map(|b| b.as_mut_slice());
         assert_eq!(
             matrix.encode(&data, &mut parity),
-            Err(Error::ShardCountMismatch {
-                expected: 4,
-                actual: 3
-            })
+            Err(Error::ShardCountMismatch { expected: 4, actual: 3 })
         );
 
         let mut buffers = [[0u8; 4]; 5];
         let mut shards: [&mut [u8]; 5] = buffers.each_mut().map(|b| b.as_mut_slice());
         assert_eq!(
             matrix.encode_all(&mut shards),
-            Err(Error::ShardCountMismatch {
-                expected: 6,
-                actual: 5
-            })
+            Err(Error::ShardCountMismatch { expected: 6, actual: 5 })
         );
     }
 
@@ -425,9 +401,7 @@ mod tests {
         shards[1].fill(0xA5);
         shards[4].fill(0xA5);
 
-        matrix
-            .reconstruct(&mut shards, &present, &mut workspace)
-            .unwrap();
+        matrix.reconstruct(&mut shards, &present, &mut workspace).unwrap();
         assert_eq!(shards[1], b"east");
         assert_ne!(shards[4], &[0xA5u8; 4]);
     }
@@ -442,15 +416,8 @@ mod tests {
 
         let mut from_owned = [[0u8; 4]; 2];
         let mut from_borrowed = [[0u8; 4]; 2];
-        OWNED
-            .encode(&data, &mut from_owned.each_mut().map(|b| b.as_mut_slice()))
-            .unwrap();
-        borrowed
-            .encode(
-                &data,
-                &mut from_borrowed.each_mut().map(|b| b.as_mut_slice()),
-            )
-            .unwrap();
+        OWNED.encode(&data, &mut from_owned.each_mut().map(|b| b.as_mut_slice())).unwrap();
+        borrowed.encode(&data, &mut from_borrowed.each_mut().map(|b| b.as_mut_slice())).unwrap();
         assert_eq!(from_owned, from_borrowed);
     }
 }

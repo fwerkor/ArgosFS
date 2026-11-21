@@ -109,11 +109,7 @@ impl<const CAP: usize> ParityMatrix<CAP> {
             "the construction refuses only splits the asserts above have already rejected"
         );
 
-        Self {
-            data_shards: data_shards as u16,
-            parity_shards: parity_shards as u16,
-            coefficients,
-        }
+        Self { data_shards: data_shards as u16, parity_shards: parity_shards as u16, coefficients }
     }
 
     /// The `parity_shards * data_shards` row-major coefficient matrix.
@@ -260,10 +256,7 @@ mod tests {
 
         assert_eq!(
             M.encode(&data, &mut parity),
-            Err(Error::ShardCountMismatch {
-                expected: 4,
-                actual: 2
-            })
+            Err(Error::ShardCountMismatch { expected: 4, actual: 2 })
         );
     }
 
@@ -293,8 +286,7 @@ mod tests {
         shards[1].fill(0xA5);
         shards[4].fill(0xA5);
 
-        M.reconstruct(&mut shards, &present, &mut workspace)
-            .unwrap();
+        M.reconstruct(&mut shards, &present, &mut workspace).unwrap();
         assert_eq!(shards[1], b"east");
         assert_ne!(shards[4], &[0xA5u8; 4]);
     }

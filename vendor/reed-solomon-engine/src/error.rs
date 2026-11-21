@@ -76,10 +76,7 @@ impl fmt::Display for Error {
             Error::NoDataShards => f.write_str("data_shards must be at least 1"),
             Error::NoParityShards => f.write_str("parity_shards must be at least 1"),
             Error::TooManyShards { total } => {
-                write!(
-                    f,
-                    "{total} total shards exceeds the maximum of {MAX_SHARDS}"
-                )
+                write!(f, "{total} total shards exceeds the maximum of {MAX_SHARDS}")
             }
             Error::ShardCountMismatch { expected, actual } => {
                 write!(f, "expected {expected} shards, got {actual}")
@@ -93,10 +90,7 @@ impl fmt::Display for Error {
                 write!(f, "expected {expected} matrix coefficients, got {actual}")
             }
             Error::WorkspaceTooSmall { required, actual } => {
-                write!(
-                    f,
-                    "workspace of {actual} bytes is smaller than the required {required}"
-                )
+                write!(f, "workspace of {actual} bytes is smaller than the required {required}")
             }
             Error::SingularMatrix => f.write_str("matrix is singular"),
         }
