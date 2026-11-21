@@ -1,0 +1,1696 @@
+# reed-solomon-engine known-answer vectors: encode and decode
+#
+# GENERATED FILE. Do not hand-edit. Regenerate with
+#
+#     cargo test --test regenerate_vectors -- --ignored
+#
+# and read the diff carefully: every byte here is wire format. Changing this
+# file is a semver-major event.
+#
+# ---------------------------------------------------------------------------
+# WHAT IS PINNED
+# ---------------------------------------------------------------------------
+#
+# One [case] block per (data_shards, parity_shards, shard_len) triple:
+#
+#   data_shards   = k
+#   parity_shards = m
+#   shard_len     = L, the length in bytes of every shard
+#   data[i]       = the pinned contents of data shard i, for i in 0..k
+#   parity[j]     = the parity shard j the encoder must produce, j in 0..m
+#   erasures      = one pinned erasure pattern, as comma-separated indices
+#                   into data[0..k] followed by parity[0..m]; repeated once
+#                   per pattern
+#
+# Encode: given data[0..k], the encoder must produce parity[0..m] exactly.
+#
+# Decode: for each `erasures` line, the listed shards are overwritten with
+# 0xA5 filler and marked missing, the rest are handed to the decoder
+# unmodified, and the decoder must restore every listed shard to the bytes
+# above, byte for byte.
+#
+# The shard lengths across the table cover 1, 2, 4, 8, 15, 16, 17, 31, 32,
+# 33, 63, 64, 65 and 1200. The awkward lengths are deliberate: a vectorised
+# kernel with a mishandled tail must fail these vectors rather than pass
+# them. 1200 is a UDP MTU payload.
+#
+# ---------------------------------------------------------------------------
+# HOW THE DATA SHARDS ARE GENERATED
+# ---------------------------------------------------------------------------
+#
+# Data shard i of the case (k, m, L) is the first L bytes of a SplitMix64
+# stream whose 64-bit state is seeded with
+#
+#     seed = ((((k * 1000003 + m) * 1000003) + L) * 1000003 + i)  mod 2^64
+#
+# Each output is produced by advancing the state:
+#
+#     state  = (state + 0x9E3779B97F4A7C15)               mod 2^64
+#     z      = state
+#     z      = ((z XOR (z >> 30)) * 0xBF58476D1CE4E5B9)   mod 2^64
+#     z      = ((z XOR (z >> 27)) * 0x94D049BB133111EB)   mod 2^64
+#     output = z XOR (z >> 31)
+#
+# where `>>` is a logical right shift. The shard is the concatenation of the
+# little-endian 8-byte encodings of the first, second, ... outputs, truncated
+# to L bytes. Ten lines in any language, which is the point: these vectors
+# can be reproduced without reading this crate's source.
+#
+# ---------------------------------------------------------------------------
+# HOW THE ERASURE PATTERNS ARE CHOSEN
+# ---------------------------------------------------------------------------
+#
+# With total = k + m, the candidates below are considered in order. Each is
+# sorted ascending and deduplicated, then dropped if it is empty, if it has
+# more than m entries, if any entry is >= total, or if an earlier candidate
+# produced the same set. Small parameter sets therefore keep fewer patterns.
+#
+#   E1  {0}                         the first data shard
+#   E2  {k}                         the first parity shard
+#   E3  {k-1}                       the last data shard
+#   E4  {k-1, k}                    across the data/parity boundary, if m >= 2
+#   E5  {0, ..., min(m,k)-1}        as many leading data shards as possible
+#   E6  {k, ..., k+m-1}             every parity shard
+#   E7  {total-1, total-3, ...}     m shards from the end, stride 2, if m <= k
+#
+# ---------------------------------------------------------------------------
+# CROSS-VALIDATION
+# ---------------------------------------------------------------------------
+#
+# Every erasure pattern below was round tripped at generation time: the
+# listed shards were overwritten with filler, reconstructed, and required to
+# come back byte for byte. A pattern this crate cannot recover therefore
+# never reaches this file.
+#
+# The parity bytes rest on the matrices in parity_matrices.txt, whose own
+# cross-validation is described in that file's header. Both the data shard
+# generator and the matrix construction are stated in full so that these
+# bytes can be reproduced without reading this crate's source.
+#
+# ---------------------------------------------------------------------------
+# FILE FORMAT
+# ---------------------------------------------------------------------------
+#
+# Line-oriented, and parsed by hand in tests/known_answer.rs so that the
+# verifier shares no code with the encoder:
+#
+#   * `[name]` opens a block.
+#   * `key = value` sets a field of the open block. A key may repeat.
+#   * A line beginning with a space or a tab continues the previous field's
+#     value; its trimmed text is appended with no separator.
+#   * Blank lines, and lines whose first non-space character is `#`, are
+#     ignored.
+#
+# Hex is lowercase with no separators. Payloads longer than 32 bytes are
+# wrapped at 32 bytes (64 characters) per continuation line. Index lists are
+# comma-separated decimal, wrapped at 16 entries per line with a trailing
+# comma so that concatenation reproduces the single-line form.
+
+[format]
+name = reed-solomon-engine-kat
+version = 1
+
+[case]
+data_shards = 1
+parity_shards = 1
+shard_len = 1
+data[0] = 0a
+parity[0] = 0a
+erasures = 0
+erasures = 1
+
+[case]
+data_shards = 1
+parity_shards = 1
+shard_len = 17
+data[0] = eecdce0db59c7ef8bb5fac17cc79199269
+parity[0] = eecdce0db59c7ef8bb5fac17cc79199269
+erasures = 0
+erasures = 1
+
+[case]
+data_shards = 2
+parity_shards = 1
+shard_len = 2
+data[0] = 5d77
+data[1] = b3d9
+parity[0] = 9c36
+erasures = 0
+erasures = 2
+erasures = 1
+
+[case]
+data_shards = 2
+parity_shards = 1
+shard_len = 16
+data[0] = 8e8b7b4ce7ee24a5abb35a041e0f89b8
+data[1] = 61a294cb1a2aa00c7625b6461ee45c8f
+parity[0] = 4dd9b85f007b31ea0c829f801ec43ed6
+erasures = 0
+erasures = 2
+erasures = 1
+
+[case]
+data_shards = 3
+parity_shards = 2
+shard_len = 33
+data[0] =
+  febdae3b178255baa420ac154aa6b715d82e40f08ef21323431b0624e3b9bbb3
+  c9
+data[1] =
+  852d7d773d43419d084d90299a8e9ae5eb680dce3ddf52cddae1926ee558e4ee
+  c7
+data[2] =
+  1fc08857a0bac247e6e92e93c9d6f697d5a660bb64147113dd8b083370178888
+  ab
+parity[0] =
+  64505b1b8a7bd6604a8412af19fedb67e6e02d85d73930fd44719c7976f6d7d5
+  a5
+parity[1] =
+  7d5aac14cf54a0ab3ce37adba9c659ed7333d2ba39e970a09cdff63c9e21d3fb
+  e8
+erasures = 0
+erasures = 3
+erasures = 2
+erasures = 2,3
+erasures = 0,1
+erasures = 3,4
+erasures = 2,4
+
+[case]
+data_shards = 4
+parity_shards = 2
+shard_len = 15
+data[0] = 7fcf96a5b77fc0f4d3bc37696f02c0
+data[1] = 692424ae3b0fb661674d0db604f50c
+data[2] = c3f6940352fdf2e238c8da30e4a520
+data[3] = 4ff803d8c6c1d13834fe342d83ee2b
+parity[0] = 67179de83a6a8bf9cf951887fdd943
+parity[1] = 0a98f139e6af1ed3cccce0eebe8127
+erasures = 0
+erasures = 4
+erasures = 3
+erasures = 3,4
+erasures = 0,1
+erasures = 4,5
+erasures = 3,5
+
+[case]
+data_shards = 4
+parity_shards = 2
+shard_len = 31
+data[0] = f88093ab6161a4eb791d0c24bb24322b886b5d38f5a5adf8e6160b5736cb44
+data[1] = fa47b009aab00749958c27ea5cb47d916f54f1b373af0da592225bd73b93cf
+data[2] = a9a14768747def3274c32e0433f9f3a85055c5e7fa3e23323872ad1fac6987
+data[3] = 704b1c45e6d643770c8653ff6e5b3d638ba25f538c0909b9df86ccc78fceb7
+parity[0] = 696e7a7c89e9be13bba9c9797aeb0a251e11bcc7cf8b9d322c55b11a474a71
+parity[1] = 8b4754db89393fd908fa0b0926d764a471a4a4ce530f26a115db4757ae2a47
+erasures = 0
+erasures = 4
+erasures = 3
+erasures = 3,4
+erasures = 0,1
+erasures = 4,5
+erasures = 3,5
+
+[case]
+data_shards = 4
+parity_shards = 2
+shard_len = 64
+data[0] =
+  b0af4cb4f62a8827bf80f13dbe3bf55f1a97671b9031edca71d6d25f48118f14
+  c74cc32cb792bc6d9d0452b90829a077aaad93de5696feef45692e30b3dda05b
+data[1] =
+  36a1224e04c58a6403b530133c1a97bf698fa0fcebe51d5791f8075e4df7636d
+  bda647b7c32191234b87341d179cb2cc95c9f81bf1173ac9a6ab02e6be0f4f8b
+data[2] =
+  259fe640d72a36efd8cbc299ff6a43ce1ab64a02792658f6e07e25944e035a98
+  2c807b536030003a61895a32be983f98fbd90aa255bb4afc053e443682b0b8d7
+data[3] =
+  2890cb489965348d8cb38fd0ac1b60c77c49de9264d1478ef1e866f67c064cd6
+  5cada1e9e5bacb2266b36495bb82ed81fafead414ab57cb28473f2745b954695
+parity[0] =
+  e36b954136693b21d81f3f10b3e12cf8bcfcf7c4882b6a9b2bf9cb38ff23ac7f
+  f80acc31b0db1f84a3e0e1d1b6cdeede8bdad66f981a7bdb68c63505cb40923d
+parity[1] =
+  78636cad6b6139a42e99f171ed3dd554b18cc70cba35c262d7604d6e48b566b4
+  be48916cd8fe5c23a9d24a7ff5bd468e30292f7e889ea990da01628c049a1ba6
+erasures = 0
+erasures = 4
+erasures = 3
+erasures = 3,4
+erasures = 0,1
+erasures = 4,5
+erasures = 3,5
+
+[case]
+data_shards = 4
+parity_shards = 2
+shard_len = 1200
+data[0] =
+  ced58bf797ca3a508b67ab6e874a9b45ffc53d83d7b28a3fed113bc2a228f47b
+  a2f49a1f8bff38bef127947b7a5076ab80acd7bf4fb8f8b0e76b53a85aea6614
+  ec0c8000d9d9cf683c98a04ed6267e0a152eb698f5787ee335aba04cbc997974
+  61d01b4e944a34f83c9c0418079d35d223a6e8891ef5fe7c58645c76b4aad465
+  4cc7d2976a691546b0d1cb20af5d6a3f49e62873667638020f25720a531569fe
+  838351c179e4b90d52a93158e6d5b2ef9b9b5a208a7529b0754be09175e16622
+  5728c447e407f606bf3b9c2d6b0059acb1c1924189251cf4f2380cdfef894481
+  e60a28fd6d73a2605d6f49635e2738000b0834d70796233ac1359d3976052a41
+  8fc0d6713e66a67817c1972c381c847d7a6a344dc76adb755f4db88895c12779
+  6d520322b7a7a6aa5eca3ac2a9272f104202d485c6640f730bc01251ad15e1c1
+  175ef119c34a71b85cfa148847edaceedae59b703da783543e44be3c0ffafa3f
+  f46d9d42fc3a7229326a55a35e4c19d455747d0bdbbc949d9f55fdc70048f902
+  a79b3975562c7bee9560858301fed91d5c4c239b93bfb81c6895f09dde2c50b3
+  8e463ddeab7da06ba13f4b579ac1fbfe41cd86ccc738238910d5fc3398887a6d
+  9b2297a6c2ec037c0253c03b119593a6f702f585b467b14d861c72326af67a21
+  241f26002d53bf34e5a43dc2301c8ae012e62a5df12451cc3b2b7f38264da10c
+  9e20833e144c271fb2f91e6510d12e9d6fb2ad27faa234e235efb26a973294e2
+  ea7492ef076a2b84a5b8156404164503b94e50b2f9b40900883a8f1e93b1593c
+  c26738cc5c7be475d304a6f0b8f6fca5ac7b53619f168cbf9e9113192a109475
+  2da0e6501fca83e0615164370f0d7a57bf3d9ce1d136644586e5d2d76cfacbcb
+  cd856ad9847f63e35bdd6226aa5529295f1c236e0fcae654d6fe475034ed3765
+  cc621a8c0deba59cd6d7df202b2ddf7005f4ef08336413608b0f6db602736ee5
+  9dc2b2ab3ae5222d73be8758a68785b8bb8179a8d43fc3c84e369e7bc813cc90
+  13ec41bbcee6f1766019d5e2989cdd6d6c7e16c5be45f8d65cf9117979ca9366
+  7949c5592ed1dd14ec275593f4ee5a1780c61c644f88c0404170ebc0c8ca3365
+  0922b1e497e95d053ddf32d2f6dc22861fb7b266fc37aa72dc87e3ad54a433ce
+  72d2c2006b54e8ace5874bf48574930da906860fb23a6664e26e24f668768b10
+  b09a9a9e46c59464fe91431b69f70dc3ba78081bf11a7fdea4e641b6ce7c85a4
+  6f64cedec13c7ca16bb4d2c12cef2b8b8e5d8a1480ccaef5ed05e581583e3f39
+  47c91a96f7b2e34960ce09f860e6a12d2d24fe037752c16f9a32b4b043ba974c
+  4c0f0e44d4635a238816e9c32da476fba34c2665c79d0ca4f2edce71a0cc6622
+  96c56f6b1988521e2398c1b3b4c5f5f78178234a8fe7559379e138bf79c2b81f
+  024b395ecdbb0ce38f9c7e20865646fd7789fa611ed633031138e24147497471
+  979886928bb5d36a47c216976cc4a6afa76bfaa438e824581e3c6371ae4ece05
+  9eb450c65f1ee24058d9f9fd3c1776b5e64705f0ce9af2d0f74912db16bc0dd3
+  f6f281a6e8d538b7d7c4620dc8ad180b3a0e0da6dbca8d99ab9dc8112b01b4c7
+  88ee0559681a0007d0f11f21854d31ed270789aba6642a4528c1c9484d596ff7
+  04fcd9145a149c7ad76d7adb5e28b9fb
+data[1] =
+  16145c0b7f26ba778b60de88d49421716fb5a8ca2ce007f85c185074aa42c1ad
+  e0a3fbca4263742fd5d044401628dd504fc67eef926207883e81dedfbf9f054c
+  85625e317c896cb855aa0dfa1ddc036dbe7feacdaf6e093842deaa4ea03c714b
+  9f4a747ac02afe40d36bf8f6083a2b062ae67705affd0fba0dd62695358f26d6
+  11bc4d5f20538f0039a7d2afccec6139a7d3d9c80e922d8dd12179d5e8f07b46
+  3e8d7f25e285b4636df31b4c60c774e98c446d2c4bee4dc88644e18d1d932825
+  86847421364d87380e4c931a08f71644efc1ee374d431a1c7aa2a29ad862780f
+  393ffcb2be4d9d0f3d2959a0f7fa1f33b811794c1e2d7296d06f2a17e5ddc265
+  98d896f966f66e9f7cbebdae44f50e1baa60cd4e21ed3d1a3975098af6c2d483
+  16900766a760ce8ca3b737159fdee5ce7f2015c868835458fddd55b2df769ece
+  a6b00d2f10fab53f06bd215dee56c21e4dbf57b56d6b73fdad66a8a7b45540f7
+  5c784d4998ef7a112be5965994ec0533419f7856cf90b8e0036d495f66143889
+  96f4798a5be0bb013f2fb3044ceb66bbdc1b930b76a44cccd9982f5a795fc1e9
+  130b86c545d91f065666677745afa848c3791fa64cf471ee427d65e14d6942f5
+  4dd89f8c32e5559a886699ec6dbb8395c3afbb85df9deeb8c0b8a8e125fcc1ce
+  a11510b73e71376b82e1046255761311cb7548db90f5803aeca8ab761e718318
+  1828627645c61041dcddca814bf89c684c5d5e3e1612f7a68532bd1fd5811023
+  9e07bf29f51c8c0c5bc2703c539122c8a24c2f617948ea0a88e97ef6a222af74
+  f514c6802caa8ecbeca0f4ae59dfff182311bf00a3d88f273d6165dc7d24b678
+  ea840b22614bf22658b17e9ab7bd1e86701faa50c47fca3ae9f46c9a513bfc79
+  d1542e9a3277cbe5f32c823d55abe252854d085a5e5095c411454673a8e20950
+  dbffd122f74b31f6eb3a9ce19049cf2fb2d088e909d11b2d5ad97ec99b557dd8
+  34be10424651ed0405883bd084cf0b9e48d0ed7766ee7bdf0e56e9abb21f4b23
+  661c1be13c847d11f38d410f37779799642724bcb1efbf6dbc3f5a66a70521a2
+  57c5ac325034791893d4b75db90b663ad7c3fce26b311c50ca9fdbd399501de1
+  c0a95c8fd649a564573007c14b0680485b288a26bf968034ef2eb2aa196fe278
+  f148216c5119b4515f983a1fad4e28366fd77aa5d1bdbd080071691c9f604590
+  3d4fa53de4746e2a0eb375111619904740d509eae8181843902dd8df1e6a376a
+  56d059851e62314da01d7790db3d72292ad48fa59c62a10966c1c9b9c89c9961
+  e018512d430fcadee204ccf03be49e253c499cb4b4ca99ee847d00420b8ee665
+  5c7932b5c10ac0dca20c3b83d7459dec88781a4fa58323c422e596963a4af3cf
+  787ceafa73454b589a1b075e924774d52bb202850837e9408e38316091f5b329
+  5f25177ee702e43af928e7f11fcf315cf8a355319a15177362ebef10e7dc436e
+  ee79ce7399b46578cdcf7c28c3e4362cb89ac5debdea0181665154a46fe21532
+  61cf25cea1bfe894c4a2c1f4053afc2407496c591681bdf35ee597fbbe38ab6a
+  0361df3278787cf8eb88ac4551cfefaa267727bf49eefd53b8afe81907610ccb
+  6977f9d8c0c4020eb6b0426a06e8ec3327cf931204f921b7415d0e3fdd60005a
+  522f87d8bff2ef0f2f7d552b67a1ffcf
+data[2] =
+  ad950d8b8d18b3e27231e2babfe91f38c2affd7c3e6a7e20fef223d0585d7560
+  aac4b6d4198b9e2b6d8d897692db286ba471e6811cd35cbfa3ca67de295d40bd
+  09e9a1a7c538d3a262b9cea245e75a2212e2272524229c17d6a8d5d33fe38819
+  b7e9adb7bd34f93cd47253fa7cd8d7eccb13434b0ab07593edf71834e662e960
+  e3f1a1aa41c486a719f74971c87c699c0f1e114ca52a5fa9f09dccae4c9a3bbd
+  4a68ba686b8e9ccba18ac7caf5fa97101ae4c541e1a0378358086c57bc4ecc53
+  dfbb58f63f036c1fcf3e262c1b18182e411ef3afb495be683c7441cb2e5bd34b
+  718654a7f8e78cfcac46e24278cc7280a9b1bfa4339295cc186a42b99c4d65b3
+  683f3bb948f8a2709f0ff7757fc5c4b2d63f31a7ba65457ead7ba33f77a9e751
+  19ac4c04712a8fd1a15ed5513c7784d9fc7fb5bad29b20b2bb10aaf7120db5c8
+  84d6f495c5a888da90792ac65d93dcb03e44f3a6119c48feab2f7e36beaf9fa9
+  51069ae694b86dc3b9dcb898167dbb5f4a6c3bd57a3c497e764e294fe08832b9
+  8594c138ba6faeed061fb9512b3a95ef42d53cdb4725f77eef55e7424ab51eec
+  fd523e23a4eec5b6275596432301c08020593964d34754c99d27f1437b1301f6
+  fa8f09ddad5e3f310ef810f31086ab367c7d73ca0759e5ccaecc5b2e16a61848
+  224a49d990d86784cf2222fe5b29951b230c33123fe5be652652bde6921c9940
+  c463cd5b5876b819a21517064c9b0eea0a6e41c1cc30ce8d7649d1a075940411
+  6052d88bd8b99feafcd570a30361cc6c6ad547080e0a8679a85353f8673ce555
+  04d0a14cbee536cb90d5a25e441633798bc6e6ca924c2f2e9d8d08ae65151da0
+  7d5302f454426b8655d4ca62d6e2cab4c49b4efd34fa9b8f7567a5f49f281e5b
+  2b4e84aad8c05da00517f19ea798809b1907470b312ee58188447cddc444fb66
+  ac733910d526caa583e7518cf5acd7287d3140d145742ff54fecd5671067f494
+  ae3e95c4654310ba0f159f1424f2bbd5a9c9f80860cbaa65c4c70ed9da004684
+  d2bad966dd817ad9773f87897045db530b23571b6f73ed64b94a1eab811ece53
+  e584ae93ab5c2a9c6da7f74c5849b657acda19b3b921649ce660541d0532b7cf
+  dd5c0a7f08c617f29d58ea7afdfc2cf89df12fc4d22bc45851e228a808ec7bdb
+  2afee00e949fe8fd924747d5187290b805948539636338235e7130b258f0568a
+  760a9c04e1afa2a116301d62539887886e20c8fb18a1405be93c0760522d5d76
+  0b4cbe65eb2bb46a997359b8c35be5658080293b3b699088c8f83b4a2539dc43
+  b41a79bc1aab0138e6de3b6636873b8964157d659865237e255531cef6d4740c
+  32df1c132c530d6c912b6dc0ff56dd4b3373ee3080858a78c6a24e1c99f2ea6c
+  208ea442316447a69aa1fd14bc5083ac6d66bb3e2de8f0fb3ba7f2aecb8688cd
+  574ef950eff99eeb30aa48973ebd4dcf17801a4f34fd80413ac65bfe922c69d1
+  0cc5c4a619d45e69c791f59e0f5847ab7cc2024785c145e30c9e1f78dd975f55
+  50af377766042aee041678eb0885d7c101700e13efcb240f87f139802c6c799a
+  ba1ceb46a706edd3e6b4f94fd6ccf404b56a88c59221f6910e818f32df0055f5
+  7ff10e5547d773c990319b4bd58a24712acd93d6211419385b8080536edde7f1
+  226767504c3a8ac8a4b8a6bc2f5ac73e
+data[3] =
+  5ee9bc1e9f95373db5b85ee69385b0e7e87a1fe756d0d4cc07337d4d1a5f5de1
+  fe167737902e1f94e2d449030e32f75311c5a9bf4c4f6625a961bd4f0894263d
+  7861b897a20f79061864b225bc6889a3ff8154cd3ead9c7d56aa021cf342388a
+  c51ea215dae6183a72be19fc8b2fd60a1defa47b92e9a7e2e371f361b35b99b9
+  1a18aaced870efc3f8cab4fa2bc8721f58b5fd3aecbad6a6bd468386510fad46
+  8f2e4b34f8b9065fc9adc08e5423115b2b78d14ef81f79e8a1e22f268e223529
+  ccc5f0fff91422a4e5c649dfaa9e05af2f1610fa8887b14395c4afe8065d2988
+  b53264318ab864cb40df88cd8baa7c87698231421fb28a83497acfd0735ba054
+  be255fa1a34322d09c053967b8658d1647c0751faa32c54c1589ffffe2624679
+  4ec7611b586994c85755f91e9273678e1b617c6667f8b3b057dd304fcd3bdbfd
+  144998992639da1d0ccad0160016416195b51b7844b936b9b38b40f757dbe1b0
+  56370db293856ca9839726c743d2cf90ab9cc61bdf63e5650f4fb5857b46f3e6
+  db04ffee2131571e382af58cd24c3f64c931862fb4af31ffe8cdd2f27d403075
+  704efcf6bb6d97419929b27b8bfc570570c8f695eef8a11daa9ab8ab919407d5
+  3381a4c4e73a9849d8c7f5e7ed817413e88f0fe22c493041c6f1cf3bd8a3b46b
+  ec6f647545b5dcb8c2676912f7ac6af8e212a94a5a60a206a6ad950b412c413d
+  a836cdac4fc89c76a1ff931c268fdc289c236e322efa66f07a517392675772c0
+  6aa8202cd1074ecb3899aa4cf5748ce72b384ce3791d02e6774b0b64ad80421f
+  a56b6cd463a19d2c9aea865a4395ef6af685c0da2cae5307141a106e45f1ec00
+  771c56561c1b7f38dbf31b74274ba1a550cc99eb34ed434157852b28055c104c
+  3605e220960dbf1ff5f57344a8e95ab38e1d621cb3a842e12dd2248752d4a9b8
+  db489f346187873bd6c98759a15ea4db2c43a8b5abfed96ac4a9ef745acd7c72
+  2f26b8915f65b074e451f45c2ff1d64875632d2a8cba71155ae12bcfc7a96948
+  6b437a3f6302e42228a1f0cccd2517c1ada9d49dcae06ba51038552267cbcc4d
+  690c8eeb9c8c023975962a6ed233bb86519624e40209c01372f79201458fa6f6
+  61a06d67bb38cd8dd43a8aa58d317b6d244d61dfb042fce076cc9af5651a3048
+  0259875cfeaaa55cd510b6afc3020407361c42a243adddda5fe05ed57296b8dd
+  1b2261d1bc4e621d34b08d21b1c651b812ee6bb43096e89dc0ce31acacb0d5e4
+  c061b54e527c9cf5ccb8351b4f19adb0a7fbe4673196901f704659109b5084a1
+  3c03a21395a38a56b66e557a6a31d936900d55a5a59f1e4a442cf432a8203782
+  8df491ce5d64e9e5bd381ac9b6c4842a836cb28899015ed36809394f863ac3a4
+  376327dd6f90a4cf9484a5628641ff96d5eb8dfb87e8497bd0141e8d153f4cd6
+  92d0671ccf76c0b26c2dcfc59794b6f637b74e8bc2ecce6c840da4a91e11fac5
+  b6538c6207d024b03ce68a98b1587af3db25eed6c0f5db3a53e59486d0098b8f
+  bae89288f10a2238815c25fe2ee5737dcfa65e66ed4893e23a0911b0f4fa4a06
+  8495ae36c62b8068c7754221d6c945b75bef15c8f38f637a218fac9d6e79ae16
+  1cc377f15d485f4e91670d75c3c12d10b6fd11c45eace9f99c0d73224247f3ee
+  9ac926d2c33c868a12c21871fe7a1677
+parity[0] =
+  31dfe5360ce80f0270bc8072f7040476382fb907a353422daf32b751250fd987
+  9d4035e6af1dce7957a749212b31401d6811298a2850530f3ef4af67fd35c979
+  1a462f7443a042feeb1e2a0e42d3d99c27c15b72aa327556eaccd1669789b07a
+  2ed504282369981e805215ec847b22770bc097ee8916be03fb67b5e18fb863d1
+  632bb68f20679ca22e6779870d3e6574622edc1f1f0ea0013a98b073b0e58a95
+  a07a56f619e6ec20ffe32c871e807b6ac0671c27edf7589cd8e1a6e82216ae4b
+  15a2bfced7a5092b70a48c65a7219cf386994d0e956b730ff61bcf1e67b12f8e
+  c476822c9e0629c444b9126a1768b215a343fc26d42cb300cce1db76a245d8ed
+  f0105240e4d779260c4ad60cd936ba6106c160ba93e270c06017e69ef8af4ac4
+  fdee9244ca5a85ab41aca45672f9e2447a0b69ce66b51484ba14a541330a92e0
+  15f0d3d4e67bc4cce7d95293367aa64a631a32192ba6da77c584ae102372eb90
+  8048441d7956c4ae611e8796ae4f61b8afee2094bb54cf890281ec78d58f3f25
+  e1767f639b32a2623e3ba6a5ca1be40cf0b600710f873ba3f18cbdf15f48ec01
+  784cbc51e2af97d7a45262cf7f9f28e5b0a5d37fdebba20224f388bf25059f0d
+  af649837d31849fbcab32dc0169cf4413fe443202fe9ccb91eb4ab6ffb97ab2a
+  99da35fcdfe6ba9e5d850cba5718df6ecf7ab798103a9035db328bd8f9bbe87e
+  922774fe02438632b2f5f2c5d426c4c2582b2208a5060bd48e451166ffbef3e9
+  2079e413fc361315a2a3a06fe8d29d030dee2398b539f89062a07abdc4223505
+  3e5631070115eacf0282e245a839566606abca09b6a33b6bd7b5d5aef5555255
+  f9c23efef0e7f1f955ec507c9755365a2609f24c043ab33d442683d48d1bf959
+  57c4bcc374652fc53fe187e6737ca755c501fb16e3a1e53882aa556632076b47
+  fa88f1a0d5025c71b3cb35a4a9fc80e7a0212b2961ee5fa553324c9608049e51
+  0cb4070a3378a7409a68d4628e2b384f6a5ef1415e93ee06511c5a9dec35535b
+  6b623499fe8b8dd3b591cd76b63509b1d3852144fa9b2beab66f51a0aaeb8cd8
+  3b9910c11d00bebfad58d6a4be2306530a7b531a3f63bf710915f760a7924a3b
+  07f56d54b48efda72bf71dd612b367099634f01f9405eb005d5bec37691c5f97
+  279dc75caaa87b28cb0c1ea2d14c5ed3000b44710460166733de8846217bfb95
+  0383f8625a71ccfea93d279d419e7f55515bfa57861495d31345d03b0d79f988
+  8b66400f203033a03cc6810c8d210e4e0de154f2f80c9e1ac459d727dd72927f
+  70c4a0d611148056f9b637d607c83dcb4b070579fdafda048da0deb285c58780
+  7192be3ad54047c1ebfc242e715bbd32b255826c6d3a9a56d246650c04bd705e
+  cea7cbb929af30d56a72606e044b18c09f2770d176ed6120aeb5b3c37ee8373a
+  1c5edb44c41419878f3af39d6a9fc11f824b51e010b4d8e50b2d4f2ea01ea7f2
+  82f26d8fa0a248d7de5b08b1630ca2a12a44efbe7691e36343bd16879464d5b8
+  b20676370d871045f04d926cc0a4d132a3c303b7e896824ee693385c2d47ba27
+  9f95eb59ebd6e8bc3595eb240b7eb03dab082034f4ed6819dd4f669f3fc934c6
+  21e41af3be4d45dbe548d5e8df7d5fc576732aede83b184ec087a3f5b6e735ff
+  833d210e0e9215f5c272764411f94988
+parity[1] =
+  13b77ba1c25f970fd8b8792fbb51c00213a60398154b1d10b3b1621d8c08a2be
+  ab2eb387fb17160cae93f9a35d08ce56a685eea3fc0308dc3785cd7ebaefb4cb
+  2346594350bfd70be8745b10250a6795053ce58e6d552d0c95962ff051340f8a
+  df3c364fdd82a805c43f7a48a1217e0ffa2f05cdcee58550696d8e91ccd5ba03
+  c11b7688ba5e1628cab6021049910e4b3d786330b1cfdaa9a9643ea4f83da7ba
+  10d980a5b26eb4682faae86e4a1220df032fe121c6b4c08e178a36878b20755f
+  72d85fd77d3cfa2cbcd6def012ed227078a954b27b284357b87dfc12120ebdb3
+  4162348fac63de662b07031c7f08639e27a601ae73ea5bdc401af0d72403de79
+  5b04ca8f31bd1c4e0a169ec9187480b14dcf30047bbfdf7cf8a9032a952648e8
+  6efd60c74ca2da0f86f86ff63334de8ba1a198c2926dc55910d31665888a8b73
+  6225687e950d53d6139cff589d45d87c7c9d2686652629804b95484a693df384
+  ed851bc94ac9fa67b233979501cd10afbf5f0f842e4fc4bdfa2fa8118798fe6c
+  af21266ac5b5f4c5cb7591e3185925444a6c8ca49edd6388d3d82419bf08d8eb
+  85fa0cd410d97cc1f8d57ebf8fbcd9f9e4cfa368c64005e83525cbf172ad2328
+  3b9c69b79862037e95badba74b447c06ec96a1d0d9558841bc61c81295bf6257
+  bb325911627b98965bc004afbe2a0ff346e0ffe0690ed59ae3a46d7b81afec01
+  52fce913da71dbcaaf4fdb1f29812b85e22f23576db7af06913cd79c40306148
+  4d1b0d8e2eca9d4cc06d60a25e1e2855d7b479db3d8554c39af35a70d5533841
+  5aaf6589b89d3cba835b99da27cbad189f37a053a1852772880ada758dbba091
+  aa8162563a8cc332f9a4ca6c84b370312e08b8086faa34c398279dd845435812
+  4d6e340ce8c926725a7a364196870ad9acf7f4e8627354b214ff9f4e926d2032
+  b0e6491596a42419e3962f1d4acbc77779ec49f199d9693e43a9a99c412df08c
+  558da04cc6871701856fa0505ac4c6d47b2ffeaa35a5015eeff5dce3d9c003f7
+  8ca442c9b9956ddbb439294c75c3700c180c92052ea7d050fd361aece478b9fa
+  fe0dd2c0c85b15629d1db6385ba39c4c86d547407e9b6e04c0f7c95190dae616
+  ed519b08e3f7c9828b11cb573b1bc100e661e198112ead7816c7cdf1e459f5ff
+  79891bb46de8410045be4808e9d707d7c211227df04c4952a1c20fa52250f5dd
+  f46271e8c03daaa68ff4e23c57f7454e98a1100539a86a8969188cab3972d793
+  a4a3b869b6583d7b943ea84b7db431c3847edb179059b381e59c424ea9500a9c
+  359fac153f3042edad7d2fa64e55f6563e49c6e10066c11c8c5b5164b94b5a5c
+  a437032385f0c417d5d00fc5068ddd0ce49be30d085f95b61ba3df74a7824a6d
+  0cfb5a0cfbf40f714602c5fe6a84adb2596223221fe7c304110dde2e22dca4e2
+  362a7211d219627905242e615381b9c9c82fdeefa5a19d46ecae546be85c6fd7
+  4b3c25b09abd6c456f571cbfaaecfbc282c1008449277bbae9a48ea8c7642cdb
+  33f5d93798e3169d3a90e92dbb3abf4da027fcecd6fae7f337da741cb8af4540
+  ea5aefaf675c5af147d006b8e353cef0a1439f5576d27c1546f54c627aff1b92
+  eba0dfac9d08a3d1cc7b0880058640be19914789be7833166a7ddc9689335dd9
+  8bfd3d7b8a0e79328303183a62a15aaf
+erasures = 0
+erasures = 4
+erasures = 3
+erasures = 3,4
+erasures = 0,1
+erasures = 4,5
+erasures = 3,5
+
+[case]
+data_shards = 5
+parity_shards = 3
+shard_len = 63
+data[0] =
+  236cb8e10b9303150e37b242b215b4677f0727a0eb8f62c4d3fbb78899f2c921
+  2e9767232897312109fbe1133981d3d7c0abf377cd93582e26ee1671a0af7a
+data[1] =
+  f9bdd5b09509db4ff9d5a375d48e52e0aa367f251605d143d9aaebd0a01d4b76
+  15272c5cb07dc4318c58dd5e2796ef1c482547a8488b846f4260f99a5b2e84
+data[2] =
+  d0e4be2147d63ff132bae173e316670231f736299269bbf49bffe8416e4f6483
+  acf6ed4e2a21fac0abcb1adc8d72f26b5b17c90f7f4704a97e409ac067a0c0
+data[3] =
+  8b27f211be566c5fd0b80375061fc9bf4b62037e562fa890c902eb93b569539a
+  b21ddc92dfac105e0c07c5049ad56ea4e0b719865cbab86d2fedf1b44355ff
+data[4] =
+  7ed14c1a425d11368c423352791fa0dc59f9547e5483729eebf0569b675287dd
+  13b475691aa660dab5ae0cf7bbef74e31939b875d940baffbf2af6e9bb3b0a
+parity[0] =
+  856ce710939bd46e05da32c332cfebc749377f2d3f9b26692c6ed5d828319c33
+  f6c33ffbf103d7c9fc7240e3937faf303b534943af3c3b87656e2667b89f48
+parity[1] =
+  f1c95ff511c80121189cabf644f8097406400a29f84bc2e559fdcb76d3e9eb35
+  a4370875570f533f1ac1bce447f53c7f07e8858732efc12452812ed4cab3f6
+parity[2] =
+  8b66d59ea7144f8d84e459568cba0a55b92a4ca8aa9f36f1c6cf17bf7e434595
+  641b3844d1cdfba27172136566d547a816ac10e7e27620d9bde67ac5166375
+erasures = 0
+erasures = 5
+erasures = 4
+erasures = 4,5
+erasures = 0,1,2
+erasures = 5,6,7
+erasures = 3,5,7
+
+[case]
+data_shards = 8
+parity_shards = 4
+shard_len = 32
+data[0] = f0a7185bfc89a868a262159352894e7bf3ec3461c1da835743b9f7aa9f366b77
+data[1] = 3c378fdd816029e88834931a83085adafb08e9168c2427534d1dd8dbc3e55df2
+data[2] = c884315ae0afa4ff4751ad3dbad1ce69c0251b2688519e619485643f76c87aa5
+data[3] = cb8362d284d6b25b301a952c89842bffbf7ba8b79c484fe51b11147a6cb99dd3
+data[4] = ce20423ba52b513b50d89416e78bc6701aa765206ac6bb05a0497eb1102b036e
+data[5] = f83b6fe927312853636e07d865f1ae3a5ab1b6a35ce46c90b5b0e446bcfcb78b
+data[6] = 728615efe62f0f83dd853a8cd4b013e9d1b2202151b2087194bd706d8e94f679
+data[7] = 4eccf3cb8892c34974883fe402516fbae894e33b813245831aed3681e41be26b
+parity[0] = 59434b6dedb8cb0d8945c4e687b832745c5ff0bb7d7893c42494d5c1f5455750
+parity[1] = 9224528a9c600078bd672093ea64ae9f7fad7f1bd2306a8db9c0a84ea3d9c1b3
+parity[2] = 99cc46b57acfe37528191bf633eedf186c33e687b6d42acc1a5c6d8a3276b11a
+parity[3] = f56e494dfd62699f05670b5880dd20fafc28ad7ddadca8bbe72cba19ed758e52
+erasures = 0
+erasures = 8
+erasures = 7
+erasures = 7,8
+erasures = 0,1,2,3
+erasures = 8,9,10,11
+erasures = 5,7,9,11
+
+[case]
+data_shards = 8
+parity_shards = 4
+shard_len = 65
+data[0] =
+  faeff5706f22c3d6c8a600cbef27ec3671263edb6eb20853a9f8f408e161fdb9
+  e73a41fafc9143b8b6d290fc1799b4101c848ada7659937283d6d231f88984aa
+  e4
+data[1] =
+  7af98abb511f376ac52a68eca28cd15003eada30b3e871e01142c15e789b0492
+  c5a20709a63e80a4d710e8e7c5fa8be70ac2fe13ff81f0ee27383cf1af5263dd
+  59
+data[2] =
+  d272a76d14380a10c460fcdc3853c92503ac04e467a69c17273c45b63805e27a
+  18610e73218cc8240c117ca91a7c44b6f4aca83db22a1021e064bb48c6633510
+  52
+data[3] =
+  b5d250dff2aee37d3d61cb585c9a8b300c716917bfa1626e8d2a0767513befd0
+  ff82c9ab1041beaf15d55851f334b733d703bb40e5cd44a0947cb721dc6bc707
+  bc
+data[4] =
+  57d8ffaa2e61d705cc85e3496f4cb2fee8bb4dd649f4e72418c2cc1e71e75b39
+  7c91a52a392185f9381c8b9746aa00ba1c41795d710018015bfffe645d694daf
+  3c
+data[5] =
+  86a7b2e1365216ed99d8190b3f3b052acdcaa40d812ebcd308b81f4b706f1a17
+  33ddacf15c2ab3e68eba6e1e219f2e22baabdeb1c54f0b7a1fb894bf8bb2b870
+  94
+data[6] =
+  aead7c56502e12c06f2d4eb7aa84a292aae127e717276dceb6147700f5a119ef
+  7c297e57b58f3599959f907f3e0cfcffb9deb4fd246bc527bcdbe2efa1253cb1
+  2f
+data[7] =
+  7204b20cf18a3d704b8605a9eac707569d4fb97addb620dc2cf05cdab6fe2624
+  6fe6f6a1f234006bc3d510e413bcab76a969e77af24783e22ff45a8a75c2b9bd
+  97
+parity[0] =
+  4407dc21f7f1f8ed84f1a6782139b2371560fb138f36f533098246582791cb2f
+  458e731cdbd89df5a029294706d1e0a834e16f2865db285bae7f95cb37c2e2ab
+  e9
+parity[1] =
+  2d2b34b2bd577b79e5fc8e3f1c47647026a00ba5290aef101e639154133d442c
+  ab3d5887cd067787fb036bc7868313b31768b0d296522393a4495b6730c29ee7
+  d2
+parity[2] =
+  790858ea12869cfd8d791e4cf51e8e11430d9f754f228ef5f810ccc230837c7f
+  a0e745faf41a5e0fa3824c6d68f8b2e18fe922fc28fcf87ba35f61c72bc52314
+  ce
+parity[3] =
+  b781b2a385e499d1991d71dbc0e2ca0ccc3e838b8e4ab734fff671f990ac54b6
+  9f3eef3ec6d13d1882ee73b9ab708ba16c99123ba536fba11be9cadd5a18174a
+  75
+erasures = 0
+erasures = 8
+erasures = 7
+erasures = 7,8
+erasures = 0,1,2,3
+erasures = 8,9,10,11
+erasures = 5,7,9,11
+
+[case]
+data_shards = 10
+parity_shards = 4
+shard_len = 1
+data[0] = e8
+data[1] = 67
+data[2] = d3
+data[3] = 2f
+data[4] = 13
+data[5] = cb
+data[6] = 14
+data[7] = cd
+data[8] = 50
+data[9] = 98
+parity[0] = b6
+parity[1] = 4f
+parity[2] = e6
+parity[3] = f9
+erasures = 0
+erasures = 10
+erasures = 9
+erasures = 9,10
+erasures = 0,1,2,3
+erasures = 10,11,12,13
+erasures = 7,9,11,13
+
+[case]
+data_shards = 16
+parity_shards = 8
+shard_len = 32
+data[0] = a53456fe5fec70543fe56d29a2254663bddf6178981a63856e56f95cee332009
+data[1] = ff85c6542cacaf8a8c2d7c964be1b99a2a522da59fb10ce400bd0c49a1fd76c0
+data[2] = f6bd516afd1ec48bc08ec109684e1624ac870f100476b3770d9ff1787464f433
+data[3] = 5c4e99b82645dc5a017213080fa3c872d6b30295c267303ceae2037d127ca20c
+data[4] = 5fa5453dd4d18b33fd4915a72096bae9e6d8906d7d05ac032862b3c2c97b8873
+data[5] = 8eaef2bb9b681736c5d4dc558fbb310a506f2af4114f181ffb1ef454bcdda6f0
+data[6] = 5018b502eb9ff4e0e1173c0bae6c9ac6f90abad543c6375a4daa5f226917e4a2
+data[7] = abe30b9e5ea2f06e0cac654e712615ef980962083562e3c2335849244ca7ffba
+data[8] = 9a2affab8525405c5cb23275a6e6cf703e8f61849f8777cea8418835c1725bfa
+data[9] = d3ccbdc1500895a12a9d0dab49abffc10452f6ccfc41e7d066ee01420a72ad14
+data[10] = c49f71e6fc1f6bb7eae0ca4616ded486b35e0c6c594f11505261e34648b36389
+data[11] = 06ea7f3db5dd82da9d9265f7d2517bfbf75da7deee5b5f7bdbf3e3928b87c3da
+data[12] = 4632ad6d3e9e984aaba12194850fb6a097c10989a4b9bf735e3228dff2cbb2b2
+data[13] = edb1d837df5a43c98aec1cfb4fa64e4b2e9e849d371b266a116a44fb7a2f1b64
+data[14] = 972d6d224dee84d4bfa915ed42942cc1a02b9c2ec30ed2711c5701abaf675cf3
+data[15] = 6dc14680c21799925e5859142eb9e00d35a908bba759b0e67889c316047960bc
+parity[0] = 073a4757f8ef11a2d5036a57090b2794695ebedac136b2d172a62201a8029857
+parity[1] = 6f95155a7688a5717f0c21dcb14f9c29e9ef6872a9675581123466724068fb6f
+parity[2] = 0527ab98ed2820a5581f4ea8510e6b2e7bec1cf0b7c5d74c3613c2227a3860d6
+parity[3] = d19a0fe84813dfaed43d74cf7a6bf8b1c51ddb5b7603e646a4363f73be302713
+parity[4] = 0a48c391a9d9b62810b813d408e2aa925baea2a6c9974eae823f29b6faf7ad25
+parity[5] = 1ec850a5b71ad122060439af0fd13932b0f5d225c0d5e934aa321e4cdf52a13b
+parity[6] = 4e803d6cdb130236cac6518285cd8e4f888b87f969164be375738a5643b812a1
+parity[7] = 3c38ee7f2896c2c8e0866bc2c5c99b23b8ffffd394bd711a29586e646fddeb86
+erasures = 0
+erasures = 16
+erasures = 15
+erasures = 15,16
+erasures = 0,1,2,3,4,5,6,7
+erasures = 16,17,18,19,20,21,22,23
+erasures = 9,11,13,15,17,19,21,23
+
+[case]
+data_shards = 17
+parity_shards = 5
+shard_len = 15
+data[0] = b4c2edb23253456ecbf792c209deb2
+data[1] = 40d67a9a2bdd602179631a8361b33b
+data[2] = 2bb537e8ccee159a2145de6c59de22
+data[3] = f5fe3ae20c004ad31c006288bc091a
+data[4] = 12c75044eff226918ff32cab86ef5d
+data[5] = d720275ed23fdfd23e36a1822b271f
+data[6] = efa2babda64d52ff5bdd3b2b3c926e
+data[7] = eb23fdee8d420eb083081e74fb992b
+data[8] = 8d42c85b8602a1a8be8dcc10e56857
+data[9] = 47e36b2784c162291abe9b771fb0d7
+data[10] = 4fa296f7e6f0d45202dc826ee5c72d
+data[11] = 787ce5c487af00013b43e88d717f5e
+data[12] = 4caef4d4f423d4c49bfa24caf7cc3b
+data[13] = 6901a1eccf551cd88e9b5b19e15227
+data[14] = 6f3a636a12f182e86eaf356d9f094b
+data[15] = aadbdd7c0b03c2e123d585a8fedfeb
+data[16] = 60d35089d215baa6dfd8e7ca7bf08e
+parity[0] = 71951623a7a020cadbdd3f5803fa64
+parity[1] = 73d3c9d8dcb6e01ebaa341ea108d8b
+parity[2] = 3b5dbccb51253bafd915a1eec7a9da
+parity[3] = 0663a945a9c89e11d9ab12b315a540
+parity[4] = 4824bf8f9560be8484089bb1dc362c
+erasures = 0
+erasures = 17
+erasures = 16
+erasures = 16,17
+erasures = 0,1,2,3,4
+erasures = 17,18,19,20,21
+erasures = 13,15,17,19,21
+
+[case]
+data_shards = 32
+parity_shards = 16
+shard_len = 16
+data[0] = 33afc686ef5b8fcdae502ecc78276e37
+data[1] = 646f1276252a63194f2708490edf0728
+data[2] = 5366771d2ea8c8a9a31a55646fb86560
+data[3] = 0a2a1f7c008cf619d8765d175491a7fe
+data[4] = f3ec9bf7a867e3ca77f0e3b228278cea
+data[5] = 9778d8850513020d47489355288c0c48
+data[6] = 25d1fa25653e9e4021f7d8c626d24974
+data[7] = 22719ebf33bf456a6c84dae6c476dded
+data[8] = ba909878dd44c8cdc7459b64ff2d41f0
+data[9] = 7b61c6c858ce9c5921cbf728cd37f3a1
+data[10] = e0f1b9225b394d9ca558e708b07828d2
+data[11] = c6754202e452c4a647ef2b82bf3f2034
+data[12] = 03b0b195207a594dba1ed69e78dd1bc4
+data[13] = b267439e159173999f216d541168bfb0
+data[14] = b0a4900e5f3dc7aadafd71d9f0fcbdf7
+data[15] = 711980080ba9b4620f5581ab2cbf394f
+data[16] = 916a419b325808257f65ab311fc86430
+data[17] = 6f139e29c33fb8206ec5589804aba9a2
+data[18] = f858d1e54462fdf8c55065f297d33739
+data[19] = b9349f189fa29a92380eed54a4d7665e
+data[20] = 992102286e151dc603efff50f35d64ad
+data[21] = db701f8177e94dccbe7a8a81da4b5ccd
+data[22] = 3c8870a3a75fdc24e516467b87d45c31
+data[23] = b8d77b5b133bb843056bd57f4c3da8a0
+data[24] = 73efd16e0de3cc5a078dc4cbdfd41057
+data[25] = 5fb3a75ab7a7bfcd15e65f05138b1464
+data[26] = f57263144bf76e88fc959b2681dc73c5
+data[27] = f4c9a07dee32c5a26a4110f312327f63
+data[28] = 16cebedc93ac0c2eb11a6df48db2d81b
+data[29] = 4c5eb2f2010fc2b189248d6ae484b167
+data[30] = 6ef81660e1e9509ca8c66e685633d8c6
+data[31] = ef46b9e9e4a42484891d7dd56436ec33
+parity[0] = 46cc78cbe893dc8936cbde8bce238b45
+parity[1] = 87aae66a314d5a72acf01d4346be4313
+parity[2] = 404239a6939a5d87a25c049c7e25a4f9
+parity[3] = 970bba95d1999c5d30d2d2beee9e9f4b
+parity[4] = 350e9e0b78743035a3408fbc087b887e
+parity[5] = 0a46d177cb3492d1066cd8a7c514b898
+parity[6] = ba59986c960a63f95c3f88517f952d71
+parity[7] = 322b5816115a216e93ecb7f7a2a83289
+parity[8] = efbc82d8dd077eaa16fcc06dc0884791
+parity[9] = b7c8bc79053395dd1d78e957ca40e220
+parity[10] = 6de2cf9feb0a4b997402ed309c23ef76
+parity[11] = 3dadc4066ed6c6cd144de7888059731b
+parity[12] = 5d64bd439b4a78f9e83e90752cc43071
+parity[13] = 7ed4d76d88bea0d612a333d29df843b1
+parity[14] = 3714e4bd4cea7ad37d73ffa186f8bb8b
+parity[15] = 1d77a1db3290737f5b93c0f073a500dd
+erasures = 0
+erasures = 32
+erasures = 31
+erasures = 31,32
+erasures = 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+erasures = 32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47
+erasures = 17,19,21,23,25,27,29,31,33,35,37,39,41,43,45,47
+
+[case]
+data_shards = 64
+parity_shards = 16
+shard_len = 8
+data[0] = 40430042f214d53b
+data[1] = cd33d58408c532ca
+data[2] = 3dc9b51e76dd3684
+data[3] = caa3abd44274d84d
+data[4] = 7ae0e5439ca42c96
+data[5] = 4a9125aba5506b73
+data[6] = 45d9f4ee805428e1
+data[7] = 4231a0852ab47aaa
+data[8] = 9265ccf227eea6ef
+data[9] = b5dc057b53e9ac68
+data[10] = ce7d1b9fa722ed1c
+data[11] = 8ad90e94f105219c
+data[12] = 88af2ecf26dd89bf
+data[13] = c88843d72b972ee9
+data[14] = e0acac2d2c7e34ad
+data[15] = 091717b00b7cdc32
+data[16] = d8f49a2afa121a4e
+data[17] = 9cb7707dba5d96df
+data[18] = c0d7885fea253239
+data[19] = dd43de78e0571964
+data[20] = 5b268e146403ab36
+data[21] = 447a677191288ff3
+data[22] = 8152015380172e1f
+data[23] = 416cdd1d94d81cb6
+data[24] = 39b7c2008ff1bde4
+data[25] = 25ee868bf8989937
+data[26] = 5cfa24ad16810a85
+data[27] = 32a943490d99c251
+data[28] = 30295a407df73f11
+data[29] = b52970a3304e44b0
+data[30] = a97f3dcdfbfd28b4
+data[31] = 4298e43f0792e0c7
+data[32] = 641a6c4d636bbf64
+data[33] = 5f20b514410ec605
+data[34] = be527a70547ec834
+data[35] = 4b6d9ed321d4d680
+data[36] = 08abb7f7ad27128f
+data[37] = dac7b5f92fb8e2ae
+data[38] = 4375974a29a115a0
+data[39] = 5da95ccc92cee111
+data[40] = 3aab2f667dc9989f
+data[41] = 35abd0cbf159b220
+data[42] = ff62eaaccd98875e
+data[43] = 544af6bc586bc895
+data[44] = 76310c7067f51f10
+data[45] = 23d94321e42eabd8
+data[46] = 64a596831c0e46b3
+data[47] = b93097102b83acbc
+data[48] = 0ae12dc4fc3f0f92
+data[49] = ebc65abd28897c23
+data[50] = 15fdb06e96692b6c
+data[51] = 359ca74367564dcf
+data[52] = 974fae7e1c242131
+data[53] = 42dcaf81c136f91e
+data[54] = 17ae1397c3be76a3
+data[55] = ddde9f9dcd8f9a35
+data[56] = 57fcb56dff25815a
+data[57] = 92c0abce39352ca2
+data[58] = c996354f4e5f2cb1
+data[59] = fa6fa9555fc2807a
+data[60] = bbda94210e460e70
+data[61] = 542ed68f8387fa5d
+data[62] = 942b444a37b84fd4
+data[63] = 524c6dd0004c353c
+parity[0] = d90e7fade0cc40cc
+parity[1] = 95138711479973cb
+parity[2] = 6faad9b35a06c30e
+parity[3] = 167e10c5b37dc21d
+parity[4] = e5fcf14baec7abd8
+parity[5] = d9685e005c0d26bd
+parity[6] = 9682cfc74e170b15
+parity[7] = be538fe8b27e956c
+parity[8] = bd3340d34271b8a6
+parity[9] = 4be09431128e5e51
+parity[10] = 5a145131f3de458c
+parity[11] = 47f060e6c8567c48
+parity[12] = 7dc8c82c592ba8ce
+parity[13] = 159f3213e839d431
+parity[14] = 9a98d061093c5d43
+parity[15] = 1b97b795d122e4e3
+erasures = 0
+erasures = 64
+erasures = 63
+erasures = 63,64
+erasures = 0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+erasures = 64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79
+erasures = 49,51,53,55,57,59,61,63,65,67,69,71,73,75,77,79
+
+[case]
+data_shards = 128
+parity_shards = 128
+shard_len = 4
+data[0] = d61c728f
+data[1] = 16d30309
+data[2] = 9ee9ab6e
+data[3] = e0654c10
+data[4] = 296c0c17
+data[5] = 1c990ade
+data[6] = a9d8b247
+data[7] = 90245e7b
+data[8] = f7336f07
+data[9] = 688ea8a1
+data[10] = 50ad4982
+data[11] = 8fdd72fe
+data[12] = 23d2bde0
+data[13] = 565d810e
+data[14] = d00edbb5
+data[15] = 26ad5893
+data[16] = 2f9cbf1d
+data[17] = d125b819
+data[18] = e5d97214
+data[19] = 9bc74ac5
+data[20] = 17e7b7b0
+data[21] = abd116a8
+data[22] = 0d81ed59
+data[23] = 6103e991
+data[24] = 58924b14
+data[25] = e559637e
+data[26] = dc6c9dc7
+data[27] = 3bf05076
+data[28] = 66c82c0a
+data[29] = f5fb88e7
+data[30] = c40ac61a
+data[31] = e24e4abe
+data[32] = cd72f34a
+data[33] = 1a52024a
+data[34] = a3ad5f8b
+data[35] = e81f5fe1
+data[36] = cd8eac3a
+data[37] = 1cb624b9
+data[38] = 3ffb999c
+data[39] = 81d97da4
+data[40] = d8e239e5
+data[41] = a9eb177e
+data[42] = 716488b5
+data[43] = 2de4376f
+data[44] = 6d00a7b0
+data[45] = 9602fe92
+data[46] = b91340bf
+data[47] = 38ef569c
+data[48] = 58fe997e
+data[49] = 1d191c7b
+data[50] = 3a81e622
+data[51] = 5c4bd141
+data[52] = ee18059e
+data[53] = 061ab687
+data[54] = bd00f388
+data[55] = 3b67552a
+data[56] = 16f1be10
+data[57] = f3d255b2
+data[58] = b6bfe471
+data[59] = 237e4a62
+data[60] = ff9e371e
+data[61] = 053cbad7
+data[62] = 0d9f47c8
+data[63] = 12854f3c
+data[64] = dfe4b2db
+data[65] = 129a4271
+data[66] = 6f477d0e
+data[67] = 849101fa
+data[68] = b7ed7770
+data[69] = 6a46e56c
+data[70] = 65f0222e
+data[71] = 733a14f3
+data[72] = 6624b557
+data[73] = 7027b13f
+data[74] = 8a3988db
+data[75] = 8f5c5622
+data[76] = 8b0c78d4
+data[77] = 7824eeaf
+data[78] = 5c915fb9
+data[79] = 61b549aa
+data[80] = c2211e56
+data[81] = 3a8961c8
+data[82] = b138659f
+data[83] = f5194cac
+data[84] = b3affc71
+data[85] = ca43ecfd
+data[86] = 49be3106
+data[87] = 08b4c407
+data[88] = aa0d658e
+data[89] = da8b2f0f
+data[90] = b066263e
+data[91] = 874dcca9
+data[92] = 273d2db8
+data[93] = 165ddb22
+data[94] = d4128bd0
+data[95] = 54180807
+data[96] = 3b81828e
+data[97] = 44e4eac5
+data[98] = 77a43565
+data[99] = 4cdfefb3
+data[100] = 71941fa8
+data[101] = 280a4b50
+data[102] = 3f459333
+data[103] = 9469335c
+data[104] = f901c16b
+data[105] = f10a82a9
+data[106] = 70622c3e
+data[107] = c2949adc
+data[108] = 4912d611
+data[109] = 7f2a85d3
+data[110] = 28193c6b
+data[111] = 785b5b72
+data[112] = 570ecfb7
+data[113] = 47684570
+data[114] = 33b26e33
+data[115] = de0bdc68
+data[116] = 06e26374
+data[117] = 71ea35dc
+data[118] = 24bd6b4e
+data[119] = 5cdd8cf3
+data[120] = 08a570fa
+data[121] = 9734ef3b
+data[122] = ae9e8183
+data[123] = 91ecd6d7
+data[124] = b96ea7bc
+data[125] = f0c1e70f
+data[126] = 17b3bf6b
+data[127] = c9fbf881
+parity[0] = dcb08624
+parity[1] = 2e9e6778
+parity[2] = df716478
+parity[3] = e5a3ecee
+parity[4] = a8ac0d4f
+parity[5] = 32fe30b7
+parity[6] = 0fab6d9a
+parity[7] = 6ffd8dab
+parity[8] = 7687d384
+parity[9] = 17244352
+parity[10] = d274e723
+parity[11] = 52e0eb34
+parity[12] = 852a38cc
+parity[13] = 5d7aac7f
+parity[14] = 4a30b726
+parity[15] = 2a00b8b6
+parity[16] = 5d693a59
+parity[17] = c261e862
+parity[18] = d9c0b817
+parity[19] = 888aab4c
+parity[20] = d58b7f45
+parity[21] = 73fafbe5
+parity[22] = f7d6cc07
+parity[23] = 0dd82660
+parity[24] = 3a219417
+parity[25] = f5d311a4
+parity[26] = f4d759c3
+parity[27] = 443bd9c1
+parity[28] = 1b7c3ee1
+parity[29] = 6888b89d
+parity[30] = 0769e0a2
+parity[31] = 35ba906b
+parity[32] = 13accbed
+parity[33] = 15c35936
+parity[34] = c2b43ad7
+parity[35] = a7786503
+parity[36] = df860d96
+parity[37] = f8b3a83f
+parity[38] = 21fa698d
+parity[39] = ef51372a
+parity[40] = ea67f19e
+parity[41] = 680af137
+parity[42] = fc2fda42
+parity[43] = a67f1a29
+parity[44] = 757a886c
+parity[45] = 1b5c67c4
+parity[46] = feab0114
+parity[47] = 4e2ce88a
+parity[48] = ab06cad5
+parity[49] = 23b62264
+parity[50] = 359aa2b1
+parity[51] = 92f10a78
+parity[52] = 7f10b097
+parity[53] = e9fc434c
+parity[54] = ab036de6
+parity[55] = 0caf49e3
+parity[56] = 4baed263
+parity[57] = 840a12d7
+parity[58] = 669201b0
+parity[59] = 144f7cd0
+parity[60] = 5bd86810
+parity[61] = db4a652f
+parity[62] = 19c49de5
+parity[63] = 41ec21cc
+parity[64] = 32065b13
+parity[65] = 89452d6f
+parity[66] = 548ee0d3
+parity[67] = 1c6d43f8
+parity[68] = 049e81d0
+parity[69] = 0d2415a0
+parity[70] = 4b6996b5
+parity[71] = a75756ee
+parity[72] = be39d01b
+parity[73] = 949ff2fd
+parity[74] = a975ef11
+parity[75] = c27acd61
+parity[76] = 54027c25
+parity[77] = 12335468
+parity[78] = 5b70e21a
+parity[79] = ba0d33e8
+parity[80] = 624c7f49
+parity[81] = 4f13510c
+parity[82] = c53693a9
+parity[83] = 0ab18366
+parity[84] = 59fd5cab
+parity[85] = fbe238f2
+parity[86] = 72ed1214
+parity[87] = 9f25c822
+parity[88] = c546ca00
+parity[89] = fa51ec0b
+parity[90] = d52983d7
+parity[91] = 620a8cd2
+parity[92] = ab72a3e3
+parity[93] = b286d130
+parity[94] = 3f292e57
+parity[95] = 06ce3132
+parity[96] = 31ab3d9f
+parity[97] = 23e92bec
+parity[98] = b2dfda18
+parity[99] = 4da4aa4e
+parity[100] = 5609c6e0
+parity[101] = 405f7dd9
+parity[102] = 32b5b71f
+parity[103] = da86cc2f
+parity[104] = 27fa8ed7
+parity[105] = a8e56017
+parity[106] = 5d3db43f
+parity[107] = f1ea61b4
+parity[108] = 0bec3238
+parity[109] = 534c87f2
+parity[110] = fb119821
+parity[111] = 12788fff
+parity[112] = 277de903
+parity[113] = c447bb95
+parity[114] = 17aa3747
+parity[115] = 8c3e460d
+parity[116] = 25678a80
+parity[117] = 3c8a51d4
+parity[118] = 1604571b
+parity[119] = a42efd5f
+parity[120] = c98e7716
+parity[121] = 314d652b
+parity[122] = bfe54835
+parity[123] = dcf54178
+parity[124] = 64a0a097
+parity[125] = 7ae68e61
+parity[126] = 5d8565a0
+parity[127] = 10799ca3
+erasures = 0
+erasures = 128
+erasures = 127
+erasures = 127,128
+erasures =
+  0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,
+  16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,
+  32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,
+  48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,
+  64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,
+  80,81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,
+  96,97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,
+  112,113,114,115,116,117,118,119,120,121,122,123,124,125,126,127,
+erasures =
+  128,129,130,131,132,133,134,135,136,137,138,139,140,141,142,143,
+  144,145,146,147,148,149,150,151,152,153,154,155,156,157,158,159,
+  160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,175,
+  176,177,178,179,180,181,182,183,184,185,186,187,188,189,190,191,
+  192,193,194,195,196,197,198,199,200,201,202,203,204,205,206,207,
+  208,209,210,211,212,213,214,215,216,217,218,219,220,221,222,223,
+  224,225,226,227,228,229,230,231,232,233,234,235,236,237,238,239,
+  240,241,242,243,244,245,246,247,248,249,250,251,252,253,254,255,
+erasures =
+  1,3,5,7,9,11,13,15,17,19,21,23,25,27,29,31,
+  33,35,37,39,41,43,45,47,49,51,53,55,57,59,61,63,
+  65,67,69,71,73,75,77,79,81,83,85,87,89,91,93,95,
+  97,99,101,103,105,107,109,111,113,115,117,119,121,123,125,127,
+  129,131,133,135,137,139,141,143,145,147,149,151,153,155,157,159,
+  161,163,165,167,169,171,173,175,177,179,181,183,185,187,189,191,
+  193,195,197,199,201,203,205,207,209,211,213,215,217,219,221,223,
+  225,227,229,231,233,235,237,239,241,243,245,247,249,251,253,255,
+
+[case]
+data_shards = 255
+parity_shards = 1
+shard_len = 4
+data[0] = 7574a326
+data[1] = 6e5f7fc6
+data[2] = 1257dcc5
+data[3] = f58be5a4
+data[4] = 0e960088
+data[5] = 1c105bff
+data[6] = 750cac6f
+data[7] = 685628ac
+data[8] = a64cc529
+data[9] = 9c5f86f2
+data[10] = 102238c7
+data[11] = 9e4684bb
+data[12] = 343825ec
+data[13] = a852fc78
+data[14] = 3875afca
+data[15] = 8425af51
+data[16] = 9589f34b
+data[17] = 02cf2160
+data[18] = 4d51566d
+data[19] = 3b4a4744
+data[20] = af102e2c
+data[21] = 232162a1
+data[22] = 17f9d86c
+data[23] = b004c172
+data[24] = 873c2f1d
+data[25] = 35041de2
+data[26] = 94d2f653
+data[27] = 1f0af326
+data[28] = 9f50f4b2
+data[29] = 376217d4
+data[30] = cd74fb98
+data[31] = ef8ce5cf
+data[32] = 15f8622e
+data[33] = db10ffc6
+data[34] = d179182a
+data[35] = 1dcf45b0
+data[36] = 3623eaca
+data[37] = 268a5276
+data[38] = 6ab177f8
+data[39] = 81fa4b76
+data[40] = 8ee779b9
+data[41] = b607cf34
+data[42] = 9228ded9
+data[43] = 5d56f5ce
+data[44] = 91c50d3c
+data[45] = 1f9b5aed
+data[46] = 4981a12b
+data[47] = ac583f86
+data[48] = c9bc6285
+data[49] = bffd8a10
+data[50] = 974f20e6
+data[51] = 31a1fe32
+data[52] = 03179723
+data[53] = 4d1e52e3
+data[54] = 22949c33
+data[55] = 2358c954
+data[56] = b8802f82
+data[57] = a1b34ff2
+data[58] = e94a1cb1
+data[59] = 0e985927
+data[60] = e36af1d2
+data[61] = cc7142f2
+data[62] = 1e609dc2
+data[63] = b963dac9
+data[64] = 628cfeeb
+data[65] = 30d0b2de
+data[66] = 7308cd61
+data[67] = a9a53db1
+data[68] = aa9cbb8c
+data[69] = 427d24a3
+data[70] = 2eb2b9b3
+data[71] = 999496d1
+data[72] = 73f0ac4f
+data[73] = 7d6cf86a
+data[74] = 8b16f295
+data[75] = ee53429f
+data[76] = 2137589b
+data[77] = 467b5cda
+data[78] = 839ab040
+data[79] = 4348d04a
+data[80] = 720dff7d
+data[81] = e8ed502d
+data[82] = c60e06f1
+data[83] = cd6dcd3d
+data[84] = f1624ff5
+data[85] = b1934e92
+data[86] = 4ed00262
+data[87] = 083cae35
+data[88] = da3f4b1e
+data[89] = 84b2b460
+data[90] = 475a08db
+data[91] = 176a0b69
+data[92] = 44e84e00
+data[93] = b3339502
+data[94] = 8392f320
+data[95] = 24360f1b
+data[96] = 0c1fe40d
+data[97] = be271332
+data[98] = 7da3ebf4
+data[99] = 1387514b
+data[100] = fcec615d
+data[101] = e88a65df
+data[102] = 403e6a37
+data[103] = 324dfaf9
+data[104] = 616a2f49
+data[105] = 0e15f542
+data[106] = 2ce9343c
+data[107] = cb03553f
+data[108] = 19c940bc
+data[109] = db2977d1
+data[110] = a2f91734
+data[111] = 491fc777
+data[112] = 2377a1e5
+data[113] = db99115a
+data[114] = 23a43233
+data[115] = 8f053dc1
+data[116] = e885f3a3
+data[117] = 1a4eab0f
+data[118] = 72a9b930
+data[119] = 2fd12a8b
+data[120] = 62928eba
+data[121] = 57b00630
+data[122] = f7ee7d38
+data[123] = f7d56287
+data[124] = 7178c6e9
+data[125] = 78993d15
+data[126] = 206fb9fc
+data[127] = 5ac9d258
+data[128] = b5089834
+data[129] = cd07422f
+data[130] = 4025293e
+data[131] = 83ac2474
+data[132] = 73954aa9
+data[133] = e18d4051
+data[134] = 9ede199c
+data[135] = fc5e7968
+data[136] = 1d3bad19
+data[137] = 0532a40e
+data[138] = 40395ea7
+data[139] = 771fd8a1
+data[140] = f2bd8355
+data[141] = 133b556e
+data[142] = 34358ce7
+data[143] = 5f3ef8b8
+data[144] = 1754ba6d
+data[145] = 724f2996
+data[146] = f8dc81e9
+data[147] = 3c0a03e1
+data[148] = 665184ac
+data[149] = 8cabc5ea
+data[150] = 63b41121
+data[151] = c334845d
+data[152] = 239c3668
+data[153] = 0a206671
+data[154] = d3619f64
+data[155] = e574c835
+data[156] = 1fc2cc31
+data[157] = 21b6a301
+data[158] = 028103af
+data[159] = 6019b1c0
+data[160] = a907d57b
+data[161] = 30cb6ad2
+data[162] = df3cf3cb
+data[163] = 0d235445
+data[164] = c2661769
+data[165] = 13d0d42b
+data[166] = a7725148
+data[167] = 7b500ff9
+data[168] = b5abce91
+data[169] = 8a659f6e
+data[170] = 82bfb56e
+data[171] = 9549a837
+data[172] = c384ef5b
+data[173] = e6a86186
+data[174] = c8baf896
+data[175] = 8a2a36a6
+data[176] = fa9f12af
+data[177] = 81e1e83d
+data[178] = 702ce155
+data[179] = af5747b1
+data[180] = 4d46280c
+data[181] = 77894a31
+data[182] = dd57fd73
+data[183] = fb1e69ac
+data[184] = f2ca9e24
+data[185] = 39904536
+data[186] = 09b10524
+data[187] = 09e948f6
+data[188] = dd79df05
+data[189] = aea2cebf
+data[190] = 02e5dcb8
+data[191] = a9bf405c
+data[192] = 9dc71806
+data[193] = 49363bc0
+data[194] = 3131fdfa
+data[195] = 7b8518ae
+data[196] = 97436f50
+data[197] = b2e7a079
+data[198] = c4ae40bd
+data[199] = a8e038fd
+data[200] = 74529525
+data[201] = 29d3a954
+data[202] = 11919ab6
+data[203] = 239d766d
+data[204] = e29257bc
+data[205] = ce4a2c27
+data[206] = c1d96ca7
+data[207] = 2fd58d68
+data[208] = 8ce0f6b1
+data[209] = a5b9b08a
+data[210] = 963f82a0
+data[211] = bed66525
+data[212] = a88247f1
+data[213] = aa601406
+data[214] = a4fc8e65
+data[215] = ac6fd039
+data[216] = edb97874
+data[217] = 30ebf239
+data[218] = 27d6a823
+data[219] = 6e0ccfef
+data[220] = 1153e2dc
+data[221] = baea514c
+data[222] = 848b1b78
+data[223] = 51541f5e
+data[224] = 82c1e4dc
+data[225] = c0954fb4
+data[226] = 4f9e5801
+data[227] = 7b84ffa5
+data[228] = 7e9628e5
+data[229] = ac37d637
+data[230] = 5c509dfb
+data[231] = b6c8ce66
+data[232] = 710235de
+data[233] = 4b775328
+data[234] = d8456085
+data[235] = a2f16c08
+data[236] = cfddcc25
+data[237] = 6099bfc2
+data[238] = 5ad72316
+data[239] = ed0930a2
+data[240] = bd02b775
+data[241] = 2800a1e3
+data[242] = ccd42717
+data[243] = 67f1169c
+data[244] = c6883c36
+data[245] = cd9a393f
+data[246] = eb44f51c
+data[247] = 9386d5a9
+data[248] = 3049bd29
+data[249] = b865b974
+data[250] = b6f56e36
+data[251] = d5ab4b13
+data[252] = 61ba660a
+data[253] = 3f91f295
+data[254] = acc87b41
+parity[0] = dbe0529a
+erasures = 0
+erasures = 255
+erasures = 254
+
+[case]
+data_shards = 1
+parity_shards = 255
+shard_len = 2
+data[0] = 36bf
+parity[0] = 36bf
+parity[1] = 36bf
+parity[2] = 36bf
+parity[3] = 36bf
+parity[4] = 36bf
+parity[5] = 36bf
+parity[6] = 36bf
+parity[7] = 36bf
+parity[8] = 36bf
+parity[9] = 36bf
+parity[10] = 36bf
+parity[11] = 36bf
+parity[12] = 36bf
+parity[13] = 36bf
+parity[14] = 36bf
+parity[15] = 36bf
+parity[16] = 36bf
+parity[17] = 36bf
+parity[18] = 36bf
+parity[19] = 36bf
+parity[20] = 36bf
+parity[21] = 36bf
+parity[22] = 36bf
+parity[23] = 36bf
+parity[24] = 36bf
+parity[25] = 36bf
+parity[26] = 36bf
+parity[27] = 36bf
+parity[28] = 36bf
+parity[29] = 36bf
+parity[30] = 36bf
+parity[31] = 36bf
+parity[32] = 36bf
+parity[33] = 36bf
+parity[34] = 36bf
+parity[35] = 36bf
+parity[36] = 36bf
+parity[37] = 36bf
+parity[38] = 36bf
+parity[39] = 36bf
+parity[40] = 36bf
+parity[41] = 36bf
+parity[42] = 36bf
+parity[43] = 36bf
+parity[44] = 36bf
+parity[45] = 36bf
+parity[46] = 36bf
+parity[47] = 36bf
+parity[48] = 36bf
+parity[49] = 36bf
+parity[50] = 36bf
+parity[51] = 36bf
+parity[52] = 36bf
+parity[53] = 36bf
+parity[54] = 36bf
+parity[55] = 36bf
+parity[56] = 36bf
+parity[57] = 36bf
+parity[58] = 36bf
+parity[59] = 36bf
+parity[60] = 36bf
+parity[61] = 36bf
+parity[62] = 36bf
+parity[63] = 36bf
+parity[64] = 36bf
+parity[65] = 36bf
+parity[66] = 36bf
+parity[67] = 36bf
+parity[68] = 36bf
+parity[69] = 36bf
+parity[70] = 36bf
+parity[71] = 36bf
+parity[72] = 36bf
+parity[73] = 36bf
+parity[74] = 36bf
+parity[75] = 36bf
+parity[76] = 36bf
+parity[77] = 36bf
+parity[78] = 36bf
+parity[79] = 36bf
+parity[80] = 36bf
+parity[81] = 36bf
+parity[82] = 36bf
+parity[83] = 36bf
+parity[84] = 36bf
+parity[85] = 36bf
+parity[86] = 36bf
+parity[87] = 36bf
+parity[88] = 36bf
+parity[89] = 36bf
+parity[90] = 36bf
+parity[91] = 36bf
+parity[92] = 36bf
+parity[93] = 36bf
+parity[94] = 36bf
+parity[95] = 36bf
+parity[96] = 36bf
+parity[97] = 36bf
+parity[98] = 36bf
+parity[99] = 36bf
+parity[100] = 36bf
+parity[101] = 36bf
+parity[102] = 36bf
+parity[103] = 36bf
+parity[104] = 36bf
+parity[105] = 36bf
+parity[106] = 36bf
+parity[107] = 36bf
+parity[108] = 36bf
+parity[109] = 36bf
+parity[110] = 36bf
+parity[111] = 36bf
+parity[112] = 36bf
+parity[113] = 36bf
+parity[114] = 36bf
+parity[115] = 36bf
+parity[116] = 36bf
+parity[117] = 36bf
+parity[118] = 36bf
+parity[119] = 36bf
+parity[120] = 36bf
+parity[121] = 36bf
+parity[122] = 36bf
+parity[123] = 36bf
+parity[124] = 36bf
+parity[125] = 36bf
+parity[126] = 36bf
+parity[127] = 36bf
+parity[128] = 36bf
+parity[129] = 36bf
+parity[130] = 36bf
+parity[131] = 36bf
+parity[132] = 36bf
+parity[133] = 36bf
+parity[134] = 36bf
+parity[135] = 36bf
+parity[136] = 36bf
+parity[137] = 36bf
+parity[138] = 36bf
+parity[139] = 36bf
+parity[140] = 36bf
+parity[141] = 36bf
+parity[142] = 36bf
+parity[143] = 36bf
+parity[144] = 36bf
+parity[145] = 36bf
+parity[146] = 36bf
+parity[147] = 36bf
+parity[148] = 36bf
+parity[149] = 36bf
+parity[150] = 36bf
+parity[151] = 36bf
+parity[152] = 36bf
+parity[153] = 36bf
+parity[154] = 36bf
+parity[155] = 36bf
+parity[156] = 36bf
+parity[157] = 36bf
+parity[158] = 36bf
+parity[159] = 36bf
+parity[160] = 36bf
+parity[161] = 36bf
+parity[162] = 36bf
+parity[163] = 36bf
+parity[164] = 36bf
+parity[165] = 36bf
+parity[166] = 36bf
+parity[167] = 36bf
+parity[168] = 36bf
+parity[169] = 36bf
+parity[170] = 36bf
+parity[171] = 36bf
+parity[172] = 36bf
+parity[173] = 36bf
+parity[174] = 36bf
+parity[175] = 36bf
+parity[176] = 36bf
+parity[177] = 36bf
+parity[178] = 36bf
+parity[179] = 36bf
+parity[180] = 36bf
+parity[181] = 36bf
+parity[182] = 36bf
+parity[183] = 36bf
+parity[184] = 36bf
+parity[185] = 36bf
+parity[186] = 36bf
+parity[187] = 36bf
+parity[188] = 36bf
+parity[189] = 36bf
+parity[190] = 36bf
+parity[191] = 36bf
+parity[192] = 36bf
+parity[193] = 36bf
+parity[194] = 36bf
+parity[195] = 36bf
+parity[196] = 36bf
+parity[197] = 36bf
+parity[198] = 36bf
+parity[199] = 36bf
+parity[200] = 36bf
+parity[201] = 36bf
+parity[202] = 36bf
+parity[203] = 36bf
+parity[204] = 36bf
+parity[205] = 36bf
+parity[206] = 36bf
+parity[207] = 36bf
+parity[208] = 36bf
+parity[209] = 36bf
+parity[210] = 36bf
+parity[211] = 36bf
+parity[212] = 36bf
+parity[213] = 36bf
+parity[214] = 36bf
+parity[215] = 36bf
+parity[216] = 36bf
+parity[217] = 36bf
+parity[218] = 36bf
+parity[219] = 36bf
+parity[220] = 36bf
+parity[221] = 36bf
+parity[222] = 36bf
+parity[223] = 36bf
+parity[224] = 36bf
+parity[225] = 36bf
+parity[226] = 36bf
+parity[227] = 36bf
+parity[228] = 36bf
+parity[229] = 36bf
+parity[230] = 36bf
+parity[231] = 36bf
+parity[232] = 36bf
+parity[233] = 36bf
+parity[234] = 36bf
+parity[235] = 36bf
+parity[236] = 36bf
+parity[237] = 36bf
+parity[238] = 36bf
+parity[239] = 36bf
+parity[240] = 36bf
+parity[241] = 36bf
+parity[242] = 36bf
+parity[243] = 36bf
+parity[244] = 36bf
+parity[245] = 36bf
+parity[246] = 36bf
+parity[247] = 36bf
+parity[248] = 36bf
+parity[249] = 36bf
+parity[250] = 36bf
+parity[251] = 36bf
+parity[252] = 36bf
+parity[253] = 36bf
+parity[254] = 36bf
+erasures = 0
+erasures = 1
+erasures = 0,1
+erasures =
+  1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,
+  17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,
+  33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,
+  49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,
+  65,66,67,68,69,70,71,72,73,74,75,76,77,78,79,80,
+  81,82,83,84,85,86,87,88,89,90,91,92,93,94,95,96,
+  97,98,99,100,101,102,103,104,105,106,107,108,109,110,111,112,
+  113,114,115,116,117,118,119,120,121,122,123,124,125,126,127,128,
+  129,130,131,132,133,134,135,136,137,138,139,140,141,142,143,144,
+  145,146,147,148,149,150,151,152,153,154,155,156,157,158,159,160,
+  161,162,163,164,165,166,167,168,169,170,171,172,173,174,175,176,
+  177,178,179,180,181,182,183,184,185,186,187,188,189,190,191,192,
+  193,194,195,196,197,198,199,200,201,202,203,204,205,206,207,208,
+  209,210,211,212,213,214,215,216,217,218,219,220,221,222,223,224,
+  225,226,227,228,229,230,231,232,233,234,235,236,237,238,239,240,
+  241,242,243,244,245,246,247,248,249,250,251,252,253,254,255,
+
