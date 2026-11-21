@@ -1,5 +1,5 @@
 use crate::backend::{FileBlockBackend, StorageBackend};
-use crate::commit_metrics::{CommitMetrics, CommitPhase};
+use crate::commit_metrics::{CheckpointReason, CommitMetrics, CommitPhase, RawWriteKind};
 use crate::error::{ArgosError, Result};
 use crate::journal;
 use crate::raw_format::{
@@ -496,7 +496,7 @@ fn write_metadata_members_parallel(
                     });
                     (
                         sb.disk_id.clone(),
-                        write_metadata_member(backend, sb, metadata, checkpoint),
+                        write_metadata_member(backend, sb, metadata, checkpoint, metrics),
                     )
                 })
             })
@@ -644,6 +644,7 @@ fn write_metadata_member(
     sb: &RawSuperblock,
     metadata: &Metadata,
     checkpoint: &MetadataTreeCheckpoint,
+    metrics: Option<&CommitMetrics>,
 ) -> Result<()> {
     let slot_len = sb.metadata.length / 2;
     if checkpoint.required_len > slot_len {
@@ -654,9 +655,15 @@ fn write_metadata_member(
         });
     }
     let slot = (metadata.txid % 2) * slot_len;
-    write_metadata_slot(backend, sb, sb.metadata.offset + slot, checkpoint)?;
+    write_metadata_slot(backend, sb, sb.metadata.offset + slot, checkpoint, metrics)?;
     let mirror_slot = ((metadata.txid + 1) % 2) * slot_len;
-    write_metadata_slot(backend, sb, sb.metadata.offset + mirror_slot, checkpoint)
+    write_metadata_slot(
+        backend,
+        sb,
+        sb.metadata.offset + mirror_slot,
+        checkpoint,
+        metrics,
+    )
 }
 
 fn write_metadata_slot(
@@ -664,12 +671,19 @@ fn write_metadata_slot(
     sb: &RawSuperblock,
     offset: u64,
     checkpoint: &MetadataTreeCheckpoint,
+    metrics: Option<&CommitMetrics>,
 ) -> Result<()> {
     for (relative_offset, data) in &checkpoint.body_writes {
         backend.write_at(&sb.disk_id, offset + relative_offset, data)?;
+        if let Some(metrics) = metrics {
+            metrics.add_raw_write_bytes(RawWriteKind::Checkpoint, data.len());
+        }
     }
     backend.flush_device(&sb.disk_id)?;
     backend.write_at(&sb.disk_id, offset, &checkpoint.header)?;
+    if let Some(metrics) = metrics {
+        metrics.add_raw_write_bytes(RawWriteKind::Checkpoint, checkpoint.header.len());
+    }
     backend.flush_device(&sb.disk_id)?;
     Ok(())
 }
@@ -767,7 +781,7 @@ pub fn write_superblock_clean_state(
     clean: bool,
 ) -> Result<()> {
     for sb in superblocks {
-        write_superblock_clean_state_member(backend, sb, clean)?;
+        write_superblock_clean_state_member(backend, sb, clean, None)?;
     }
     Ok(())
 }
@@ -777,6 +791,26 @@ pub(crate) fn write_superblock_clean_state_quorum(
     superblocks: &[RawSuperblock],
     metadata: &Metadata,
     clean: bool,
+) -> Result<QuorumWriteReport> {
+    write_superblock_clean_state_quorum_impl(backend, superblocks, metadata, clean, None)
+}
+
+pub(crate) fn write_superblock_clean_state_quorum_measured(
+    backend: &dyn StorageBackend,
+    superblocks: &[RawSuperblock],
+    metadata: &Metadata,
+    clean: bool,
+    metrics: &CommitMetrics,
+) -> Result<QuorumWriteReport> {
+    write_superblock_clean_state_quorum_impl(backend, superblocks, metadata, clean, Some(metrics))
+}
+
+fn write_superblock_clean_state_quorum_impl(
+    backend: &dyn StorageBackend,
+    superblocks: &[RawSuperblock],
+    metadata: &Metadata,
+    clean: bool,
+    metrics: Option<&CommitMetrics>,
 ) -> Result<QuorumWriteReport> {
     let need = metadata_quorum_requirement(metadata);
     if superblocks.len() < need {
@@ -789,7 +823,7 @@ pub(crate) fn write_superblock_clean_state_quorum(
     let mut report = QuorumWriteReport::default();
     let mut durable = 0usize;
     for sb in superblocks {
-        match write_superblock_clean_state_member(backend, sb, clean) {
+        match write_superblock_clean_state_member(backend, sb, clean, metrics) {
             Ok(()) => durable += 1,
             Err(err) => report.record_failure(&sb.disk_id, &err),
         }
@@ -809,6 +843,7 @@ fn write_superblock_clean_state_member(
     backend: &dyn StorageBackend,
     sb: &RawSuperblock,
     clean: bool,
+    metrics: Option<&CommitMetrics>,
 ) -> Result<()> {
     let mut encoded_current = vec![0u8; SUPERBLOCK_SIZE];
     let mut copy = if backend
@@ -835,8 +870,17 @@ fn write_superblock_clean_state_member(
     let encoded = copy.encode();
     let label = copy.device_label().encode();
     backend.write_at(&copy.disk_id, PRIMARY_SUPERBLOCK_OFFSET, &encoded)?;
+    if let Some(metrics) = metrics {
+        metrics.add_raw_write_bytes(RawWriteKind::CleanState, encoded.len());
+    }
     backend.write_at(&copy.disk_id, DEVICE_LABEL_OFFSET, &label)?;
+    if let Some(metrics) = metrics {
+        metrics.add_raw_write_bytes(RawWriteKind::CleanState, label.len());
+    }
     backend.write_at(&copy.disk_id, copy.backup_superblock_offset, &encoded)?;
+    if let Some(metrics) = metrics {
+        metrics.add_raw_write_bytes(RawWriteKind::CleanState, encoded.len());
+    }
     backend.flush_device(&copy.disk_id)
 }
 
@@ -1222,10 +1266,17 @@ fn append_journal_member(
     end: u64,
     entry: &[u8],
     flush: bool,
+    metrics: Option<&CommitMetrics>,
 ) -> Result<()> {
     backend.write_at(&sb.disk_id, sb.journal.offset + write_offset, entry)?;
+    if let Some(metrics) = metrics {
+        metrics.add_raw_write_bytes(RawWriteKind::Journal, entry.len());
+    }
     put_u64(&mut header, 24, end);
     backend.write_at(&sb.disk_id, sb.journal.offset, &header)?;
+    if let Some(metrics) = metrics {
+        metrics.add_raw_write_bytes(RawWriteKind::Journal, header.len());
+    }
     if flush {
         backend.flush_device(&sb.disk_id)?;
     }
@@ -1239,6 +1290,7 @@ fn append_quorum_commit_certificate(
     certificate: &[u8],
     need: usize,
     report: &mut QuorumWriteReport,
+    metrics: Option<&CommitMetrics>,
 ) -> Result<()> {
     let mut durable = 0usize;
     for sb in superblocks {
@@ -1255,6 +1307,7 @@ fn append_quorum_commit_certificate(
                     end,
                     certificate,
                     true,
+                    metrics,
                 ) {
                     Ok(()) => durable += 1,
                     Err(err) => report.record_failure(&sb.disk_id, &err),
@@ -1328,6 +1381,7 @@ fn append_journal_with_previous_validation(
                 end,
                 &entry,
                 !metadata.config.defer_journal_flush,
+                None,
             )?;
             if index + 1 < superblocks.len() {
                 journal::inject_crash(FaultPoint::AfterPartialJournalFanout.as_str())?;
@@ -1442,6 +1496,9 @@ fn append_journal_quorum(
             let _encode_timer = metrics.map(|metrics| metrics.timer(CommitPhase::CheckpointEncode));
             prepare_checkpoint_writes(metadata, &eligible)?
         };
+        if let Some(metrics) = metrics {
+            metrics.record_checkpoint_reason(CheckpointReason::JournalRollover);
+        }
         let _rollover_timer = metrics.map(|metrics| metrics.timer(CommitPhase::JournalRollover));
         for (disk_id, result) in checkpoint_members_and_reset_parallel(
             backend,
@@ -1482,6 +1539,7 @@ fn append_journal_quorum(
                 &checkpoint_certificate,
                 need,
                 &mut report,
+                metrics,
             )?;
         }
         return Ok(report);
@@ -1501,6 +1559,7 @@ fn append_journal_quorum(
                 end,
                 &entry,
                 !metadata.config.defer_journal_flush,
+                metrics,
             )
         };
         match member_result {
@@ -1552,6 +1611,7 @@ fn append_journal_quorum(
             &journal_certificate,
             need,
             &mut report,
+            metrics,
         )?;
     }
     Ok(report)
@@ -1573,10 +1633,13 @@ fn checkpoint_members_and_reset_parallel(
                         metrics.member_timer(CommitPhase::CheckpointMemberIo, &sb.disk_id)
                     });
                     let result = (|| {
-                        write_metadata_member(backend, sb, metadata, checkpoint)?;
+                        write_metadata_member(backend, sb, metadata, checkpoint, metrics)?;
                         // Never discard the old journal before both checkpoint
                         // slots have been flushed and their headers committed.
                         initialize_journal_region(backend, &sb.disk_id, sb)?;
+                        if let Some(metrics) = metrics {
+                            metrics.add_raw_write_bytes(RawWriteKind::Journal, RAW_HEADER_SIZE);
+                        }
                         backend.flush_device(&sb.disk_id)
                     })();
                     (sb.disk_id.clone(), result)
