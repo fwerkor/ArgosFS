@@ -1,10 +1,10 @@
 use super::*;
-use std::sync::{Mutex as StdMutex, OnceLock};
 use tempfile::tempdir;
 
+// Keep ARGOSFS_KEY/ARGOSFS_KEY_FILE tests serialized with the crypto, data
+// plane, and FUSE tests; a local mutex cannot protect process-wide env vars.
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| StdMutex::new(())).lock().unwrap()
+    crypto::test_env_lock()
 }
 
 fn host_volume(disks: usize) -> (tempfile::TempDir, ArgosFs) {
