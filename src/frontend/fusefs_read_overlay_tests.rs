@@ -80,21 +80,22 @@ fn mixed_persisted_prefix_and_buffered_tail_return_exact_byte_ranges() {
 }
 
 #[test]
-fn overwrite_sparse_and_invalid_dirty_extent_keep_flush_before_read_behavior() {
+fn overwrite_sparse_and_invalid_dirty_extent_preserve_read_semantics() {
     let (_dir, volume, ino) = fixture(1, 0, 4096);
     volume.write_file("/stream", b"persisted", 0o600).unwrap();
     let fuse = ArgosFuse::new(volume.clone());
     assert!(fuse.queue_writeback(ino, 1, b"XY"));
     assert_eq!(fuse.read_visible_inode(ino, 0, 10).unwrap(), b"pXYsisted");
-    assert!(fuse.writeback.lock().dirty.is_empty());
+    assert!(fuse.writeback.lock().dirty.contains_key(&ino));
+    fuse.flush_inode_writeback(ino).unwrap();
 
     assert!(fuse.queue_writeback(ino, 11, b"Z"));
     assert_eq!(
         fuse.read_visible_inode(ino, 0, 20).unwrap(),
         b"pXYsisted\0\0Z"
     );
-    assert!(fuse.writeback.lock().dirty.is_empty());
-    assert_eq!(volume.attr_inode(ino).unwrap().size, 12);
+    assert!(fuse.writeback.lock().dirty.contains_key(&ino));
+    fuse.flush_inode_writeback(ino).unwrap();
 
     assert!(fuse.queue_writeback(ino, u64::MAX, b"error"));
     assert!(fuse.read_visible_inode(ino, 0, 20).is_err());

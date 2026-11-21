@@ -1,6 +1,7 @@
 use super::fuse_queue::FuseRequestExecutor;
 use super::metrics;
 use crate::acl;
+use crate::commit_metrics::WritebackFlushReason;
 use crate::error::{ArgosError, Result};
 use crate::types::{CapacitySource, DiskStatus, InodeId, NodeKind};
 use crate::util::now_f64;
@@ -548,13 +549,18 @@ impl ArgosFuseShared {
             return Ok(false);
         }
         let prefix_len = complete_end - old_size;
-        match self.volume.write_inode_range_from_open_handle_at(
+        let result = self.volume.write_inode_range_from_open_handle_at(
             ino,
             dirty.offset,
             &dirty.data[..prefix_len],
             dirty.written_at,
             dirty.seen_ctime,
-        ) {
+        );
+        self.volume.commit_metrics().record_writeback_flush(
+            WritebackFlushReason::AppendStage,
+            matches!(&result, Ok(written) if *written == prefix_len),
+        );
+        match result {
             Ok(written) if written == prefix_len => {
                 let dirty = writeback.dirty.get_mut(&ino).expect("locked dirty inode");
                 dirty.offset += prefix_len as u64;
@@ -590,26 +596,22 @@ impl ArgosFuseShared {
         Ok(false)
     }
 
-    /// A plain stat/lookup does not require the append tail to hit the
-    /// devices. As long as buffered bytes are a *contiguous EOF append*,
-    /// expose their logical size and write time without materializing a
-    /// partial stripe. Any other write (overwrite, gap, invalid extent) uses
-    /// the existing flush path, which is also used for reads/fsync/close.
+    /// Attribute reads observe acknowledged writes without forcing a COW
+    /// rewrite. This includes in-place overwrites and sparse extensions:
+    /// neither stat nor path lookup is a durability boundary.
     ///
-    /// Hold the writeback guard across the metadata lookup: flushes publish
-    /// the new persisted inode while holding this same guard. Otherwise
-    /// getattr may race between observing an old inode size and a completed
-    /// writeback, incorrectly reporting the previous size.
+    /// The writeback lock serializes observation with persistence; the inode
+    /// cannot publish a stale size or timestamps halfway through a flush.
     fn visible_inode_attr(&self, ino: InodeId) -> Result<NodeAttr> {
         let writeback = self.writeback.lock();
         let mut attr = self.volume.attr_inode(ino)?;
         let Some(dirty) = writeback.dirty.get(&ino) else {
             return Ok(attr);
         };
-        if attr.kind == NodeKind::File && dirty.offset == attr.size {
+        if attr.kind == NodeKind::File {
             if let Some(end) = dirty.end() {
-                attr.size = end;
-                attr.blocks = end.div_ceil(512);
+                attr.size = attr.size.max(end);
+                attr.blocks = attr.size.div_ceil(512);
                 attr.mtime = dirty.written_at;
                 if !dirty.seen_ctime.is_some_and(|seen| seen != attr.ctime) {
                     attr.ctime = dirty.written_at;
@@ -619,18 +621,18 @@ impl ArgosFuseShared {
             }
         }
         drop(writeback);
-        self.flush_inode_writeback(ino)?;
+        self.flush_inode_writeback_reason(ino, WritebackFlushReason::StatFallback)?;
         self.volume.attr_inode(ino)
     }
 
-    /// Serve a read from the persisted prefix plus the acknowledged EOF tail
-    /// without forcing a premature partial-stripe COW write. This applies
-    /// only when the pending extent begins exactly at the *current* on-disk
-    /// EOF; all other dirty writes keep the existing flush-before-read path.
+    /// Overlay a bounded acknowledged extent over checked persisted bytes.
+    /// In-place rewrites can now survive arbitrary reads without premature
+    /// decode/encode cycles; sparse gaps between EOF and the write read as
+    /// zero. A damaged persisted prefix still fails closed via the normal
+    /// decoder, while a failed commit retains the original dirty extent.
     ///
-    /// The writeback guard spans metadata validation, persisted-prefix read
-    /// (with the normal checksum/repair path), and overlay. A concurrent FUSE
-    /// flush or append cannot publish a torn combination of old and new data.
+    /// Holding the writeback lock across metadata/read/overlay is necessary:
+    /// a concurrent flush must not mix two inode generations in one reply.
     fn read_visible_inode(&self, ino: InodeId, offset: u64, size: usize) -> Result<Vec<u8>> {
         let writeback = self.writeback.lock();
         let Some(dirty) = writeback.dirty.get(&ino) else {
@@ -638,45 +640,81 @@ impl ArgosFuseShared {
             return self.volume.read_inode(ino, offset, size, true);
         };
         let attr = self.volume.attr_inode(ino)?;
-        if attr.kind != NodeKind::File || dirty.offset != attr.size || dirty.end().is_none() {
+        let Some(dirty_end) = dirty.end() else {
             drop(writeback);
-            self.flush_inode_writeback(ino)?;
+            self.flush_inode_writeback_reason(ino, WritebackFlushReason::ReadFallback)?;
+            return self.volume.read_inode(ino, offset, size, true);
+        };
+        if attr.kind != NodeKind::File {
+            drop(writeback);
+            self.flush_inode_writeback_reason(ino, WritebackFlushReason::ReadFallback)?;
             return self.volume.read_inode(ino, offset, size, true);
         }
-        let logical_end = dirty.end().unwrap();
+
+        let logical_end = attr.size.max(dirty_end);
         let read_end = offset.saturating_add(size as u64).min(logical_end);
         if offset >= read_end {
             self.volume.account_buffered_read(ino, 0, false);
             return Ok(Vec::new());
         }
 
-        // Read only the persisted prefix through the existing checked decoder.
-        // An unreadable prefix is an error: never silently substitute zeros or
-        // return an apparently successful partial read on a corrupted stripe.
-        let prefix_end = read_end.min(attr.size);
-        let prefix_len = prefix_end.saturating_sub(offset) as usize;
-        let mut output = if prefix_len != 0 {
-            self.volume.read_inode(ino, offset, prefix_len, true)?
+        // Decode and validate every persisted byte in the requested range.
+        // Do not mask an unreadable old stripe, even when overwritten by the
+        // pending extent: an eventual partial-stripe commit may need it.
+        let persisted_end = read_end.min(attr.size);
+        let persisted_len = persisted_end.saturating_sub(offset) as usize;
+        let mut output = if persisted_len > 0 {
+            self.volume.read_inode(ino, offset, persisted_len, true)?
         } else {
             Vec::new()
         };
-        if output.len() != prefix_len {
+        if output.len() != persisted_len {
             return Err(ArgosError::Invalid(format!(
                 "concurrent inode size change during buffered read of inode {ino}"
             )));
         }
-        let tail_start = offset.max(attr.size);
-        if read_end > tail_start {
-            let start = (tail_start - attr.size) as usize;
-            let end = (read_end - attr.size) as usize;
-            output.extend_from_slice(&dirty.data[start..end]);
+
+        let visible_len = (read_end - offset) as usize;
+        if visible_len > crate::volume::MAX_IN_MEMORY_IO_BYTES {
+            return Err(ArgosError::FileTooLarge(format!(
+                "buffered read requires {visible_len} bytes, limit is {}",
+                crate::volume::MAX_IN_MEMORY_IO_BYTES
+            )));
+        }
+        output
+            .try_reserve_exact(visible_len.saturating_sub(output.len()))
+            .map_err(|_| ArgosError::Io(std::io::Error::from_raw_os_error(libc::ENOMEM)))?;
+        output.resize(visible_len, 0);
+        let overlay_start = offset.max(dirty.offset);
+        let overlay_end = read_end.min(dirty_end);
+        if overlay_end > overlay_start {
+            let src_start = (overlay_start - dirty.offset) as usize;
+            let dst_start = (overlay_start - offset) as usize;
+            let len = (overlay_end - overlay_start) as usize;
+            output[dst_start..dst_start + len]
+                .copy_from_slice(&dirty.data[src_start..src_start + len]);
+        }
+
+        // The persisted prefix was already counted by read_inode. Count the
+        // additionally visible sparse gap/dirty tail (or an EOF read) once.
+        let buffered_bytes = visible_len - persisted_len;
+        if buffered_bytes > 0 || persisted_len == 0 {
             self.volume
-                .account_buffered_read(ino, end - start, prefix_len != 0);
+                .account_buffered_read(ino, buffered_bytes, persisted_len != 0);
         }
         Ok(output)
     }
 
+    #[cfg(test)]
     fn flush_inode_writeback(&self, ino: InodeId) -> Result<()> {
+        self.flush_inode_writeback_reason(ino, WritebackFlushReason::Other)
+    }
+
+    fn flush_inode_writeback_reason(
+        &self,
+        ino: InodeId,
+        reason: WritebackFlushReason,
+    ) -> Result<()> {
         let mut writeback = self.writeback.lock();
         let Some(dirty) = writeback.remove_dirty(ino) else {
             let reap_after_flush = writeback.reap_after_flush.remove(&ino);
@@ -689,13 +727,18 @@ impl ArgosFuseShared {
             }
             return Ok(());
         };
-        let reap_after_flush = match self.volume.write_inode_range_from_open_handle_at(
+        let result = self.volume.write_inode_range_from_open_handle_at(
             ino,
             dirty.offset,
             dirty.data.as_slice(),
             dirty.written_at,
             dirty.seen_ctime,
-        ) {
+        );
+        self.volume.commit_metrics().record_writeback_flush(
+            reason,
+            matches!(&result, Ok(written) if *written == dirty.data.len()),
+        );
+        let reap_after_flush = match result {
             Ok(written) if written == dirty.data.len() => writeback.reap_after_flush.remove(&ino),
             Ok(written) => {
                 writeback.insert_dirty(ino, dirty);
@@ -732,7 +775,7 @@ impl ArgosFuseShared {
             let Some(ino) = next else {
                 return Ok(());
             };
-            self.flush_inode_writeback(ino)?;
+            self.flush_inode_writeback_reason(ino, WritebackFlushReason::Bulk)?;
         }
     }
 
@@ -747,7 +790,7 @@ impl ArgosFuseShared {
                 .collect::<BTreeSet<_>>()
         };
         for ino in inodes {
-            let _ = self.flush_inode_writeback(ino);
+            let _ = self.flush_inode_writeback_reason(ino, WritebackFlushReason::Bulk);
         }
     }
 
@@ -780,7 +823,9 @@ impl ArgosFuseShared {
         // block removal. If this inode cannot be flushed, retain its buffered data
         // until the namespace mutation actually succeeds; otherwise a rejected
         // unlink (for example, sticky-directory permissions) would lose data.
-        let target_flush_failed = self.flush_inode_writeback(attr.ino).is_err();
+        let target_flush_failed = self
+            .flush_inode_writeback_reason(attr.ino, WritebackFlushReason::Metadata)
+            .is_err();
         let removes_inode = attr.nlink <= 1;
         let result = self.volume.unlink_at_as(parent, name, uid);
         if result.is_ok() && target_flush_failed && removes_inode {
@@ -977,7 +1022,9 @@ impl Filesystem for ArgosFuse {
         let req = RequestIdentity::from_request(req);
         self.submit_io(ino.0, move |shared| {
             let req = &req;
-            if let Err(err) = shared.flush_inode_writeback(ino.0) {
+            if let Err(err) =
+                shared.flush_inode_writeback_reason(ino.0, WritebackFlushReason::Metadata)
+            {
                 reply.error(errno(&err));
                 return;
             }
@@ -1068,7 +1115,9 @@ impl Filesystem for ArgosFuse {
 
     fn readlink(&self, _req: &Request, ino: INodeNo, reply: ReplyData) {
         self.submit_io(ino.0, move |shared| {
-            if let Err(err) = shared.flush_inode_writeback(ino.0) {
+            if let Err(err) =
+                shared.flush_inode_writeback_reason(ino.0, WritebackFlushReason::Metadata)
+            {
                 reply.error(errno(&err));
                 return;
             }
@@ -1326,7 +1375,9 @@ impl Filesystem for ArgosFuse {
         self.submit_io(ino.0, move |shared| {
             let req = &req;
             if flags.0 & libc::O_TRUNC != 0 {
-                if let Err(err) = shared.flush_inode_writeback(ino.0) {
+                if let Err(err) =
+                    shared.flush_inode_writeback_reason(ino.0, WritebackFlushReason::Metadata)
+                {
                     reply.error(errno(&err));
                     return;
                 }
@@ -1432,17 +1483,25 @@ impl Filesystem for ArgosFuse {
                         || data.len() > FUSE_WRITEBACK_MAX_BYTES
                         || sync_write;
                     let written = if direct {
-                        shared.flush_inode_writeback(ino.0).and_then(|()| {
-                            shared
-                                .volume
-                                .write_inode_range_from_open_handle(ino.0, offset, data)
-                        })?
+                        shared
+                            .flush_inode_writeback_reason(
+                                ino.0,
+                                WritebackFlushReason::WritePressure,
+                            )
+                            .and_then(|()| {
+                                shared
+                                    .volume
+                                    .write_inode_range_from_open_handle(ino.0, offset, data)
+                            })?
                     } else {
                         shared.require_regular_file(ino)?;
                         if shared.queue_writeback_staged(ino.0, offset, data)? {
                             data.len()
                         } else {
-                            shared.flush_inode_writeback(ino.0)?;
+                            shared.flush_inode_writeback_reason(
+                                ino.0,
+                                WritebackFlushReason::WritePressure,
+                            )?;
                             if shared.queue_writeback_staged(ino.0, offset, data)? {
                                 data.len()
                             } else {
@@ -1490,7 +1549,7 @@ impl Filesystem for ArgosFuse {
                             "FUSE file handle inode mismatch".to_string(),
                         ));
                     }
-                    shared.flush_inode_writeback(ino.0)?;
+                    shared.flush_inode_writeback_reason(ino.0, WritebackFlushReason::Metadata)?;
                     shared
                         .volume
                         .seek_data_or_hole(ino.0, offset as u64, whence)
@@ -1528,7 +1587,7 @@ impl Filesystem for ArgosFuse {
                             "FUSE file handle is not open for this write".to_string(),
                         ));
                     }
-                    shared.flush_inode_writeback(ino.0)?;
+                    shared.flush_inode_writeback_reason(ino.0, WritebackFlushReason::Metadata)?;
                     shared
                         .volume
                         .fallocate_inode_as(ino.0, offset, length, mode)
@@ -1580,9 +1639,10 @@ impl Filesystem for ArgosFuse {
                     ));
                 }
                 drop(handles);
-                shared.flush_inode_writeback(ino_in.0)?;
+                shared.flush_inode_writeback_reason(ino_in.0, WritebackFlushReason::Metadata)?;
                 if ino_out != ino_in {
-                    shared.flush_inode_writeback(ino_out.0)?;
+                    shared
+                        .flush_inode_writeback_reason(ino_out.0, WritebackFlushReason::Metadata)?;
                 }
                 shared
                     .volume
@@ -1623,7 +1683,8 @@ impl Filesystem for ArgosFuse {
         reply: ReplyEmpty,
     ) {
         self.submit_io(ino.0, move |shared| {
-            let flush_result = shared.flush_inode_writeback(ino.0);
+            let flush_result =
+                shared.flush_inode_writeback_reason(ino.0, WritebackFlushReason::Release);
             let mut handles = shared.handles.lock();
             let Some((file, last)) = handles.close(fh) else {
                 reply.error(Errno::EBADF);
@@ -1674,7 +1735,7 @@ impl Filesystem for ArgosFuse {
                             "FUSE file handle inode mismatch".to_string(),
                         ));
                     }
-                    shared.flush_inode_writeback(ino.0)?;
+                    shared.flush_inode_writeback_reason(ino.0, WritebackFlushReason::Sync)?;
                     shared.volume.sync()
                 });
             match result {
@@ -1701,7 +1762,9 @@ impl Filesystem for ArgosFuse {
             let req = &req;
             let name = name.as_os_str();
             let value = value.as_slice();
-            if let Err(err) = shared.flush_inode_writeback(ino.0) {
+            if let Err(err) =
+                shared.flush_inode_writeback_reason(ino.0, WritebackFlushReason::Metadata)
+            {
                 reply.error(errno(&err));
                 return;
             }
@@ -1748,7 +1811,9 @@ impl Filesystem for ArgosFuse {
         self.submit_io(ino.0, move |shared| {
             let req = &req;
             let name = name.as_os_str();
-            if let Err(err) = shared.flush_inode_writeback(ino.0) {
+            if let Err(err) =
+                shared.flush_inode_writeback_reason(ino.0, WritebackFlushReason::Metadata)
+            {
                 reply.error(errno(&err));
                 return;
             }
@@ -1768,7 +1833,9 @@ impl Filesystem for ArgosFuse {
         let req = RequestIdentity::from_request(req);
         self.submit_io(ino.0, move |shared| {
             let req = &req;
-            if let Err(err) = shared.flush_inode_writeback(ino.0) {
+            if let Err(err) =
+                shared.flush_inode_writeback_reason(ino.0, WritebackFlushReason::Metadata)
+            {
                 reply.error(errno(&err));
                 return;
             }
@@ -1804,7 +1871,9 @@ impl Filesystem for ArgosFuse {
         self.submit_io(ino.0, move |shared| {
             let req = &req;
             let name = name.as_os_str();
-            if let Err(err) = shared.flush_inode_writeback(ino.0) {
+            if let Err(err) =
+                shared.flush_inode_writeback_reason(ino.0, WritebackFlushReason::Metadata)
+            {
                 reply.error(errno(&err));
                 return;
             }
@@ -2285,6 +2354,9 @@ fn xattr_name(name: &OsStr) -> Result<&str> {
 #[cfg(test)]
 #[path = "fusefs_full_stripe_tests.rs"]
 mod fusefs_full_stripe_tests;
+#[cfg(test)]
+#[path = "fusefs_non_eof_tests.rs"]
+mod fusefs_non_eof_tests;
 #[cfg(test)]
 #[path = "fusefs_read_overlay_tests.rs"]
 mod fusefs_read_overlay_tests;
