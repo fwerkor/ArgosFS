@@ -3,10 +3,6 @@
 ## One-click release
 
 The workflow is Actions → **Release** → **Run workflow**, on **main**.
-While AUR is under maintenance or the AUR account has not been provisioned,
-uncheck **Publish AUR packages**. GitHub Releases and crates.io publishing
-continue independently; the AUR step will be explicitly skipped. Re-enable
-it on future releases once AUR access is ready.
 Leave the optional version blank to use Cargo.toml's version. This workflow
 intentionally does **not** change project versions: update Cargo.toml and
 Cargo.lock in a reviewed PR before shipping a new version.
