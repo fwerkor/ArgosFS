@@ -766,6 +766,21 @@ pub struct FsckReport {
     pub directories_checked: u64,
     pub damaged_files: u64,
     pub repaired_files: u64,
+    /// Physical shards reconstructed without rewriting the containing files.
+    #[serde(default)]
+    pub reconstructed_shards: u64,
+    /// Verified shard payload bytes consumed by successful reconstruction.
+    #[serde(default)]
+    pub repair_bytes_read: u64,
+    /// Physical reconstructed shard payload bytes written.
+    #[serde(default)]
+    pub repair_bytes_written: u64,
+    /// Time spent in successful reconstruction, in milliseconds.
+    #[serde(default)]
+    pub repair_elapsed_ms: u64,
+    /// Whole-file rewrites triggered by repair (normally zero).
+    #[serde(default)]
+    pub full_file_rewrites: u64,
     pub unrecoverable_files: u64,
     pub missing_shards: u64,
     pub checksum_errors: u64,

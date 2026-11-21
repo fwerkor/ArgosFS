@@ -114,6 +114,10 @@ mod maintenance;
 mod metadata_budget;
 mod namespace;
 mod read_advisory;
+mod shard_repair;
+#[cfg(test)]
+mod shard_repair_tests;
+use shard_repair::RepairCounters;
 #[cfg(test)]
 mod read_advisory_tests;
 #[cfg(test)]
@@ -265,6 +269,7 @@ pub struct ArgosFs {
     read_retries: usize,
     read_retries_seen: Arc<AtomicU64>,
     read_recovered: Arc<AtomicU64>,
+    repair_counters: Arc<RepairCounters>,
     mount_owners: Arc<AtomicUsize>,
 }
 
@@ -291,6 +296,7 @@ impl Clone for ArgosFs {
             read_retries: self.read_retries,
             read_retries_seen: self.read_retries_seen.clone(),
             read_recovered: self.read_recovered.clone(),
+            repair_counters: self.repair_counters.clone(),
             mount_owners: self.mount_owners.clone(),
         }
     }
@@ -526,6 +532,7 @@ impl ArgosFs {
             read_retries: configured_read_retries(),
             read_retries_seen: Arc::new(AtomicU64::new(0)),
             read_recovered: Arc::new(AtomicU64::new(0)),
+            repair_counters: Arc::new(RepairCounters::default()),
             mount_owners: Arc::new(AtomicUsize::new(1)),
         })
     }
@@ -760,6 +767,7 @@ impl ArgosFs {
             read_retries: configured_read_retries(),
             read_retries_seen: Arc::new(AtomicU64::new(0)),
             read_recovered: Arc::new(AtomicU64::new(0)),
+            repair_counters: Arc::new(RepairCounters::default()),
             mount_owners: Arc::new(AtomicUsize::new(1)),
         })
     }
