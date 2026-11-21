@@ -44,7 +44,7 @@ must not be added together as if independent.
 | `durability_validation` | Precommit data-durability verification |
 | `data_flush` | Deferred member data flushes and repeat validation |
 | `journal` | Journal append, quorum confirmation and crash-injection checks |
-| `journal_delta` | Encoding changed-metadata delta before journal record construction |
+| `journal_delta` | Building a journal delta when no prepared v2 group-commit delta is available; zero for normal v2 group commits that reuse their integrity-phase delta |
 | `journal_member_io` | One member's journal append/write (excluding deferred flush and quorum certificate), with additional per-disk labels |
 | `journal_flush` | A single deferred journal member flush, including failures; *per-device durations* sum to more than wall time if parallelized in future |
 | `journal_quorum` | Quorum commit certificate preparation excluded; timer covers certificate fanout/write/flush and final quorum decision |
@@ -94,8 +94,11 @@ interpret a `/metrics` scrape timeout during a long commit as proof that the
 FUSE mount is down. The full endpoint has **no promised latency bound** under
 write load.
 
-`journal_delta` measures delta *construction*, including on v1 append paths;
-it does not mean that a v1 pool has enabled the v2 hash scheme. The nested
+`journal_delta` measures delta *construction* at journal encoding on paths that
+have not already prepared it, including legacy append paths; it does not mean
+that a v1 pool has enabled the v2 hash scheme. On normal v2 deferred group
+commits the delta is built once inside `integrity` and passed to the journal
+encoder, so `journal_delta` is zero. Do not interpret that as no delta work. The nested
 `checkpoint_member_io` also counts full-checkpoint writes done **inside
 `journal_rollover`**, not only `checkpoint` writes. Summing nested per-member
 latencies, phase totals, and wall time double-counts parallel and nested work.

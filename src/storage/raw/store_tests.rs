@@ -1772,6 +1772,37 @@ fn journal_rollover_checkpoints_shared_state_and_recovers_after_reset() {
 }
 
 #[test]
+fn prepared_v2_group_delta_survives_quorum_journal_replay() {
+    let (_dir, images, previous, superblocks) = quorum_fixture();
+    let backend = block_backend_for(&images);
+    let upgraded = upgrade_delta_integrity_members(&backend, &superblocks, &previous).unwrap();
+    let mut next = previous.clone();
+    next.raw_pool.pool_name = "prepared-v2-journal".into();
+    next.txid += 1;
+    next.updated_at += 1.0;
+    let prepared = journal::prepare_delta_integrity_with_delta(&mut next, &previous).unwrap();
+    append_journal_quorum(
+        &backend,
+        &upgraded,
+        &next,
+        Some(&previous),
+        "prepared-v2-group",
+        serde_json::json!({ "previous_txid": previous.txid }),
+        JournalQuorumOptions {
+            mode: JournalQuorumMode::TrustedTransaction,
+            metrics: None,
+            prepared_delta: Some(prepared),
+        },
+    )
+    .unwrap();
+    let (recovered, report) = load_or_recover(&backend, &upgraded, false).unwrap();
+    assert!(report.replayed);
+    assert_eq!(report.invalid_entries, 0, "{:?}", report.errors);
+    assert_eq!(recovered.integrity, next.integrity);
+    assert_eq!(recovered.raw_pool.pool_name, next.raw_pool.pool_name);
+}
+
+#[test]
 fn delta_integrity_v2_journal_quorum_replays_without_checkpoint() {
     let (_dir, images, previous, superblocks) = quorum_fixture();
     let backend = block_backend_for(&images);
