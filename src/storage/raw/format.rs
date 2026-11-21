@@ -34,6 +34,15 @@ pub const ENDIAN_MARKER: u32 = 0x1234_5678;
 /// Persistent opt-in: old releases reject any member with this bit set.
 /// Only enable after every active member is fenced against legacy writers.
 pub const REQUIRED_FEATURE_DELTA_INTEGRITY: u64 = 1 << 0;
+/// Bits 8..15 of optional feature flags identify the erasure-code wire format.
+/// Zero is the implicit legacy ID used by superblocks formatted before #259.
+/// Both IDs currently use byte-identical GF(2^8) systematic Vandermonde parity.
+/// An incompatible future codec MUST also set a required feature bit so older
+/// writers cannot silently produce incompatible stripes.
+pub const CODEC_ID_LEGACY_GF8: u8 = 0;
+pub const CODEC_ID_VANDERMONDE_GF8: u8 = 1;
+const CODEC_ID_SHIFT: u32 = 8;
+const CODEC_ID_MASK: u64 = 0xff << CODEC_ID_SHIFT;
 const SUPPORTED_REQUIRED_FEATURE_FLAGS: u64 = REQUIRED_FEATURE_DELTA_INTEGRITY;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -129,7 +138,7 @@ impl RawSuperblock {
             chunk_size,
             generation: 1,
             clean: true,
-            feature_flags: 0,
+            feature_flags: u64::from(CODEC_ID_VANDERMONDE_GF8) << CODEC_ID_SHIFT,
             required_feature_flags: 0,
             block_size: RAW_BLOCK_SIZE as u32,
             sector_size: 512,
@@ -145,6 +154,11 @@ impl RawSuperblock {
             last_mount_time: 0,
             last_clean_unmount_time: 0,
         })
+    }
+
+    /// The on-disk erasure codec identifier; zero means a legacy superblock.
+    pub fn codec_id(&self) -> u8 {
+        ((self.feature_flags & CODEC_ID_MASK) >> CODEC_ID_SHIFT) as u8
     }
 
     pub fn device_label(&self) -> RawDeviceLabel {
@@ -224,6 +238,13 @@ impl RawSuperblock {
                 "raw superblock checksum mismatch".to_string(),
             ));
         }
+        let feature_flags = get_u64(bytes, 40)?;
+        let codec_id = ((feature_flags & CODEC_ID_MASK) >> CODEC_ID_SHIFT) as u8;
+        if !matches!(codec_id, CODEC_ID_LEGACY_GF8 | CODEC_ID_VANDERMONDE_GF8) {
+            return Err(ArgosError::IncompatibleFormat(format!(
+                "unsupported raw erasure codec id {codec_id}"
+            )));
+        }
         let required_feature_flags = get_u64(bytes, 48)?;
         let unsupported = required_feature_flags & !SUPPORTED_REQUIRED_FEATURE_FLAGS;
         if unsupported != 0 {
@@ -271,7 +292,7 @@ impl RawSuperblock {
             chunk_size,
             generation: get_u64(bytes, 32)?,
             clean: get_u32(bytes, 108)? != 0,
-            feature_flags: get_u64(bytes, 40)?,
+            feature_flags,
             required_feature_flags,
             block_size,
             sector_size,

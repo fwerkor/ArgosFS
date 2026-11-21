@@ -26,7 +26,7 @@ target/debug/argosfs preflight-root --backend loop --images disk0.img,disk1.img,
 ```
 
 See `docs/cli.md`, `docs/raw-backend.md`, `docs/capos-rootfs.md`, and
-`docs/repository-layout.md` for CLI selection/configuration, the raw layout,
+`docs/repository-layout.md` and `docs/erasure-codec.md` for CLI selection/configuration, the raw layout,
 CapOS boot flow, and repository organization.
 
 ArgosFS is a Rust implementation of a self-driving, erasure-coded Linux
@@ -37,7 +37,7 @@ artifact-generation workflows.
 ArgosFS is implemented in Rust for memory safety and future kernel-adjacent
 reuse. The data plane uses mature crates rather than hand-rolled primitives:
 
-- `erase` for configurable `k+m` Reed-Solomon layouts.
+- Vendored reed-solomon-engine for portable runtime-dispatched Reed–Solomon layouts.
 - `fuser`/libfuse3 for the Linux filesystem mount frontend.
 - `zstd` and `lz4_flex` for transparent block compression.
 - `chacha20poly1305` and `argon2` for built-in authenticated encryption.

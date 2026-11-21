@@ -781,6 +781,9 @@ impl ArgosFs {
             let data = self.read_inode(ino, 0, u64::MAX as usize, true)?;
             maintenance_after_read_delay();
             let mut meta = self.meta.write();
+            // Fold queued read traffic into the inode before hot/cold tier
+            // classification. Common reads retain their shared guard.
+            self.drain_read_advisory_locked(&mut meta);
             if let Some(inode) = meta.inodes.get_mut(&ino) {
                 classify_inode(inode);
             }
@@ -880,8 +883,9 @@ impl ArgosFs {
 
     pub fn health_report(&self) -> HealthReport {
         let meta = self.meta.read();
-        let disks = meta
-            .disks
+        let mut live_disks = meta.disks.clone();
+        self.read_advisory.project_disks(&mut live_disks);
+        let disks = live_disks
             .values()
             .map(|disk| risk_report(disk, &relative_or_absolute(&self.root, &disk.path)))
             .collect();
@@ -1057,7 +1061,7 @@ impl ArgosFs {
                                 report.missing_shards += 1;
                                 continue;
                             }
-                            match self.read_shard_verified_locked(&mut meta, shard) {
+                            match self.read_shard_verified_locked(&meta, shard) {
                                 Ok(Some(_)) => {
                                     if shard.slot < total_slots {
                                         available_slots.insert(shard.slot);

@@ -230,6 +230,7 @@ pub fn run() -> Result<()> {
                         "disk_index": superblock.disk_index,
                         "k": superblock.k,
                         "m": superblock.m,
+                        "codec_id": superblock.codec_id(),
                         "chunk_size": superblock.chunk_size,
                         "generation": superblock.generation,
                         "clean": superblock.clean,

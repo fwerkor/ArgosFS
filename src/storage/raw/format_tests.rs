@@ -435,3 +435,42 @@ fn alignment_and_binary_field_helpers_cover_zero_short_and_saturation() {
     put_fixed_str(&mut fixed, 0, 5, "too-long-value");
     assert_eq!(&fixed, b"too-\0");
 }
+
+#[test]
+fn codec_id_is_optional_for_legacy_and_rejects_unknown_codecs() {
+    let new = sample_superblock();
+    assert_eq!(new.codec_id(), CODEC_ID_VANDERMONDE_GF8);
+    assert_eq!(RawSuperblock::decode(&new.encode()).unwrap().codec_id(), 1);
+
+    // The old (pre-#259) superblock has no codec ID. Re-encoding it does
+    // not rewrite any reserved bits or force a migration.
+    let mut legacy = new.clone();
+    legacy.feature_flags &= !CODEC_ID_MASK;
+    let encoded = legacy.encode();
+    let reopened = RawSuperblock::decode(&encoded).unwrap();
+    assert_eq!(reopened.codec_id(), CODEC_ID_LEGACY_GF8);
+    assert_eq!(reopened.encode(), encoded);
+
+    // Future incompatible codes must be rejected, not silently decoded
+    // using a different generator matrix.
+    let mut unknown = legacy.clone();
+    unknown.feature_flags |= 2u64 << CODEC_ID_SHIFT;
+    assert!(matches!(
+        RawSuperblock::decode(&unknown.encode()),
+        Err(ArgosError::IncompatibleFormat(_))
+    ));
+}
+
+#[test]
+fn codec_identifier_does_not_change_existing_superblock_geometry() {
+    let new = sample_superblock();
+    let mut old = new.clone();
+    old.feature_flags = 0;
+    let mut old_bytes = old.encode();
+    let new_bytes = new.encode();
+    assert_eq!(old_bytes.len(), new_bytes.len());
+    // The optional feature bits and their checksum are the only changes.
+    old_bytes[40..48].copy_from_slice(&new_bytes[40..48]);
+    old_bytes[224..256].copy_from_slice(&new_bytes[224..256]);
+    assert_eq!(old_bytes, new_bytes);
+}
