@@ -203,3 +203,24 @@ and write-fencing remain unchanged. At clean unmount, advisory-only changes
 are rehashed before the final required replicated metadata copies so the
 checkpoint cannot contain stale integrity information. The ordinary
 `/commit-metrics` counters remain runtime diagnostics, not durable storage.
+
+### Concurrent read-side advisory accounting (#255)
+
+Raw and LoopBlock FUSE reads now decode directly from a **shared** namespace
+metadata guard instead of constructing one cloned decoder `Metadata` for
+every request. They accumulate access/read-byte/workload-score changes and
+per-device latency EWMAs in 64 separately locked runtime buckets, without
+taking the global namespace write lock or the deferred-commit mutex. The
+accounting is bounded by the number of distinct accessed inodes and members,
+not the number of FUSE reads; a compact EWMA composition preserves the effect
+of each latency sample. Explicit metadata snapshots project current pending
+counters, while the next real namespace transaction merges them into its
+integrity-checked journal/checkpoint image. Clean unmount merges and rehashes
+pending advisory changes before writing its final checkpoint. Background
+rebalance merges the current read heat before classifying inode placement.
+
+This preserves verified data-shard reads, fail-closed corruption handling,
+exclusive self-heal, and the read-only no-checkpoint guarantee from #251.
+It does not change FUSE `max_read`, the raw on-disk format, checkpoint quorum,
+or data durability. Physical Borg throughput still requires a matched device
+retest to confirm the CPU gain; no speedup is inferred from unit tests.

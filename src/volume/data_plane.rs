@@ -3,6 +3,26 @@ use crate::backend::StorageBackend;
 use crate::storage::guard::GuardedBackend;
 use std::sync::Arc;
 
+/// Stitch checked data shards using bounded bulk copies.  Avoids the
+/// byte-at-a-time iterator/collect path on verified and reconstructed reads.
+pub(super) fn assemble_data_shards<'a>(
+    chunks: impl Iterator<Item = &'a [u8]> + Clone,
+    compressed_size: usize,
+) -> Vec<u8> {
+    let available = chunks
+        .clone()
+        .fold(0usize, |total, chunk| total.saturating_add(chunk.len()));
+    let mut compressed = Vec::with_capacity(compressed_size.min(available));
+    for chunk in chunks {
+        let remaining = compressed_size.saturating_sub(compressed.len());
+        if remaining == 0 {
+            break;
+        }
+        compressed.extend_from_slice(&chunk[..remaining.min(chunk.len())]);
+    }
+    compressed
+}
+
 impl ArgosFs {
     pub(super) fn replace_inode_data(
         &self,
@@ -37,7 +57,7 @@ impl ArgosFs {
         exclude_disks: &BTreeSet<String>,
     ) -> Result<()> {
         self.ensure_block_backend_writable_locked(meta)?;
-        let rollback = commit_previous_snapshot(meta);
+        let rollback = self.commit_previous_with_advisory_locked(meta);
         let (storage_class, boot_critical, old_size) = {
             let inode = meta
                 .inodes
@@ -170,7 +190,7 @@ impl ArgosFs {
 
     pub(super) fn decode_inode_range_with_cache_policy_locked(
         &self,
-        meta: &mut Metadata,
+        meta: &Metadata,
         inode: &Inode,
         start: usize,
         end: usize,
@@ -272,7 +292,7 @@ impl ArgosFs {
         details: serde_json::Value,
         write_time: Option<BufferedWriteTime>,
     ) -> Result<()> {
-        let rollback = commit_previous_snapshot(meta);
+        let rollback = self.commit_previous_with_advisory_locked(meta);
         let (storage_class, boot_critical, old_size, old_blocks) = {
             let inode = meta
                 .inodes
@@ -388,7 +408,7 @@ impl ArgosFs {
 
     pub(super) fn decode_inode_data_with_cache_policy_locked(
         &self,
-        meta: &mut Metadata,
+        meta: &Metadata,
         inode: &Inode,
         cache_policy: BlockCachePolicy,
     ) -> Result<(Vec<u8>, Vec<String>)> {
@@ -453,7 +473,7 @@ impl ArgosFs {
 
     fn decode_block_with_cache_policy_locked(
         &self,
-        meta: &mut Metadata,
+        meta: &Metadata,
         block: &FileBlock,
         decrypt_key: Option<&[u8; 32]>,
         damaged: &mut Vec<String>,
@@ -529,12 +549,13 @@ impl ArgosFs {
         let compressed: Vec<u8> = if shards[..layout.k].iter().all(Option::is_some) {
             // Each data shard has already passed its individual hash. The
             // reconstructed block is checked against raw_sha256 below too.
-            shards
-                .iter()
-                .take(layout.k)
-                .flat_map(|shard| shard.as_ref().unwrap().iter().copied())
-                .take(block.compressed_size)
-                .collect()
+            assemble_data_shards(
+                shards
+                    .iter()
+                    .take(layout.k)
+                    .map(|shard| shard.as_deref().unwrap()),
+                block.compressed_size,
+            )
         } else {
             let present = shards.iter().filter(|shard| shard.is_some()).count();
             if present < layout.k {
@@ -545,12 +566,10 @@ impl ArgosFs {
             }
             let codec = RsCodec::new(layout.k, layout.m)?;
             let reconstructed = codec.reconstruct(shards)?;
-            reconstructed
-                .iter()
-                .take(layout.k)
-                .flat_map(|shard| shard.iter().copied())
-                .take(block.compressed_size)
-                .collect()
+            assemble_data_shards(
+                reconstructed.iter().take(layout.k).map(Vec::as_slice),
+                block.compressed_size,
+            )
         };
         let compressed = if block.encrypted {
             let nonce = hex::decode(&block.nonce_hex).map_err(|err| {
@@ -583,7 +602,7 @@ impl ArgosFs {
 
     pub(super) fn decode_block_range_locked(
         &self,
-        meta: &mut Metadata,
+        meta: &Metadata,
         block: &FileBlock,
         start: usize,
         end: usize,
@@ -648,22 +667,18 @@ impl ArgosFs {
         ) {
             Ok(data) => data,
             Err(err) => {
-                self.update_read_latency_locked(
-                    meta,
-                    &shard.disk_id,
-                    0,
-                    start_time.elapsed().as_secs_f64(),
-                );
+                if let Some(disk) = meta.disks.get(&shard.disk_id) {
+                    self.read_advisory
+                        .disk(disk, 0, start_time.elapsed().as_secs_f64());
+                }
                 damaged.push(format!("{}:missing-range:{}", shard.disk_id, shard.slot));
                 return Err(err);
             }
         };
-        self.update_read_latency_locked(
-            meta,
-            &shard.disk_id,
-            data.len() as u64,
-            start_time.elapsed().as_secs_f64(),
-        );
+        if let Some(disk) = meta.disks.get(&shard.disk_id) {
+            self.read_advisory
+                .disk(disk, data.len() as u64, start_time.elapsed().as_secs_f64());
+        }
 
         let first_checksum = verify_start / checksum_block_size;
         let last_checksum = verify_end.div_ceil(checksum_block_size);
@@ -715,7 +730,7 @@ impl ArgosFs {
 
     fn decode_single_shard_block_with_cache_policy_locked(
         &self,
-        meta: &mut Metadata,
+        meta: &Metadata,
         block: &FileBlock,
         damaged: &mut Vec<String>,
         cache_key: &str,
@@ -1319,6 +1334,7 @@ impl ArgosFs {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(super) fn update_read_latency_locked(
         &self,
         meta: &mut Metadata,
@@ -1326,22 +1342,6 @@ impl ArgosFs {
         bytes: u64,
         seconds: f64,
     ) {
-        let captured = READ_LATENCY_SAMPLES.with(|slot| {
-            let mut slot = slot.borrow_mut();
-            if let Some(samples) = slot.as_mut() {
-                samples.push(ReadLatencySample {
-                    disk_id: disk_id.to_owned(),
-                    bytes,
-                    elapsed_seconds: seconds,
-                });
-                true
-            } else {
-                false
-            }
-        });
-        if captured {
-            return;
-        }
         if meta.backend != BackendKind::Host {
             self.deferred_commit.lock().raw_advisory_metadata_dirty = true;
         }
@@ -1452,7 +1452,7 @@ impl ArgosFs {
     /// already fenced the device for those.
     pub(super) fn read_shard_verified_locked(
         &self,
-        meta: &mut Metadata,
+        meta: &Metadata,
         shard: &Shard,
     ) -> Result<Option<Vec<u8>>> {
         let (result, attempts) = retry_verified(
@@ -1461,21 +1461,20 @@ impl ArgosFs {
                 let start = std::time::Instant::now();
                 match self.read_shard_locked(meta, shard) {
                     Ok(data) => {
-                        self.update_read_latency_locked(
-                            meta,
-                            &shard.disk_id,
-                            data.len() as u64,
-                            start.elapsed().as_secs_f64(),
-                        );
+                        if let Some(disk) = meta.disks.get(&shard.disk_id) {
+                            self.read_advisory.disk(
+                                disk,
+                                data.len() as u64,
+                                start.elapsed().as_secs_f64(),
+                            );
+                        }
                         Ok(data)
                     }
                     Err(err) => {
-                        self.update_read_latency_locked(
-                            meta,
-                            &shard.disk_id,
-                            0,
-                            start.elapsed().as_secs_f64(),
-                        );
+                        if let Some(disk) = meta.disks.get(&shard.disk_id) {
+                            self.read_advisory
+                                .disk(disk, 0, start.elapsed().as_secs_f64());
+                        }
                         Err(err)
                     }
                 }

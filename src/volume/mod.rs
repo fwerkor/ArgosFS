@@ -30,7 +30,7 @@ use crate::util::{
 };
 use parking_lot::{Mutex, RwLock};
 use serde_json::json;
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
@@ -65,48 +65,6 @@ impl BufferedWriteTime {
             current_ctime
         } else {
             self.at
-        }
-    }
-}
-
-/// Read-side samples collected while an immutable metadata read guard is held.
-/// This avoids taking the namespace write lock for each individual shard I/O.
-struct ReadLatencySample {
-    disk_id: String,
-    bytes: u64,
-    elapsed_seconds: f64,
-}
-
-thread_local! {
-    static READ_LATENCY_SAMPLES: RefCell<Option<Vec<ReadLatencySample>>> = const { RefCell::new(None) };
-}
-
-struct ReadLatencyCapture {
-    previous: Option<Vec<ReadLatencySample>>,
-    active: bool,
-}
-
-impl ReadLatencyCapture {
-    fn start() -> Self {
-        let previous = READ_LATENCY_SAMPLES.with(|slot| slot.replace(Some(Vec::new())));
-        Self {
-            previous,
-            active: true,
-        }
-    }
-
-    fn finish(mut self) -> Vec<ReadLatencySample> {
-        self.active = false;
-        READ_LATENCY_SAMPLES.with(|slot| slot.replace(self.previous.take()).unwrap_or_default())
-    }
-}
-
-impl Drop for ReadLatencyCapture {
-    fn drop(&mut self) {
-        if self.active {
-            READ_LATENCY_SAMPLES.with(|slot| {
-                slot.replace(self.previous.take());
-            });
         }
     }
 }
@@ -155,6 +113,9 @@ mod helpers;
 mod maintenance;
 mod metadata_budget;
 mod namespace;
+mod read_advisory;
+#[cfg(test)]
+mod read_advisory_tests;
 #[cfg(test)]
 mod read_cache_range_tests;
 #[cfg(test)]
@@ -292,6 +253,7 @@ pub struct ArgosFs {
     meta: Arc<RwLock<Metadata>>,
     quota_runtime: Arc<RwLock<QuotaRuntime>>,
     deferred_commit: Arc<Mutex<DeferredCommitState>>,
+    read_advisory: Arc<read_advisory::ReadAdvisory>,
     commit_metrics: Arc<CommitMetrics>,
     quarantined_devices: Arc<Mutex<BTreeSet<String>>>,
     quarantine_since: Arc<Mutex<BTreeMap<String, f64>>>,
@@ -317,6 +279,7 @@ impl Clone for ArgosFs {
             meta: self.meta.clone(),
             quota_runtime: self.quota_runtime.clone(),
             deferred_commit: self.deferred_commit.clone(),
+            read_advisory: self.read_advisory.clone(),
             commit_metrics: self.commit_metrics.clone(),
             quarantined_devices: self.quarantined_devices.clone(),
             quarantine_since: self.quarantine_since.clone(),
@@ -549,6 +512,7 @@ impl ArgosFs {
             raw_superblocks: Arc::new(Vec::new()),
             root: Arc::new(root),
             deferred_commit: Arc::new(Mutex::new(DeferredCommitState::new(&meta))),
+            read_advisory: Arc::new(read_advisory::ReadAdvisory::default()),
             commit_metrics: Arc::new(CommitMetrics::default()),
             quarantined_devices: Arc::new(Mutex::new(BTreeSet::new())),
             quarantine_since: Arc::new(Mutex::new(BTreeMap::new())),
@@ -782,6 +746,7 @@ impl ArgosFs {
             backend_writable,
             raw_superblocks: Arc::new(superblocks),
             deferred_commit,
+            read_advisory: Arc::new(read_advisory::ReadAdvisory::default()),
             commit_metrics: Arc::new(CommitMetrics::default()),
             quarantined_devices,
             quarantine_since: Arc::new(Mutex::new(BTreeMap::new())),
@@ -822,13 +787,20 @@ impl ArgosFs {
     }
 
     pub fn metadata_snapshot(&self) -> Metadata {
-        self.meta.read().clone()
+        let guard = self.meta.read();
+        let mut snapshot = guard.clone();
+        self.read_advisory.project(&mut snapshot);
+        snapshot
     }
 
     /// Nonblocking metadata observation for advisory queries such as statfs.
     /// A checkpoint may hold the writer lock for slow device I/O.
     pub(crate) fn try_metadata_snapshot(&self) -> Option<Metadata> {
-        self.meta.try_read().map(|meta| meta.clone())
+        self.meta.try_read().map(|meta| {
+            let mut snapshot = meta.clone();
+            self.read_advisory.project(&mut snapshot);
+            snapshot
+        })
     }
 
     #[cfg(test)]
@@ -1024,9 +996,27 @@ impl ArgosFs {
         err.is_fatal_device_error()
     }
 
+    fn drain_read_advisory_locked(&self, meta: &mut Metadata) {
+        if self.read_advisory.drain(meta) && meta.backend != BackendKind::Host {
+            self.deferred_commit.lock().raw_advisory_metadata_dirty = true;
+        }
+    }
+
+    fn commit_previous_with_advisory_locked(&self, meta: &mut Metadata) -> Option<Metadata> {
+        // Immediate commits restore this snapshot on failure. Merge all
+        // successful *preceding* reads before taking it so a rollback cannot
+        // silently erase their counters. Deferred raw writes have their own
+        // durable commit baseline and must avoid draining on every write.
+        if meta.backend == BackendKind::Host || !meta.config.defer_metadata_commit {
+            self.drain_read_advisory_locked(meta);
+        }
+        commit_previous_snapshot(meta)
+    }
+
     pub fn sync(&self) -> Result<()> {
         let waiting = Instant::now();
         let mut meta = self.meta.write();
+        self.drain_read_advisory_locked(&mut meta);
         self.commit_metrics
             .observe(CommitPhase::SyncLockWait, waiting.elapsed());
         let _lock_hold = self.commit_metrics.timer(CommitPhase::SyncLockHold);
@@ -1098,9 +1088,11 @@ impl ArgosFs {
         // Before the mandatory final checkpoint, promote that volatile dirt to
         // a real checkpoint request so sync() re-anchors integrity. Never copy
         // an in-memory read-stat image with a stale integrity tuple to media.
-        if self.meta.read().backend != BackendKind::Host {
+        {
+            let mut meta = self.meta.write();
+            self.drain_read_advisory_locked(&mut meta);
             let mut state = self.deferred_commit.lock();
-            if state.raw_advisory_metadata_dirty {
+            if meta.backend != BackendKind::Host && state.raw_advisory_metadata_dirty {
                 state.raw_uncommitted_metadata_dirty = true;
                 state.raw_checkpoint_required = true;
             }
@@ -1393,7 +1385,7 @@ impl ArgosFs {
         {
             return Err(ArgosError::AlreadyExists(name.to_string()));
         }
-        let rollback = commit_previous_snapshot(meta);
+        let rollback = self.commit_previous_with_advisory_locked(meta);
         let file_type = mode & libc::S_IFMT;
         let kind = if file_type == libc::S_IFREG || file_type == 0 {
             if rdev != 0 {
@@ -2298,6 +2290,7 @@ impl ArgosFs {
 
     fn commit_deferred_locked(&self, meta: &mut Metadata, checkpoint: bool) -> Result<bool> {
         self.ensure_block_backend_writable_locked(meta)?;
+        self.drain_read_advisory_locked(meta);
         let mut state = self.deferred_commit.lock();
         if state.dirty_transactions == 0
             && state.pending_reclaims.is_empty()
@@ -2501,6 +2494,7 @@ impl ArgosFs {
         details: serde_json::Value,
     ) -> Result<()> {
         self.ensure_block_backend_writable_locked(meta)?;
+        self.drain_read_advisory_locked(meta);
         if meta.backend != BackendKind::Host
             && (bulk_import_enabled() || meta.config.defer_metadata_commit)
         {
