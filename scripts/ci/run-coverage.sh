@@ -8,7 +8,6 @@ minimum_lines="${ARGOSFS_COVERAGE_MIN_LINES:-80}"
 require_fuse="${ARGOSFS_COVERAGE_REQUIRE_FUSE:-0}"
 artifacts="${ARGOSFS_COVERAGE_ARTIFACTS:-$repo/target/coverage}"
 rm -rf "$artifacts"
-mkdir -p "$artifacts"
 
 if ! cargo llvm-cov --version >/dev/null 2>&1; then
   echo "ERROR: cargo-llvm-cov is required" >&2
@@ -25,7 +24,11 @@ eval "$(cargo llvm-cov show-env --sh)"
 # profiles. Use one profile per process/module so the final report is a union of
 # every Cargo, CLI, and FUSE execution.
 export LLVM_PROFILE_FILE="$repo/target/argosfs-%p-%m.profraw"
+# Cargo now validates CACHEDIR.TAG before cleaning an existing target dir.
+# Creating target/coverage before Cargo has initialized target makes clean fail
+# on fresh checkouts (and can invalidate the coverage instrumentation).
 cargo llvm-cov clean --workspace
+mkdir -p "$artifacts"
 
 cargo test --all-targets --all-features -- --test-threads=1
 cargo build --locked --bin argosfs
