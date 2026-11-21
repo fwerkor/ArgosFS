@@ -310,3 +310,16 @@ See `docs/artifact-evaluation.md`, `docs/compatibility-report.md`,
 `docs/safety-invariants.md`, and `docs/related-work.md` for paper-oriented
 reproduction and positioning. A static project website lives in
 `website/index.html`.
+
+## Contributing and Support
+
+Contributions and bug reports are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md)
+for development setup, tests, and pull request guidelines. Please follow the
+[Code of Conduct](CODE_OF_CONDUCT.md).
+
+For usage questions, use [GitHub Discussions](https://github.com/fwerkor/ArgosFS/discussions).
+For reproducible defects and feature requests, open a
+[GitHub issue](https://github.com/fwerkor/ArgosFS/issues/new/choose).
+The [support guide](SUPPORT.md) explains what diagnostics to include.
+Report suspected vulnerabilities **privately** according to
+[SECURITY.md](SECURITY.md).
