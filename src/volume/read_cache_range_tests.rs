@@ -130,3 +130,62 @@ fn single_shard_verified_range_does_not_trust_a_prior_whole_block_cache_hit() {
         "a cached prior full decode must not conceal damaged physical 1+0 data"
     );
 }
+
+#[test]
+fn unaligned_coded_reads_remain_coherent_after_rewrite_and_clean_remount() {
+    for compression in [Compression::None, Compression::Lz4] {
+        let dir = tempfile::tempdir().unwrap();
+        let fs = ArgosFs::create(
+            dir.path(),
+            VolumeConfig {
+                k: 2,
+                m: 1,
+                chunk_size: 64 * 1024,
+                compression,
+                ..VolumeConfig::default()
+            },
+            4,
+            false,
+        )
+        .unwrap();
+        let ino = fs.create_file_path("/fixture", 0o600).unwrap();
+        let mut expected = (0..512 * 1024)
+            .map(|i| ((i / 109 + i / 1024) % 211) as u8)
+            .collect::<Vec<_>>();
+        fs.write_inode_range(ino, 0, &expected).unwrap();
+        assert_eq!(
+            fs.read_inode(ino, 0, expected.len(), false).unwrap(),
+            expected
+        );
+        for (start, len) in [(1, 4096), (64 * 1024 - 77, 8192), (257 * 1024, 4097)] {
+            for _ in 0..3 {
+                assert_eq!(
+                    fs.read_inode(ino, start as u64, len, true).unwrap(),
+                    expected[start..start + len]
+                );
+            }
+        }
+        let patch = vec![0xafu8; 6144];
+        let patch_start = 64 * 1024 - 39;
+        fs.write_inode_range(ino, patch_start as u64, &patch)
+            .unwrap();
+        expected[patch_start..patch_start + patch.len()].copy_from_slice(&patch);
+        assert_eq!(
+            fs.read_inode(ino, 0, expected.len(), true).unwrap(),
+            expected
+        );
+        drop(fs);
+        let reopened = ArgosFs::open(dir.path()).unwrap();
+        let ino = reopened.resolve_path("/fixture", true).unwrap();
+        assert_eq!(
+            reopened.read_inode(ino, 0, expected.len(), true).unwrap(),
+            expected
+        );
+        assert_eq!(
+            reopened
+                .read_inode(ino, (patch_start - 17) as u64, patch.len() + 34, false)
+                .unwrap(),
+            expected[patch_start - 17..patch_start + patch.len() + 17]
+        );
+    }
+}

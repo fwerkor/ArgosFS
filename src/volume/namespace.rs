@@ -468,8 +468,7 @@ impl ArgosFs {
         let inode = guard
             .inodes
             .get(&ino)
-            .ok_or_else(|| ArgosError::NotFound(format!("inode {ino}")))?
-            .clone();
+            .ok_or_else(|| ArgosError::NotFound(format!("inode {ino}")))?;
         match inode.kind {
             NodeKind::Directory => return Err(ArgosError::IsDirectory(format!("inode {ino}"))),
             NodeKind::Symlink => {
@@ -500,7 +499,7 @@ impl ArgosFs {
         // does reporting advisory counters require an exclusive guard.
         let decoded = self.decode_inode_range_with_cache_policy_locked(
             &guard,
-            &inode,
+            inode,
             start,
             end,
             cache_policy,

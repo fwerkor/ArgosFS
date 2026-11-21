@@ -280,3 +280,40 @@ fn larger_redundancy_layouts_preserve_legacy_parity_and_repair() {
         }
     }
 }
+
+#[test]
+fn reused_data_decoder_matches_full_reconstruction_across_layouts_and_threads() {
+    let work = || {
+        for (k, m) in [(4, 4), (2, 1), (4, 4), (3, 2), (2, 1)] {
+            let codec = RsCodec::new(k, m).unwrap();
+            let data = (0..k).map(|i| fill_shard(i, 4097)).collect::<Vec<_>>();
+            let encoded = codec.encode(&data).unwrap();
+            for lost in 0..k + m {
+                let mut shards = encoded.iter().cloned().map(Some).collect::<Vec<_>>();
+                shards[lost] = None;
+                assert_eq!(
+                    RsCodec::reconstruct_data_cached(k, m, shards).unwrap(),
+                    data,
+                    "{k}+{m} missing slot {lost}"
+                );
+            }
+        }
+    };
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            scope.spawn(work);
+        }
+    });
+}
+
+#[test]
+fn cached_data_decoder_keeps_full_reconstruction_errors() {
+    assert!(matches!(
+        RsCodec::reconstruct_data_cached(2, 1, vec![Some(vec![1]), None]),
+        Err(ArgosError::Invalid(_))
+    ));
+    assert!(matches!(
+        RsCodec::reconstruct_data_cached(2, 1, vec![Some(vec![1]), None, None]),
+        Err(ArgosError::Erasure(_))
+    ));
+}

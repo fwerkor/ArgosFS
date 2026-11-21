@@ -240,14 +240,13 @@ impl ArgosFs {
                 {
                     let cache_key =
                         format!("{}:{}:{}", meta.uuid, block.stripe_id, block.raw_sha256);
-                    if let Some(range) = self.cache.get_range(
+                    if self.cache.copy_range(
                         &cache_key,
                         Some(&block.raw_sha256),
                         block.raw_size,
                         copy_start - block_start,
-                        copy_end - block_start,
+                        &mut out[dst_start..dst_start + len],
                     ) {
-                        out[dst_start..dst_start + len].copy_from_slice(&range);
                         continue;
                     }
                 }
@@ -564,8 +563,7 @@ impl ArgosFs {
                     reason: format!("only {present} shards available, need {}", layout.k),
                 });
             }
-            let codec = RsCodec::new(layout.k, layout.m)?;
-            let reconstructed = codec.reconstruct(shards)?;
+            let reconstructed = RsCodec::reconstruct_data_cached(layout.k, layout.m, shards)?;
             assemble_data_shards(
                 reconstructed.iter().take(layout.k).map(Vec::as_slice),
                 block.compressed_size,
@@ -587,7 +585,13 @@ impl ArgosFs {
         } else {
             compressed
         };
-        let raw = decompress(&compressed, block.codec)?;
+        // Plain blocks are already assembled/decrypted into an owned buffer.
+        // Decompress(None) would allocate and copy the entire stripe again.
+        let raw = if block.codec == Compression::None {
+            compressed
+        } else {
+            decompress(&compressed, block.codec)?
+        };
         if raw.len() != block.raw_size || !content_hash_matches(&raw, &block.raw_sha256) {
             return Err(ArgosError::UnrecoverableStripe {
                 stripe_id: block.stripe_id.clone(),
