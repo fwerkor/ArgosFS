@@ -23,6 +23,10 @@ SCENARIO_ORDER = (
     "argosfs-loop-fuse-deferred",
     "argosfs-loop-fuse-batched",
     "ext4-loop",
+    "xfs-loop",
+    "btrfs-loop",
+    "f2fs-loop",
+    "zfs-pool",
     "host-directory",
 )
 SCENARIO_LABELS = {
@@ -31,6 +35,10 @@ SCENARIO_LABELS = {
     "argosfs-loop-fuse-deferred": "ArgosFS deferred journal",
     "argosfs-loop-fuse-batched": "ArgosFS batched metadata/data",
     "ext4-loop": "ext4 loop baseline",
+    "xfs-loop": "XFS loop baseline",
+    "btrfs-loop": "Btrfs loop baseline",
+    "f2fs-loop": "F2FS loop baseline",
+    "zfs-pool": "OpenZFS file-vdev pool",
     "host-directory": "Runner host filesystem",
 }
 
@@ -78,6 +86,27 @@ def ordered_scenarios(scenarios: set[str]) -> list[str]:
     return known + sorted(scenarios.difference(known))
 
 
+def measured_scenarios(records: list[dict[str, Any]]) -> list[str]:
+    return ordered_scenarios({
+        str(record["scenario"])
+        for record in records if record.get("scenario") != "environment"
+    })
+
+
+def sample_status(records: list[dict[str, Any]], scenario: str) -> str:
+    statuses = [
+        record.get("status", "unknown") for record in records
+        if record.get("scenario") == scenario
+    ]
+    if statuses and all(status == "passed" for status in statuses):
+        return "passed"
+    if statuses and all(status == "skipped" for status in statuses):
+        return "skipped"
+    if "failed" in statuses:
+        return "failed" if "passed" not in statuses else "partial"
+    return "partial" if "passed" in statuses else "missing"
+
+
 def render_markdown(
     records: list[dict[str, Any]],
     aggregates: dict[str, dict[str, list[float]]],
@@ -90,7 +119,7 @@ def render_markdown(
     baseline = {
         metric: median(aggregates["ext4-loop"][metric]) for metric, _, _ in METRICS
     }
-    scenarios = ordered_scenarios(set(aggregates))
+    scenarios = measured_scenarios(records)
     mode = environment.get("mode", "unknown")
     iterations = environment.get(
         "iterations",
@@ -111,16 +140,22 @@ def render_markdown(
         "",
         "All values are medians. Ratios use the ext4 loop-image result from the same runner; higher is better.",
         "",
-        "| Filesystem mode | Samples | Large write | vs ext4 | Large read | vs ext4 | Small create | vs ext4 | Small stat | vs ext4 |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Filesystem mode | Status | Samples | Large write | vs ext4 | Large read | vs ext4 | Small create | vs ext4 | Small stat | vs ext4 |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for scenario in scenarios:
         sample_count = len(aggregates[scenario][METRICS[0][0]])
-        cells = [SCENARIO_LABELS.get(scenario, scenario), str(sample_count)]
+        cells = [
+            SCENARIO_LABELS.get(scenario, scenario),
+            sample_status(records, scenario),
+            str(sample_count),
+        ]
         for metric, _, unit in METRICS:
-            value = median(aggregates[scenario][metric])
+            samples = aggregates[scenario][metric]
+            value = median(samples)
             cells.extend(
-                [f"{format_value(value)} {unit}", format_ratio(value, baseline[metric])]
+                [f"{format_value(value)} {unit}" if samples else "n/a",
+                 format_ratio(value, baseline[metric]) if samples else "n/a"]
             )
         lines.append("| " + " | ".join(cells) + " |")
 
@@ -139,6 +174,7 @@ def render_markdown(
         cells = [SCENARIO_LABELS.get(scenario, scenario)]
         cells.extend(
             f"{variation(aggregates[scenario][metric]):.1f}%"
+            if aggregates[scenario][metric] else "n/a"
             for metric, _, _ in METRICS
         )
         lines.append("| " + " | ".join(cells) + " |")
@@ -159,8 +195,11 @@ def render_markdown(
             "",
             "## Interpretation limits",
             "",
-            "ArgosFS is measured through its FUSE frontend over a loop-backed image; ext4 is a kernel filesystem over a loop-backed image. "
-            "The comparison exposes end-to-end overhead but does not isolate FUSE, encoding, journaling, or metadata costs.",
+            "ArgosFS uses FUSE over a loop-backed image; ext4, XFS, Btrfs, and F2FS use kernel drivers over loop-backed images; "
+            "ZFS uses a single file-backed vdev (compression disabled). "
+            "These are single-device, same-runner comparisons, not RAID or production-device measurements. "
+            "Caching is not cleared between write and read phases. The comparison does not isolate FUSE, "
+            "cache behavior, encoding, journaling, or metadata costs.",
             "",
             "GitHub-hosted runners vary between executions. This report is diagnostic and is intentionally not a performance regression gate.",
             "",
@@ -171,6 +210,7 @@ def render_markdown(
 
 
 def render_csv(
+    records: list[dict[str, Any]],
     aggregates: dict[str, dict[str, list[float]]],
     output: Path,
 ) -> None:
@@ -183,6 +223,7 @@ def render_csv(
         writer.writerow(
             [
                 "scenario",
+                "status",
                 "samples",
                 *(
                     column
@@ -195,15 +236,20 @@ def render_csv(
                 ),
             ]
         )
-        for scenario in ordered_scenarios(set(aggregates)):
-            row: list[Any] = [scenario, len(aggregates[scenario][METRICS[0][0]])]
+        for scenario in measured_scenarios(records):
+            row: list[Any] = [
+                scenario,
+                sample_status(records, scenario),
+                len(aggregates[scenario][METRICS[0][0]]),
+            ]
             for metric, _, _ in METRICS:
-                value = median(aggregates[scenario][metric])
+                samples = aggregates[scenario][metric]
+                value = median(samples)
                 row.extend(
                     [
-                        value,
-                        value / baseline[metric] if baseline[metric] else "",
-                        variation(aggregates[scenario][metric]),
+                        value if samples else "",
+                        value / baseline[metric] if samples and baseline[metric] else "",
+                        variation(samples) if samples else "",
                     ]
                 )
             writer.writerow(row)
@@ -235,7 +281,7 @@ def main() -> int:
         raise SystemExit("no successful ArgosFS sample was found")
 
     render_markdown(records, aggregates, args.markdown, args.commit)
-    render_csv(aggregates, args.csv)
+    render_csv(records, aggregates, args.csv)
     return 0
 
 

@@ -38,7 +38,7 @@ env:
 
 jobs:
   rootfs-performance:
-    name: ArgosFS versus ext4
+    name: ArgosFS vs ext4/XFS/Btrfs/F2FS/ZFS
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
@@ -58,6 +58,10 @@ jobs:
           sudo apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=3 -o Acquire::https::Timeout=15 install -y --no-install-recommends \
             build-essential \
             e2fsprogs \
+            xfsprogs \
+            btrfs-progs \
+            f2fs-tools \
+            zfsutils-linux \
             fuse3 \
             libfuse3-dev \
             libssl-dev \
@@ -81,6 +85,19 @@ jobs:
           test -e /dev/loop-control
           mountpoint --version
           mkfs.ext4 -V
+          mkfs.xfs -V
+          mkfs.btrfs --version
+          mkfs.f2fs -V
+          # The OpenZFS module is supplied by the runner kernel, not zfsutils-linux.
+          # Some hosted kernels do not expose it: record the absence as a skip.
+          if sudo modprobe zfs; then
+            echo "ZFS kernel module is available"
+          else
+            echo "::warning::ZFS kernel module unavailable; benchmark will report a skipped ZFS sample"
+          fi
+
+      - name: Unit-test benchmark harness
+        run: python3 -m unittest discover -s scripts/experiments -p test_rootfs_perf.py -v
 
       - name: Build release binary
         run: cargo build --release
@@ -94,6 +111,7 @@ jobs:
               --mode "$PERF_MODE" \
               --iterations "$PERF_ITERATIONS" \
               --require-all \
+              --optional-scenarios zfs-pool \
               --output "$PERF_OUTPUT/rootfs-perf.jsonl"
           status=$?
           set -e
@@ -103,7 +121,7 @@ jobs:
           fi
           exit "$status"
 
-      - name: Render ext4 comparison report
+      - name: Render multi-filesystem comparison report
         if: always()
         run: |
           python3 scripts/experiments/render_rootfs_perf_report.py \
@@ -112,6 +130,17 @@ jobs:
             --csv "$PERF_OUTPUT/performance-summary.csv" \
             --commit "$GITHUB_SHA"
           cat "$PERF_OUTPUT/performance-report.md" >> "$GITHUB_STEP_SUMMARY"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          path = Path(os.environ["PERF_OUTPUT"]) / "rootfs-perf.jsonl"
+          if path.exists():
+              for line in path.read_text().splitlines():
+                  item = json.loads(line)
+                  if item.get("scenario") == "zfs-pool" and item.get("status") == "skipped":
+                      print(f"::warning::ZFS benchmark skipped: {item.get('reason')}")
+          PY
 
       - name: Record runner details
         if: always()
@@ -126,6 +155,9 @@ jobs:
             echo "cpu=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | xargs)"
             echo "memory_kib=$(awk '/MemTotal/ {print $2}' /proc/meminfo)"
             echo "filesystem=$(findmnt -no FSTYPE -T "$RUNNER_TEMP")"
+            echo "zfs_module=$(lsmod | awk '$1 == "zfs" {print $1}' | head -1)"
+            zfs_info="$(zpool version 2>&1 || true)"
+            echo "zfs_version=$(printf '%s\n' "$zfs_info" | head -2 | tr '\n' ' ')"
           } > "$PERF_OUTPUT/environment.txt"
 
       - name: Upload performance artifacts
