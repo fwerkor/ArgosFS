@@ -30,6 +30,11 @@ const TTL: Duration = Duration::from_secs(5);
 // adjacent requests amortizes one partially-covered stripe at each boundary
 // across a larger sequential write, without unbounded per-inode buffering.
 const FUSE_WRITEBACK_MAX_BYTES: usize = 4 * 1024 * 1024;
+// A hot mount with many open files must not accumulate a full per-inode
+// allowance for every inode. Once full, new writes take the existing
+// synchronous fallback without evicting another inode's acknowledged data.
+const FUSE_WRITEBACK_MAX_MOUNT_BYTES: usize = 64 * 1024 * 1024;
+const FUSE_WRITEBACK_MAX_INODES: usize = 4096;
 // The small FUSE reader pool does not run blocking I/O. The execution pool
 // follows available CPU parallelism and both pools are independently tunable.
 fn fuse_thread_count(variable: &str, min: usize, max: usize) -> usize {
@@ -278,21 +283,22 @@ impl DirtyExtent {
         self.offset.checked_add(self.data.len() as u64)
     }
 
-    fn try_merge(&mut self, offset: u64, data: &[u8], max_bytes: usize) -> bool {
-        let Some(existing_end) = self.end() else {
-            return false;
-        };
-        let Some(new_end) = offset.checked_add(data.len() as u64) else {
-            return false;
-        };
+    fn merge_bounds(&self, offset: u64, len: usize, max_bytes: usize) -> Option<(u64, usize)> {
+        let existing_end = self.end()?;
+        let new_end = offset.checked_add(u64::try_from(len).ok()?)?;
         if offset > existing_end || self.offset > new_end {
-            return false;
+            return None;
         }
         let merged_start = self.offset.min(offset);
         let merged_end = existing_end.max(new_end);
-        let merged_len = match usize::try_from(merged_end.saturating_sub(merged_start)) {
-            Ok(len) if len <= max_bytes => len,
-            _ => return false,
+        let merged_len = usize::try_from(merged_end.checked_sub(merged_start)?).ok()?;
+        (merged_len <= max_bytes).then_some((merged_start, merged_len))
+    }
+
+    fn try_merge(&mut self, offset: u64, data: &[u8], max_bytes: usize) -> bool {
+        let Some((merged_start, merged_len)) = self.merge_bounds(offset, data.len(), max_bytes)
+        else {
+            return false;
         };
         let mut merged = vec![0; merged_len];
         let old_start = (self.offset - merged_start) as usize;
@@ -310,6 +316,23 @@ impl DirtyExtent {
 struct FuseWriteback {
     dirty: BTreeMap<InodeId, DirtyExtent>,
     reap_after_flush: BTreeSet<InodeId>,
+    pending_bytes: usize,
+}
+
+impl FuseWriteback {
+    fn insert_dirty(&mut self, ino: InodeId, dirty: DirtyExtent) {
+        let old = self.dirty.insert(ino, dirty);
+        if let Some(old) = old {
+            self.pending_bytes -= old.data.len();
+        }
+        self.pending_bytes += self.dirty[&ino].data.len();
+    }
+
+    fn remove_dirty(&mut self, ino: InodeId) -> Option<DirtyExtent> {
+        let dirty = self.dirty.remove(&ino)?;
+        self.pending_bytes -= dirty.data.len();
+        Some(dirty)
+    }
 }
 
 impl ArgosFuse {
@@ -459,15 +482,32 @@ impl ArgosFuseShared {
             return false;
         }
         let mut writeback = self.writeback.lock();
-        let seen_ctime = self.volume.attr_inode(ino).ok().map(|attr| attr.ctime);
-        if let Some(dirty) = writeback.dirty.get_mut(&ino) {
-            let merged = dirty.try_merge(offset, data, FUSE_WRITEBACK_MAX_BYTES);
-            if merged {
-                dirty.seen_ctime = seen_ctime;
+        if let Some(dirty) = writeback.dirty.get(&ino) {
+            let old_len = dirty.data.len();
+            let Some((_, merged_len)) =
+                dirty.merge_bounds(offset, data.len(), FUSE_WRITEBACK_MAX_BYTES)
+            else {
+                return false;
+            };
+            if writeback.pending_bytes - old_len + merged_len > FUSE_WRITEBACK_MAX_MOUNT_BYTES {
+                return false;
             }
-            return merged;
+            let seen_ctime = self.volume.attr_inode(ino).ok().map(|attr| attr.ctime);
+            let dirty = writeback.dirty.get_mut(&ino).expect("existing dirty inode");
+            if !dirty.try_merge(offset, data, FUSE_WRITEBACK_MAX_BYTES) {
+                return false;
+            }
+            dirty.seen_ctime = seen_ctime;
+            writeback.pending_bytes = writeback.pending_bytes - old_len + merged_len;
+            return true;
         }
-        writeback.dirty.insert(
+        if writeback.dirty.len() >= FUSE_WRITEBACK_MAX_INODES
+            || writeback.pending_bytes + data.len() > FUSE_WRITEBACK_MAX_MOUNT_BYTES
+        {
+            return false;
+        }
+        let seen_ctime = self.volume.attr_inode(ino).ok().map(|attr| attr.ctime);
+        writeback.insert_dirty(
             ino,
             DirtyExtent {
                 offset,
@@ -477,6 +517,73 @@ impl ArgosFuseShared {
             },
         );
         true
+    }
+
+    /// When the bounded coalescer fills, persist only whole logical stripes
+    /// from a contiguous EOF append. Keep the incomplete last stripe buffered
+    /// so the next append cannot force it through another COW rewrite.
+    /// The same guard serializes this with reads, attrs, fsync and inode writes.
+    /// On error, no acknowledged dirty bytes are discarded.
+    fn flush_complete_stripes_for_append(&self, ino: InodeId, next_offset: u64) -> Result<bool> {
+        let mut writeback = self.writeback.lock();
+        let Some(dirty) = writeback.dirty.get(&ino) else {
+            return Ok(false);
+        };
+        // This optimization is only for strictly sequential EOF appends.
+        // A gap/overwrite must use the existing ordered flush fallback.
+        if dirty.end() != Some(next_offset) {
+            return Ok(false);
+        }
+        let Ok((old_size, stripe_size)) = self.volume.writeback_stripe_geometry(ino) else {
+            return Ok(false);
+        };
+        if stripe_size == 0 || dirty.offset != old_size as u64 {
+            return Ok(false);
+        }
+        let Some(end) = old_size.checked_add(dirty.data.len()) else {
+            return Ok(false);
+        };
+        let complete_end = end / stripe_size * stripe_size;
+        if complete_end <= old_size {
+            return Ok(false);
+        }
+        let prefix_len = complete_end - old_size;
+        match self.volume.write_inode_range_from_open_handle_at(
+            ino,
+            dirty.offset,
+            &dirty.data[..prefix_len],
+            dirty.written_at,
+            dirty.seen_ctime,
+        ) {
+            Ok(written) if written == prefix_len => {
+                let dirty = writeback.dirty.get_mut(&ino).expect("locked dirty inode");
+                dirty.offset += prefix_len as u64;
+                dirty.data.drain(..prefix_len);
+                writeback.pending_bytes -= prefix_len;
+                if writeback.dirty[&ino].data.is_empty() {
+                    writeback.dirty.remove(&ino);
+                }
+                Ok(true)
+            }
+            Ok(written) => Err(ArgosError::Invalid(format!(
+                "short full-stripe writeback for inode {ino}: wrote {written} of {prefix_len} bytes"
+            ))),
+            Err(err) => Err(err),
+        }
+    }
+
+    /// First try bounded in-memory coalescing. If it is full, make space by
+    /// writing a whole-stripe prefix, never the incomplete EOF tail.
+    fn queue_writeback_staged(&self, ino: InodeId, offset: u64, data: &[u8]) -> Result<bool> {
+        if self.queue_writeback(ino, offset, data) {
+            return Ok(true);
+        }
+        if data.len() <= FUSE_WRITEBACK_MAX_BYTES
+            && self.flush_complete_stripes_for_append(ino, offset)?
+        {
+            return Ok(self.queue_writeback(ino, offset, data));
+        }
+        Ok(false)
     }
 
     /// A plain stat/lookup does not require the append tail to hit the
@@ -567,7 +674,7 @@ impl ArgosFuseShared {
 
     fn flush_inode_writeback(&self, ino: InodeId) -> Result<()> {
         let mut writeback = self.writeback.lock();
-        let Some(dirty) = writeback.dirty.remove(&ino) else {
+        let Some(dirty) = writeback.remove_dirty(ino) else {
             let reap_after_flush = writeback.reap_after_flush.remove(&ino);
             drop(writeback);
             if reap_after_flush {
@@ -587,13 +694,13 @@ impl ArgosFuseShared {
         ) {
             Ok(written) if written == dirty.data.len() => writeback.reap_after_flush.remove(&ino),
             Ok(written) => {
-                writeback.dirty.insert(ino, dirty);
+                writeback.insert_dirty(ino, dirty);
                 return Err(ArgosError::Invalid(format!(
                     "short writeback flush for inode {ino}: wrote {written} bytes"
                 )));
             }
             Err(err) => {
-                writeback.dirty.insert(ino, dirty);
+                writeback.insert_dirty(ino, dirty);
                 return Err(err);
             }
         };
@@ -642,7 +749,7 @@ impl ArgosFuseShared {
 
     fn discard_inode_writeback(&self, ino: InodeId) {
         let mut writeback = self.writeback.lock();
-        writeback.dirty.remove(&ino);
+        writeback.remove_dirty(ino);
         writeback.reap_after_flush.remove(&ino);
     }
 
@@ -1328,11 +1435,11 @@ impl Filesystem for ArgosFuse {
                         })?
                     } else {
                         shared.require_regular_file(ino)?;
-                        if shared.queue_writeback(ino.0, offset, data) {
+                        if shared.queue_writeback_staged(ino.0, offset, data)? {
                             data.len()
                         } else {
                             shared.flush_inode_writeback(ino.0)?;
-                            if shared.queue_writeback(ino.0, offset, data) {
+                            if shared.queue_writeback_staged(ino.0, offset, data)? {
                                 data.len()
                             } else {
                                 shared
