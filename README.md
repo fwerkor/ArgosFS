@@ -1,4 +1,8 @@
-# ArgosFS
+<p align="center">
+  <img src="website/favicon.svg" alt="ArgosFS logo" width="104" height="104" />
+</p>
+
+<h1 align="center">ArgosFS</h1>
 
 ArgosFS is a self-driving, erasure-coded filesystem with a Rust core and FUSE
 frontend. It now has three storage backends:
@@ -26,7 +30,7 @@ target/debug/argosfs preflight-root --backend loop --images disk0.img,disk1.img,
 ```
 
 See `docs/cli.md`, `docs/raw-backend.md`, `docs/capos-rootfs.md`, and
-`docs/repository-layout.md` for CLI selection/configuration, the raw layout,
+`docs/repository-layout.md` and `docs/erasure-codec.md` for CLI selection/configuration, the raw layout,
 CapOS boot flow, and repository organization.
 
 ArgosFS is a Rust implementation of a self-driving, erasure-coded Linux
@@ -37,7 +41,7 @@ artifact-generation workflows.
 ArgosFS is implemented in Rust for memory safety and future kernel-adjacent
 reuse. The data plane uses mature crates rather than hand-rolled primitives:
 
-- `erase` for configurable `k+m` Reed-Solomon layouts.
+- Vendored reed-solomon-engine for portable runtime-dispatched Reed–Solomon layouts.
 - `fuser`/libfuse3 for the Linux filesystem mount frontend.
 - `zstd` and `lz4_flex` for transparent block compression.
 - `chacha20poly1305` and `argon2` for built-in authenticated encryption.
@@ -101,6 +105,22 @@ reuse. The data plane uses mature crates rather than hand-rolled primitives:
   and metadata-conflict protection.
 - Root filesystem integration assets for initramfs and systemd.
 - Comprehensive Rust tests and validation workflows for reproducible artifacts.
+
+## Installation and releases
+
+Official release archives, checksums, crates.io, AUR, and Nix flake instructions
+are described in [the release guide](docs/releasing.md). Once the first
+crates.io and AUR releases have been published, installation options include:
+
+~~~bash
+cargo install argosfs --locked
+# Arch Linux (AUR helper required): yay -S argosfs or yay -S argosfs-bin
+nix profile install github:fwerkor/ArgosFS
+~~~
+
+Binary archives are Linux-specific and require compatible FUSE3/glibc
+runtime libraries. Building and mounting ArgosFS also require the relevant
+system permissions and FUSE/kernel support.
 
 ## Build
 
@@ -290,3 +310,16 @@ See `docs/artifact-evaluation.md`, `docs/compatibility-report.md`,
 `docs/safety-invariants.md`, and `docs/related-work.md` for paper-oriented
 reproduction and positioning. A static project website lives in
 `website/index.html`.
+
+## Contributing and Support
+
+Contributions and bug reports are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md)
+for development setup, tests, and pull request guidelines. Please follow the
+[Code of Conduct](CODE_OF_CONDUCT.md).
+
+For usage questions, use [GitHub Discussions](https://github.com/fwerkor/ArgosFS/discussions).
+For reproducible defects and feature requests, open a
+[GitHub issue](https://github.com/fwerkor/ArgosFS/issues/new/choose).
+The [support guide](SUPPORT.md) explains what diagnostics to include.
+Report suspected vulnerabilities **privately** according to
+[SECURITY.md](SECURITY.md).

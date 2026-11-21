@@ -1,0 +1,308 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Stable version to release (blank = Cargo.toml version)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: argosfs-release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    name: Verify release identity
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Require a main-branch release and exact source revision
+        id: version
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          test "${GITHUB_REF}" = "refs/heads/main" || {
+            echo 'Release must be dispatched from main' >&2
+            exit 1
+          }
+          # Never silently tag an older commit after main advances.
+          test "$(git ls-remote origin refs/heads/main | cut -f1)" = "${GITHUB_SHA}" || {
+            echo 'main moved since this run was dispatched; start a new run' >&2
+            exit 1
+          }
+          version="$(python3 scripts/release/release.py check --version "${REQUESTED_VERSION}" --git-sha "${GITHUB_SHA}")"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "tag=v${version}" >> "${GITHUB_OUTPUT}"
+          echo "Releasing ArgosFS v${version} from ${GITHUB_SHA}"
+
+  verify:
+    name: Test publishable crate
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install FUSE build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libfuse3-dev fuse3
+      - name: Install Rust
+        run: scripts/ci/install-rust.sh stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify vendored codec and release helper
+        run: |
+          python3 scripts/ci/verify-vendored-codec.py
+          python3 -m unittest discover -s scripts/release -p 'test_*.py' -v
+      - name: Run library tests
+        run: cargo test --locked --lib
+      - name: Verify distributable crate and packaged codec
+        run: |
+          cargo package --locked
+          version="$(python3 scripts/release/release.py check)"
+          cargo test --manifest-path "target/package/argosfs-${version}/Cargo.toml" --lib data::erasure::tests -- --test-threads=1
+
+  binaries:
+    name: Linux ${{ matrix.arch }} release
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install FUSE build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libfuse3-dev fuse3
+      - name: Install Rust
+        run: scripts/ci/install-rust.sh stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.arch }}
+      - name: Build portable release binary
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS
+          cargo build --release --locked --bin argosfs
+          test "$(uname -m)" = "${ARCH}"
+          file target/release/argosfs
+          mkdir -p staging dist
+          install -m755 target/release/argosfs staging/argosfs
+          cp LICENSE README.md staging/
+          cp -r integrations staging/
+          tar -C staging -czf "dist/argosfs-${VERSION}-${ARCH}-unknown-linux-gnu.tar.gz" argosfs LICENSE README.md integrations
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.arch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+
+  github-release:
+    name: Publish tagged GitHub Release
+    needs: [prepare, verify, binaries]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Assemble deterministic source archive and checksums
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          git archive --format=tar --prefix="argosfs-${VERSION}/" "${GITHUB_SHA}" | gzip -n > "dist/argosfs-${VERSION}-source.tar.gz"
+          python3 - <<'PY'
+          from pathlib import Path
+          from scripts.release.release import expected_assets, sha256
+          import os
+          version = os.environ["VERSION"]
+          dist = Path("dist")
+          names = sorted(expected_assets(version))
+          (dist / "SHA256SUMS").write_text("".join(f"{sha256(dist / n)}  {n}\n" for n in names))
+          PY
+          (cd dist && sha256sum -c SHA256SUMS)
+      - name: Create tag and publish archives (idempotent)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if git rev-parse --verify -q "refs/tags/${TAG}^{commit}" >/dev/null; then
+            test "$(git rev-parse "refs/tags/${TAG}^{commit}")" = "${GITHUB_SHA}"
+          else
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git tag -a "${TAG}" -m "ArgosFS ${TAG}"
+            git push origin "refs/tags/${TAG}"
+          fi
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            # Reruns must not overwrite previously published immutable assets.
+            mkdir -p published
+            gh release download "${TAG}" --repo "${GITHUB_REPOSITORY}" --dir published
+            (cd published && sha256sum -c SHA256SUMS)
+            python3 - <<'PY'
+          from pathlib import Path
+          from scripts.release.release import expected_assets
+          import os
+          version = os.environ["VERSION"]
+          actual = {p.name for p in Path("published").iterdir()}
+          required = set(expected_assets(version)) | {"SHA256SUMS"}
+          if not required.issubset(actual):
+              raise SystemExit(f"Incomplete existing release: missing {sorted(required - actual)}")
+          PY
+          else
+            gh release create "${TAG}" dist/* --repo "${GITHUB_REPOSITORY}" \
+              --verify-tag --title "ArgosFS ${TAG}" --generate-notes
+          fi
+      - name: Show published files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" --json url,assets
+
+  crates-io:
+    name: Publish crates.io
+    needs: [prepare, github-release]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      CRATES_IO_BOOTSTRAP_TOKEN: ${{ secrets.CRATES_IO_BOOTSTRAP_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check registry for existing version
+        id: registry
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.error, urllib.request
+          version = os.environ["VERSION"]
+          request = urllib.request.Request("https://crates.io/api/v1/crates/argosfs", headers={"User-Agent": "ArgosFS-Release (https://argosfs.org)"})
+          try:
+              with urllib.request.urlopen(request, timeout=20) as result:
+                  exists = any(v["num"] == version for v in json.load(result)["versions"])
+          except urllib.error.HTTPError as exc:
+              if exc.code != 404:
+                  raise
+              exists = False
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"publish={'false' if exists else 'true'}\n")
+          print(f"Crates.io {version}: {'already published' if exists else 'publish required'}")
+          PY
+      - name: Install FUSE build dependencies
+        if: steps.registry.outputs.publish == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libfuse3-dev fuse3
+      - name: Install Rust
+        if: steps.registry.outputs.publish == 'true'
+        run: scripts/ci/install-rust.sh stable
+      - name: Authenticate via crates.io Trusted Publishing
+        if: steps.registry.outputs.publish == 'true' && env.CRATES_IO_BOOTSTRAP_TOKEN == ''
+        id: oidc
+        uses: rust-lang/crates-io-auth-action@v1
+      - name: Publish crate
+        if: steps.registry.outputs.publish == 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.oidc.outputs.token || secrets.CRATES_IO_BOOTSTRAP_TOKEN }}
+        run: |
+          test -n "${CARGO_REGISTRY_TOKEN}" || { echo 'Configure crates.io Trusted Publisher, or a bootstrap token.' >&2; exit 1; }
+          cargo publish --locked
+
+  aur:
+    name: Publish AUR source and binary packages
+    needs: [prepare, github-release]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    env:
+      AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Require AUR credentials
+        run: |
+          test -n "${AUR_SSH_PRIVATE_KEY}" || {
+            echo 'Missing repository secret AUR_SSH_PRIVATE_KEY. Add its public key to your AUR account.' >&2
+            exit 1
+          }
+      - uses: webfactory/ssh-agent@v0.9.1
+        with:
+          ssh-private-key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+      - name: Configure verified AUR SSH host key
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          ssh-keyscan -T 10 -t ed25519 aur.archlinux.org > ~/.ssh/known_hosts
+          test -s ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+      - name: Download and verify published release archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "${TAG}" --repo "${GITHUB_REPOSITORY}" --dir dist
+          (cd dist && sha256sum -c SHA256SUMS)
+          python3 scripts/release/release.py aur --version "${VERSION}" --dist dist --out aur
+      - name: Generate and validate Arch package metadata
+        run: |
+          set -euo pipefail
+          for package in argosfs argosfs-bin; do
+            docker run --rm -v "${PWD}/aur/${package}:/src:ro" archlinux:base-devel \
+              bash -c 'useradd -m builder && cp /src/PKGBUILD /home/builder/PKGBUILD && su builder -c "cd ~ && makepkg --printsrcinfo"' \
+              > "aur/${package}/.SRCINFO"
+            test -s "aur/${package}/.SRCINFO"
+          done
+      - name: Push AUR packages
+        run: |
+          set -euo pipefail
+          for package in argosfs argosfs-bin; do
+            git clone "ssh://aur@aur.archlinux.org/${package}.git" "aur-remote-${package}"
+            cp "aur/${package}/PKGBUILD" "aur-remote-${package}/"
+            cp "aur/${package}/.SRCINFO" "aur-remote-${package}/"
+            cd "aur-remote-${package}"
+            git config user.name 'ArgosFS Release Bot'
+            git config user.email 'fwerkor@users.noreply.github.com'
+            git add PKGBUILD .SRCINFO
+            if ! git diff --cached --quiet; then
+              git commit -m "Release ArgosFS ${{ needs.prepare.outputs.version }}"
+              git push origin HEAD:master
+            fi
+            cd ..
+          done

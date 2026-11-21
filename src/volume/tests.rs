@@ -413,7 +413,7 @@ fn raw_journal_events_refresh_stale_read_telemetry_integrity() {
         journal::canonical_metadata_hash(&dirty).unwrap(),
         dirty.integrity.meta_hash
     );
-    assert!(fs.deferred_commit.lock().raw_advisory_metadata_dirty);
+    assert!(fs.read_advisory.pending_entries().0 > 0);
     assert!(!fs.deferred_commit.lock().raw_uncommitted_metadata_dirty);
 
     {
@@ -425,7 +425,13 @@ fn raw_journal_events_refresh_stale_read_telemetry_integrity() {
     let report = fs.transaction_report().unwrap();
     assert_eq!(report.invalid_entries, 0);
     assert_eq!(report.raw_journal_quorum, Some(true));
-    assert!(fs.deferred_commit.lock().raw_uncommitted_metadata_dirty);
+    // Event journal snapshots do not include unflushed, crash-optional read
+    // telemetry. The next real transaction must fold it into its valid hash.
+    assert!(fs.read_advisory.pending_entries().0 > 0);
+    assert!(!fs.deferred_commit.lock().raw_uncommitted_metadata_dirty);
+    fs.write_file("/subsequent", b"durable", 0o600).unwrap();
+    fs.sync().unwrap();
+    assert_eq!(fs.transaction_report().unwrap().invalid_entries, 0);
 }
 
 #[test]
@@ -1232,42 +1238,6 @@ fn concurrent_readers_share_metadata_guard_and_merge_telemetry() {
     );
 }
 
-#[test]
-fn read_decoder_snapshot_excludes_allocator_and_dirty_inode_state() {
-    let dir = tempfile::tempdir().unwrap();
-    let image = dir.path().join("snapshot.img");
-    let fs = ArgosFs::create_loop(
-        std::slice::from_ref(&image),
-        VolumeConfig {
-            k: 1,
-            m: 0,
-            chunk_size: 4096,
-            compression: Compression::None,
-            ..VolumeConfig::default()
-        },
-        32 * 1024 * 1024,
-        "read-snapshot",
-        false,
-    )
-    .unwrap();
-    fs.write_file("/data", &[0x41; 8192], 0o600).unwrap();
-    let ino = fs.resolve_path("/data", true).unwrap();
-    let live = fs.meta.read();
-    assert!(!live.raw_pool.allocators.is_empty());
-    assert!(!live.inodes.is_empty());
-    let decoder = ArgosFs::read_decoder_metadata(&live);
-    assert!(decoder.raw_pool.allocators.is_empty());
-    assert!(decoder.inodes.is_empty());
-    assert_eq!(decoder.uuid, live.uuid);
-    assert_eq!(decoder.disks.len(), live.disks.len());
-    assert_eq!(decoder.layouts.len(), live.layouts.len());
-    drop(live);
-    assert_eq!(
-        fs.read_inode(ino, 0, 8192, false).unwrap(),
-        vec![0x41; 8192]
-    );
-}
-
 /// Freeze scrub after it starts decoding its first physical stripe, so a
 /// concurrent read can cache a reconstructed *later* stripe before scrub
 /// reaches it. Scrub must still discover the later stripe's damage.
@@ -1489,6 +1459,72 @@ fn concurrent_read_rechecks_corrupt_shard_before_self_heal() {
     );
     assert!(!repaired_again);
 }
+#[test]
+fn legacy_codec_superblocks_import_write_recover_without_reformatting() {
+    use std::os::unix::fs::FileExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|i| dir.path().join(format!("codec-legacy-{i}.img")))
+        .collect::<Vec<_>>();
+    let config = VolumeConfig {
+        k: 2,
+        m: 1,
+        chunk_size: 4096,
+        compression: Compression::None,
+        ..VolumeConfig::default()
+    };
+    let fs =
+        ArgosFs::create_loop(&images, config, 32 * 1024 * 1024, "codec-legacy", false).unwrap();
+    let original = (0..125_000)
+        .map(|i| ((i as u64 * 151) ^ (i as u64 >> 9)) as u8)
+        .collect::<Vec<_>>();
+    fs.write_file("/before", &original, 0o600).unwrap();
+    fs.sync().unwrap();
+    fs.mark_clean_unmount().unwrap();
+    drop(fs);
+
+    // Simulate a real pre-#259 pool: old superblock copies lack the optional
+    // codec identifier. Both checksums must be valid after the mutation.
+    for path in &images {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let mut bytes = [0u8; raw_format::SUPERBLOCK_SIZE];
+        file.read_at(&mut bytes, raw_format::PRIMARY_SUPERBLOCK_OFFSET)
+            .unwrap();
+        let mut sb = raw_format::RawSuperblock::decode(&bytes).unwrap();
+        assert_eq!(sb.codec_id(), raw_format::CODEC_ID_VANDERMONDE_GF8);
+        sb.feature_flags = 0;
+        let legacy = sb.encode();
+        for offset in [
+            raw_format::PRIMARY_SUPERBLOCK_OFFSET,
+            sb.backup_superblock_offset,
+        ] {
+            assert_eq!(file.write_at(&legacy, offset).unwrap(), legacy.len());
+        }
+        file.sync_all().unwrap();
+    }
+
+    let reopened = ArgosFs::open_loop(&images, true).unwrap();
+    assert_eq!(reopened.read_file("/before", false).unwrap(), original);
+    let after = vec![0xA5; 73_117];
+    reopened.write_file("/after", &after, 0o600).unwrap();
+    reopened.sync().unwrap();
+    reopened.mark_clean_unmount().unwrap();
+    drop(reopened);
+
+    let readonly = ArgosFs::open_loop(&images, false).unwrap();
+    assert_eq!(readonly.read_file("/before", true).unwrap(), original);
+    assert_eq!(readonly.read_file("/after", true).unwrap(), after);
+    for path in &images {
+        let (sb, _label) = raw_store::inspect_device(BackendKind::LoopBlock, path.clone()).unwrap();
+        assert_eq!(sb.codec_id(), raw_format::CODEC_ID_LEGACY_GF8);
+    }
+}
+
 #[test]
 fn offline_delta_integrity_upgrade_replays_transactions_and_fences_downgrade() {
     let dir = tempfile::tempdir().unwrap();
@@ -1751,7 +1787,7 @@ fn upgraded_legacy_event_rollover_with_read_telemetry_reanchors_before_first_v2_
     fs.upgrade_delta_integrity().unwrap();
     assert_eq!(fs.metadata_snapshot().integrity.hash_scheme, None);
     assert_eq!(fs.read_file("/old", false).unwrap(), b"old payload");
-    assert!(fs.deferred_commit.lock().raw_advisory_metadata_dirty);
+    assert!(fs.read_advisory.pending_entries().0 > 0);
     assert!(!fs.deferred_commit.lock().raw_uncommitted_metadata_dirty);
     {
         let meta = fs.meta.read();
@@ -1762,10 +1798,17 @@ fn upgraded_legacy_event_rollover_with_read_telemetry_reanchors_before_first_v2_
         )
         .unwrap();
     }
-    assert!(fs.deferred_commit.lock().raw_checkpoint_required);
+    // Pending read telemetry is separate from the canonical journal event.
+    // An advisory-only read must not require a full metadata checkpoint.
+    assert!(!fs.deferred_commit.lock().raw_checkpoint_required);
     fs.write_file("/first-new", b"first new", 0o600).unwrap();
     fs.sync().unwrap();
-    assert_eq!(fs.metadata_snapshot().integrity.hash_scheme, None);
+    // Without a forced full checkpoint, the first real transaction may
+    // safely switch directly to v2 delta integrity on upgraded members.
+    assert_eq!(
+        fs.metadata_snapshot().integrity.hash_scheme,
+        Some(journal::DELTA_INTEGRITY_SCHEME)
+    );
     fs.write_file("/v2", b"v2 data", 0o600).unwrap();
     fs.sync().unwrap();
     assert_eq!(
@@ -1888,7 +1931,9 @@ fn deferred_commit_reports_real_journal_and_checkpoint_phases() {
     assert!(counts(CommitPhase::Integrity) >= 1);
     assert!(counts(CommitPhase::DurabilityValidation) >= 1);
     assert!(counts(CommitPhase::Journal) >= 1);
-    assert!(counts(CommitPhase::JournalDelta) >= 1);
+    // The v2 delta is constructed during the integrity phase and reused
+    // when writing the journal; there must be no second delta pass.
+    assert_eq!(counts(CommitPhase::JournalDelta), 0);
     assert!(counts(CommitPhase::JournalMemberIo) >= 2);
     assert!(counts(CommitPhase::SyncLockHold) >= 2);
     assert_eq!(counts(CommitPhase::CheckpointEncode), 0);

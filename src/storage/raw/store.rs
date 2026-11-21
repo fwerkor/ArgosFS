@@ -370,6 +370,7 @@ pub(crate) fn append_transaction_quorum(
         JournalQuorumOptions {
             mode: JournalQuorumMode::Transaction,
             metrics: None,
+            prepared_delta: None,
         },
     )?;
     journal::inject_crash(FaultPoint::AfterJournalCommitBeforeMetadataCommit.as_str())?;
@@ -393,6 +394,7 @@ pub(crate) fn append_event_quorum(
         JournalQuorumOptions {
             mode: JournalQuorumMode::Event,
             metrics: None,
+            prepared_delta: None,
         },
     )?;
     journal::inject_crash(FaultPoint::AfterJournalCommitBeforeMetadataCommit.as_str())?;
@@ -417,10 +419,18 @@ pub(crate) fn append_transaction_with_trusted_integrity_quorum(
         JournalQuorumOptions {
             mode: JournalQuorumMode::TrustedTransaction,
             metrics: None,
+            prepared_delta: None,
         },
     )?;
     journal::inject_crash(FaultPoint::AfterJournalCommitBeforeMetadataCommit.as_str())?;
     Ok(report)
+}
+
+/// A trusted v2 group commit may carry the delta authenticated against this
+/// exact durable base, avoiding a second metadata traversal at journal encode.
+pub(crate) struct PreparedJournalBase<'a> {
+    pub(crate) previous: &'a Metadata,
+    pub(crate) delta: Option<Vec<journal::MetadataDeltaOp>>,
 }
 
 /// Timed group commit; the original entry point is retained for uninstrumented
@@ -429,7 +439,7 @@ pub(crate) fn append_transaction_with_trusted_integrity_quorum_measured(
     backend: &dyn StorageBackend,
     superblocks: &[RawSuperblock],
     metadata: &Metadata,
-    previous_metadata: Option<&Metadata>,
+    prepared: PreparedJournalBase<'_>,
     metrics: &CommitMetrics,
     action: &str,
     details: serde_json::Value,
@@ -438,12 +448,13 @@ pub(crate) fn append_transaction_with_trusted_integrity_quorum_measured(
         backend,
         superblocks,
         metadata,
-        previous_metadata,
+        Some(prepared.previous),
         action,
         details,
         JournalQuorumOptions {
             mode: JournalQuorumMode::TrustedTransaction,
             metrics: Some(metrics),
+            prepared_delta: prepared.delta,
         },
     )?;
     journal::inject_crash(FaultPoint::AfterJournalCommitBeforeMetadataCommit.as_str())?;
@@ -995,6 +1006,7 @@ fn build_journal_entry(
         details,
         trust_integrity,
         None,
+        None,
     )
 }
 
@@ -1004,6 +1016,7 @@ fn build_journal_entry_measured(
     action: &str,
     details: serde_json::Value,
     trust_integrity: bool,
+    prepared_delta: Option<Vec<journal::MetadataDeltaOp>>,
     metrics: Option<&CommitMetrics>,
 ) -> Result<(Vec<u8>, String)> {
     let delta_base = match previous_metadata {
@@ -1029,8 +1042,21 @@ fn build_journal_entry_measured(
         ));
     }
     let write_checkpoint = delta_base.is_none();
+    if prepared_delta.is_some()
+        && (!trust_integrity
+            || metadata.integrity.hash_scheme != Some(journal::DELTA_INTEGRITY_SCHEME)
+            || write_checkpoint)
+    {
+        return Err(ArgosError::CorruptedMetadata(
+            "precomputed delta requires a trusted v2 transaction with a matching base".into(),
+        ));
+    }
     let metadata_delta = if write_checkpoint {
         None
+    } else if let Some(delta) = prepared_delta {
+        // The delta was built when preparing v2 integrity, before any I/O.
+        // Neither superblock discovery nor the data flush mutates metadata.
+        Some(delta)
     } else {
         let _delta_timer = metrics.map(|metrics| metrics.timer(CommitPhase::JournalDelta));
         Some(journal::metadata_delta(
@@ -1331,6 +1357,7 @@ enum JournalQuorumMode {
 struct JournalQuorumOptions<'a> {
     mode: JournalQuorumMode,
     metrics: Option<&'a CommitMetrics>,
+    prepared_delta: Option<Vec<journal::MetadataDeltaOp>>,
 }
 
 fn append_journal_quorum(
@@ -1342,7 +1369,11 @@ fn append_journal_quorum(
     details: serde_json::Value,
     options: JournalQuorumOptions<'_>,
 ) -> Result<QuorumWriteReport> {
-    let JournalQuorumOptions { mode, metrics } = options;
+    let JournalQuorumOptions {
+        mode,
+        metrics,
+        prepared_delta,
+    } = options;
     let trust_integrity = matches!(mode, JournalQuorumMode::TrustedTransaction);
     let allow_same_txid = matches!(mode, JournalQuorumMode::Event);
     let need = metadata_quorum_requirement(metadata);
@@ -1359,6 +1390,7 @@ fn append_journal_quorum(
         action,
         details,
         trust_integrity,
+        prepared_delta,
         metrics,
     )?;
     let journal_certificate =

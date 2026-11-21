@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Questions and troubleshooting
+    url: https://github.com/fwerkor/ArgosFS/discussions
+    about: Ask for help or discuss ideas before filing a reproducible bug.
+  - name: Private security reporting
+    url: https://github.com/fwerkor/ArgosFS/security/policy
+    about: Do not disclose vulnerabilities in public issues. Follow the security policy.

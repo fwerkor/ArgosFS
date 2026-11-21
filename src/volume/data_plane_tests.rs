@@ -329,34 +329,34 @@ fn single_shard_decoding_reports_missing_unavailable_and_checksum_failures() {
 #[test]
 fn range_decode_shortcuts_and_metadata_validation_cover_fallbacks() {
     let (_dir, fs) = host_volume(1);
-    let mut meta = fs.meta.write();
+    let meta = fs.meta.write();
     let id = meta.disks.keys().next().unwrap().clone();
     let mut block = block_with_shard(&id, b"payload", PathBuf::from("unused"));
     let mut damaged = Vec::new();
     assert_eq!(
-        fs.decode_block_range_locked(&mut meta, &block, 2, 2, &mut damaged)
+        fs.decode_block_range_locked(&meta, &block, 2, 2, &mut damaged)
             .unwrap(),
         Some(Vec::new())
     );
     block.encrypted = true;
     assert!(fs
-        .decode_block_range_locked(&mut meta, &block, 0, 1, &mut damaged)
+        .decode_block_range_locked(&meta, &block, 0, 1, &mut damaged)
         .unwrap()
         .is_none());
     block.encrypted = false;
     block.codec = Compression::Zstd;
     assert!(fs
-        .decode_block_range_locked(&mut meta, &block, 0, 1, &mut damaged)
+        .decode_block_range_locked(&meta, &block, 0, 1, &mut damaged)
         .unwrap()
         .is_none());
     block.codec = Compression::None;
     assert!(fs
-        .decode_block_range_locked(&mut meta, &block, 0, block.raw_size + 1, &mut damaged)
+        .decode_block_range_locked(&meta, &block, 0, block.raw_size + 1, &mut damaged)
         .unwrap()
         .is_none());
     block.shards.clear();
     assert!(matches!(
-        fs.decode_block_range_locked(&mut meta, &block, 0, 1, &mut damaged),
+        fs.decode_block_range_locked(&meta, &block, 0, 1, &mut damaged),
         Err(ArgosError::UnrecoverableStripe { .. })
     ));
 }
@@ -719,7 +719,7 @@ fn range_decode_validates_metadata_missing_disks_status_checksums_and_read_error
     };
     let mut damaged = Vec::new();
     assert_eq!(
-        fs.decode_block_range_locked(&mut meta, &block, 2, 10, &mut damaged)
+        fs.decode_block_range_locked(&meta, &block, 2, 10, &mut damaged)
             .unwrap()
             .unwrap(),
         data[2..10]
@@ -727,13 +727,13 @@ fn range_decode_validates_metadata_missing_disks_status_checksums_and_read_error
 
     block.shards[0].subblock_sha256.pop();
     assert!(fs
-        .decode_block_range_locked(&mut meta, &block, 0, 1, &mut Vec::new())
+        .decode_block_range_locked(&meta, &block, 0, 1, &mut Vec::new())
         .unwrap()
         .is_none());
     block.shards[0].subblock_sha256 = shard_subblock_hashes(&data, &hash);
     block.shards[0].subblock_sha256[0] = "bad".to_string();
     assert!(matches!(
-        fs.decode_block_range_locked(&mut meta, &block, 0, 1, &mut Vec::new()),
+        fs.decode_block_range_locked(&meta, &block, 0, 1, &mut Vec::new()),
         Err(ArgosError::UnrecoverableStripe { .. })
     ));
     block.shards[0].subblock_sha256 = shard_subblock_hashes(&data, &hash);
@@ -741,13 +741,13 @@ fn range_decode_validates_metadata_missing_disks_status_checksums_and_read_error
     let original_disk = block.shards[0].disk_id.clone();
     block.shards[0].disk_id = "missing".to_string();
     assert!(matches!(
-        fs.decode_block_range_locked(&mut meta, &block, 0, 1, &mut Vec::new()),
+        fs.decode_block_range_locked(&meta, &block, 0, 1, &mut Vec::new()),
         Err(ArgosError::UnrecoverableStripe { .. })
     ));
     block.shards[0].disk_id = original_disk.clone();
     meta.disks.get_mut(&original_disk).unwrap().status = DiskStatus::Failed;
     assert!(matches!(
-        fs.decode_block_range_locked(&mut meta, &block, 0, 1, &mut Vec::new()),
+        fs.decode_block_range_locked(&meta, &block, 0, 1, &mut Vec::new()),
         Err(ArgosError::UnrecoverableStripe { .. })
     ));
     meta.disks.get_mut(&original_disk).unwrap().status = DiskStatus::Online;
@@ -761,7 +761,7 @@ fn range_decode_validates_metadata_missing_disks_status_checksums_and_read_error
     ))
     .unwrap();
     assert!(fs
-        .decode_block_range_locked(&mut meta, &block, 0, 1, &mut Vec::new())
+        .decode_block_range_locked(&meta, &block, 0, 1, &mut Vec::new())
         .is_err());
 }
 
@@ -922,4 +922,17 @@ fn inline_only_range_updates_do_not_count_stripe_reencoding() {
     assert_eq!(encoded["range_accepted"], 603);
     assert_eq!(encoded["range_rewrite_input"], 602);
     assert_eq!(encoded["shard_payload_written"], 602);
+}
+
+#[test]
+fn verified_shard_assembly_bulk_copies_only_the_logical_payload() {
+    let shards = [vec![1, 2, 3], vec![4, 5, 6], vec![7, 8, 9]];
+    let assemble =
+        |length| data_plane::assemble_data_shards(shards.iter().map(Vec::as_slice), length);
+    assert_eq!(assemble(0), Vec::<u8>::new());
+    assert_eq!(assemble(4), vec![1, 2, 3, 4]);
+    assert_eq!(assemble(9), vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    // A malformed oversized declared length does not reserve or append
+    // more bytes than the member payload actually contains.
+    assert_eq!(assemble(usize::MAX), vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
 }

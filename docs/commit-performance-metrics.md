@@ -44,7 +44,7 @@ must not be added together as if independent.
 | `durability_validation` | Precommit data-durability verification |
 | `data_flush` | Deferred member data flushes and repeat validation |
 | `journal` | Journal append, quorum confirmation and crash-injection checks |
-| `journal_delta` | Encoding changed-metadata delta before journal record construction |
+| `journal_delta` | Building a journal delta when no prepared v2 group-commit delta is available; zero for normal v2 group commits that reuse their integrity-phase delta |
 | `journal_member_io` | One member's journal append/write (excluding deferred flush and quorum certificate), with additional per-disk labels |
 | `journal_flush` | A single deferred journal member flush, including failures; *per-device durations* sum to more than wall time if parallelized in future |
 | `journal_quorum` | Quorum commit certificate preparation excluded; timer covers certificate fanout/write/flush and final quorum decision |
@@ -94,8 +94,11 @@ interpret a `/metrics` scrape timeout during a long commit as proof that the
 FUSE mount is down. The full endpoint has **no promised latency bound** under
 write load.
 
-`journal_delta` measures delta *construction*, including on v1 append paths;
-it does not mean that a v1 pool has enabled the v2 hash scheme. The nested
+`journal_delta` measures delta *construction* at journal encoding on paths that
+have not already prepared it, including legacy append paths; it does not mean
+that a v1 pool has enabled the v2 hash scheme. On normal v2 deferred group
+commits the delta is built once inside `integrity` and passed to the journal
+encoder, so `journal_delta` is zero. Do not interpret that as no delta work. The nested
 `checkpoint_member_io` also counts full-checkpoint writes done **inside
 `journal_rollover`**, not only `checkpoint` writes. Summing nested per-member
 latencies, phase totals, and wall time double-counts parallel and nested work.
@@ -203,3 +206,24 @@ and write-fencing remain unchanged. At clean unmount, advisory-only changes
 are rehashed before the final required replicated metadata copies so the
 checkpoint cannot contain stale integrity information. The ordinary
 `/commit-metrics` counters remain runtime diagnostics, not durable storage.
+
+### Concurrent read-side advisory accounting (#255)
+
+Raw and LoopBlock FUSE reads now decode directly from a **shared** namespace
+metadata guard instead of constructing one cloned decoder `Metadata` for
+every request. They accumulate access/read-byte/workload-score changes and
+per-device latency EWMAs in 64 separately locked runtime buckets, without
+taking the global namespace write lock or the deferred-commit mutex. The
+accounting is bounded by the number of distinct accessed inodes and members,
+not the number of FUSE reads; a compact EWMA composition preserves the effect
+of each latency sample. Explicit metadata snapshots project current pending
+counters, while the next real namespace transaction merges them into its
+integrity-checked journal/checkpoint image. Clean unmount merges and rehashes
+pending advisory changes before writing its final checkpoint. Background
+rebalance merges the current read heat before classifying inode placement.
+
+This preserves verified data-shard reads, fail-closed corruption handling,
+exclusive self-heal, and the read-only no-checkpoint guarantee from #251.
+It does not change FUSE `max_read`, the raw on-disk format, checkpoint quorum,
+or data durability. Physical Borg throughput still requires a matched device
+retest to confirm the CPU gain; no speedup is inferred from unit tests.
