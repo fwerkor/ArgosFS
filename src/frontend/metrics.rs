@@ -200,6 +200,24 @@ fn emit_commit_metrics(volume: &ArgosFs, emitter: &mut MetricEmitter<'_>) {
             "counter",
         );
     }
+    for (kind, bytes) in volume.commit_metrics().raw_write_byte_snapshots() {
+        emitter.typed_metric(
+            "argosfs_raw_metadata_write_bytes_total",
+            "Successful mounted-volume raw metadata write payload bytes; excludes mount-time recovery",
+            bytes as f64,
+            &[("kind", kind)],
+            "counter",
+        );
+    }
+    for (reason, attempts) in volume.commit_metrics().checkpoint_reason_snapshots() {
+        emitter.typed_metric(
+            "argosfs_checkpoint_reason_total",
+            "Mounted-volume full checkpoint attempts by cause; excludes mount-time recovery",
+            attempts as f64,
+            &[("reason", reason)],
+            "counter",
+        );
+    }
     for (phase, snapshot) in volume.commit_metrics().snapshots() {
         let labels = [("phase", phase)];
         emitter.typed_metric(

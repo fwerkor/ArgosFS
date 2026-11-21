@@ -97,6 +97,56 @@ impl DataPlaneByteKind {
     }
 }
 
+/// Successful raw metadata write_at payload bytes, excluding mount-time
+/// recovery (which runs before the mounted volume's counters exist).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum RawWriteKind {
+    Checkpoint,
+    Journal,
+    CleanState,
+}
+
+impl RawWriteKind {
+    const ALL: [Self; 3] = [Self::Checkpoint, Self::Journal, Self::CleanState];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Checkpoint => "checkpoint",
+            Self::Journal => "journal",
+            Self::CleanState => "clean_state",
+        }
+    }
+}
+
+/// Why a mounted-volume checkpoint was requested, not a claim that every
+/// checkpoint completed. Mount replay checkpointing happens before these
+/// counters are constructed and is deliberately excluded.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum CheckpointReason {
+    RecoveryOrFormat,
+    BulkImport,
+    LegacyFallback,
+    JournalRollover,
+}
+
+impl CheckpointReason {
+    const ALL: [Self; 4] = [
+        Self::RecoveryOrFormat,
+        Self::BulkImport,
+        Self::LegacyFallback,
+        Self::JournalRollover,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::RecoveryOrFormat => "recovery_or_format",
+            Self::BulkImport => "bulk_import",
+            Self::LegacyFallback => "legacy_fallback",
+            Self::JournalRollover => "journal_rollover",
+        }
+    }
+}
+
 #[derive(Default)]
 struct PhaseCounters {
     count: AtomicU64,
@@ -133,6 +183,8 @@ pub(crate) struct PhaseSnapshot {
 pub(crate) struct CommitMetrics {
     phases: [PhaseCounters; CommitPhase::ALL.len()],
     data_plane_bytes: [AtomicU64; DataPlaneByteKind::ALL.len()],
+    raw_write_bytes: [AtomicU64; RawWriteKind::ALL.len()],
+    checkpoint_reasons: [AtomicU64; CheckpointReason::ALL.len()],
     // Member IDs are bounded by the volume's device set. The map lock is
     // independent of the global namespace lock and never spans device I/O.
     per_member: RwLock<BTreeMap<String, [PhaseCounters; 2]>>,
@@ -163,6 +215,49 @@ impl CommitMetrics {
             (
                 kind.name(),
                 self.data_plane_bytes[kind as usize].load(Ordering::Relaxed),
+            )
+        })
+    }
+
+    pub(crate) fn add_raw_write_bytes(&self, kind: RawWriteKind, bytes: usize) {
+        let counter = &self.raw_write_bytes[kind as usize];
+        let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        let mut current = counter.load(Ordering::Relaxed);
+        loop {
+            match counter.compare_exchange_weak(
+                current,
+                current.saturating_add(bytes),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
+    pub(crate) fn raw_write_byte_snapshots(
+        &self,
+    ) -> impl Iterator<Item = (&'static str, u64)> + '_ {
+        RawWriteKind::ALL.into_iter().map(|kind| {
+            (
+                kind.name(),
+                self.raw_write_bytes[kind as usize].load(Ordering::Relaxed),
+            )
+        })
+    }
+
+    pub(crate) fn record_checkpoint_reason(&self, reason: CheckpointReason) {
+        self.checkpoint_reasons[reason as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn checkpoint_reason_snapshots(
+        &self,
+    ) -> impl Iterator<Item = (&'static str, u64)> + '_ {
+        CheckpointReason::ALL.into_iter().map(|reason| {
+            (
+                reason.name(),
+                self.checkpoint_reasons[reason as usize].load(Ordering::Relaxed),
             )
         })
     }

@@ -16,6 +16,23 @@ volume handle and marking the pool clean. Read and write socket timeouts are
 2 seconds; a request already inside the volume may wait for an existing
 metadata operation to release its lock.
 
+New raw-volume write diagnostics (`/commit-metrics`, reset at volume open):
+
+- `argosfs_raw_metadata_write_bytes_total{kind="checkpoint|journal|clean_state"}`:
+  actual successful `write_at` payload bytes on instrumented mounted-volume
+  checkpoint/group-journal/clean-state paths (before later flush/quorum outcomes).
+  No filesystem block accounting or redundant device controller write amplification.
+- `argosfs_checkpoint_reason_total{reason="recovery_or_format|bulk_import|legacy_fallback|journal_rollover"}`:
+  attempted full checkpoint operations by cause. These are request counts and
+  may include attempts that ultimately failed. They distinguish required
+  normalization, bulk import, non-v2 fallback, and journal rollover.
+
+**Scope:** Mount-time journal replay/checkpoint occurs before these counters
+exist, and unmeasured manual maintenance/legacy immediate transactions are not
+included. To reconcile all physical writes, also collect device-level bytes and
+classify mount open, Borg lock/namespace writes, and other housekeeping separately.
+These counters require no on-disk format or recovery changes.
+
 The three series, labeled by `phase` (and additionally by `disk` for
 per-member journal/checkpoint I/O), are:
 
@@ -201,11 +218,15 @@ turning `borg check --verify-data` into a metadata-write workload (#251).
 
 When an actual file/namespace or allocator transaction commits, any live
 advisory counters are included while retaining the last trusted durable
-integrity hash as the previous journal state. Mandatory recovery checkpoints
-and write-fencing remain unchanged. At clean unmount, advisory-only changes
-are rehashed before the final required replicated metadata copies so the
-checkpoint cannot contain stale integrity information. The ordinary
-`/commit-metrics` counters remain runtime diagnostics, not durable storage.
+integrity hash as the previous journal state. Mandatory recovery/format
+checkpoints and write-fencing remain unchanged. At clean unmount, pending
+real transactions are persisted before writing only the small superblock
+clean-state flags; advisory-only changes are **not** rehashed or checkpointed.
+Their live values can differ from the trusted hash, but only the trusted
+journal/checkpoint image is recovered. The ordinary `/commit-metrics` counters
+remain runtime diagnostics, not durable storage. On writable open a necessary
+journal replay checkpoint can still incur a full metadata fanout before any
+reads; it must be accounted for separately from pure-read I/O.
 
 ### Concurrent read-side advisory accounting (#255)
 
@@ -218,9 +239,10 @@ accounting is bounded by the number of distinct accessed inodes and members,
 not the number of FUSE reads; a compact EWMA composition preserves the effect
 of each latency sample. Explicit metadata snapshots project current pending
 counters, while the next real namespace transaction merges them into its
-integrity-checked journal/checkpoint image. Clean unmount merges and rehashes
-pending advisory changes before writing its final checkpoint. Background
-rebalance merges the current read heat before classifying inode placement.
+integrity-checked journal/checkpoint image. Without a real transaction,
+`sync` and clean unmount drain but do not persist advisory changes; clean
+unmount updates only the superblock flags. Background rebalance merges the
+current read heat before classifying inode placement.
 
 This preserves verified data-shard reads, fail-closed corruption handling,
 exclusive self-heal, and the read-only no-checkpoint guarantee from #251.
