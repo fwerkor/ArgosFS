@@ -106,6 +106,22 @@ reuse. The data plane uses mature crates rather than hand-rolled primitives:
 - Root filesystem integration assets for initramfs and systemd.
 - Comprehensive Rust tests and validation workflows for reproducible artifacts.
 
+## Installation and releases
+
+Official release archives, checksums, crates.io, AUR, and Nix flake instructions
+are described in [the release guide](docs/releasing.md). Once the first
+crates.io and AUR releases have been published, installation options include:
+
+~~~bash
+cargo install argosfs --locked
+# Arch Linux (AUR helper required): yay -S argosfs or yay -S argosfs-bin
+nix profile install github:fwerkor/ArgosFS
+~~~
+
+Binary archives are Linux-specific and require compatible FUSE3/glibc
+runtime libraries. Building and mounting ArgosFS also require the relevant
+system permissions and FUSE/kernel support.
+
 ## Build
 
 ArgosFS requires Rust 1.87 or newer. The FUSE frontend also needs libfuse3

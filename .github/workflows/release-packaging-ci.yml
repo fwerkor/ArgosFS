@@ -1,0 +1,69 @@
+name: Release packaging CI
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - '.github/workflows/release-packaging-ci.yml'
+      - 'scripts/release/**'
+      - 'flake.nix'
+      - 'flake.lock'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/release.yml'
+      - '.github/workflows/release-packaging-ci.yml'
+      - 'scripts/release/**'
+      - 'flake.nix'
+      - 'flake.lock'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+
+permissions:
+  contents: read
+
+jobs:
+  release-metadata:
+    name: Release metadata and AUR manifests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Verify release helper tests
+        run: python3 -m unittest discover -s scripts/release -p 'test_*.py' -v
+      - name: Render AUR packages from local artifact fixtures
+        run: |
+          set -euo pipefail
+          version="$(python3 scripts/release/release.py check)"
+          mkdir -p dist
+          for name in \
+            "argosfs-${version}-source.tar.gz" \
+            "argosfs-${version}-x86_64-unknown-linux-gnu.tar.gz" \
+            "argosfs-${version}-aarch64-unknown-linux-gnu.tar.gz"; do
+            printf 'fixture: %s\n' "${name}" > "dist/${name}"
+          done
+          (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+          python3 scripts/release/release.py aur --version "${version}" --dist dist --out aur
+          for package in argosfs argosfs-bin; do
+            bash -n "aur/${package}/PKGBUILD"
+            docker run --rm -v "${PWD}/aur/${package}:/src:ro" archlinux:base-devel \
+              bash -c 'useradd -m builder && cp /src/PKGBUILD /home/builder/PKGBUILD && su builder -c "cd ~ && makepkg --printsrcinfo"' \
+              > "aur/${package}/.SRCINFO"
+            grep -Fq "pkgname = ${package}" "aur/${package}/.SRCINFO"
+            grep -Fq "pkgver = ${version}" "aur/${package}/.SRCINFO"
+          done
+
+  nix:
+    name: Nix flake build (x86_64 Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+      - name: Validate Nix flake output structure
+        run: nix flake check --no-build --show-trace
+      - name: Compile and test the Nix package
+        run: nix build .#argosfs --print-build-logs --show-trace
+      - name: Smoke-test Nix executable
+        run: ./result/bin/argosfs --help
