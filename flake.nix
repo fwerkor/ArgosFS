@@ -23,7 +23,7 @@
             cargoLock.lockFile = ./Cargo.lock;
 
             nativeBuildInputs = [ pkgs.pkg-config ];
-            buildInputs = [ pkgs.fuse3 ];
+            buildInputs = [ pkgs.fuse3 pkgs.zstd ];
 
             # Rootfs systemd/initramfs units are shipped as examples, not
             # enabled automatically on an arbitrary user's root filesystem.
@@ -56,7 +56,7 @@
         let pkgs = import nixpkgs { inherit system; };
         in {
           default = pkgs.mkShell {
-            packages = with pkgs; [ cargo rustc rustfmt clippy pkg-config fuse3 ];
+            packages = with pkgs; [ cargo rustc rustfmt clippy pkg-config fuse3 zstd ];
           };
         });
     };
