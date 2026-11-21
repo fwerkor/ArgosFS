@@ -1,0 +1,48 @@
+name: Feature request
+description: Propose a feature or improvement to ArgosFS.
+title: "[Enhancement] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please check existing issues and discussions for related proposals.
+        For exploratory questions, consider [GitHub Discussions](https://github.com/fwerkor/ArgosFS/discussions).
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Core storage / erasure coding
+        - Metadata / journal / recovery
+        - FUSE / POSIX behavior
+        - CLI / management / autopilot
+        - Rootfs / CapOS / deployment
+        - Performance / observability
+        - Testing / CI / documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Problem or motivation
+      description: What is currently difficult, incorrect, or missing? Include a concrete use case.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Explain the change and its expected user-visible outcome.
+    validations:
+      required: true
+  - type: textarea
+    id: tradeoffs
+    attributes:
+      label: Compatibility, safety, and alternatives
+      description: Consider persistence, on-disk format changes, degraded operation, performance, and other approaches.
+  - type: textarea
+    id: validation
+    attributes:
+      label: How could this be validated?
+      description: Suggested tests, scenarios, or benchmarks (optional).
