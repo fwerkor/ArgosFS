@@ -19,9 +19,11 @@ readers need no shared codec mutex.
 
 Source provenance: reed-solomon-engine 0.2.0, crates.io archive SHA-256:
 5d902386f55ac0890d3d0f56c932daa0b80b55bcf56631565eed76f0f7f54b6f.
-The vendored copy includes license notices, upstream tests and wire-format
-documentation. Cargo uses the local path with an exact version requirement;
-the source is normalized using Rust 1.94 rustfmt for CI.
+The vendored copy includes license notices and wire-format documentation;
+upstream development examples, benchmarks and tests are omitted because
+ArgosFS runs its own compatibility regressions. Cargo uses the local path
+with an exact version requirement. All 15 production Rust source files are
+byte-identical to the 0.2.0 registry archive; their hashes are checked in CI.
 
 ## Disk format and upgrade safety
 
@@ -63,3 +65,28 @@ the codec must never treat a checksum mismatch as a valid present shard.
 No Borg or USB throughput improvement is claimed. On the reported SD-card
 pool the bottleneck is mostly outside Reed–Solomon; the primary benefits are
 portable runtime dispatch and removal of C SIMD toolchain maintenance.
+
+
+## Packaging and upstream updates
+
+Cargo resolves a dependency declared with both path and version differently
+during development and distribution:
+
+- Repository checkout: compile the pinned vendored source.
+- Published ArgosFS crate: resolve exactly reed-solomon-engine 0.2.0 from
+  crates.io. The upstream crate source is not bundled with ArgosFS.
+
+Every CI build checks the vendor SHA-256 manifest, compiles a publishable
+ArgosFS package using the real registry dependency, and reruns the legacy
+parity oracle from the packaged source. Both deployment paths must pass.
+For local formatting, use cargo fmt --package argosfs -- --check; do not
+reformat third-party source or silently change pinned hashes.
+
+An upstream update must be deliberate: review advisories and release changes,
+verify the new crate archive checksum, re-import production sources and legal
+notices, update Cargo's explicit version and source fingerprints, and rerun
+local-vendor plus packaged-registry parity tests. Cross-arch, raw pool recovery,
+and CapOS CI remain mandatory. Dependabot is configured not to auto-bump
+this single vendored dependency: updating only its registry version would
+break our equivalence guarantee. Other dependencies retain normal update and
+security-audit workflows.
