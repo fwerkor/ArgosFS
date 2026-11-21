@@ -7,6 +7,11 @@ on:
         description: 'Stable version to release (blank = Cargo.toml version)'
         required: false
         type: string
+      publish_aur:
+        description: 'Publish AUR packages (disable while AUR is under maintenance)'
+        required: true
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -245,6 +250,7 @@ jobs:
 
   aur:
     name: Publish AUR source and binary packages
+    if: inputs.publish_aur
     needs: [prepare, github-release]
     runs-on: ubuntu-24.04
     permissions:
