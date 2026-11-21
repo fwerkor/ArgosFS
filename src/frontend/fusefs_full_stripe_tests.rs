@@ -248,3 +248,74 @@ fn repeated_partial_stripe_staging_preserves_data_and_byte_budget() {
     assert_eq!(fuse.writeback.lock().pending_bytes, 0);
     assert_eq!(volume.read_file("/stream", true).unwrap(), expected);
 }
+
+#[test]
+fn quota_rejection_during_prefix_commit_preserves_dirty_bytes_and_retries() {
+    const CHUNK: usize = 256 * 1024;
+    let (_dir, volume, _) = fixture(4, 4, CHUNK);
+    volume.mkdir("/quota", 0o755).unwrap();
+    let ino = volume.create_file_path("/quota/data", 0o644).unwrap();
+    volume.set_directory_quota("/quota", 1024 * 1024).unwrap();
+    let fuse = ArgosFuse::new(volume.clone());
+    let mut expected = Vec::new();
+    for i in 0..16 {
+        let chunk = vec![i as u8; CHUNK];
+        assert!(fuse
+            .queue_writeback_staged(ino, expected.len() as u64, &chunk)
+            .unwrap());
+        expected.extend_from_slice(&chunk);
+    }
+    assert_eq!(
+        fuse.writeback.lock().pending_bytes,
+        FUSE_WRITEBACK_MAX_BYTES
+    );
+    let tail = vec![0xfd; CHUNK];
+    let err = fuse
+        .queue_writeback_staged(ino, expected.len() as u64, &tail)
+        .unwrap_err();
+    assert!(
+        matches!(err, ArgosError::QuotaExceeded { .. }),
+        "unexpected: {err}"
+    );
+    assert_eq!(volume.attr_inode(ino).unwrap().size, 0);
+    assert_eq!(fuse.writeback.lock().dirty[&ino].data, expected);
+    assert_eq!(
+        fuse.writeback.lock().pending_bytes,
+        FUSE_WRITEBACK_MAX_BYTES
+    );
+    assert_eq!(
+        fuse.read_visible_inode(ino, 0, expected.len()).unwrap(),
+        expected
+    );
+    volume.clear_directory_quota("/quota").unwrap();
+    assert!(fuse
+        .queue_writeback_staged(ino, expected.len() as u64, &tail)
+        .unwrap());
+    expected.extend_from_slice(&tail);
+    fuse.flush_inode_writeback(ino).unwrap();
+    volume.sync().unwrap();
+    assert_eq!(volume.read_file("/quota/data", true).unwrap(), expected);
+    assert_eq!(fuse.writeback.lock().pending_bytes, 0);
+}
+
+#[test]
+fn failed_full_flush_restores_mount_budget_and_retry_after_quota_change() {
+    const CHUNK: usize = 4096;
+    let (_dir, volume, _) = fixture(2, 1, CHUNK);
+    volume.mkdir("/quota", 0o755).unwrap();
+    let ino = volume.create_file_path("/quota/data", 0o644).unwrap();
+    volume.set_directory_quota("/quota", 1).unwrap();
+    let fuse = ArgosFuse::new(volume.clone());
+    let payload = b"pending-after-quota";
+    assert!(fuse.queue_writeback(ino, 0, payload));
+    assert!(matches!(
+        fuse.flush_inode_writeback(ino),
+        Err(ArgosError::QuotaExceeded { .. })
+    ));
+    assert_eq!(fuse.writeback.lock().pending_bytes, payload.len());
+    assert_eq!(fuse.writeback.lock().dirty[&ino].data, payload);
+    volume.clear_directory_quota("/quota").unwrap();
+    fuse.flush_inode_writeback(ino).unwrap();
+    assert_eq!(fuse.writeback.lock().pending_bytes, 0);
+    assert_eq!(volume.read_file("/quota/data", true).unwrap(), payload);
+}
