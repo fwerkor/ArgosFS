@@ -100,6 +100,8 @@ done
 
 for ((i = 0; i < jobs; i++)); do
   worker_out="${out%.jsonl}-shard-$((i + 1)).jsonl"
+  # A skipped or failed mount must never inherit a successful previous run.
+  rm -f "$worker_out"
   echo "pjdfstest shard $((i + 1))/$jobs:${shards[$i]}"
   (
     export ARGOSFS_PJDFSTEST_TESTS="${shards[$i]}"
