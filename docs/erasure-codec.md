@@ -86,7 +86,9 @@ An upstream update must be deliberate: review advisories and release changes,
 verify the new crate archive checksum, re-import production sources and legal
 notices, update Cargo's explicit version and source fingerprints, and rerun
 local-vendor plus packaged-registry parity tests. Cross-arch, raw pool recovery,
-and CapOS CI remain mandatory. Dependabot is configured not to auto-bump
-this single vendored dependency: updating only its registry version would
-break our equivalence guarantee. Other dependencies retain normal update and
-security-audit workflows.
+and CapOS CI remain mandatory. Dependabot remains enabled for this dependency
+so that potential version and security updates are visible. A Dependabot PR
+that only edits its registry version MUST fail the pinned manifest check;
+reviewers should treat such a PR as a request to perform a complete vetted
+vendor refresh, not as a safe automatic version bump. Keep security advisory
+notifications and dependency audits enabled for the pinned release.

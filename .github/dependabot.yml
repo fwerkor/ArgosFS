@@ -7,9 +7,6 @@ updates:
       day: monday
       time: "05:00"
     open-pull-requests-limit: 5
-    # A path-vendored codec requires manual wire-format compatibility review.
-    ignore:
-      - dependency-name: "reed-solomon-engine"
 
   - package-ecosystem: github-actions
     directory: /
