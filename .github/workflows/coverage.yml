@@ -32,12 +32,18 @@ jobs:
       - name: Install Rust toolchain
         run: scripts/ci/install-rust.sh stable
 
-      # Restore ~/.cargo/bin before installing cargo-llvm-cov so rust-cache
-      # includes the installed tool in subsequent runs.
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
         with:
           key: rust-coverage
+
+      # A hit on the existing Rust cache key cannot save a newly installed
+      # binary. Give the pinned llvm-cov CLI its own reusable cache entry.
+      - name: Cache cargo-llvm-cov executable
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-llvm-cov
+          key: cargo-llvm-cov-${{ runner.os }}-${{ runner.arch }}-v0.8.7
 
       - name: Install cargo-llvm-cov
         run: |
