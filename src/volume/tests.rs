@@ -1460,6 +1460,72 @@ fn concurrent_read_rechecks_corrupt_shard_before_self_heal() {
     assert!(!repaired_again);
 }
 #[test]
+fn legacy_codec_superblocks_import_write_recover_without_reformatting() {
+    use std::os::unix::fs::FileExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|i| dir.path().join(format!("codec-legacy-{i}.img")))
+        .collect::<Vec<_>>();
+    let config = VolumeConfig {
+        k: 2,
+        m: 1,
+        chunk_size: 4096,
+        compression: Compression::None,
+        ..VolumeConfig::default()
+    };
+    let fs =
+        ArgosFs::create_loop(&images, config, 32 * 1024 * 1024, "codec-legacy", false).unwrap();
+    let original = (0..125_000)
+        .map(|i| ((i as u64 * 151) ^ (i as u64 >> 9)) as u8)
+        .collect::<Vec<_>>();
+    fs.write_file("/before", &original, 0o600).unwrap();
+    fs.sync().unwrap();
+    fs.mark_clean_unmount().unwrap();
+    drop(fs);
+
+    // Simulate a real pre-#259 pool: old superblock copies lack the optional
+    // codec identifier. Both checksums must be valid after the mutation.
+    for path in &images {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let mut bytes = [0u8; raw_format::SUPERBLOCK_SIZE];
+        file.read_at(&mut bytes, raw_format::PRIMARY_SUPERBLOCK_OFFSET)
+            .unwrap();
+        let mut sb = raw_format::RawSuperblock::decode(&bytes).unwrap();
+        assert_eq!(sb.codec_id(), raw_format::CODEC_ID_VANDERMONDE_GF8);
+        sb.feature_flags = 0;
+        let legacy = sb.encode();
+        for offset in [
+            raw_format::PRIMARY_SUPERBLOCK_OFFSET,
+            sb.backup_superblock_offset,
+        ] {
+            assert_eq!(file.write_at(&legacy, offset).unwrap(), legacy.len());
+        }
+        file.sync_all().unwrap();
+    }
+
+    let reopened = ArgosFs::open_loop(&images, true).unwrap();
+    assert_eq!(reopened.read_file("/before", false).unwrap(), original);
+    let after = vec![0xA5; 73_117];
+    reopened.write_file("/after", &after, 0o600).unwrap();
+    reopened.sync().unwrap();
+    reopened.mark_clean_unmount().unwrap();
+    drop(reopened);
+
+    let readonly = ArgosFs::open_loop(&images, false).unwrap();
+    assert_eq!(readonly.read_file("/before", true).unwrap(), original);
+    assert_eq!(readonly.read_file("/after", true).unwrap(), after);
+    for path in &images {
+        let (sb, _label) = raw_store::inspect_device(BackendKind::LoopBlock, path.clone()).unwrap();
+        assert_eq!(sb.codec_id(), raw_format::CODEC_ID_LEGACY_GF8);
+    }
+}
+
+#[test]
 fn offline_delta_integrity_upgrade_replays_transactions_and_fences_downgrade() {
     let dir = tempfile::tempdir().unwrap();
     let images = (0..3)

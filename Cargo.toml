@@ -33,7 +33,7 @@ lz4_flex = "0.14"
 memmap2 = "0.9.11"
 parking_lot = "0.12.5"
 rand = "0.10"
-erase = "4.0"
+reed-solomon-engine = { version = "=0.2.0", path = "vendor/reed-solomon-engine" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11"
@@ -43,9 +43,15 @@ walkdir = "2.5"
 zstd = "0.14"
 
 [dev-dependencies]
+# Test-only oracle for persisted legacy GF(2^8) parity and reconstruction.
+erase = "=4.0.0"
 tempfile = "3.10"
 
 [profile.release]
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+[workspace]
+# The standalone libFuzzer package and third-party codec are not workspace members.
+exclude = ["fuzz", "vendor/reed-solomon-engine"]
