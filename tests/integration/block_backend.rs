@@ -1,5 +1,30 @@
 use super::*;
 
+/// Tests requiring a current on-disk checkpoint must establish one explicitly.
+/// Ordinary raw sync/unmount intentionally leaves journal-durable changes in
+/// the journal until a mandatory recovery or rollover checkpoint.
+fn checkpoint_loop_metadata(images: &[std::path::PathBuf], metadata: &Metadata) {
+    let superblocks = images
+        .iter()
+        .map(|path| {
+            argosfs::raw_store::inspect_device(BackendKind::LoopBlock, path.clone())
+                .unwrap()
+                .0
+        })
+        .collect::<Vec<_>>();
+    let backend = FileBlockBackend::open_with_ids(
+        BackendKind::LoopBlock,
+        images
+            .iter()
+            .enumerate()
+            .map(|(index, path)| (format!("disk-{index:04}"), path.clone()))
+            .collect(),
+        true,
+    )
+    .unwrap();
+    argosfs::raw_store::write_metadata_copies(&backend, &superblocks, metadata).unwrap();
+}
+
 #[test]
 fn raw_superblock_builder_rejects_overflowing_layout_fields() {
     let err = argosfs::raw_store::superblock_for_device(
@@ -670,7 +695,9 @@ fn raw_journal_partial_tail_is_audited_and_data_remains_readable() {
     );
     let report = reopened.transaction_report().unwrap();
     assert!(report.invalid_entries > 0);
-    assert_eq!(report.raw_journal_quorum, Some(false));
+    // The valid, quorum-certified prefix is still replayable even though
+    // the trailing uncommitted bytes are invalid.
+    assert_eq!(report.raw_journal_quorum, Some(true));
     assert_eq!(report.raw_journal_members.len(), 1);
     assert!(report.raw_journal_members[0].invalid_entries > 0);
 }
@@ -691,7 +718,12 @@ fn fsck_repair_clears_a_stale_raw_journal_tail() {
     fs.write_file("/journal-tail", b"valid-before-tail", 0o644)
         .unwrap();
     fs.sync().unwrap();
+    let durable = fs.metadata_snapshot();
     drop(fs);
+
+    // This is a stale suffix only after the valid prefix has been checkpointed.
+    // Never reset a journal with unreplayed committed transactions.
+    checkpoint_loop_metadata(&images, &durable);
 
     let disk = fs::OpenOptions::new()
         .read(true)
@@ -941,7 +973,9 @@ fn raw_metadata_tree_checkpoint_spans_pages() {
         .unwrap();
     }
     fs.sync().unwrap();
+    let durable = fs.metadata_snapshot();
     drop(fs);
+    checkpoint_loop_metadata(&images, &durable);
 
     let (superblock, _) =
         argosfs::raw_store::inspect_device(BackendKind::LoopBlock, images[0].clone()).unwrap();
