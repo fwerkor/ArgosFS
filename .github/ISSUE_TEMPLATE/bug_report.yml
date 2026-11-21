@@ -1,0 +1,67 @@
+name: Bug report
+description: Report a reproducible defect in ArgosFS.
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a bug. Search existing issues first.
+        **Do not report security vulnerabilities here**; follow [Security Policy](https://github.com/fwerkor/ArgosFS/security/policy).
+        Do not upload private data, encryption keys, or raw disk images.
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Storage backend
+      description: Select the backend used when the problem occurred.
+      options:
+        - Host filesystem (host)
+        - Loop images (loop)
+        - Raw block devices (raw)
+        - Not applicable / unknown
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: ArgosFS version or commit
+      placeholder: "e.g. v1.2.0 or a Git commit hash"
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment and layout
+      description: "Linux distribution/kernel, CPU architecture, FUSE setup, pool k+m layout, and any other relevant details. Redact identifiers."
+      placeholder: "Linux kernel; x86_64/arm64; 4+2; mount options; ..."
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Use disposable test data; do not include destructive commands against real devices.
+      placeholder: "1. Create a disposable test pool ...\n2. Run ...\n3. Observe ..."
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Include error messages and whether the issue is repeatable.
+    validations:
+      required: true
+  - type: textarea
+    id: integrity
+    attributes:
+      label: Data integrity or recovery impact
+      description: "Any corruption, crash, degraded state, fsck/scan output, or read-only recovery? State 'none observed' if known."
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs and other context
+      description: Remove sensitive paths, filenames, keys, hostnames, and device data.
+      render: shell
