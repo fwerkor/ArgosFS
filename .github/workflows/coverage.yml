@@ -32,13 +32,18 @@ jobs:
       - name: Install Rust toolchain
         run: scripts/ci/install-rust.sh stable
 
-      - name: Install cargo-llvm-cov
-        run: cargo install cargo-llvm-cov --version 0.8.7 --locked
-
+      # Restore ~/.cargo/bin before installing cargo-llvm-cov so rust-cache
+      # includes the installed tool in subsequent runs.
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
         with:
           key: rust-coverage
+
+      - name: Install cargo-llvm-cov
+        run: |
+          if ! cargo llvm-cov --version 2>/dev/null | grep -Eq '^cargo-llvm-cov 0\.8\.7([[:space:]]|$)'; then
+            cargo install cargo-llvm-cov --version 0.8.7 --locked --force
+          fi
 
       - name: Prepare FUSE
         run: |
