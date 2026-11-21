@@ -48,9 +48,9 @@ export ARGOSFS_COMPAT_MOUNT_OPTIONS="allow_other,default_permissions"
 export ARGOSFS_PJDFSTEST_REQUIRE=1
 export ARGOSFS_PJDFSTEST_RUN_AS_ROOT=1
 
-# Each pjdfstest file uses the mount root as its working directory. Separate
-# mounts (not prove -j on one mount) prevent concurrent suites from clobbering
-# one another's paths or changing their results.
+# Each pjdfstest TAP file uses the mount root as its working directory.
+# Separate mounts (not prove -j on one mount) prevent concurrent tests from
+# clobbering one another's paths or changing their results.
 jobs="${ARGOSFS_PJDFSTEST_JOBS:-1}"
 if [[ ! "$jobs" =~ ^[1-8]$ ]]; then
   echo "ERROR: ARGOSFS_PJDFSTEST_JOBS must be an integer from 1 to 8" >&2
@@ -63,7 +63,14 @@ fi
 requested="${ARGOSFS_PJDFSTEST_TESTS:-chmod chown link mkdir open rename rmdir symlink truncate unlink utimensat}"
 selected=()
 for test_name in $requested; do
-  if [ -f "$PJDFSTEST_ROOT/tests/$test_name" ]; then
+  entry="$PJDFSTEST_ROOT/tests/$test_name"
+  if [ -d "$entry" ]; then
+    # Shard individual TAP files, not entire categories: rename and chown
+    # account for most of the work in the upstream pjdfstest suite.
+    while IFS= read -r -d '' test_file; do
+      selected+=("${test_file#"$PJDFSTEST_ROOT/tests/"}")
+    done < <(find "$entry" -type f -name '*.t' -print0 | sort -z)
+  elif [ -f "$entry" ]; then
     selected+=("$test_name")
   fi
 done
