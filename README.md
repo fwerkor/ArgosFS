@@ -1,4 +1,8 @@
-# ArgosFS
+<p align="center">
+  <img src="website/favicon.svg" alt="ArgosFS logo" width="104" height="104" />
+</p>
+
+<h1 align="center">ArgosFS</h1>
 
 ArgosFS is a self-driving, erasure-coded filesystem with a Rust core and FUSE
 frontend. It now has three storage backends:
