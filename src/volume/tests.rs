@@ -1931,7 +1931,9 @@ fn deferred_commit_reports_real_journal_and_checkpoint_phases() {
     assert!(counts(CommitPhase::Integrity) >= 1);
     assert!(counts(CommitPhase::DurabilityValidation) >= 1);
     assert!(counts(CommitPhase::Journal) >= 1);
-    assert!(counts(CommitPhase::JournalDelta) >= 1);
+    // The v2 delta is constructed during the integrity phase and reused
+    // when writing the journal; there must be no second delta pass.
+    assert_eq!(counts(CommitPhase::JournalDelta), 0);
     assert!(counts(CommitPhase::JournalMemberIo) >= 2);
     assert!(counts(CommitPhase::SyncLockHold) >= 2);
     assert_eq!(counts(CommitPhase::CheckpointEncode), 0);
