@@ -53,5 +53,5 @@ codegen-units = 1
 strip = "symbols"
 
 [workspace]
-# Upstream source is retained byte-for-byte; lint and format ArgosFS separately.
-exclude = ["vendor/reed-solomon-engine"]
+# The standalone libFuzzer package and third-party codec are not workspace members.
+exclude = ["fuzz", "vendor/reed-solomon-engine"]
