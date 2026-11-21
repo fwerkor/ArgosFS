@@ -1,11 +1,25 @@
 use crate::error::{ArgosError, Result};
 use reed_solomon_engine::{Codec, ShardMask};
+use std::cell::RefCell;
+
+thread_local! {
+    // One layout per reader thread, bounded independently of stripe count.
+    // There is no shared mutable codec state between FUSE workers.
+    static READ_CODEC: RefCell<Option<(usize, usize, RsCodec)>> = const { RefCell::new(None) };
+    // The RS engine explicitly permits reusing workspace contents.
+    static DECODE_WORKSPACE: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
 
 /// Backend boundary: ArgosFS owns its shard and error semantics, independently
 /// of the implementation of GF(2^8) systematic Vandermonde encoding.
 trait StripeCodec {
     fn encode_all(&self, shards: &mut [Vec<u8>]) -> Result<()>;
-    fn reconstruct(&self, shards: &mut [Vec<u8>], present: &ShardMask) -> Result<()>;
+    fn reconstruct(
+        &self,
+        shards: &mut [Vec<u8>],
+        present: &ShardMask,
+        data_only: bool,
+    ) -> Result<()>;
 }
 
 struct VandermondeCodec(Codec);
@@ -17,11 +31,23 @@ impl StripeCodec for VandermondeCodec {
             .map_err(|err| ArgosError::Erasure(err.to_string()))
     }
 
-    fn reconstruct(&self, shards: &mut [Vec<u8>], present: &ShardMask) -> Result<()> {
-        let mut workspace = self.0.workspace();
-        self.0
-            .reconstruct(shards, present, &mut workspace)
-            .map_err(|err| ArgosError::Erasure(err.to_string()))
+    fn reconstruct(
+        &self,
+        shards: &mut [Vec<u8>],
+        present: &ShardMask,
+        data_only: bool,
+    ) -> Result<()> {
+        DECODE_WORKSPACE.with(|scratch| {
+            let mut workspace = scratch.borrow_mut();
+            workspace.resize(self.0.workspace_len(), 0);
+            let result = if data_only {
+                // Reads only need systematic data; skip work to rebuild parity.
+                self.0.reconstruct_data(shards, present, &mut workspace)
+            } else {
+                self.0.reconstruct(shards, present, &mut workspace)
+            };
+            result.map_err(|err| ArgosError::Erasure(err.to_string()))
+        })
     }
 }
 
@@ -90,6 +116,30 @@ impl RsCodec {
     }
 
     pub fn reconstruct(&self, shards: Vec<Option<Vec<u8>>>) -> Result<Vec<Vec<u8>>> {
+        self.reconstruct_inner(shards, false)
+    }
+
+    /// Decode data shards only. Reuse the immutable generator matrix and
+    /// reconstruction scratch on the current thread, not once per stripe.
+    pub(crate) fn reconstruct_data_cached(
+        k: usize,
+        m: usize,
+        shards: Vec<Option<Vec<u8>>>,
+    ) -> Result<Vec<Vec<u8>>> {
+        READ_CODEC.with(|cached| {
+            let mut cached = cached.borrow_mut();
+            if !matches!(cached.as_ref(), Some((old_k, old_m, _)) if *old_k == k && *old_m == m) {
+                *cached = Some((k, m, Self::new(k, m)?));
+            }
+            cached.as_ref().unwrap().2.reconstruct_inner(shards, true)
+        })
+    }
+
+    fn reconstruct_inner(
+        &self,
+        shards: Vec<Option<Vec<u8>>>,
+        data_only: bool,
+    ) -> Result<Vec<Vec<u8>>> {
         if shards.len() != self.total {
             return Err(ArgosError::Invalid(format!(
                 "expected {} shards, got {}",
@@ -153,7 +203,10 @@ impl RsCodec {
             self.inner
                 .as_ref()
                 .expect("parity layout must have a codec")
-                .reconstruct(&mut buffers, &present)?;
+                .reconstruct(&mut buffers, &present, data_only)?;
+        }
+        if data_only {
+            buffers.truncate(self.k);
         }
         Ok(buffers)
     }
