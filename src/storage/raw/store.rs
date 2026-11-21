@@ -1258,6 +1258,11 @@ fn journal_tip_accepts_transaction(
     Ok(true)
 }
 
+struct JournalMemberWriteOptions<'a> {
+    flush: bool,
+    metrics: Option<&'a CommitMetrics>,
+}
+
 fn append_journal_member(
     backend: &dyn StorageBackend,
     sb: &RawSuperblock,
@@ -1265,19 +1270,18 @@ fn append_journal_member(
     write_offset: u64,
     end: u64,
     entry: &[u8],
-    flush: bool,
-    metrics: Option<&CommitMetrics>,
+    options: JournalMemberWriteOptions<'_>,
 ) -> Result<()> {
     backend.write_at(&sb.disk_id, sb.journal.offset + write_offset, entry)?;
-    if let Some(metrics) = metrics {
+    if let Some(metrics) = options.metrics {
         metrics.add_raw_write_bytes(RawWriteKind::Journal, entry.len());
     }
     put_u64(&mut header, 24, end);
     backend.write_at(&sb.disk_id, sb.journal.offset, &header)?;
-    if let Some(metrics) = metrics {
+    if let Some(metrics) = options.metrics {
         metrics.add_raw_write_bytes(RawWriteKind::Journal, header.len());
     }
-    if flush {
+    if options.flush {
         backend.flush_device(&sb.disk_id)?;
     }
     Ok(())
@@ -1306,8 +1310,10 @@ fn append_quorum_commit_certificate(
                     write_offset,
                     end,
                     certificate,
-                    true,
-                    metrics,
+                    JournalMemberWriteOptions {
+                        flush: true,
+                        metrics,
+                    },
                 ) {
                     Ok(()) => durable += 1,
                     Err(err) => report.record_failure(&sb.disk_id, &err),
@@ -1380,8 +1386,10 @@ fn append_journal_with_previous_validation(
                 write_offset,
                 end,
                 &entry,
-                !metadata.config.defer_journal_flush,
-                None,
+                JournalMemberWriteOptions {
+                    flush: !metadata.config.defer_journal_flush,
+                    metrics: None,
+                },
             )?;
             if index + 1 < superblocks.len() {
                 journal::inject_crash(FaultPoint::AfterPartialJournalFanout.as_str())?;
@@ -1558,8 +1566,10 @@ fn append_journal_quorum(
                 write_offset,
                 end,
                 &entry,
-                !metadata.config.defer_journal_flush,
-                metrics,
+                JournalMemberWriteOptions {
+                    flush: !metadata.config.defer_journal_flush,
+                    metrics,
+                },
             )
         };
         match member_result {

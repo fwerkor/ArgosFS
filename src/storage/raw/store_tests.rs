@@ -724,8 +724,10 @@ fn stale_same_txid_suffix_is_excluded_from_new_quorum_append() {
         write_offset,
         end,
         &stale_entry,
-        true,
-        None,
+        JournalMemberWriteOptions {
+            flush: true,
+            metrics: None,
+        },
     )
     .unwrap();
     drop(backend);
