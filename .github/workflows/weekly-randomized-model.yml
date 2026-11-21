@@ -384,7 +384,7 @@ jobs:
         run: cargo install cargo-fuzz --version 0.13.2 --locked
 
       - name: Restore evolving corpus
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: fuzz/corpus/${{ matrix.target }}
           key: argosfs-fuzz-corpus-${{ matrix.target }}-${{ matrix.shard }}-${{ github.run_id }}
@@ -402,7 +402,7 @@ jobs:
 
       - name: Save evolved corpus
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: fuzz/corpus/${{ matrix.target }}
           key: argosfs-fuzz-corpus-${{ matrix.target }}-${{ matrix.shard }}-${{ github.run_id }}
