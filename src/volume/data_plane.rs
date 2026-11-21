@@ -3,6 +3,26 @@ use crate::backend::StorageBackend;
 use crate::storage::guard::GuardedBackend;
 use std::sync::Arc;
 
+/// Stitch checked data shards using bounded bulk copies.  Avoids the
+/// byte-at-a-time iterator/collect path on verified and reconstructed reads.
+pub(super) fn assemble_data_shards<'a>(
+    chunks: impl Iterator<Item = &'a [u8]> + Clone,
+    compressed_size: usize,
+) -> Vec<u8> {
+    let available = chunks
+        .clone()
+        .fold(0usize, |total, chunk| total.saturating_add(chunk.len()));
+    let mut compressed = Vec::with_capacity(compressed_size.min(available));
+    for chunk in chunks {
+        let remaining = compressed_size.saturating_sub(compressed.len());
+        if remaining == 0 {
+            break;
+        }
+        compressed.extend_from_slice(&chunk[..remaining.min(chunk.len())]);
+    }
+    compressed
+}
+
 impl ArgosFs {
     pub(super) fn replace_inode_data(
         &self,
@@ -529,12 +549,13 @@ impl ArgosFs {
         let compressed: Vec<u8> = if shards[..layout.k].iter().all(Option::is_some) {
             // Each data shard has already passed its individual hash. The
             // reconstructed block is checked against raw_sha256 below too.
-            shards
-                .iter()
-                .take(layout.k)
-                .flat_map(|shard| shard.as_ref().unwrap().iter().copied())
-                .take(block.compressed_size)
-                .collect()
+            assemble_data_shards(
+                shards
+                    .iter()
+                    .take(layout.k)
+                    .map(|shard| shard.as_deref().unwrap()),
+                block.compressed_size,
+            )
         } else {
             let present = shards.iter().filter(|shard| shard.is_some()).count();
             if present < layout.k {
@@ -545,12 +566,10 @@ impl ArgosFs {
             }
             let codec = RsCodec::new(layout.k, layout.m)?;
             let reconstructed = codec.reconstruct(shards)?;
-            reconstructed
-                .iter()
-                .take(layout.k)
-                .flat_map(|shard| shard.iter().copied())
-                .take(block.compressed_size)
-                .collect()
+            assemble_data_shards(
+                reconstructed.iter().take(layout.k).map(Vec::as_slice),
+                block.compressed_size,
+            )
         };
         let compressed = if block.encrypted {
             let nonce = hex::decode(&block.nonce_hex).map_err(|err| {
