@@ -2279,6 +2279,9 @@ fn xattr_name(name: &OsStr) -> Result<&str> {
 }
 
 #[cfg(test)]
+#[path = "fusefs_full_stripe_tests.rs"]
+mod fusefs_full_stripe_tests;
+#[cfg(test)]
 #[path = "fusefs_read_overlay_tests.rs"]
 mod fusefs_read_overlay_tests;
 #[cfg(test)]
