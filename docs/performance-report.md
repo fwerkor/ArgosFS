@@ -1,54 +1,71 @@
 # Performance report
 
-The `Performance report` GitHub Actions workflow compares the loop-backed ArgosFS
-FUSE frontend with an ext4 loop image on the same GitHub-hosted runner.
+The `Performance report` GitHub Actions workflow compares the loop-backed
+ArgosFS FUSE frontend with ext4, XFS, Btrfs, F2FS, and OpenZFS on the same
+Ubuntu runner. It also measures a regular directory on the runner filesystem.
 
-It runs three ArgosFS durability configurations:
+| Scenario | Backing storage | Setup |
+| --- | --- | --- |
+| `argosfs-loop-default` | Image file | ArgosFS default group-commit policy, FUSE frontend |
+| `ext4-loop` | Image file | Linux ext4 mounted as a loop device |
+| `xfs-loop` | Image file (at least 384 MiB) | Linux XFS mounted as a loop device |
+| `btrfs-loop` | Image file | Linux Btrfs mounted as a loop device |
+| `f2fs-loop` | Image file | Linux F2FS mounted as a loop device |
+| `zfs-pool` | Single file vdev | OpenZFS pool, `compression=off`, `ashift=12` |
+| `host-directory` | Runner's filesystem | Regular directory, no loop image |
 
-- strict journal flushing,
-- deferred journal flushing,
-- batched metadata commits with deferred data flushing.
+The runner supports additional ArgosFS durability scenarios via
+`--scenarios argosfs-loop-strict,argosfs-loop-deferred,argosfs-loop-batched`.
+The normal CI job benchmarks the default policy.
 
-The report measures:
+The benchmarks measure sequential write throughput including a final
+`fsync`, sequential cached read throughput, small-file creation rate, and
+small-file `stat` rate. Small-file creation does **not** fsync each file.
 
-- sequential write throughput followed by `fsync`,
-- sequential cached read throughput,
-- small-file creation rate,
-- small-file `stat` rate.
+PRs and main use the quick workload with three iterations. Weekly scheduled
+runs use the full workload with five iterations. Scenario order rotates between
+iterations, and loop images are removed after each iteration to bound disk use.
 
-Pull requests and pushes to `main` use the quick workload with three repeated
-measurements. The scheduled run uses the full workload with five repetitions.
-Manual runs can select either workload and set the repetition count.
+Each run writes a table to the Actions job summary and uploads:
 
-Each run writes a Markdown table to the GitHub job summary and uploads:
+- `rootfs-perf.jsonl`: every raw measurement and any failures or skips.
+- `performance-summary.csv`: status, sample counts, medians, ratios to ext4,
+  and coefficients of variation.
+- `performance-report.md`: table, variability, skipped scenarios, limits.
+- `environment.txt`: runner, filesystem and ZFS module details.
 
-- `rootfs-perf.jsonl`, containing every raw measurement,
-- `performance-summary.csv`, containing medians, ext4 ratios, and coefficients
-  of variation,
-- `performance-report.md`, containing the rendered report,
-- `environment.txt`, containing runner and workload details.
+## Environment and failure policy
 
-Scenario order rotates between repetitions to reduce fixed ordering bias. The
-reported values are medians, and every throughput metric is shown as a ratio to
-the ext4 loop-image result collected on the same runner.
+The benchmark requires loop-device access, mount privileges, kernel filesystem
+support, and the corresponding `mkfs` tools. OpenZFS additionally needs a
+loadable `zfs` kernel module. Installing `zfsutils-linux` alone does not
+provide the module on every runner kernel.
+
+CI requires ArgosFS, ext4, XFS, Btrfs, F2FS, and host-directory measurements
+to complete. **ZFS may be skipped only if its tools or kernel module are
+unavailable**; the report contains an explicit `skipped` status and the
+workflow emits a warning. Once ZFS is available, pool creation, benchmark
+execution and teardown failures are treated as failures, not as skips.
+All successful ZFS pools are destroyed in the cleanup path.
+
+If strict coverage of ZFS is needed, run on a machine with OpenZFS kernel
+support and omit `--optional-scenarios zfs-pool`.
 
 ## Interpretation
 
-The comparison is end-to-end. ArgosFS runs through FUSE and its own block,
-metadata, and journal paths, while ext4 runs in the kernel. It therefore shows
-user-visible overhead but does not isolate the cost of FUSE, journaling,
-erasure coding, or metadata handling.
+All measurements use the **same runner** and an image file (or ZFS file vdev)
+on the runner's storage. These are not standalone physical disks, RAID setups,
+or cold-cache tests. ext4, XFS, Btrfs, and F2FS use kernel drivers; ArgosFS
+uses FUSE; OpenZFS uses its kernel module. The results show end-to-end behavior,
+not the isolated cost of a filesystem algorithm. Caching, copy-on-write,
+journaling and metadata durability policies differ. In particular, ZFS
+performance is sensitive to its ARC cache and vdev setup.
 
-The small-file workload does not call `fsync` for every file, so ext4 may retain
-more dirty state than strict ArgosFS. The sequential write workload does call
-`fsync` before it is recorded.
+The output is diagnostic, **not** a performance-regression gate; hosted runner
+hardware and load vary. Stable regression gating needs dedicated hardware and
+a historical baseline distribution.
 
-GitHub-hosted runner hardware and load vary. The workflow reports sample
-variation and deliberately does not enforce a performance threshold. Stable
-regression gating would require a dedicated, pinned self-hosted runner and a
-stored reference distribution.
-
-Run the same benchmark locally with:
+Run locally with supported filesystems installed:
 
 ```bash
 cargo build --release
@@ -56,6 +73,7 @@ python3 scripts/experiments/run_rootfs_perf.py \
   --mode quick \
   --iterations 3 \
   --require-all \
+  --optional-scenarios zfs-pool \
   --output target/rootfs-perf/rootfs-perf.jsonl
 python3 scripts/experiments/render_rootfs_perf_report.py \
   target/rootfs-perf/rootfs-perf.jsonl \
@@ -64,6 +82,6 @@ python3 scripts/experiments/render_rootfs_perf_report.py \
   --commit "$(git rev-parse HEAD)"
 ```
 
-The ext4 scenario needs loop-device mount privileges. The script uses `sudo`
-for ext4 mount, ownership transfer, and unmount when it is not already running
-as root.
+Run as root or with passwordless `sudo` for mounts, ownership transfer,
+ZFS pool creation, and teardown. The script only creates disposable image
+files and its own uniquely named ZFS pool; it never formats physical devices.
