@@ -51,6 +51,7 @@ jobs:
         env:
           ARGOSFS_COVERAGE_REQUIRE_FUSE: "1"
           ARGOSFS_COVERAGE_MIN_LINES: "80"
+          ARGOSFS_PJDFSTEST_JOBS: "4"
           PJDFSTEST_ROOT: ${{ github.workspace }}/external/pjdfstest
         run: scripts/ci/run-coverage.sh
 
