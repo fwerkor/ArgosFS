@@ -575,13 +575,44 @@ fn delta_integrity_hash(
 /// Build a v2 transaction using only changed inode keys, disk metadata, and
 /// a bounded header, leveraging the existing COW mutation tracker.
 pub fn prepare_delta_integrity(meta: &mut Metadata, previous: &Metadata) -> Result<()> {
+    prepare_delta_integrity_with_delta(meta, previous).map(|_| ())
+}
+
+/// Return the exact delta authenticated by this v2 transaction, including the
+/// final integrity field. A group commit can reuse it when encoding its raw
+/// journal record instead of traversing the changed inode set twice.
+pub(crate) fn prepare_delta_integrity_with_delta(
+    meta: &mut Metadata,
+    previous: &Metadata,
+) -> Result<Vec<MetadataDeltaOp>> {
     meta.integrity.generation = meta.txid;
     meta.integrity.previous_meta_hash = previous.integrity.meta_hash.clone();
     meta.integrity.hash_scheme = Some(DELTA_INTEGRITY_SCHEME);
     meta.integrity.meta_hash.clear();
-    let delta = metadata_delta(previous, meta)?;
+    let mut delta = metadata_delta(previous, meta)?;
     meta.integrity.meta_hash = delta_integrity_hash(previous, meta, &delta)?;
-    Ok(())
+    // Only the integrity hash changes after constructing the authenticated
+    // delta. Patch that one JSON operation rather than rebuilding the entire
+    // delta. The previous v2 tip necessarily has a nonempty 64-byte hash.
+    let mut found = false;
+    for op in &mut delta {
+        match op {
+            MetadataDeltaOp::Add { path, value } | MetadataDeltaOp::Replace { path, value }
+                if path == "/integrity/meta_hash" =>
+            {
+                *value = serde_json::Value::String(meta.integrity.meta_hash.clone());
+                found = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    if !found {
+        return Err(ArgosError::CorruptedMetadata(
+            "v2 integrity delta omitted the metadata hash update".to_string(),
+        ));
+    }
+    Ok(delta)
 }
 
 pub fn inject_crash(point: &str) -> Result<()> {

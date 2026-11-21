@@ -2339,10 +2339,13 @@ impl ArgosFs {
                 self.account_blocks_locked(meta, std::slice::from_ref(block), false);
                 self.delete_blocks_locked(meta, std::slice::from_ref(block));
             }
+            let mut prepared_delta = None;
             {
                 let _integrity_timer = self.commit_metrics.timer(CommitPhase::Integrity);
                 if incremental_integrity_enabled && !checkpoint {
-                    journal::prepare_delta_integrity(meta, &previous)?;
+                    prepared_delta = Some(journal::prepare_delta_integrity_with_delta(
+                        meta, &previous,
+                    )?);
                 } else {
                     journal::prepare_metadata_integrity_with_previous(
                         meta,
@@ -2391,7 +2394,10 @@ impl ArgosFs {
                             backend,
                             &superblocks,
                             meta,
-                            Some(&previous),
+                            raw_store::PreparedJournalBase {
+                                previous: &previous,
+                                delta: prepared_delta.take(),
+                            },
                             &self.commit_metrics,
                             "group-commit",
                             json!({

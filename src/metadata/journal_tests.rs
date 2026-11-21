@@ -998,6 +998,35 @@ fn metadata_scale_274k_eight_shard_inodes() {
 }
 
 #[test]
+fn prepared_v2_delta_matches_fresh_delta_including_final_integrity_hash() {
+    let (_dir, fs) = volume();
+    let mut base = fs.metadata_snapshot();
+    base.inodes.mark_committed();
+    let mut next = base.clone();
+    next.txid += 1;
+    next.updated_at += 1.0;
+    next.inodes.get_mut(&1).unwrap().read_bytes += 17;
+    next.raw_pool.pool_name = "changed-pool-name".into();
+    let disk = next.disks.keys().next().unwrap().clone();
+    next.disks.get_mut(&disk).unwrap().used_bytes += 1;
+
+    let prepared = prepare_delta_integrity_with_delta(&mut next, &base).unwrap();
+    let fresh = metadata_delta(&base, &next).unwrap();
+    assert_eq!(
+        serde_json::to_value(&prepared).unwrap(),
+        serde_json::to_value(&fresh).unwrap(),
+        "cached delta must retain the exact v2 wire representation"
+    );
+    let replayed = apply_metadata_delta(&base, &prepared).unwrap();
+    assert_eq!(replayed.integrity, next.integrity);
+    assert_eq!(replayed.inodes[&1].read_bytes, next.inodes[&1].read_bytes);
+    assert_eq!(
+        replayed.disks[&disk].used_bytes,
+        next.disks[&disk].used_bytes
+    );
+}
+
+#[test]
 fn delta_integrity_v2_binds_changes_and_replays_without_full_hash() {
     let (_dir, fs) = volume();
     let mut base = fs.metadata_snapshot();
