@@ -559,6 +559,10 @@ impl ArgosFuseShared {
                 let dirty = writeback.dirty.get_mut(&ino).expect("locked dirty inode");
                 dirty.offset += prefix_len as u64;
                 dirty.data.drain(..prefix_len);
+                // Vec::drain retains the original (up to 4 MiB) capacity.
+                // Release it so the mount-wide pending-byte budget also
+                // bounds retained heap capacity after many partial flushes.
+                dirty.data.shrink_to_fit();
                 writeback.pending_bytes -= prefix_len;
                 if writeback.dirty[&ino].data.is_empty() {
                     writeback.dirty.remove(&ino);

@@ -217,3 +217,34 @@ fn raw_loop_stripe_prefix_and_tail_survive_sync_and_reopen() {
     assert_eq!(reopened.transaction_report().unwrap().invalid_entries, 0);
     assert_eq!(reopened.fsck(false, false).unwrap().missing_shards, 0);
 }
+
+#[test]
+fn repeated_partial_stripe_staging_preserves_data_and_byte_budget() {
+    const STEP: usize = 128 * 1024;
+    let (_dir, volume, ino) = fixture(2, 1, 4096);
+    let initial = vec![0x59; 512];
+    volume.write_file("/stream", &initial, 0o644).unwrap();
+    let fuse = ArgosFuse::new(volume.clone());
+    let mut expected = initial;
+    for i in 0..82 {
+        let bytes = vec![i as u8; STEP];
+        assert!(fuse
+            .queue_writeback_staged(ino, expected.len() as u64, &bytes)
+            .unwrap());
+        expected.extend_from_slice(&bytes);
+        let wb = fuse.writeback.lock();
+        assert_eq!(wb.pending_bytes, wb.dirty[&ino].data.len());
+        assert!(wb.pending_bytes <= FUSE_WRITEBACK_MAX_BYTES);
+    }
+    assert_eq!(
+        fuse.visible_inode_attr(ino).unwrap().size,
+        expected.len() as u64
+    );
+    assert_eq!(
+        fuse.read_visible_inode(ino, 0, expected.len()).unwrap(),
+        expected
+    );
+    fuse.flush_inode_writeback(ino).unwrap();
+    assert_eq!(fuse.writeback.lock().pending_bytes, 0);
+    assert_eq!(volume.read_file("/stream", true).unwrap(), expected);
+}
