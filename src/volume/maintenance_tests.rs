@@ -728,7 +728,15 @@ fn fsck_repairs_only_damaged_stripes_in_large_file() {
     assert_eq!(after.size, large_size);
     assert_eq!(after.mtime, before.mtime, "fsck must preserve file mtime");
     assert_eq!(after.blocks.len(), 2);
-    assert_ne!(after.blocks[0].stripe_id, before.blocks[0].stripe_id);
+    assert_eq!(after.blocks[0].stripe_id, before.blocks[0].stripe_id);
+    assert_ne!(
+        after.blocks[0].shards[0].relpath, before.blocks[0].shards[0].relpath,
+        "only the damaged shard should be relocated"
+    );
+    assert_eq!(
+        after.blocks[0].shards[1].relpath,
+        before.blocks[0].shards[1].relpath
+    );
     assert_eq!(after.blocks[1].stripe_id, before.blocks[1].stripe_id);
     assert_eq!(
         fs.read_inode(ino, 0, payload.len(), false).unwrap(),
