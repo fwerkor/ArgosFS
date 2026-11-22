@@ -272,10 +272,14 @@ impl ArgosFs {
                         Err(ArgosError::NotEnoughDisks { .. }) => choose(&excluded)?.remove(0),
                         Err(err) => return Err(err),
                     };
-                    // Host filenames are immutable per allocation: using the
-                    // original stripe/slot path on the same disk would overwrite
-                    // the still-durable copy before commit.
-                    let storage_id = format!("r{}", Uuid::new_v4().simple());
+                    // Host paths need a fresh physical name for COW. Raw extents
+                    // are already unique, and the write verifier must retain
+                    // the block's logical stripe ID to find the live extent.
+                    let storage_id = if meta.backend == BackendKind::Host {
+                        format!("r{}", Uuid::new_v4().simple())
+                    } else {
+                        block.stripe_id.clone()
+                    };
                     let integrity = old.map(|shard| ShardIntegrity {
                         sha256: shard.sha256.clone(),
                         checksum_block_size: shard.checksum_block_size,
