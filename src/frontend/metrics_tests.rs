@@ -244,3 +244,21 @@ fn data_plane_byte_counters_are_live_and_scrapable_without_metadata_lock() {
         assert!(render_commit_metrics(&clone).contains("kind=\"range_accepted\"} 1024"));
     });
 }
+
+#[test]
+fn raw_checkpoint_causes_and_write_bytes_are_exposed_without_metadata_lock() {
+    use crate::commit_metrics::{CheckpointReason, RawWriteKind};
+    let volume = volume();
+    let metrics = volume.commit_metrics();
+    metrics.add_raw_write_bytes(RawWriteKind::Checkpoint, 8192);
+    metrics.add_raw_write_bytes(RawWriteKind::Journal, 1024);
+    metrics.record_checkpoint_reason(CheckpointReason::JournalRollover);
+    volume.test_with_metadata_write_lock(|| {
+        let output = render_commit_metrics(&volume);
+        assert!(output.contains("argosfs_raw_metadata_write_bytes_total{kind=\"checkpoint\"} 8192"));
+        assert!(output.contains("argosfs_raw_metadata_write_bytes_total{kind=\"journal\"} 1024"));
+        assert!(output.contains("argosfs_raw_metadata_write_bytes_total{kind=\"clean_state\"} 0"));
+        assert!(output.contains("argosfs_checkpoint_reason_total{reason=\"journal_rollover\"} 1"));
+        assert!(output.contains("argosfs_checkpoint_reason_total{reason=\"recovery_or_format\"} 0"));
+    });
+}

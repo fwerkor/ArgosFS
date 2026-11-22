@@ -56,7 +56,7 @@ fn raw_journal_replays_write_after_read_side_metadata_mutation() {
 }
 
 #[test]
-fn raw_sync_after_read_refreshes_integrity_and_dirty_state() {
+fn raw_sync_after_read_retains_durable_hash_until_a_real_write() {
     let tmp = TempDir::new().unwrap();
     let image = tmp.path().join("disk-sync.img");
     let images = vec![image];
@@ -73,11 +73,16 @@ fn raw_sync_after_read_refreshes_integrity_and_dirty_state() {
     fs.write_file("/seed", &seed_payload, 0o644).unwrap();
     let seed = fs.resolve_path("/seed", true).unwrap();
     assert!(!fs.metadata_snapshot().inodes[&seed].blocks.is_empty());
+    let durable = fs.metadata_snapshot();
     assert_eq!(fs.read_file("/seed", false).unwrap(), seed_payload);
     fs.sync().unwrap();
 
+    // Read telemetry is ephemeral and must not turn sync into a checkpoint.
+    // Preserve the last journal-durable hash until an actual mutation commits.
     let synced = fs.metadata_snapshot();
-    assert_eq!(
+    assert_eq!(synced.txid, durable.txid);
+    assert_eq!(synced.integrity.meta_hash, durable.integrity.meta_hash);
+    assert_ne!(
         synced.integrity.meta_hash,
         journal::canonical_metadata_hash(&synced).unwrap()
     );

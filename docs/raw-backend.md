@@ -66,10 +66,13 @@ The raw journal region stores length-prefixed JSON transaction records with an
 entry checksum and an internal record hash. Records normally carry metadata
 deltas and a full snapshot when a validated delta base is unavailable. The
 journal rolls over to a per-member checkpoint only when its space is exhausted,
-so open can replay a newer committed state when checkpoint copies are stale. Rw open marks member superblocks dirty. A
-clean unmount writes fresh metadata checkpoint copies before marking the member
-superblocks clean. A pool counts as cleanly unmounted when at least a metadata
-quorum of its members is clean, not only when every member is clean: a card
+so open can replay a newer committed state when checkpoint copies are stale.
+Rw open marks member superblocks dirty. Clean unmount first commits pending
+namespace/allocator transactions and any mandatory recovery checkpoint, then
+marks a superblock quorum clean. When only crash-optional read/access statistics
+have changed, it **does not** rewrite the two metadata slots or the journal:
+the previously trusted durable hash remains authoritative. A pool counts as
+cleanly unmounted when at least a metadata quorum of its members is clean, not only when every member is clean: a card
 that failed during the unmount (or missed a later cleanup) can stay dirty
 without forcing every future writable mount to replay or refuse the pool.
 

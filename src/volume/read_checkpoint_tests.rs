@@ -169,34 +169,40 @@ fn clean_unmount_after_advisory_only_reads_never_persists_a_stale_integrity_hash
         assert_eq!(fs.read_inode(ino, 0, 4, false).unwrap(), b"read");
     }
     assert!(fs.read_advisory.pending_entries().0 > 0);
+    let durable = fs.deferred_commit.lock().durable_metadata.clone().unwrap();
     let before = phase(&fs, CommitPhase::Checkpoint);
+    let before_journal = phase(&fs, CommitPhase::Journal);
     fs.mark_clean_unmount().unwrap();
     let live_hash = fs.metadata_snapshot();
-    // Check the actual checkpoint image *before* open normalizes disk usage
-    // and other runtime metadata fields; these are intentionally allowed to
-    // differ from the stored canonical hash in a recovered live metadata view.
-    assert_eq!(
+    // In-memory read telemetry does not match the trusted durable hash;
+    // persisting it without a real transaction would corrupt recovery.
+    assert_ne!(
         journal::canonical_metadata_hash(&live_hash).unwrap(),
         live_hash.integrity.meta_hash
     );
-    assert_eq!(phase(&fs, CommitPhase::Checkpoint), before + 1);
+    assert_eq!(phase(&fs, CommitPhase::Checkpoint), before);
+    assert_eq!(phase(&fs, CommitPhase::Journal), before_journal);
     let state = fs.deferred_commit.lock();
-    assert!(!state.raw_advisory_metadata_dirty);
+    assert!(state.raw_advisory_metadata_dirty);
     assert!(!state.raw_uncommitted_metadata_dirty);
     drop(state);
     drop(fs);
     let recovered = ArgosFs::open_loop(&images, false).unwrap();
+    let recovered_meta = recovered.metadata_snapshot();
     assert_eq!(
         recovered.read_file("/value", false).unwrap(),
         b"read-only telemetry must not trigger a full checkpoint"
     );
     assert_eq!(recovered.transaction_report().unwrap().invalid_entries, 0);
-    let recovered_meta = recovered.metadata_snapshot();
     assert_eq!(
         recovered_meta.integrity.meta_hash,
-        live_hash.integrity.meta_hash
+        durable.integrity.meta_hash
     );
-    assert_eq!(recovered_meta.txid, live_hash.txid);
+    assert_eq!(recovered_meta.txid, durable.txid);
+    assert_eq!(
+        recovered_meta.inodes[&ino].read_bytes,
+        durable.inodes[&ino].read_bytes
+    );
 }
 
 #[test]
@@ -234,4 +240,227 @@ fn immediate_metadata_commit_after_advisory_reads_reanchors_trusted_hash() {
     assert_eq!(recovered.read_file("/old", false).unwrap(), b"the old file");
     assert_eq!(recovered.read_file("/new", false).unwrap(), b"the new file");
     assert_eq!(recovered.transaction_report().unwrap().invalid_entries, 0);
+}
+
+/// Observe real successful device writes, classified by raw on-disk region.
+/// This catches unmeasured checkpoints in clean-unmount as well as commits.
+struct WriteAuditBackend {
+    inner: Arc<dyn StorageBackend>,
+    regions: BTreeMap<String, RawSuperblock>,
+    bytes: Mutex<BTreeMap<String, [u64; 3]>>,
+}
+
+impl WriteAuditBackend {
+    fn new(inner: Arc<dyn StorageBackend>, superblocks: &[RawSuperblock]) -> Self {
+        Self {
+            inner,
+            regions: superblocks
+                .iter()
+                .map(|sb| (sb.disk_id.clone(), sb.clone()))
+                .collect(),
+            bytes: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn totals(&self) -> [u64; 3] {
+        self.bytes
+            .lock()
+            .values()
+            .fold([0u64; 3], |mut sum, bytes| {
+                for (total, value) in sum.iter_mut().zip(bytes) {
+                    *total += *value;
+                }
+                sum
+            })
+    }
+}
+
+impl StorageBackend for WriteAuditBackend {
+    fn backend_kind(&self) -> BackendKind {
+        self.inner.backend_kind()
+    }
+
+    fn list_devices(&self) -> Result<Vec<crate::storage::backend::BackendDeviceInfo>> {
+        self.inner.list_devices()
+    }
+
+    fn read_at(&self, id: &String, offset: u64, data: &mut [u8]) -> Result<()> {
+        self.inner.read_at(id, offset, data)
+    }
+
+    fn write_at(&self, id: &String, offset: u64, data: &[u8]) -> Result<()> {
+        self.inner.write_at(id, offset, data)?;
+        let sb = &self.regions[id];
+        let in_region = |start: u64, len: u64| offset >= start && offset < start + len;
+        // [metadata slots, journal records, superblock/label/other]
+        let kind = if in_region(sb.metadata.offset, sb.metadata.length) {
+            0
+        } else if in_region(sb.journal.offset, sb.journal.length) {
+            1
+        } else {
+            2
+        };
+        self.bytes.lock().entry(id.clone()).or_default()[kind] += data.len() as u64;
+        Ok(())
+    }
+
+    fn flush_device(&self, id: &String) -> Result<()> {
+        self.inner.flush_device(id)
+    }
+
+    fn flush_all(&self) -> Result<()> {
+        self.inner.flush_all()
+    }
+
+    fn drop_cache(&self, id: &String, offset: u64, length: u64) -> Result<()> {
+        self.inner.drop_cache(id, offset, length)
+    }
+
+    fn capacity(&self, id: &String) -> Result<u64> {
+        self.inner.capacity(id)
+    }
+
+    fn device_status(&self, id: &String) -> Result<DiskStatus> {
+        self.inner.device_status(id)
+    }
+
+    fn capabilities(&self) -> crate::storage::backend::BackendCapabilities {
+        self.inner.capabilities()
+    }
+}
+
+#[test]
+fn nine_member_clean_read_cycle_only_writes_small_superblock_flags() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..9)
+        .map(|i| dir.path().join(format!("nine-member-{i}.img")))
+        .collect::<Vec<_>>();
+    let mut fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 4,
+            m: 4,
+            chunk_size: 4096,
+            compression: Compression::None,
+            defer_metadata_commit: true,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "nine-member-read",
+        false,
+    )
+    .unwrap();
+    fs.upgrade_delta_integrity().unwrap();
+    let ino = fs.create_file_path("/archive", 0o600).unwrap();
+    fs.write_inode_range(ino, 0, b"borg verify read only")
+        .unwrap();
+    fs.sync().unwrap();
+    let baseline = fs.metadata_snapshot();
+    let bytes_before = fs
+        .commit_metrics()
+        .raw_write_byte_snapshots()
+        .collect::<Vec<_>>();
+    let reasons_before = fs
+        .commit_metrics()
+        .checkpoint_reason_snapshots()
+        .collect::<Vec<_>>();
+    let audit = Arc::new(WriteAuditBackend::new(
+        fs.backend.clone(),
+        &fs.raw_superblocks,
+    ));
+    fs.backend = audit.clone();
+    for _ in 0..48 {
+        assert_eq!(
+            fs.read_inode(ino, 0, 21, true).unwrap(),
+            b"borg verify read only"
+        );
+        assert!(!fs.sync_deferred_if_dirty().unwrap());
+        fs.sync().unwrap();
+    }
+    fs.mark_clean_unmount().unwrap();
+    let [metadata_bytes, journal_bytes, superblock_bytes] = audit.totals();
+    assert_eq!(
+        metadata_bytes, 0,
+        "advisory-only reads wrote metadata slots"
+    );
+    assert_eq!(
+        journal_bytes, 0,
+        "advisory-only reads wrote journal records"
+    );
+    assert_eq!(
+        superblock_bytes,
+        9 * 3 * 4096,
+        "only clean-state headers should change"
+    );
+    let bytes_after = fs
+        .commit_metrics()
+        .raw_write_byte_snapshots()
+        .collect::<Vec<_>>();
+    assert_eq!(bytes_after[0].1, bytes_before[0].1);
+    assert_eq!(bytes_after[1].1, bytes_before[1].1);
+    assert_eq!(bytes_after[2].1 - bytes_before[2].1, superblock_bytes);
+    assert_eq!(
+        fs.commit_metrics()
+            .checkpoint_reason_snapshots()
+            .collect::<Vec<_>>(),
+        reasons_before
+    );
+    assert_eq!(fs.metadata_snapshot().txid, baseline.txid);
+    assert_eq!(
+        fs.metadata_snapshot().integrity.meta_hash,
+        baseline.integrity.meta_hash
+    );
+    assert_eq!(phase(&fs, CommitPhase::Checkpoint), 0);
+    assert_eq!(phase(&fs, CommitPhase::Journal), 1);
+    drop(fs);
+    let recovered = ArgosFs::open_loop(&images, false).unwrap();
+    assert_eq!(
+        recovered.read_file("/archive", false).unwrap(),
+        b"borg verify read only"
+    );
+    assert_eq!(recovered.transaction_report().unwrap().invalid_entries, 0);
+}
+
+#[test]
+fn immediate_raw_reads_and_clean_unmount_do_not_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|i| dir.path().join(format!("immediate-read-{i}.img")))
+        .collect::<Vec<_>>();
+    let mut fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            defer_metadata_commit: false,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "immediate-read",
+        false,
+    )
+    .unwrap();
+    fs.write_file("/archive", b"stable", 0o600).unwrap();
+    let baseline = fs.metadata_snapshot();
+    let audit = Arc::new(WriteAuditBackend::new(
+        fs.backend.clone(),
+        &fs.raw_superblocks,
+    ));
+    fs.backend = audit.clone();
+    for _ in 0..20 {
+        assert_eq!(fs.read_file("/archive", true).unwrap(), b"stable");
+        fs.sync().unwrap();
+    }
+    fs.mark_clean_unmount().unwrap();
+    assert_eq!(audit.totals(), [0, 0, 3 * 3 * 4096]);
+    assert_eq!(fs.metadata_snapshot().txid, baseline.txid);
+    assert_eq!(
+        fs.metadata_snapshot().integrity.meta_hash,
+        baseline.integrity.meta_hash
+    );
+    drop(fs);
+    let reopened = ArgosFs::open_loop(&images, false).unwrap();
+    assert_eq!(reopened.read_file("/archive", false).unwrap(), b"stable");
+    assert_eq!(reopened.transaction_report().unwrap().invalid_entries, 0);
 }

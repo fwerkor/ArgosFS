@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import platform
+import signal
 import shutil
 import subprocess
 import sys
@@ -372,60 +373,155 @@ def run_argosfs_loop_variant(
                 proc.kill()
 
 
-def run_ext4_loop(
-    out: Path, mode: str, work: Path, file_mib: int, small_files: int
+KERNEL_LOOP_FILESYSTEMS = {
+    "ext4": ("mkfs.ext4", "-F", "-q"),
+    "xfs": ("mkfs.xfs", "-f", "-q"),
+    "btrfs": ("mkfs.btrfs", "-f", "-q"),
+    "f2fs": ("mkfs.f2fs", "-f"),
+}
+
+
+def filesystem_image_size(mode: str, fs_type: str) -> int:
+    size_mib = 512 if mode == "full" else 128
+    # XFS requires at least 300 MiB (even for the quick workload).
+    if fs_type == "xfs":
+        size_mib = max(size_mib, 384)
+    if fs_type == "zfs":
+        size_mib = max(size_mib, 1024 if mode == "full" else 512)
+    return size_mib * 1024 * 1024
+
+
+def failed(out: Path, mode: str, scenario: str, reason: str) -> None:
+    emit(out, {"mode": mode, "scenario": scenario, "status": "failed", "reason": reason})
+
+
+def run_kernel_loop(
+    fs_type: str, out: Path, mode: str, work: Path, file_mib: int, small_files: int
 ) -> None:
+    scenario = f"{fs_type}-loop"
+    mkfs_cmd = KERNEL_LOOP_FILESYSTEMS[fs_type]
     missing = [
-        name
-        for name in ("mkfs.ext4", "mount", "umount", "mountpoint")
+        name for name in (mkfs_cmd[0], "mount", "umount", "mountpoint", "truncate")
         if not command(name)
     ]
     if missing:
-        skip(out, mode, "ext4-loop", f"missing commands: {','.join(missing)}")
+        skip(out, mode, scenario, f"missing commands: {','.join(missing)}")
         return
-    image = work / "ext4.img"
-    mountpoint = work / "ext4-mnt"
+
+    image = work / f"{fs_type}.img"
+    mountpoint = work / f"{fs_type}-mnt"
     remove_path(image)
     remove_path(mountpoint)
     mountpoint.mkdir(parents=True)
-    image_size = 512 * 1024 * 1024 if mode == "full" else 128 * 1024 * 1024
-    run(["truncate", "-s", str(image_size), str(image)])
-    mkfs = run(["mkfs.ext4", "-F", "-q", str(image)], check=False)
-    if mkfs.returncode != 0:
-        skip(out, mode, "ext4-loop", f"mkfs.ext4 failed: {mkfs.stderr.strip()}")
-        return
-    mount = run(
-        privileged(["mount", "-o", "loop", str(image), str(mountpoint)]), check=False
-    )
-    if mount.returncode != 0:
-        skip(out, mode, "ext4-loop", f"mount -o loop failed: {mount.stderr.strip()}")
-        return
-    owner = f"{os.getuid()}:{os.getgid()}"
-    chown = run(privileged(["chown", owner, str(mountpoint)]), check=False)
-    if chown.returncode != 0:
-        subprocess.run(privileged(["umount", str(mountpoint)]), capture_output=True)
-        skip(
-            out,
-            mode,
-            "ext4-loop",
-            f"failed to transfer mountpoint ownership: {chown.stderr.strip()}",
-        )
-        return
-    started = time.perf_counter()
+    run(["truncate", "-s", str(filesystem_image_size(mode, fs_type)), str(image)])
+    created = False
     try:
-        metrics = workload(mountpoint, file_mib=file_mib, small_files=small_files)
-        metrics.update(
-            {
-                "mode": mode,
-                "scenario": "ext4-loop",
-                "status": "passed",
-                "elapsed_sec": time.perf_counter() - started,
-                "reason": "ext4 loop image mounted on the same runner",
-            }
+        formatted = run([*mkfs_cmd, str(image)], check=False)
+        if formatted.returncode:
+            raise RuntimeError(f"mkfs failed: {formatted.stderr.strip() or formatted.stdout.strip()}")
+        mounted = run(
+            privileged(["mount", "-o", "loop", str(image), str(mountpoint)]), check=False
         )
+        if mounted.returncode:
+            raise RuntimeError(f"mount failed: {mounted.stderr.strip()}")
+        created = True
+        owner = f"{os.getuid()}:{os.getgid()}"
+        chown = run(privileged(["chown", owner, str(mountpoint)]), check=False)
+        if chown.returncode:
+            raise RuntimeError(f"chown failed: {chown.stderr.strip()}")
+        started = time.perf_counter()
+        metrics = workload(mountpoint, file_mib=file_mib, small_files=small_files)
+        metrics.update({
+            "mode": mode,
+            "scenario": scenario,
+            "status": "passed",
+            "elapsed_sec": time.perf_counter() - started,
+            "reason": f"{fs_type} loop image mounted on the same runner",
+        })
         emit(out, metrics)
+    except (OSError, RuntimeError, subprocess.CalledProcessError) as err:
+        failed(out, mode, scenario, str(err))
     finally:
-        subprocess.run(privileged(["umount", str(mountpoint)]), capture_output=True)
+        if created:
+            unmount(mountpoint)
+            if run(["mountpoint", "-q", str(mountpoint)], check=False).returncode == 0:
+                raise RuntimeError(f"failed to unmount {scenario}: {mountpoint}")
+
+
+def run_ext4_loop(out: Path, mode: str, work: Path, file_mib: int, small_files: int) -> None:
+    run_kernel_loop("ext4", out, mode, work, file_mib, small_files)
+
+
+def run_xfs_loop(out: Path, mode: str, work: Path, file_mib: int, small_files: int) -> None:
+    run_kernel_loop("xfs", out, mode, work, file_mib, small_files)
+
+
+def run_btrfs_loop(out: Path, mode: str, work: Path, file_mib: int, small_files: int) -> None:
+    run_kernel_loop("btrfs", out, mode, work, file_mib, small_files)
+
+
+def run_f2fs_loop(out: Path, mode: str, work: Path, file_mib: int, small_files: int) -> None:
+    run_kernel_loop("f2fs", out, mode, work, file_mib, small_files)
+
+
+def run_zfs_pool(
+    out: Path, mode: str, work: Path, file_mib: int, small_files: int
+) -> None:
+    scenario = "zfs-pool"
+    missing = [
+        name for name in ("zpool", "zfs", "modprobe", "mountpoint", "truncate")
+        if not command(name)
+    ]
+    if missing:
+        skip(out, mode, scenario, f"missing commands: {','.join(missing)}")
+        return
+    module = run(privileged(["modprobe", "zfs"]), check=False)
+    if module.returncode:
+        skip(out, mode, scenario, f"ZFS kernel module unavailable: {module.stderr.strip()}")
+        return
+
+    # Never use a shared pool name or a host disk. A file vdev is isolated to
+    # this iteration and destroyed even when the workload raises an exception.
+    pool = f"argosperf_{os.getpid()}_{CURRENT_ITERATION}"
+    image = (work / "zfs.img").resolve()
+    mountpoint = (work / "zfs-mnt").resolve()
+    remove_path(image)
+    remove_path(mountpoint)
+    mountpoint.mkdir(parents=True)
+    run(["truncate", "-s", str(filesystem_image_size(mode, "zfs")), str(image)])
+    created = False
+    try:
+        result = run(privileged([
+            "zpool", "create", "-f", "-o", "cachefile=none", "-o", "ashift=12",
+            "-O", "compression=off", "-m", str(mountpoint), pool, str(image),
+        ]), check=False)
+        if result.returncode:
+            raise RuntimeError(f"zpool create failed: {result.stderr.strip()}")
+        created = True
+        # Check that ZFS actually mounted the pool before timing I/O.
+        if run(["mountpoint", "-q", str(mountpoint)], check=False).returncode:
+            raise RuntimeError("zpool created but dataset is not mounted")
+        owner = f"{os.getuid()}:{os.getgid()}"
+        chown = run(privileged(["chown", owner, str(mountpoint)]), check=False)
+        if chown.returncode:
+            raise RuntimeError(f"chown failed: {chown.stderr.strip()}")
+        started = time.perf_counter()
+        metrics = workload(mountpoint, file_mib=file_mib, small_files=small_files)
+        metrics.update({
+            "mode": mode,
+            "scenario": scenario,
+            "status": "passed",
+            "elapsed_sec": time.perf_counter() - started,
+            "reason": "OpenZFS single-file-vdev pool, compression disabled",
+        })
+        emit(out, metrics)
+    except (OSError, RuntimeError, subprocess.CalledProcessError) as err:
+        failed(out, mode, scenario, str(err))
+    finally:
+        if created:
+            destroyed = run(privileged(["zpool", "destroy", "-f", pool]), check=False)
+            if destroyed.returncode:
+                raise RuntimeError(f"failed to destroy ZFS benchmark pool {pool}: {destroyed.stderr.strip()}")
 
 
 def main() -> int:
@@ -447,10 +543,19 @@ def main() -> int:
     )
     parser.add_argument(
         "--scenarios",
-        default="host-directory,argosfs-loop-default,ext4-loop",
+        default="host-directory,argosfs-loop-default,ext4-loop,xfs-loop,btrfs-loop,f2fs-loop,zfs-pool",
         help="comma-separated scenarios to run",
     )
+    parser.add_argument(
+        "--optional-scenarios", default="",
+        help="comma-separated scenarios allowed to skip when --require-all is set; failures are never optional",
+    )
     args = parser.parse_args()
+    # Let timeout trigger Python finally blocks (pool/mount teardown).
+    def terminate(_signum: int, _frame: Any) -> None:
+        raise KeyboardInterrupt("benchmark terminated")
+
+    signal.signal(signal.SIGTERM, terminate)
     if args.iterations < 1:
         parser.error("--iterations must be positive")
 
@@ -486,6 +591,10 @@ def main() -> int:
         "argosfs-loop-deferred": run_argosfs_loop_deferred,
         "argosfs-loop-batched": run_argosfs_loop_batched,
         "ext4-loop": run_ext4_loop,
+        "xfs-loop": run_xfs_loop,
+        "btrfs-loop": run_btrfs_loop,
+        "f2fs-loop": run_f2fs_loop,
+        "zfs-pool": run_zfs_pool,
     }
     scenarios = [name.strip() for name in args.scenarios.split(",") if name.strip()]
     if not scenarios:
@@ -493,6 +602,9 @@ def main() -> int:
     unknown = [name for name in scenarios if name not in scenario_map]
     if unknown:
         parser.error(f"unknown scenario(s): {','.join(unknown)}")
+    optional = {name.strip() for name in args.optional_scenarios.split(",") if name.strip()}
+    if optional.difference(scenarios):
+        parser.error("--optional-scenarios must be a subset of --scenarios")
     result_scenarios = {
         "argosfs-loop-default": "argosfs-loop-fuse-default",
         "argosfs-loop-strict": "argosfs-loop-fuse-strict",
@@ -500,6 +612,10 @@ def main() -> int:
         "argosfs-loop-batched": "argosfs-loop-fuse-batched",
         "host-directory": "host-directory",
         "ext4-loop": "ext4-loop",
+        "xfs-loop": "xfs-loop",
+        "btrfs-loop": "btrfs-loop",
+        "f2fs-loop": "f2fs-loop",
+        "zfs-pool": "zfs-pool",
     }
     for iteration in range(1, args.iterations + 1):
         CURRENT_ITERATION = iteration
@@ -507,14 +623,16 @@ def main() -> int:
         iteration_work.mkdir(parents=True, exist_ok=True)
         offset = (iteration - 1) % len(scenarios)
         ordered_scenarios = scenarios[offset:] + scenarios[:offset]
-        for scenario in ordered_scenarios:
-            scenario_map[scenario](
-                args.output,
-                args.mode,
-                iteration_work,
-                file_mib,
-                small_files,
-            )
+        try:
+            for scenario in ordered_scenarios:
+                scenario_map[scenario](
+                    args.output, args.mode, iteration_work, file_mib, small_files,
+                )
+        finally:
+            if not args.keep_workdir:
+                # Reclaim loop images after each iteration instead of growing
+                # across all iterations on the 14-GiB hosted runner disk.
+                shutil.rmtree(iteration_work)
 
     if args.require_all:
         records = [
@@ -532,7 +650,9 @@ def main() -> int:
             for scenario in scenarios:
                 result_scenario = result_scenarios[scenario]
                 status = observed.get((iteration, result_scenario), "missing")
-                if status != "passed":
+                if status != "passed" and not (
+                    status == "skipped" and scenario in optional
+                ):
                     incomplete.append(
                         f"iteration {iteration} {result_scenario}: {status}"
                     )

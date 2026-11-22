@@ -32,13 +32,24 @@ jobs:
       - name: Install Rust toolchain
         run: scripts/ci/install-rust.sh stable
 
-      - name: Install cargo-llvm-cov
-        run: cargo install cargo-llvm-cov --version 0.8.7 --locked
-
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
         with:
           key: rust-coverage
+
+      # A hit on the existing Rust cache key cannot save a newly installed
+      # binary. Give the pinned llvm-cov CLI its own reusable cache entry.
+      - name: Cache cargo-llvm-cov executable
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-llvm-cov
+          key: cargo-llvm-cov-${{ runner.os }}-${{ runner.arch }}-v0.8.7
+
+      - name: Install cargo-llvm-cov
+        run: |
+          if ! cargo llvm-cov --version 2>/dev/null | grep -Eq '^cargo-llvm-cov 0\.8\.7([[:space:]]|$)'; then
+            cargo install cargo-llvm-cov --version 0.8.7 --locked --force
+          fi
 
       - name: Prepare FUSE
         run: |
@@ -51,6 +62,7 @@ jobs:
         env:
           ARGOSFS_COVERAGE_REQUIRE_FUSE: "1"
           ARGOSFS_COVERAGE_MIN_LINES: "80"
+          ARGOSFS_PJDFSTEST_JOBS: "4"
           PJDFSTEST_ROOT: ${{ github.workspace }}/external/pjdfstest
         run: scripts/ci/run-coverage.sh
 

@@ -4,7 +4,7 @@ use crate::allocator;
 use crate::autopilot::{plan_background_io, AutopilotMode, AutopilotPolicy, BackgroundIoPolicy};
 use crate::backend::{FileBlockBackend, HostFsBackend, StorageBackend};
 use crate::cache::BlockCache;
-use crate::commit_metrics::{CommitMetrics, CommitPhase, DataPlaneByteKind};
+use crate::commit_metrics::{CheckpointReason, CommitMetrics, CommitPhase, DataPlaneByteKind};
 use crate::compression::{compress, decompress};
 use crate::crypto;
 use crate::erasure::RsCodec;
@@ -922,7 +922,11 @@ impl ArgosFs {
             return Ok(false);
         }
         let state = self.deferred_commit.lock();
-        if state.dirty_transactions == 0 && !state.raw_uncommitted_metadata_dirty {
+        if state.dirty_transactions == 0
+            && state.pending_reclaims.is_empty()
+            && !state.raw_uncommitted_metadata_dirty
+            && !state.raw_checkpoint_required
+        {
             return Ok(false);
         }
         drop(state);
@@ -1026,20 +1030,37 @@ impl ArgosFs {
                 self.commit_deferred_locked(&mut meta, bulk_import_enabled())?;
                 return Ok(());
             }
-            let raw_uncommitted_metadata_dirty = {
+            let checkpoint_required = {
                 let state = self.deferred_commit.lock();
-                state.raw_uncommitted_metadata_dirty || state.raw_advisory_metadata_dirty
+                state.raw_uncommitted_metadata_dirty || state.raw_checkpoint_required
             };
-            if raw_uncommitted_metadata_dirty {
-                let previous_meta_hash = meta.integrity.meta_hash.clone();
-                journal::prepare_metadata_integrity_with_previous(&mut meta, previous_meta_hash)?;
+            // Immediate raw mutations are already journal-durable. Read-side
+            // telemetry changes only the live view, not the trusted durable
+            // hash; fsync must not turn it into a full metadata fanout.
+            if !checkpoint_required {
+                return Ok(());
             }
+            let previous_meta_hash = meta.integrity.meta_hash.clone();
+            journal::prepare_metadata_integrity_with_previous(&mut meta, previous_meta_hash)?;
             let superblocks = self.metadata_superblocks_locked(&meta)?;
+            self.commit_metrics
+                .record_checkpoint_reason(CheckpointReason::RecoveryOrFormat);
+            let _checkpoint_timer = self.commit_metrics.timer(CommitPhase::Checkpoint);
             let result = if self.open_backend_covers_superblocks(&superblocks) {
-                raw_store::write_metadata_copies_quorum(&*self.backend, &superblocks, &meta)
+                raw_store::write_metadata_copies_quorum_measured(
+                    &*self.backend,
+                    &superblocks,
+                    &meta,
+                    &self.commit_metrics,
+                )
             } else {
                 let backend = self.metadata_block_backend_locked(&meta, &superblocks, true)?;
-                raw_store::write_metadata_copies_quorum(&*backend, &superblocks, &meta)
+                raw_store::write_metadata_copies_quorum_measured(
+                    &*backend,
+                    &superblocks,
+                    &meta,
+                    &self.commit_metrics,
+                )
             };
             let durability = match result {
                 Ok(report) => self.apply_quorum_write_report(&meta, report),
@@ -1082,21 +1103,11 @@ impl ArgosFs {
     }
 
     pub fn mark_clean_unmount(&self) -> Result<()> {
-        // A clean unmount writes full metadata copies to every voting member.
-        // Advisory-only reads were deliberately skipped by periodic commits,
-        // so their live in-memory hash may differ from the last durable hash.
-        // Before the mandatory final checkpoint, promote that volatile dirt to
-        // a real checkpoint request so sync() re-anchors integrity. Never copy
-        // an in-memory read-stat image with a stale integrity tuple to media.
-        {
-            let mut meta = self.meta.write();
-            self.drain_read_advisory_locked(&mut meta);
-            let mut state = self.deferred_commit.lock();
-            if meta.backend != BackendKind::Host && state.raw_advisory_metadata_dirty {
-                state.raw_uncommitted_metadata_dirty = true;
-                state.raw_checkpoint_required = true;
-            }
-        }
+        // Commit any real transactions and required recovery/format checkpoint.
+        // Advisory-only read counters are crash-optional: do not promote them
+        // to a transaction or write the untrusted live hash to metadata slots.
+        // The journal already contains acknowledged changes, so a clean
+        // unmount only needs the small superblock clean-state quorum write.
         self.sync()?;
         let meta = self.meta.read();
         if meta.backend == BackendKind::Host {
@@ -1105,15 +1116,13 @@ impl ArgosFs {
         self.ensure_block_backend_writable_locked(&meta)?;
         let superblocks = self.metadata_superblocks_locked(&meta)?;
         let mark_clean = |backend: &dyn StorageBackend| -> Result<()> {
-            if meta.config.defer_metadata_commit {
-                let report = raw_store::write_metadata_copies_quorum(backend, &superblocks, &meta)?;
-                self.apply_quorum_write_report(&meta, report)?;
-            }
-            // Mark clean on a quorum of members.  A card that failed during
-            // the sync must not make unmount hang or abort; its clean flag is
-            // not needed while it is unavailable.
-            let report =
-                raw_store::write_superblock_clean_state_quorum(backend, &superblocks, &meta, true)?;
+            let report = raw_store::write_superblock_clean_state_quorum_measured(
+                backend,
+                &superblocks,
+                &meta,
+                true,
+                &self.commit_metrics,
+            )?;
             self.apply_quorum_write_report(&meta, report)
         };
         if self.open_backend_covers_superblocks(&superblocks) {
@@ -2295,6 +2304,7 @@ impl ArgosFs {
         if state.dirty_transactions == 0
             && state.pending_reclaims.is_empty()
             && !state.raw_uncommitted_metadata_dirty
+            && !state.raw_checkpoint_required
         {
             return Ok(false);
         }
@@ -2381,6 +2391,14 @@ impl ArgosFs {
                         )?;
                     }
                     if checkpoint {
+                        let reason = if state.raw_checkpoint_required {
+                            CheckpointReason::RecoveryOrFormat
+                        } else if bulk_import_enabled() {
+                            CheckpointReason::BulkImport
+                        } else {
+                            CheckpointReason::LegacyFallback
+                        };
+                        self.commit_metrics.record_checkpoint_reason(reason);
                         let _checkpoint_timer = self.commit_metrics.timer(CommitPhase::Checkpoint);
                         raw_store::write_metadata_copies_quorum_measured(
                             backend,

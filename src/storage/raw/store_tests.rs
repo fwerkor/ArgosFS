@@ -389,7 +389,7 @@ fn quorum_fixture() -> (
     fs.sync().unwrap();
     let metadata = fs.metadata_snapshot();
     drop(fs);
-    let superblocks = images
+    let superblocks: Vec<RawSuperblock> = images
         .iter()
         .map(|path| {
             inspect_device(BackendKind::LoopBlock, path.clone())
@@ -397,6 +397,10 @@ fn quorum_fixture() -> (
                 .0
         })
         .collect();
+    // These raw-store tests explicitly require two durable metadata slots.
+    // Normal sync/unmount no longer checkpoints an already journal-durable
+    // transaction, so construct the checkpoint as part of the fixture.
+    write_metadata_copies_quorum(&block_backend_for(&images), &superblocks, &metadata).unwrap();
     (dir, images, metadata, superblocks)
 }
 
@@ -720,7 +724,10 @@ fn stale_same_txid_suffix_is_excluded_from_new_quorum_append() {
         write_offset,
         end,
         &stale_entry,
-        true,
+        JournalMemberWriteOptions {
+            flush: true,
+            metrics: None,
+        },
     )
     .unwrap();
     drop(backend);

@@ -340,3 +340,154 @@ fn concurrent_unrelated_admissions_preserve_verified_l2_hits() {
     assert!(cache.stats()["l2_hits"].as_u64().unwrap() >= 60);
     assert_eq!(cache.stats()["l2_errors"], 0);
 }
+
+#[test]
+fn direct_copy_checks_checksum_bounds_and_l1_eviction() {
+    let dir = tempdir().unwrap();
+    let cache = BlockCache::new(dir.path(), 64, 0);
+    let payload = b"validated-block-content";
+    let hash = crate::util::content_hash_hex(payload);
+    cache.put("stripe", payload).unwrap();
+    let mut destination = [0xa5u8; 7];
+    assert!(cache.copy_range("stripe", Some(&hash), payload.len(), 10, &mut destination));
+    assert_eq!(&destination, &payload[10..17]);
+    destination.fill(0xa5);
+    assert!(!cache.copy_range(
+        "stripe",
+        Some(&hash),
+        payload.len(),
+        payload.len() - 2,
+        &mut destination
+    ));
+    assert_eq!(
+        destination, [0xa5; 7],
+        "failed bounds validation must not mutate the caller's buffer"
+    );
+    assert!(!cache.copy_range(
+        "stripe",
+        Some(&hash),
+        payload.len(),
+        usize::MAX,
+        &mut destination
+    ));
+    assert_eq!(destination, [0xa5; 7]);
+    assert!(!cache.copy_range(
+        "stripe",
+        Some(&hash),
+        payload.len() + 1,
+        0,
+        &mut destination
+    ));
+    assert_eq!(destination, [0xa5; 7]);
+    cache.put("stripe", payload).unwrap();
+    assert!(!cache.copy_range(
+        "stripe",
+        Some(&sha256_hex(b"tampered")),
+        payload.len(),
+        0,
+        &mut destination
+    ));
+    assert_eq!(destination, [0xa5; 7]);
+    assert_eq!(cache.stats()["memory_items"], 0);
+    assert!(!cache.copy_range("stripe", Some(&hash), payload.len(), 0, &mut destination));
+    cache.put("stripe", payload).unwrap();
+    assert!(cache.copy_range("stripe", Some(&hash), payload.len(), 0, &mut destination));
+    assert_eq!(&destination, &payload[..7]);
+    cache.remove("stripe");
+    assert!(!cache.copy_range("stripe", Some(&hash), payload.len(), 0, &mut destination));
+    assert_eq!(cache.stats()["memory_bytes"], 0);
+}
+
+#[test]
+fn direct_copy_validates_l2_and_keeps_cache_within_limit() {
+    let dir = tempdir().unwrap();
+    let payload = vec![0x73; 24 * 1024];
+    let hash = crate::util::content_hash_hex(&payload);
+    let writer = BlockCache::new(dir.path(), 0, 128 * 1024);
+    writer.put("stripe", &payload).unwrap();
+    let cache = BlockCache::new(dir.path(), 32 * 1024, 128 * 1024);
+    let mut destination = vec![0xabu8; 4096];
+    assert!(cache.copy_range("stripe", Some(&hash), payload.len(), 777, &mut destination));
+    assert_eq!(destination, payload[777..777 + 4096]);
+    assert_eq!(cache.stats()["l2_hits"], 1);
+    assert!(cache.copy_range(
+        "stripe",
+        Some(&hash),
+        payload.len(),
+        12_000,
+        &mut destination
+    ));
+    assert_eq!(cache.stats()["hits"], 1);
+    cache.put("second", &payload).unwrap();
+    assert!(cache.stats()["memory_bytes"].as_u64().unwrap() <= 32 * 1024);
+    assert!(cache.copy_range("stripe", Some(&hash), payload.len(), 777, &mut destination));
+    assert_eq!(destination, payload[777..777 + 4096]);
+    assert_eq!(cache.stats()["l2_errors"], 0);
+}
+
+#[test]
+fn direct_copy_concurrent_cache_eviction_does_not_leak_or_return_wrong_bytes() {
+    use std::sync::Arc;
+    let dir = tempdir().unwrap();
+    let cache = Arc::new(BlockCache::new(dir.path(), 8192, 0));
+    let payload = vec![0x6bu8; 4096];
+    let hash = crate::util::content_hash_hex(&payload);
+    cache.put("stripe", &payload).unwrap();
+    let writer_cache = Arc::clone(&cache);
+    let writer_payload = payload.clone();
+    let writer = std::thread::spawn(move || {
+        for _ in 0..500 {
+            writer_cache.remove("stripe");
+            writer_cache.put("stripe", &writer_payload).unwrap();
+        }
+    });
+    for _ in 0..500 {
+        let mut out = vec![0xcc; 1024];
+        if cache.copy_range("stripe", Some(&hash), payload.len(), 3072, &mut out) {
+            assert_eq!(out, payload[3072..]);
+        } else {
+            assert_eq!(out, vec![0xcc; 1024]);
+        }
+    }
+    writer.join().unwrap();
+    assert!(cache.stats()["memory_bytes"].as_u64().unwrap() <= 8192);
+}
+
+#[test]
+#[ignore = "run with cargo test cache_copy_range_microbench -- --ignored --nocapture"]
+fn cache_copy_range_microbench() {
+    use std::hint::black_box;
+    use std::time::Instant;
+    let dir = tempdir().unwrap();
+    let cache = BlockCache::new(dir.path(), 2 * 1024 * 1024, 0);
+    let block = (0..1024 * 1024)
+        .map(|i| (i % 251) as u8)
+        .collect::<Vec<_>>();
+    let hash = crate::util::content_hash_hex(&block);
+    cache.put("stripe", &block).unwrap();
+    const COUNT: usize = 4096;
+    const READ: usize = 128 * 1024;
+    let mut dst = vec![0u8; READ];
+    let start = Instant::now();
+    for i in 0..COUNT {
+        let off = (i % 8) * READ;
+        dst.copy_from_slice(
+            &cache
+                .get_range("stripe", Some(&hash), block.len(), off, off + READ)
+                .unwrap(),
+        );
+        black_box(&dst);
+    }
+    let before = start.elapsed();
+    let start = Instant::now();
+    for i in 0..COUNT {
+        let off = (i % 8) * READ;
+        assert!(cache.copy_range("stripe", Some(&hash), block.len(), off, &mut dst));
+        black_box(&dst);
+    }
+    let after = start.elapsed();
+    eprintln!(
+        "cached_range_then_copy={before:?} direct_cached_range_copy={after:?} speedup={:.2}x",
+        before.as_secs_f64() / after.as_secs_f64()
+    );
+}

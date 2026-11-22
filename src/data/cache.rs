@@ -210,6 +210,34 @@ impl BlockCache {
         Some(data[start..end].to_vec())
     }
 
+    /// Copy directly into the caller's output. The cache mutex protects the
+    /// lookup and LRU update only; the immutable Arc keeps the bytes alive
+    /// after eviction or concurrent invalidation, without a temporary Vec.
+    pub fn copy_range(
+        &self,
+        key: &str,
+        expected_sha: Option<&str>,
+        expected_len: usize,
+        start: usize,
+        destination: &mut [u8],
+    ) -> bool {
+        let Some(end) = start.checked_add(destination.len()) else {
+            return false;
+        };
+        if end > expected_len {
+            return false;
+        }
+        let Some(data) = self.get_shared(key, expected_sha) else {
+            return false;
+        };
+        if data.len() != expected_len {
+            self.remove(key);
+            return false;
+        }
+        destination.copy_from_slice(&data[start..end]);
+        true
+    }
+
     fn get_shared(&self, key: &str, expected_sha: Option<&str>) -> Option<Arc<[u8]>> {
         let mut inner = self.inner.lock();
         if let Some(item) = inner.items.get_mut(key) {
