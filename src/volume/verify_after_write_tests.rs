@@ -321,7 +321,11 @@ fn repaired_raw_extent_is_verified_against_its_original_stripe() {
         let meta = fs.meta.read();
         let block = &meta.inodes[&ino].blocks[0];
         assert_eq!(block.stripe_id, stripe_id);
-        let shard = block.shards.iter().find(|shard| shard.slot == slot).unwrap();
+        let shard = block
+            .shards
+            .iter()
+            .find(|shard| shard.slot == slot)
+            .unwrap();
         assert_ne!(shard.disk_id, removed_disk);
         let Some(ShardLocation::RawExtent(extent)) = &shard.location else {
             panic!("repaired shard must be a raw extent");
