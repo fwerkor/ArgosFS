@@ -295,3 +295,15 @@ fn writeback_flush_latency_histogram_is_cumulative_and_counts_failures() {
         ("sync", 2, 1)
     );
 }
+
+#[test]
+fn read_cache_counters_are_scrapable_with_metadata_write_lock_held() {
+    let volume = volume();
+    volume.test_with_metadata_write_lock(|| {
+        let output = render_commit_metrics(&volume);
+        assert!(output.contains("argosfs_read_cache_requests_total{result=\"memory_hit\"} 0"));
+        assert!(output.contains("argosfs_read_cache_requests_total{result=\"l2_hit\"} 0"));
+        assert!(output.contains("argosfs_read_cache_direct_copy_bytes_total 0"));
+        assert!(output.contains("argosfs_read_cache_l2_read_bytes_total 0"));
+    });
+}

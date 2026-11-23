@@ -4,6 +4,7 @@ use parking_lot::Mutex;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Once admitted, cached block bytes are immutable. Compute their trusted
@@ -167,6 +168,10 @@ pub struct BlockCache {
     memory_limit: usize,
     l2_limit: u64,
     inner: Mutex<CacheInner>,
+    // These byte counters must not take a second global cache lock on the
+    // very hot direct-copy path. They reset on each volume open.
+    direct_copy_bytes: AtomicU64,
+    l2_read_bytes: AtomicU64,
 }
 
 impl BlockCache {
@@ -179,6 +184,8 @@ impl BlockCache {
             memory_limit,
             l2_limit,
             inner: Mutex::new(CacheInner::default()),
+            direct_copy_bytes: AtomicU64::new(0),
+            l2_read_bytes: AtomicU64::new(0),
         }
     }
 
@@ -235,6 +242,8 @@ impl BlockCache {
             return false;
         }
         destination.copy_from_slice(&data[start..end]);
+        self.direct_copy_bytes
+            .fetch_add(destination.len() as u64, Ordering::Relaxed);
         true
     }
 
@@ -262,6 +271,8 @@ impl BlockCache {
         // Disk I/O and all cryptographic work are done outside the global
         // cache lock. Immutable bytes cannot be mutated after admission.
         let candidate = std::fs::read(&path).ok().map(|data| {
+            self.l2_read_bytes
+                .fetch_add(data.len() as u64, Ordering::Relaxed);
             let mut item = MemoryItem::new(Arc::from(data), 0);
             let valid = item.matches(expected_sha);
             (item, valid)
@@ -367,6 +378,14 @@ impl BlockCache {
             ("l2_errors".to_string(), json!(inner.l2_errors)),
             ("l2_bytes".to_string(), json!(inner.l2_bytes)),
             ("l2_items".to_string(), json!(inner.l2_index.len())),
+            (
+                "direct_copy_bytes".to_string(),
+                json!(self.direct_copy_bytes.load(Ordering::Relaxed)),
+            ),
+            (
+                "l2_read_bytes".to_string(),
+                json!(self.l2_read_bytes.load(Ordering::Relaxed)),
+            ),
             (
                 "hit_ratio".to_string(),
                 json!(if total == 0 {

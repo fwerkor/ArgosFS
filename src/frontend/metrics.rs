@@ -173,6 +173,7 @@ pub fn render(volume: &ArgosFs) -> String {
             &labels,
         );
     }
+    emit_read_cache_metrics(volume, &mut emitter);
     emit_commit_metrics(volume, &mut emitter);
     out
 }
@@ -182,8 +183,60 @@ pub fn render(volume: &ArgosFs) -> String {
 pub fn render_commit_metrics(volume: &ArgosFs) -> String {
     let mut out = String::new();
     let mut emitter = MetricEmitter::new(&mut out);
+    emit_read_cache_metrics(volume, &mut emitter);
     emit_commit_metrics(volume, &mut emitter);
     out
+}
+
+fn emit_read_cache_metrics(volume: &ArgosFs, emitter: &mut MetricEmitter<'_>) {
+    let cache = volume.read_cache_stats();
+    for (kind, key) in [
+        ("memory_hit", "hits"),
+        ("l2_hit", "l2_hits"),
+        ("miss", "misses"),
+    ] {
+        if let Some(value) = cache.get(key).and_then(serde_json::Value::as_u64) {
+            emitter.typed_metric(
+                "argosfs_read_cache_requests_total",
+                "Verified decoded-stripe cache lookups by outcome",
+                value as f64,
+                &[("result", kind)],
+                "counter",
+            );
+        }
+    }
+    for (name, key) in [
+        (
+            "argosfs_read_cache_direct_copy_bytes_total",
+            "direct_copy_bytes",
+        ),
+        ("argosfs_read_cache_l2_read_bytes_total", "l2_read_bytes"),
+    ] {
+        if let Some(value) = cache.get(key).and_then(serde_json::Value::as_u64) {
+            emitter.typed_metric(
+                name,
+                "Read-cache data bytes since volume open",
+                value as f64,
+                &[],
+                "counter",
+            );
+        }
+    }
+    for (name, key) in [
+        ("argosfs_read_cache_memory_bytes", "memory_bytes"),
+        ("argosfs_read_cache_memory_items", "memory_items"),
+        ("argosfs_read_cache_l2_bytes", "l2_bytes"),
+        ("argosfs_read_cache_l2_items", "l2_items"),
+    ] {
+        if let Some(value) = cache.get(key).and_then(serde_json::Value::as_u64) {
+            emitter.metric(
+                name,
+                "Current decoded-stripe cache residency",
+                value as f64,
+                &[],
+            );
+        }
+    }
 }
 
 fn emit_commit_metrics(volume: &ArgosFs, emitter: &mut MetricEmitter<'_>) {
