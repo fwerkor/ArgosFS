@@ -112,9 +112,12 @@ fn protected_rollover_preserves_prior_checkpoint_and_halves_physical_bytes() {
         .find(|(kind, _)| *kind == "checkpoint")
         .unwrap()
         .1;
-    assert_eq!(checkpoint_bytes, 3 * bytes_per_slot);
-    // Former rollover wrote two slots on each member.
-    assert_eq!(checkpoint_bytes * 2, 3 * 2 * bytes_per_slot);
+    assert!(
+        checkpoint_bytes <= 3 * bytes_per_slot,
+        "sparse writes must never exceed one full slot per healthy member"
+    );
+    // Historical dual-slot rollover wrote two full copies per member.
+    assert!(checkpoint_bytes < 3 * 2 * bytes_per_slot);
     for sb in &superblocks {
         let mut txids = checkpoint_slot_txids(&backend, sb);
         txids.sort_unstable();
@@ -452,5 +455,151 @@ fn rollover_refuses_to_erase_last_certified_replay_base() {
     assert_eq!(
         recover_metadata(&backend, &superblocks).unwrap().txid,
         acknowledged.txid
+    );
+}
+
+#[test]
+fn changed_page_checkpoint_rewrites_only_modified_and_corrupt_target_pages() {
+    let (_dir, images, _, superblocks) = quorum_fixture();
+    let backend = block_backend_for(&images);
+    let sb = &superblocks[0];
+    let slot = sb.metadata.offset;
+    let mut bytes = (0..2 * CHECKPOINT_BATCH_BYTES + 17)
+        .map(|index| (index as u64 * 31 % 251) as u8)
+        .collect::<Vec<_>>();
+    let old = metadata_tree_checkpoint(
+        &sb.disk_id,
+        100,
+        100,
+        &bytes,
+        &sha256_hex(&bytes),
+        sb.metadata.length / 2,
+    )
+    .unwrap();
+    write_metadata_slot(&backend, sb, slot, &old, None).unwrap();
+    let data_start = align_up(
+        RAW_HEADER_SIZE as u64 + get_u64(&old.header, 160).unwrap(),
+        METADATA_PAGE_SIZE as u64,
+    );
+    // One new page in each of the first two 1 MiB batches. Corrupt a third
+    // page which the logical transaction *did not change*: the writer must
+    // use verified physical comparison, not trust the old slot's index hash.
+    bytes[100 * METADATA_PAGE_SIZE + 8] ^= 1;
+    bytes[300 * METADATA_PAGE_SIZE + 7] ^= 1;
+    let corrupt_offset = slot + data_start + 400 * METADATA_PAGE_SIZE as u64 + 11;
+    backend
+        .write_at(&sb.disk_id, corrupt_offset, &[0xab])
+        .unwrap();
+    let next = metadata_tree_checkpoint(
+        &sb.disk_id,
+        101,
+        101,
+        &bytes,
+        &sha256_hex(&bytes),
+        sb.metadata.length / 2,
+    )
+    .unwrap();
+    let metrics = CommitMetrics::default();
+    write_metadata_slot_differential(&backend, sb, slot, &next, Some(&metrics)).unwrap();
+    let written = metrics
+        .raw_write_byte_snapshots()
+        .find(|(kind, _)| *kind == "checkpoint")
+        .unwrap()
+        .1;
+    let full = next.header.len() as u64
+        + next
+            .body_writes
+            .iter()
+            .map(|(_, data)| data.len() as u64)
+            .sum::<u64>();
+    assert!(
+        written < full / 16,
+        "expected sparse write << full checkpoint: {written} vs {full}",
+    );
+    assert!(
+        written >= (3 * METADATA_PAGE_SIZE + RAW_HEADER_SIZE) as u64,
+        "all changed and corrupted pages must be rewritten",
+    );
+    let mut header = [0u8; RAW_HEADER_SIZE];
+    backend.read_at(&sb.disk_id, slot, &mut header).unwrap();
+    assert_eq!(get_u64(&header, 24).unwrap(), 101);
+    assert_eq!(
+        read_tree_metadata_candidate(&backend, sb, slot, sb.metadata.length / 2, &header).unwrap(),
+        bytes,
+    );
+}
+
+#[test]
+fn unchanged_target_checkpoint_publishes_only_new_header() {
+    let (_dir, images, _, superblocks) = quorum_fixture();
+    let backend = block_backend_for(&images);
+    let sb = &superblocks[0];
+    let slot = sb.metadata.offset;
+    let bytes = vec![61u8; 2 * CHECKPOINT_BATCH_BYTES + 17];
+    let first = metadata_tree_checkpoint(
+        &sb.disk_id,
+        1,
+        1,
+        &bytes,
+        &sha256_hex(&bytes),
+        sb.metadata.length / 2,
+    )
+    .unwrap();
+    write_metadata_slot(&backend, sb, slot, &first, None).unwrap();
+    let newer = metadata_tree_checkpoint(
+        &sb.disk_id,
+        2,
+        2,
+        &bytes,
+        &sha256_hex(&bytes),
+        sb.metadata.length / 2,
+    )
+    .unwrap();
+    let metrics = CommitMetrics::default();
+    write_metadata_slot_differential(&backend, sb, slot, &newer, Some(&metrics)).unwrap();
+    let written = metrics
+        .raw_write_byte_snapshots()
+        .find(|(kind, _)| *kind == "checkpoint")
+        .unwrap()
+        .1;
+    assert_eq!(written, RAW_HEADER_SIZE as u64);
+    let mut header = [0u8; RAW_HEADER_SIZE];
+    backend.read_at(&sb.disk_id, slot, &mut header).unwrap();
+    assert_eq!(get_u64(&header, 24).unwrap(), 2);
+    assert_eq!(
+        read_tree_metadata_candidate(&backend, sb, slot, sb.metadata.length / 2, &header).unwrap(),
+        bytes,
+    );
+}
+
+#[test]
+fn unreadable_target_data_falls_back_to_full_verified_write() {
+    let (_dir, images, _, superblocks) = quorum_fixture();
+    let backend = block_backend_for(&images);
+    let sb = &superblocks[0];
+    let slot = sb.metadata.offset;
+    let bytes = vec![29u8; METADATA_PAGE_SIZE * 3 + 13];
+    let checkpoint = metadata_tree_checkpoint(
+        &sb.disk_id,
+        17,
+        17,
+        &bytes,
+        &sha256_hex(&bytes),
+        sb.metadata.length / 2,
+    )
+    .unwrap();
+    let failing = JournalPayloadFailBackend {
+        inner: block_backend_for(&images),
+        failed_device: sb.disk_id.clone(),
+        fail_from: slot + METADATA_PAGE_SIZE as u64,
+        fail_to: slot + sb.metadata.length / 2,
+    };
+    let metrics = CommitMetrics::default();
+    write_metadata_slot_differential(&failing, sb, slot, &checkpoint, Some(&metrics)).unwrap();
+    let mut header = [0u8; RAW_HEADER_SIZE];
+    backend.read_at(&sb.disk_id, slot, &mut header).unwrap();
+    assert_eq!(
+        read_tree_metadata_candidate(&backend, sb, slot, sb.metadata.length / 2, &header).unwrap(),
+        bytes,
     );
 }
