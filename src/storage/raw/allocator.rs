@@ -130,8 +130,19 @@ pub fn validate_allocations(
         }
         previous_free_end = free.offset.saturating_add(free.length);
     }
+    // Both lists are sorted, and each was verified non-overlapping above.
+    // Advance a single cursor rather than comparing every allocated extent
+    // against every free extent. On large pools the latter is quadratic in
+    // hundreds of thousands of allocations and free-list entries.
+    let mut free_cursor = 0;
     for allocated in &extents {
-        for free in &free_extents {
+        while let Some(free) = free_extents.get(free_cursor) {
+            if free.offset.saturating_add(free.length) > allocated.offset {
+                break;
+            }
+            free_cursor += 1;
+        }
+        if let Some(free) = free_extents.get(free_cursor) {
             let allocated_end = allocated.offset.saturating_add(allocated.length);
             let free_end = free.offset.saturating_add(free.length);
             if allocated.offset < free_end && free.offset < allocated_end {
