@@ -2038,6 +2038,9 @@ fn read_legacy_metadata_candidate(
     Ok(bytes)
 }
 
+// Keep recovery I/O bounded while avoiding one sysread per metadata page.
+const METADATA_READ_BATCH_BYTES: usize = 1024 * 1024;
+
 fn read_tree_metadata_candidate(
     backend: &dyn StorageBackend,
     sb: &RawSuperblock,
@@ -2087,40 +2090,58 @@ fn read_tree_metadata_candidate(
     }
     let data_start = align_up(index_end, page_size as u64);
     let mut bytes = Vec::with_capacity(len);
-    for page_index in 0..page_count {
-        let entry_start = page_index * METADATA_INDEX_ENTRY_SIZE;
-        let entry = &index[entry_start..entry_start + METADATA_INDEX_ENTRY_SIZE];
-        let stored_page_hash = hex::encode(&entry[..HASH_BYTES_LEN]);
-        let relative_offset = get_u64(entry, 32)?;
-        let page_len = get_u32(entry, 40)? as usize;
-        let expected_offset = (page_index as u64)
-            .checked_mul(page_size as u64)
-            .and_then(|delta| data_start.checked_add(delta))
-            .ok_or_else(|| {
-                ArgosError::CorruptedMetadata("raw metadata page offset overflows".to_string())
-            })?;
-        let end = relative_offset
-            .checked_add(page_len as u64)
-            .ok_or_else(|| {
-                ArgosError::CorruptedMetadata("raw metadata page overflows".to_string())
-            })?;
-        if page_len == 0
-            || page_len > page_size
-            || relative_offset != expected_offset
-            || end > slot_len
-        {
-            return Err(ArgosError::CorruptedMetadata(
-                "invalid raw metadata page extent".to_string(),
-            ));
+    let pages_per_batch = (METADATA_READ_BATCH_BYTES / page_size).max(1);
+    // The page index format remains unchanged: validate the same individual
+    // page offsets/digests, but read physically contiguous pages in a single
+    // bounded I/O request. The result buffer is the normal checkpoint payload
+    // already required by the decoder; there is no second large allocation.
+    for first in (0..page_count).step_by(pages_per_batch) {
+        let last = first.saturating_add(pages_per_batch).min(page_count);
+        for page_index in first..last {
+            let entry_start = page_index * METADATA_INDEX_ENTRY_SIZE;
+            let entry = &index[entry_start..entry_start + METADATA_INDEX_ENTRY_SIZE];
+            let relative_offset = get_u64(entry, 32)?;
+            let page_len = get_u32(entry, 40)? as usize;
+            let expected_offset = (page_index as u64)
+                .checked_mul(page_size as u64)
+                .and_then(|delta| data_start.checked_add(delta))
+                .ok_or_else(|| {
+                    ArgosError::CorruptedMetadata("raw metadata page offset overflows".to_string())
+                })?;
+            let end = relative_offset
+                .checked_add(page_len as u64)
+                .ok_or_else(|| {
+                    ArgosError::CorruptedMetadata("raw metadata page overflows".to_string())
+                })?;
+            if page_len == 0
+                || page_len != (len - page_index * page_size).min(page_size)
+                || relative_offset != expected_offset
+                || end > slot_len
+            {
+                return Err(ArgosError::CorruptedMetadata(
+                    "invalid raw metadata page extent".to_string(),
+                ));
+            }
         }
-        let mut page = vec![0u8; page_len];
-        backend.read_at(&sb.disk_id, offset + relative_offset, &mut page)?;
-        if sha256_hex(&page) != stored_page_hash {
-            return Err(ArgosError::Checksum(format!(
-                "raw metadata page {page_index} checksum mismatch"
-            )));
+        let begin = first * page_size;
+        let end = (last * page_size).min(len);
+        bytes.resize(end, 0);
+        backend.read_at(
+            &sb.disk_id,
+            offset + data_start + begin as u64,
+            &mut bytes[begin..end],
+        )?;
+        for page_index in first..last {
+            let entry_start = page_index * METADATA_INDEX_ENTRY_SIZE;
+            let entry = &index[entry_start..entry_start + HASH_BYTES_LEN];
+            let page_begin = page_index * page_size;
+            let page_end = (page_begin + page_size).min(len);
+            if Sha256::digest(&bytes[page_begin..page_end]).as_slice() != entry {
+                return Err(ArgosError::Checksum(format!(
+                    "raw metadata page {page_index} checksum mismatch"
+                )));
+            }
         }
-        bytes.extend_from_slice(&page);
     }
     if bytes.len() != len || sha256_hex(&bytes) != stored_hash {
         return Err(ArgosError::Checksum(
