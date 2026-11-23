@@ -1474,72 +1474,30 @@ fn diff_json(
         // forces a full multi-member checkpoint. Use only legacy JSON pointer
         // operations so existing on-disk journals remain compatible.
         (serde_json::Value::Array(left), serde_json::Value::Array(right)) => {
-            let prefix = left
-                .iter()
-                .zip(right)
-                .take_while(|(a, b)| json_values_identical(a, b))
-                .count();
-            if prefix == left.len() && prefix == right.len() {
-                return;
-            }
-            let suffix = left
-                .len()
-                .saturating_sub(prefix)
-                .min(right.len().saturating_sub(prefix));
-            let suffix = (0..suffix)
-                .take_while(|i| {
-                    json_values_identical(&left[left.len() - 1 - i], &right[right.len() - 1 - i])
-                })
-                .count();
-            let old_end = left.len() - suffix;
-            let new_end = right.len() - suffix;
-            let old_middle = old_end - prefix;
-            let new_middle = new_end - prefix;
-            // Each array removal moves the following entries. A wide deletion
-            // would make thousands of repeated shifts (quadratic replay); a
-            // single full replacement is then safer and often smaller.
-            if old_middle.saturating_sub(new_middle) > 64 {
+            let mut array_ops = Vec::new();
+            if !diff_json_array(path, left, right, next, &mut array_ops) {
                 ops.push(MetadataDeltaOp::Replace {
                     path: path.to_string(),
                     value: next.clone(),
                 });
                 return;
             }
-            if new_middle > old_middle && suffix != 0 {
-                // An insertion before a retained suffix is not representable
-                // by legacy JSON Add (it replaces array elements, not inserts).
-                // Fall back rather than constructing a subtly invalid delta.
+            if array_ops.is_empty() {
+                return;
+            }
+            // A sparse delta wins when only a few elements change. When most
+            // of a large array changes, one pointer operation per element
+            // repeats the path and the operation envelope and can serialize
+            // *larger* than replacing the array once. That regressed the
+            // 2026-11-23 Borg write from 12 to 90 journal rollovers. Pick the
+            // smaller encoding instead of assuming sparsity.
+            if sparse_array_delta_is_not_smaller(path, next, &array_ops) {
                 ops.push(MetadataDeltaOp::Replace {
                     path: path.to_string(),
                     value: next.clone(),
                 });
-                return;
-            }
-            for index in prefix..(prefix + old_middle.min(new_middle)) {
-                diff_json(
-                    &push_json_pointer(path, &index.to_string()),
-                    &left[index],
-                    &right[index],
-                    ops,
-                );
-            }
-            // Remove surplus elements at one stable index; each removal shifts
-            // the suffix left, preserving its exact values and byte ordering.
-            for _ in new_middle..old_middle {
-                ops.push(MetadataDeltaOp::Remove {
-                    path: push_json_pointer(path, &(prefix + new_middle).to_string()),
-                });
-            }
-            for (index, value) in right
-                .iter()
-                .enumerate()
-                .take(new_end)
-                .skip(prefix + old_middle)
-            {
-                ops.push(MetadataDeltaOp::Add {
-                    path: push_json_pointer(path, &index.to_string()),
-                    value: value.clone(),
-                });
+            } else {
+                ops.extend(array_ops);
             }
         }
         // Value::PartialEq treats -0.0 and +0.0 as equal, although those
@@ -1550,6 +1508,154 @@ fn diff_json(
         }),
         _ => {}
     }
+}
+
+/// Emit only the operations needed to rebuild one changed array. Returns
+/// `false` when the caller should replace the whole array instead; the caller
+/// may also collapse a returned sparse form when it serializes larger.
+fn diff_json_array(
+    path: &str,
+    left: &[serde_json::Value],
+    right: &[serde_json::Value],
+    next: &serde_json::Value,
+    ops: &mut Vec<MetadataDeltaOp>,
+) -> bool {
+    let prefix = left
+        .iter()
+        .zip(right)
+        .take_while(|(a, b)| json_values_identical(a, b))
+        .count();
+    if prefix == left.len() && prefix == right.len() {
+        return true;
+    }
+    let suffix = left
+        .len()
+        .saturating_sub(prefix)
+        .min(right.len().saturating_sub(prefix));
+    let suffix = (0..suffix)
+        .take_while(|i| {
+            json_values_identical(&left[left.len() - 1 - i], &right[right.len() - 1 - i])
+        })
+        .count();
+    let old_end = left.len() - suffix;
+    let new_end = right.len() - suffix;
+    let old_middle = old_end - prefix;
+    let new_middle = new_end - prefix;
+    let planned_ops = if new_middle > old_middle {
+        right.len().saturating_sub(left.len()) + left.len().saturating_sub(prefix)
+    } else {
+        old_middle
+    };
+    // Building tens of thousands of operations only to discard them in the
+    // size guard is wasteful. When the sparse form's lower bound already
+    // exceeds a whole-array replacement, fall back before materializing it.
+    if planned_ops > 256
+        && sparse_array_shift_exceeds_replacement(
+            path,
+            next,
+            planned_ops,
+            left.len().max(right.len()),
+        )
+    {
+        return false;
+    }
+    if new_middle > old_middle {
+        // The array grew. Legacy JSON operations cannot insert in place, but
+        // an append-and-shift is equivalent: append the final tail first, then
+        // overwrite every position before that tail. This is cheap when a
+        // freed extent is inserted near the end of a large sorted list, which
+        // previously fell back to rewriting the entire 1.9 MB list.
+        for index in left.len()..right.len() {
+            ops.push(MetadataDeltaOp::Add {
+                path: push_json_pointer(path, &index.to_string()),
+                value: right[index].clone(),
+            });
+        }
+        for index in prefix..left.len() {
+            ops.push(MetadataDeltaOp::Replace {
+                path: push_json_pointer(path, &index.to_string()),
+                value: right[index].clone(),
+            });
+        }
+        return true;
+    }
+    for index in prefix..(prefix + new_middle) {
+        diff_json(
+            &push_json_pointer(path, &index.to_string()),
+            &left[index],
+            &right[index],
+            ops,
+        );
+    }
+    // Remove surplus elements at one stable index; each removal shifts the
+    // suffix left, preserving its exact values and byte ordering. A sparse
+    // run of removals is much smaller than reserializing the whole list; the
+    // caller's size guard collapses it only when it would not be.
+    for _ in new_middle..old_middle {
+        ops.push(MetadataDeltaOp::Remove {
+            path: push_json_pointer(path, &(prefix + new_middle).to_string()),
+        });
+    }
+    true
+}
+
+/// Conservative lower bound for `planned_ops` sparse operations against one
+/// whole-array replacement. Returns false when the sparse form is provably
+/// smaller without serializing the array.
+fn sparse_array_shift_exceeds_replacement(
+    path: &str,
+    next: &serde_json::Value,
+    planned_ops: usize,
+    element_count: usize,
+) -> bool {
+    let Ok(encoded_path) = serde_json::to_vec(path) else {
+        return true;
+    };
+    // Remove needs 23 bytes plus the path; Add/Replace need at least as many
+    // and always carry a value of at least one byte.
+    let lower = planned_ops.saturating_mul(24usize.saturating_add(encoded_path.len()));
+    // A JSON array is never shorter than its element count.
+    if lower < element_count {
+        return false;
+    }
+    let Ok(value) = serde_json::to_vec(next) else {
+        return true;
+    };
+    lower
+        >= 33usize
+            .saturating_add(encoded_path.len())
+            .saturating_add(value.len())
+}
+
+/// Compare the serialized sparse operations with one serialized
+/// `Replace { path, value: next }`. The comparison is exact, but avoids
+/// serializing a large array when the sparse form is already below the
+/// replacement's lower bound (every JSON array element is at least one byte).
+fn sparse_array_delta_is_not_smaller(
+    path: &str,
+    next: &serde_json::Value,
+    ops: &[MetadataDeltaOp],
+) -> bool {
+    let Ok(sparse) = serde_json::to_vec(ops) else {
+        return true;
+    };
+    let Ok(encoded_path) = serde_json::to_vec(path) else {
+        return true;
+    };
+    // {"op":"replace","path":<path>,"value":<value>}
+    let envelope = 33usize.saturating_add(encoded_path.len());
+    let minimum_value = next.as_array().map_or(2, |items| items.len().max(1));
+    // The sparse vector's serialization includes two bytes for its own
+    // brackets; the replacement operation is a single member of the parent
+    // vector, so account for that difference.
+    let sparse_cost = sparse.len().saturating_sub(2);
+    if sparse_cost < envelope.saturating_add(minimum_value) {
+        return false;
+    }
+    let Ok(value) = serde_json::to_vec(next) else {
+        return true;
+    };
+    sparse_cost >= envelope.saturating_add(value.len())
 }
 
 // Value's numeric equality ignores the sign bit of zero, but a journal

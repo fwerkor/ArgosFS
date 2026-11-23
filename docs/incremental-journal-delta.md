@@ -23,6 +23,29 @@ copies, so its peak RSS can remain above the steady-state table. The opt-in
 v2 raw integrity scheme below avoids this legacy full-tree hash per normal
 deferred group commit.
 
+## Sparse array deltas (Issue #231 follow-up)
+
+The raw allocator free-extent lists and inode block lists can contain tens of
+thousands of entries. A changed array is diffed by its unchanged prefix and
+suffix:
+
+- A pure append emits one `Add` per new element.
+- A removal (including a bulk run) emits one `Remove` at a stable index;
+  legacy replay shifts the suffix itself.
+- A growth/insertion cannot use a legacy JSON pointer insert. It appends the
+  final tail elements and then replaces only the positions before that tail.
+  A freed extent inserted near the end of a sorted free list therefore costs a
+  few operations instead of reserializing the whole list.
+- When most elements change, per-element paths and operation envelopes can
+  serialize larger than one whole-array `Replace`. The encoder compares the
+  two serialized forms and keeps the smaller one.
+
+The 2026-11-23 Borg run showed 1.90 MB whole-array replacements of a 47,289
+entry free-extents list in single group commits, which drove the journal from
+12 to 90 rollovers. The insertion and bulk-removal paths keep those commits
+sparse; the size guard bounds the dense case. This changes only delta
+construction: the legacy operation set and replay semantics are unchanged.
+
 ## Raw delta-integrity v2 (Issue #230; explicit upgrade)
 
 The raw/loop metadata journal can authenticate each deferred transaction using
