@@ -913,6 +913,104 @@ fn write_metadata_slot(
     Ok(())
 }
 
+/// On a quorum-protected rollover the target slot is *not* a recovery
+/// anchor: another physically verified slot is retained untouched. Compare
+/// target pages with the prepared next checkpoint and rewrite only changed
+/// ranges. This reuses unchanged bytes already physically present in the
+/// target slot, without changing the existing tree index or disk format.
+///
+/// The target bytes are read and compared, not trusted from their old header
+/// or index. An unreadable range is conservatively rewritten in full.
+/// Power loss at any point can corrupt only this unprotected slot; the prior
+/// independently verified quorum remains available until new headers flush.
+fn write_metadata_slot_differential(
+    backend: &dyn StorageBackend,
+    sb: &RawSuperblock,
+    offset: u64,
+    checkpoint: &MetadataTreeCheckpoint,
+    metrics: Option<&CommitMetrics>,
+) -> Result<()> {
+    let mut old = vec![0u8; CHECKPOINT_BATCH_BYTES];
+    for (relative, data) in &checkpoint.body_writes {
+        for (chunk_index, chunk) in data.chunks(CHECKPOINT_BATCH_BYTES).enumerate() {
+            let absolute = offset + relative + (chunk_index * CHECKPOINT_BATCH_BYTES) as u64;
+            let readable = backend
+                .read_at(&sb.disk_id, absolute, &mut old[..chunk.len()])
+                .is_ok();
+            // Writing one full batch is preferable when at least half its
+            // pages changed: it avoids one syscall for every isolated page
+            // of a completely different compressed checkpoint.
+            if readable {
+                if let Some(metrics) = metrics {
+                    metrics.record_checkpoint_cow_bytes(chunk.len(), 0);
+                }
+            }
+            let dirty_pages = if readable {
+                chunk
+                    .chunks(METADATA_PAGE_SIZE)
+                    .zip(old[..chunk.len()].chunks(METADATA_PAGE_SIZE))
+                    .filter(|(new, previous)| new != previous)
+                    .count()
+            } else {
+                chunk.len().div_ceil(METADATA_PAGE_SIZE)
+            };
+            if dirty_pages == 0 {
+                if let Some(metrics) = metrics {
+                    metrics.record_checkpoint_cow_bytes(0, chunk.len());
+                }
+                continue;
+            }
+            if !readable || dirty_pages * 2 >= chunk.len().div_ceil(METADATA_PAGE_SIZE) {
+                backend.write_at(&sb.disk_id, absolute, chunk)?;
+                if let Some(metrics) = metrics {
+                    metrics.add_raw_write_bytes(RawWriteKind::Checkpoint, chunk.len());
+                }
+                continue;
+            }
+            let mut dirty_start = None;
+            let mut written = 0usize;
+            for start in (0..chunk.len()).step_by(METADATA_PAGE_SIZE) {
+                let end = (start + METADATA_PAGE_SIZE).min(chunk.len());
+                if chunk[start..end] != old[start..end] {
+                    dirty_start.get_or_insert(start);
+                } else if let Some(run_start) = dirty_start.take() {
+                    backend.write_at(
+                        &sb.disk_id,
+                        absolute + run_start as u64,
+                        &chunk[run_start..start],
+                    )?;
+                    written += start - run_start;
+                    if let Some(metrics) = metrics {
+                        metrics.add_raw_write_bytes(RawWriteKind::Checkpoint, start - run_start);
+                    }
+                }
+            }
+            if let Some(run_start) = dirty_start {
+                backend.write_at(
+                    &sb.disk_id,
+                    absolute + run_start as u64,
+                    &chunk[run_start..],
+                )?;
+                written += chunk.len() - run_start;
+                if let Some(metrics) = metrics {
+                    metrics.add_raw_write_bytes(RawWriteKind::Checkpoint, chunk.len() - run_start);
+                }
+            }
+            if let Some(metrics) = metrics {
+                metrics.record_checkpoint_cow_bytes(0, chunk.len() - written);
+            }
+        }
+    }
+    // The pre-existing durability protocol must stay unchanged: publish the
+    // new slot header only after every retained/written body byte is safe.
+    backend.flush_device(&sb.disk_id)?;
+    backend.write_at(&sb.disk_id, offset, &checkpoint.header)?;
+    if let Some(metrics) = metrics {
+        metrics.add_raw_write_bytes(RawWriteKind::Checkpoint, checkpoint.header.len());
+    }
+    backend.flush_device(&sb.disk_id)
+}
+
 /// Upgrade every active member's primary AND backup superblock before any
 /// delta-chain record is emitted. This is an explicit offline maintenance
 /// operation: a partially completed upgrade can be retried, and no v2 record
@@ -1891,7 +1989,7 @@ fn checkpoint_members_and_reset_parallel(
                                     available: sb.metadata.length / 2,
                                 });
                             }
-                            write_metadata_slot(
+                            write_metadata_slot_differential(
                                 backend,
                                 sb,
                                 sb.metadata.offset + slot * (sb.metadata.length / 2),
