@@ -86,6 +86,51 @@ fn verify_journal_cli_supports_loop_backend() {
 }
 
 #[test]
+fn targeted_member_scrub_emits_only_jsonl_on_stderr() {
+    let tmp = TempDir::new().unwrap();
+    let fs = ArgosFs::create(tmp.path(), config(2, 1), 4, false).unwrap();
+    fs.write_file("/payload", b"targeted JSONL regression", 0o644)
+        .unwrap();
+    let member = fs
+        .metadata_snapshot()
+        .inodes
+        .values()
+        .find(|inode| !inode.blocks.is_empty())
+        .unwrap()
+        .blocks[0]
+        .shards[0]
+        .disk_id
+        .clone();
+    fs.mark_disk(&member, DiskStatus::Failed).unwrap();
+    fs.sync().unwrap();
+    drop(fs);
+
+    let output = Command::new(argosfs_binary())
+        .arg("scrub")
+        .arg(tmp.path())
+        .args(["--member", &member, "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "scrub failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let final_report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(final_report["unrecoverable_files"], 0);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let events = stderr
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(events[0]["event"], "member-rebuild-start");
+    assert_eq!(events[0]["member"], member);
+    assert!(events
+        .iter()
+        .any(|event| event["event"] == "member-rebuild-progress"));
+}
+
+#[test]
 fn tree_transfer_cli_rejects_mismatched_pool_config() {
     let tmp = TempDir::new().unwrap();
     let images = loop_images(&tmp, 1);

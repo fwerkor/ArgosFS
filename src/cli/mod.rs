@@ -733,7 +733,14 @@ pub fn run() -> Result<()> {
             let fs = open_backend(root, storage.backend, storage.images, storage.devices, true)?;
             validate_requested_pool(&fs, storage.pool.as_deref())?;
             let report = if let Some(member_id) = member {
-                eprintln!("targeted member rebuild for {member_id}; other shards are not verified");
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "member-rebuild-start",
+                        "member": member_id,
+                        "warning": "targeted member rebuild; other shards are not verified"
+                    })
+                );
                 fs.repair_member_shards(&member_id, |done, total, report| {
                     // Flush one durable progress record per batch. Long repairs
                     // retain useful counters even when an external timeout
