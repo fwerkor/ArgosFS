@@ -277,6 +277,10 @@ pub(crate) struct CommitMetrics {
     writeback_flush_errors: [AtomicU64; WritebackFlushReason::ALL.len()],
     writeback_flush_duration: [FlushDurationCounters; WritebackFlushReason::ALL.len()],
     raw_write_bytes: [AtomicU64; RawWriteKind::ALL.len()],
+    // Bytes physically compared and retained in an unprotected checkpoint
+    // target slot during journal rollover; excludes mandatory old-slot quorum
+    // verification and conservative full-slot checkpoint writes.
+    checkpoint_cow_bytes: [AtomicU64; 2],
     checkpoint_reasons: [AtomicU64; CheckpointReason::ALL.len()],
     // Attempted member checkpoint strategies during raw journal rollover.
     // Values count member attempts, not successful writes or mount replay.
@@ -376,6 +380,27 @@ impl CommitMetrics {
                 self.raw_write_bytes[kind as usize].load(Ordering::Relaxed),
             )
         })
+    }
+
+    pub(crate) fn record_checkpoint_cow_bytes(&self, bytes_read: usize, bytes_reused: usize) {
+        for (index, value) in [(0, bytes_read), (1, bytes_reused)] {
+            self.checkpoint_cow_bytes[index]
+                .fetch_add(u64::try_from(value).unwrap_or(u64::MAX), Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn checkpoint_cow_byte_snapshots(
+        &self,
+    ) -> impl Iterator<Item = (&'static str, u64)> + '_ {
+        ["target_bytes_read", "reused_bytes"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| {
+                (
+                    name,
+                    self.checkpoint_cow_bytes[index].load(Ordering::Relaxed),
+                )
+            })
     }
 
     pub(crate) fn record_checkpoint_reason(&self, reason: CheckpointReason) {
