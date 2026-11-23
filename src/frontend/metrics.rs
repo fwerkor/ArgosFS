@@ -278,6 +278,15 @@ fn emit_commit_metrics(volume: &ArgosFs, emitter: &mut MetricEmitter<'_>) {
             "counter",
         );
     }
+    for (kind, bytes) in volume.commit_metrics().checkpoint_cow_byte_snapshots() {
+        emitter.typed_metric(
+            "argosfs_checkpoint_cow_bytes_total",
+            "Raw rollover checkpoint target bytes physically read or safely reused",
+            bytes as f64,
+            &[("kind", kind)],
+            "counter",
+        );
+    }
     for (strategy, attempts) in volume.commit_metrics().rollover_member_strategy_snapshots() {
         emitter.typed_metric(
             "argosfs_checkpoint_rollover_member_strategy_total",
