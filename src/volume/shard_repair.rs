@@ -50,6 +50,21 @@ impl ArgosFs {
         repair_offline: bool,
         action: &str,
     ) -> Result<u64> {
+        self.repair_inode_shards_with_key_locked(meta, ino, stripes, repair_offline, action, None)
+    }
+
+    /// The optional key was already authenticated against the current pool
+    /// configuration. Targeted member rebuild can derive it once per pass;
+    /// callers without a cached key retain the previous per-inode behavior.
+    pub(super) fn repair_inode_shards_with_key_locked(
+        &self,
+        meta: &mut Metadata,
+        ino: InodeId,
+        stripes: Option<&BTreeSet<String>>,
+        repair_offline: bool,
+        action: &str,
+        authenticated_key: Option<&[u8; 32]>,
+    ) -> Result<u64> {
         self.ensure_block_backend_writable_locked(meta)?;
         let inode = meta
             .inodes
@@ -63,13 +78,18 @@ impl ArgosFs {
         }
 
         let start_time = Instant::now();
-        // Argon2 derivation is expensive. Derive once for the entire inode,
-        // not once per reconstructed stripe.
-        let decrypt_key = if inode.blocks.iter().any(|block| block.encrypted) {
+        // Callers with a pass-scoped authenticated key avoid running the
+        // costly Argon2id KDF once per affected inode. Other paths can still
+        // derive on demand, preserving their current error semantics.
+        let encrypted = inode.blocks.iter().any(|block| block.encrypted);
+        let derived_key = if encrypted && authenticated_key.is_none() {
             Some(self.encryption_key_locked(meta)?)
         } else {
             None
         };
+        let decrypt_key = encrypted
+            .then_some(authenticated_key.or(derived_key.as_ref()))
+            .flatten();
         // A raw journal delta must compare against the state *before*
         // allocating any replacement extent. Taking the previous snapshot
         // after physical allocations silently omits allocator changes.
@@ -178,7 +198,7 @@ impl ArgosFs {
                     block.compressed_size,
                 );
                 let transformed = if block.encrypted {
-                    let key = decrypt_key.as_ref().ok_or_else(|| {
+                    let key = decrypt_key.ok_or_else(|| {
                         ArgosError::PermissionDenied("missing ArgosFS encryption key".to_string())
                     })?;
                     let nonce = hex::decode(&block.nonce_hex).map_err(|err| {

@@ -1347,6 +1347,9 @@ impl ArgosFs {
         let retries_before = self.read_retries_seen.load(Ordering::Relaxed);
         let recovered_before = self.read_recovered.load(Ordering::Relaxed);
         let mut report = FsckReport::default();
+        // Like full fsck, a targeted recovery shares one authenticated
+        // volume key among all affected encrypted files in this pass.
+        let mut decrypt_key_cache = FsckKeyCache::default();
         let total = targets.len();
         for (index, (ino, stripes)) in targets.into_iter().enumerate() {
             let lock = self.inode_lock(ino);
@@ -1380,13 +1383,30 @@ impl ArgosFs {
                     .flat_map(|block| &block.shards)
                     .filter(|shard| shard.disk_id == disk_id)
                     .count() as u64;
-                match self.repair_inode_shards_locked(
-                    &mut meta,
-                    ino,
-                    Some(&live_stripes),
-                    true,
-                    "member-rebuild",
-                ) {
+                let needs_key = meta.inodes[&ino]
+                    .blocks
+                    .iter()
+                    .any(|block| live_stripes.contains(&block.stripe_id) && block.encrypted);
+                let repair = (|| -> Result<u64> {
+                    let key = if needs_key {
+                        Some(decrypt_key_cache.get_or_derive(
+                            &meta.encryption,
+                            &meta.uuid,
+                            || self.encryption_key_locked(&meta),
+                        )?)
+                    } else {
+                        None
+                    };
+                    self.repair_inode_shards_with_key_locked(
+                        &mut meta,
+                        ino,
+                        Some(&live_stripes),
+                        true,
+                        "member-rebuild",
+                        key,
+                    )
+                })();
+                match repair {
                     Ok(count) if count > 0 => {
                         report.damaged_files += 1;
                         report.repaired_files += 1;

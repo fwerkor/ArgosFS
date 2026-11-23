@@ -273,3 +273,102 @@ fn targeted_member_repair_recovers_on_loop_backend_after_reopen() {
     assert_eq!(health.unrecoverable_files, 0, "{health:?}");
     assert_eq!(health.checksum_errors, 0, "{health:?}");
 }
+
+#[test]
+fn encrypted_targeted_member_repair_derives_key_once_for_all_affected_inodes() {
+    let _guard = crypto::test_env_lock();
+    let previous = std::env::var_os("ARGOSFS_KEY");
+    unsafe { std::env::set_var("ARGOSFS_KEY", "member-targeted-crypt-test") };
+    let (_dir, fs) = redundant_host_volume();
+    fs.enable_encryption("member-targeted-crypt-test").unwrap();
+    for index in 0..8 {
+        fs.write_file(&format!("/encrypted-{index}"), &[index as u8; 8192], 0o600)
+            .unwrap();
+    }
+    let before = fs.metadata_snapshot();
+    let mut usage = BTreeMap::<String, usize>::new();
+    for inode in before
+        .inodes
+        .values()
+        .filter(|inode| inode.kind == NodeKind::File)
+    {
+        for block in &inode.blocks {
+            assert!(block.encrypted);
+            for shard in &block.shards {
+                *usage.entry(shard.disk_id.clone()).or_default() += 1;
+            }
+        }
+    }
+    let member = usage.into_iter().max_by_key(|(_, count)| *count).unwrap().0;
+    let affected = before
+        .inodes
+        .values()
+        .filter(|inode| {
+            inode
+                .blocks
+                .iter()
+                .any(|block| block.shards.iter().any(|shard| shard.disk_id == member))
+        })
+        .count();
+    assert!(affected >= 2);
+    fs.mark_disk(&member, DiskStatus::Failed).unwrap();
+
+    super::maintenance_key::reset_derivation_attempts();
+    let report = fs.repair_member_shards(&member, |_, _, _| {}).unwrap();
+    assert_eq!(report.files_checked, affected as u64);
+    assert_eq!(report.unrecoverable_files, 0, "{report:?}");
+    assert_eq!(report.repaired_files, affected as u64, "{report:?}");
+    assert_eq!(super::maintenance_key::derivation_attempts(), 1);
+    for index in 0..8 {
+        assert_eq!(
+            fs.read_file(&format!("/encrypted-{index}"), false).unwrap(),
+            vec![index as u8; 8192]
+        );
+    }
+    if let Some(key) = previous {
+        unsafe { std::env::set_var("ARGOSFS_KEY", key) };
+    } else {
+        unsafe { std::env::remove_var("ARGOSFS_KEY") };
+    }
+}
+
+#[test]
+fn missing_targeted_rebuild_key_is_deferred_and_reports_final_progress() {
+    let _guard = crypto::test_env_lock();
+    let previous = std::env::var_os("ARGOSFS_KEY");
+    unsafe { std::env::set_var("ARGOSFS_KEY", "member-rebuild-key-required") };
+    let (_dir, fs) = redundant_host_volume();
+    fs.enable_encryption("member-rebuild-key-required").unwrap();
+    fs.write_file("/encrypted", &[42; 8192], 0o600).unwrap();
+    let snapshot = fs.metadata_snapshot();
+    let block = &snapshot
+        .inodes
+        .values()
+        .find(|inode| inode.kind == NodeKind::File)
+        .unwrap()
+        .blocks[0];
+    let member = block.shards[0].disk_id.clone();
+    fs.mark_disk(&member, DiskStatus::Failed).unwrap();
+    unsafe { std::env::remove_var("ARGOSFS_KEY") };
+
+    let mut last_progress = None;
+    let report = fs
+        .repair_member_shards(&member, |done, total, partial| {
+            last_progress = Some((done, total, partial.repaired_files));
+        })
+        .unwrap();
+    assert_eq!(report.files_checked, 1);
+    assert_eq!(report.repaired_files, 0);
+    assert_eq!(report.unrecoverable_files, 0, "{report:?}");
+    assert!(report
+        .errors
+        .iter()
+        .any(|line| line.contains("ARGOSFS_KEY")));
+    assert_eq!(last_progress, Some((1, 1, 0)));
+
+    if let Some(key) = previous {
+        unsafe { std::env::set_var("ARGOSFS_KEY", key) };
+    } else {
+        unsafe { std::env::remove_var("ARGOSFS_KEY") };
+    }
+}
