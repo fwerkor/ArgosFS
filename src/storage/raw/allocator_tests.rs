@@ -199,3 +199,45 @@ fn allocator_linear_sweep_preserves_overlapping_range_detection() {
         ));
     }
 }
+
+#[test]
+fn allocator_sweep_matches_reference_overlap_check_at_boundaries() {
+    let mut state = init_allocator(4096, 64 * 4096, 4096);
+    state.free_extents = vec![
+        RawFreeExtent {
+            offset: 11 * 4096,
+            length: 2 * 4096,
+        },
+        RawFreeExtent {
+            offset: 37 * 4096,
+            length: 5 * 4096,
+        },
+        RawFreeExtent {
+            offset: 24 * 4096,
+            length: 4096,
+        },
+    ];
+    for offset in (4096..(64 * 4096)).step_by(1024) {
+        for length in [0, 1, 1024, 4096, 8192, 65536] {
+            if offset + length > state.data_end {
+                continue;
+            }
+            let original_overlap = state.free_extents.iter().any(|free| {
+                offset < free.offset.saturating_add(free.length)
+                    && free.offset < offset.saturating_add(length)
+            });
+            let candidate = PhysicalExtent {
+                disk_id: "disk-0000".into(),
+                offset,
+                length,
+                generation: 1,
+                flags: 0,
+            };
+            assert_eq!(
+                validate_allocations(&state, vec![candidate]).is_err(),
+                original_overlap,
+                "offset={offset}, length={length}"
+            );
+        }
+    }
+}
