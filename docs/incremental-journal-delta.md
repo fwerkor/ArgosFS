@@ -42,10 +42,36 @@ suffix:
 
 The 2026-11-23 Borg run showed 1.90 MB whole-array replacements of a 47,289
 entry free-extents list in single group commits, consistent with the journal
-payload growth behind the 12-to-90 rollover regression. The insertion and
-bulk-removal paths keep those commits sparse; the size guard bounds the dense
-case. This changes only delta construction: the legacy operation set and
-replay semantics are unchanged.
+payload growth behind the 12-to-90 rollover regression. There were also
+commits that changed seven allocator lists at once; even the smallest legacy
+per-array encoding produced a 10-12 MB journal entry, larger than the 8 MiB
+journal region. Those commits roll over immediately and write a full
+checkpoint, so per-array minimisation alone is not sufficient.
+
+### Journal array splice (optional feature)
+
+Pools that advertise the `raw-journal-array-splice` required feature
+(`required_feature_flags` bit 1) encode a changed array as one range operation
+per contiguous changed run:
+
+```json
+{"op":"splice","path":".../free_extents","start":23000,"delete":0,"insert":[...]}
+```
+
+`start` is the unchanged prefix length at that point, `delete` is the changed
+old run, and `insert` is the replacement run. Replay splices the range into
+the array, so the untouched stretches between changes never have to move.
+A middle insertion, a contiguous allocation run, or a scattered bulk deletion
+therefore stays bounded by the changed elements rather than the array suffix.
+Dense changes still carry the changed values; more than 8,192 separate runs
+fall back to one full-range splice.
+
+The feature is enabled only when **every active member** carries the required
+bit; mixed or legacy pools keep the per-element encoding above. The bit is
+written by the same offline `argosfs upgrade-integrity --offline-confirmed`
+operation as v2 delta integrity, and is intentionally one-way: older readers
+reject it rather than attempting to interpret a splice record they do not
+know.
 
 ## Raw delta-integrity v2 (Issue #230; explicit upgrade)
 

@@ -179,7 +179,10 @@ pub fn run() -> Result<()> {
                 "{}",
                 serde_json::json!({
                     "upgraded": true,
-                    "required_feature": "raw-delta-integrity-v2",
+                    "required_features": [
+                        "raw-delta-integrity-v2",
+                        "raw-journal-array-splice"
+                    ],
                     "pool_uuid": fs.metadata_snapshot().uuid
                 })
             );

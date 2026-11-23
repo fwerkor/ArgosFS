@@ -2017,7 +2017,9 @@ fn interrupted_integrity_feature_upgrade_is_retryable_without_v2_records() {
             sb.required_feature_flags & REQUIRED_FEATURE_DELTA_INTEGRITY,
             0
         );
+        assert_ne!(sb.required_feature_flags & REQUIRED_FEATURE_ARRAY_SPLICE, 0);
     }
+    assert!(array_splice_feature_enabled(&upgraded));
     assert_eq!(
         recover_metadata(&backend, &upgraded).unwrap().txid,
         previous.txid

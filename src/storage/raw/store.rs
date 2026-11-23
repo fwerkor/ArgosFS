@@ -5,7 +5,7 @@ use crate::journal;
 use crate::raw_format::{
     align_down, align_up, RawDeviceLabel, RawSuperblock, BACKUP_REGION_SIZE, DEVICE_LABEL_OFFSET,
     DEVICE_LABEL_SIZE, PRIMARY_SUPERBLOCK_OFFSET, PROTECTIVE_HEADER_OFFSET,
-    REQUIRED_FEATURE_DELTA_INTEGRITY, SUPERBLOCK_SIZE,
+    REQUIRED_FEATURE_ARRAY_SPLICE, REQUIRED_FEATURE_DELTA_INTEGRITY, SUPERBLOCK_SIZE,
 };
 use crate::storage::guard::GuardedBackend;
 use crate::types::{
@@ -1060,7 +1060,8 @@ pub(crate) fn upgrade_delta_integrity_members(
             }
         }
         let mut next = primary;
-        next.required_feature_flags |= REQUIRED_FEATURE_DELTA_INTEGRITY;
+        next.required_feature_flags |=
+            REQUIRED_FEATURE_DELTA_INTEGRITY | REQUIRED_FEATURE_ARRAY_SPLICE;
         for offset in [sb.backup_superblock_offset, PRIMARY_SUPERBLOCK_OFFSET] {
             backend.write_at(&sb.disk_id, offset, &next.encode())?;
             backend.flush_device(&sb.disk_id)?;
@@ -1076,6 +1077,16 @@ pub(crate) fn upgrade_delta_integrity_members(
         upgraded.push(next);
     }
     Ok(upgraded)
+}
+
+/// A journal delta may use the compact array-splice operation only when every
+/// member in the write set advertises the required feature. Mixed or legacy
+/// pools keep the older per-element array encoding.
+pub(crate) fn array_splice_feature_enabled(superblocks: &[RawSuperblock]) -> bool {
+    !superblocks.is_empty()
+        && superblocks
+            .iter()
+            .all(|sb| sb.required_feature_flags & REQUIRED_FEATURE_ARRAY_SPLICE != 0)
 }
 
 pub fn recover_metadata(
@@ -1774,6 +1785,7 @@ fn append_journal_quorum(
             superblocks.len(),
         ));
     }
+    let _splice_guard = journal::allow_array_splice(array_splice_feature_enabled(superblocks));
     let (entry, target_record_hash) = build_journal_entry_measured(
         metadata,
         previous_metadata,
@@ -1797,8 +1809,9 @@ fn append_journal_quorum(
             Ok(true) => match journal_append_position(backend, sb, entry.len()) {
                 Ok(position) => {
                     let certificate_end = position.2.checked_add(journal_certificate.len() as u64);
-                    rollover |=
+                    let member_rollover =
                         position.3 || certificate_end.is_none_or(|end| end > sb.journal.length);
+                    rollover |= member_rollover;
                     positions.push((sb, position));
                 }
                 Err(err) => report.record_failure(&sb.disk_id, &err),

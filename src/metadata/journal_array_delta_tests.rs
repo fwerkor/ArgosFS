@@ -36,6 +36,11 @@ fn round_trip_arrays(before: Value, after: Value) -> Vec<MetadataDeltaOp> {
     round_trip_arrays_at("/extents", before, after)
 }
 
+fn round_trip_arrays_splice(path: &str, before: Value, after: Value) -> Vec<MetadataDeltaOp> {
+    let _guard = allow_array_splice(true);
+    round_trip_arrays_at(path, before, after)
+}
+
 #[test]
 fn array_deltas_handle_append_remove_middle_and_nested_mutations() {
     for (before, after) in [
@@ -185,6 +190,104 @@ fn sparse_array_mutations_keep_the_small_encoding() {
 }
 
 #[test]
+fn splice_encodes_insertions_removals_and_dense_edits_as_one_range_op() {
+    let path = "/raw_pool/allocators/disk-0007/free_extents";
+    let before = Value::Array(
+        (0_u64..47_289)
+            .map(|i| json!({"offset": i * 8192, "length": 4096}))
+            .collect(),
+    );
+
+    // A middle insertion would previously shift or rewrite ~47k entries.
+    let mut inserted = before.clone();
+    inserted
+        .as_array_mut()
+        .unwrap()
+        .insert(23_000, json!({"offset": 123_456, "length": 8192}));
+    let ops = round_trip_arrays_splice(path, before.clone(), inserted);
+    assert_eq!(ops.len(), 1);
+    assert!(matches!(
+        &ops[0],
+        MetadataDeltaOp::Splice { start: 23_000, delete: 0, insert, .. } if insert.len() == 1
+    ));
+    assert!(serde_json::to_vec(&ops).unwrap().len() < 512);
+
+    // A contiguous allocation run is one deletion range, no shifted suffix.
+    let mut deleted = before.clone();
+    deleted.as_array_mut().unwrap().drain(20_000..20_500);
+    let ops = round_trip_arrays_splice(path, before.clone(), deleted);
+    assert_eq!(ops.len(), 1);
+    assert!(matches!(
+        &ops[0],
+        MetadataDeltaOp::Splice {
+            start: 20_000,
+            delete: 500,
+            insert,
+            ..
+        } if insert.is_empty()
+    ));
+
+    // A commit that frees extents throughout a sorted list changes many
+    // scattered runs. The encoder must keep the untouched stretches in place
+    // instead of replacing the whole middle from the first to the last change.
+    let mut scattered = before.clone();
+    for index in (500..47_000).step_by(997) {
+        scattered.as_array_mut().unwrap().insert(
+            index,
+            json!({"offset": 400_000_000 + index as u64 * 8192, "length": 4096}),
+        );
+    }
+    let added = scattered.as_array().unwrap().len() - before.as_array().unwrap().len();
+    let ops = round_trip_arrays_splice(path, before.clone(), scattered);
+    assert_eq!(ops.len(), added);
+    assert!(
+        serde_json::to_vec(&ops).unwrap().len() < 30_000,
+        "scattered insertions must not reserialize the untouched list"
+    );
+
+    // Dense changes remain one bounded range operation.
+    let mut dense = before.clone();
+    for entry in dense.as_array_mut().unwrap() {
+        entry["length"] = json!(8192);
+    }
+    let ops = round_trip_arrays_splice(path, before, dense);
+    assert_eq!(ops.len(), 1);
+    assert!(matches!(&ops[0], MetadataDeltaOp::Splice { start: 0, .. }));
+}
+
+#[test]
+fn randomized_splice_edits_round_trip() {
+    let path = "/raw_pool/allocators/disk-0003/free_extents";
+    let mut seed = 0x517c_c1b7_2722_0a95_u64;
+    let mut base = Value::Array(
+        (0_u64..96)
+            .map(|i| json!({"offset": i * 8192, "length": 4096}))
+            .collect(),
+    );
+    for _ in 0..256 {
+        let mut next = base.clone();
+        let items = next.as_array_mut().unwrap();
+        for _ in 0..(seed % 5) + 1 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let kind = seed % 3;
+            let index = (seed as usize / 3) % (items.len() + 1);
+            match kind {
+                0 => items.insert(index, json!({"offset": seed, "length": 8192})),
+                1 if index < items.len() => {
+                    items.remove(index);
+                }
+                _ if index < items.len() => {
+                    items[index]["length"] = json!(seed);
+                }
+                _ => {}
+            }
+        }
+        round_trip_arrays_splice(path, base.clone(), next.clone());
+        base = next;
+    }
+}
+
+#[test]
 fn randomized_array_edits_round_trip_within_the_replacement_bound() {
     let path = "/raw_pool/allocators/disk-0003/free_extents";
     let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
@@ -296,6 +399,96 @@ fn allocator_delta_round_trips_through_authenticated_v2_journal() {
     )).unwrap();
     if let MetadataDeltaOp::Replace { value, .. } = entry {
         *value = json!(12288);
+    }
+    assert!(apply_metadata_delta(&previous, &corrupt).is_err());
+}
+
+#[test]
+fn splice_delta_round_trips_through_authenticated_v2_journal() {
+    use crate::types::{RawAllocatorState, RawFreeExtent, VolumeConfig};
+    use crate::volume::ArgosFs;
+    use tempfile::tempdir;
+
+    let root = tempdir().unwrap();
+    let fs = ArgosFs::create(
+        root.path(),
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            ..VolumeConfig::default()
+        },
+        1,
+        false,
+    )
+    .unwrap();
+    let mut previous = fs.metadata_snapshot();
+    previous.raw_pool.allocators.insert(
+        "disk-0000".into(),
+        RawAllocatorState {
+            block_size: 4096,
+            data_start: 4096,
+            data_end: 100_000_000,
+            next_offset: 64_000_000,
+            free_extents: (0_u64..10_000)
+                .map(|i| RawFreeExtent {
+                    offset: 8192 + i * 4096,
+                    length: 4096,
+                })
+                .collect(),
+        },
+    );
+    prepare_metadata_integrity(&mut previous, String::new()).unwrap();
+    previous.inodes.mark_committed();
+
+    let mut next = previous.clone();
+    next.txid += 1;
+    next.raw_pool
+        .allocators
+        .get_mut("disk-0000")
+        .unwrap()
+        .free_extents
+        .insert(
+            5_000,
+            RawFreeExtent {
+                offset: 50_000_000,
+                length: 8192,
+            },
+        );
+    let prepared = {
+        let _guard = allow_array_splice(true);
+        prepare_delta_integrity_with_delta(&mut next, &previous).unwrap()
+    };
+    assert_eq!(
+        prepared
+            .iter()
+            .filter(|op| matches!(op, MetadataDeltaOp::Splice { .. }))
+            .count(),
+        1,
+        "the free list must use one splice op"
+    );
+    assert!(prepared.iter().any(|op| matches!(
+        op,
+        MetadataDeltaOp::Splice {
+            start: 5_000,
+            delete: 0,
+            ..
+        }
+    )));
+    assert!(serde_json::to_vec(&prepared).unwrap().len() < 1024);
+    let replayed = apply_metadata_delta(&previous, &prepared).unwrap();
+    assert_eq!(replayed.integrity, next.integrity);
+    assert_eq!(
+        serde_json::to_vec(&replayed.raw_pool.allocators).unwrap(),
+        serde_json::to_vec(&next.raw_pool.allocators).unwrap()
+    );
+
+    let mut corrupt = prepared.clone();
+    if let MetadataDeltaOp::Splice { start, .. } = corrupt
+        .iter_mut()
+        .find(|op| matches!(op, MetadataDeltaOp::Splice { .. }))
+        .unwrap()
+    {
+        *start = 9_999;
     }
     assert!(apply_metadata_delta(&previous, &corrupt).is_err());
 }

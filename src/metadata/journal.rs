@@ -25,6 +25,27 @@ thread_local! {
     static THREAD_CRASH_POINT: RefCell<Option<String>> = const { RefCell::new(None) };
     static THREAD_CHECKPOINT_INTERVAL: Cell<Option<u64>> = const { Cell::new(None) };
     static THREAD_COMPACTION_DISABLED: Cell<Option<bool>> = const { Cell::new(None) };
+    static THREAD_ARRAY_SPLICE: Cell<bool> = const { Cell::new(false) };
+}
+
+fn array_splice_allowed() -> bool {
+    THREAD_ARRAY_SPLICE.with(Cell::get)
+}
+
+/// Enable gated array-splice deltas for the current commit thread.
+pub struct ArraySpliceGuard {
+    previous: bool,
+}
+
+pub fn allow_array_splice(allow: bool) -> ArraySpliceGuard {
+    let previous = THREAD_ARRAY_SPLICE.with(|value| value.replace(allow));
+    ArraySpliceGuard { previous }
+}
+
+impl Drop for ArraySpliceGuard {
+    fn drop(&mut self) {
+        THREAD_ARRAY_SPLICE.with(|value| value.set(self.previous));
+    }
 }
 
 pub struct ThreadCrashPointGuard {
@@ -116,6 +137,16 @@ pub enum MetadataDeltaOp {
     Replace {
         path: String,
         value: serde_json::Value,
+    },
+    /// Replace `delete` array elements starting at `start` with `insert`.
+    /// A middle insertion or deletion remains one operation regardless of the
+    /// array length, so a large allocator free list never has to shift its
+    /// suffix through per-element pointer operations.
+    Splice {
+        path: String,
+        start: u64,
+        delete: u64,
+        insert: Vec<serde_json::Value>,
     },
 }
 
@@ -1250,6 +1281,12 @@ pub fn apply_metadata_delta(previous: &Metadata, delta: &[MetadataDeltaOp]) -> R
                                 )));
                             }
                         }
+                        MetadataDeltaOp::Splice { .. } => {
+                            return Err(ArgosError::Invalid(format!(
+                                "metadata delta splice cannot target an inode object: {}",
+                                delta_path(op)
+                            )));
+                        }
                     }
                 } else {
                     if pending_inode.as_ref().is_some_and(|(id, _)| *id != ino) {
@@ -1297,6 +1334,12 @@ pub fn apply_metadata_delta(previous: &Metadata, delta: &[MetadataDeltaOp]) -> R
                                     delta_path(op)
                                 )));
                             }
+                        }
+                        MetadataDeltaOp::Splice { .. } => {
+                            return Err(ArgosError::Invalid(format!(
+                                "metadata delta splice cannot target a disk object: {}",
+                                delta_path(op)
+                            )));
                         }
                     }
                 } else {
@@ -1405,7 +1448,8 @@ fn delta_path(op: &MetadataDeltaOp) -> &str {
     match op {
         MetadataDeltaOp::Add { path, .. }
         | MetadataDeltaOp::Remove { path }
-        | MetadataDeltaOp::Replace { path, .. } => path,
+        | MetadataDeltaOp::Replace { path, .. }
+        | MetadataDeltaOp::Splice { path, .. } => path,
     }
 }
 
@@ -1420,6 +1464,17 @@ fn scoped_delta(op: &MetadataDeltaOp, tail: &[String]) -> MetadataDeltaOp {
         MetadataDeltaOp::Replace { value, .. } => MetadataDeltaOp::Replace {
             path,
             value: value.clone(),
+        },
+        MetadataDeltaOp::Splice {
+            start,
+            delete,
+            insert,
+            ..
+        } => MetadataDeltaOp::Splice {
+            path,
+            start: *start,
+            delete: *delete,
+            insert: insert.clone(),
         },
     }
 }
@@ -1469,11 +1524,15 @@ fn diff_json(
             }
         }
         // The raw free-extent list (and file block lists) can contain
-        // hundreds of thousands of entries. Replacing the *whole* JSON array
-        // for a single allocation unnecessarily fills the 8 MiB journal and
-        // forces a full multi-member checkpoint. Use only legacy JSON pointer
-        // operations so existing on-disk journals remain compatible.
+        // hundreds of thousands of entries. A middle insertion or bulk
+        // deletion cannot be expressed compactly with legacy JSON pointer
+        // operations, so pools that advertise the array-splice feature use a
+        // single range operation. Other pools keep the legacy encoding.
         (serde_json::Value::Array(left), serde_json::Value::Array(right)) => {
+            if array_splice_allowed() {
+                push_array_splice(path, left, right, ops);
+                return;
+            }
             let mut array_ops = Vec::new();
             if !diff_json_array(path, left, right, next, &mut array_ops) {
                 ops.push(MetadataDeltaOp::Replace {
@@ -1507,6 +1566,103 @@ fn diff_json(
             value: next.clone(),
         }),
         _ => {}
+    }
+}
+
+/// Collapse one changed array into a single range splice. The unchanged
+/// prefix and suffix stay in place, and replay splices the new middle into the
+/// old array, so a middle insertion never shifts a large suffix through
+/// per-element pointer operations.
+fn push_array_splice(
+    path: &str,
+    left: &[serde_json::Value],
+    right: &[serde_json::Value],
+    ops: &mut Vec<MetadataDeltaOp>,
+) {
+    // The previous single prefix/suffix splice replaced everything between
+    // the first and last change. Sorted allocator free lists change in many
+    // scattered runs, so that spanned almost the whole 47k-entry array. Walk
+    // the two sequences and keep every unchanged stretch in place.
+    const LOOKAHEAD: usize = 32;
+    const MAX_NET_WINDOW: usize = 4_096;
+    const MAX_RUNS: usize = 8_192;
+    // A net deletion or insertion can exceed the fixed lookahead. Extend the
+    // matching window by the length difference so a contiguous allocation
+    // run is still recognised as one deletion/insertion instead of hundreds
+    // of element replacements. Bound the extension to avoid quadratic scan
+    // cost on arrays that differ completely.
+    let delete_window = LOOKAHEAD + left.len().saturating_sub(right.len()).min(MAX_NET_WINDOW);
+    let insert_window = LOOKAHEAD + right.len().saturating_sub(left.len()).min(MAX_NET_WINDOW);
+    // (old start, old count, new start, new end)
+    let mut runs: Vec<(usize, usize, usize, usize)> = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < left.len() || j < right.len() {
+        if i < left.len() && j < right.len() && json_values_identical(&left[i], &right[j]) {
+            i += 1;
+            j += 1;
+            continue;
+        }
+        let old_start = i;
+        let new_start = j;
+        while i < left.len() || j < right.len() {
+            if i < left.len() && j < right.len() && json_values_identical(&left[i], &right[j]) {
+                break;
+            }
+            let insert = (1..=insert_window)
+                .find(|offset| {
+                    i < left.len()
+                        && j + offset < right.len()
+                        && json_values_identical(&left[i], &right[j + offset])
+                })
+                .map(|offset| offset);
+            let delete = (1..=delete_window)
+                .find(|offset| {
+                    j < right.len()
+                        && i + offset < left.len()
+                        && json_values_identical(&left[i + offset], &right[j])
+                })
+                .map(|offset| offset);
+            match (insert, delete) {
+                (Some(insert), Some(delete)) if insert <= delete => j += insert,
+                (Some(_), Some(delete)) => i += delete,
+                (Some(insert), None) => j += insert,
+                (None, Some(delete)) => i += delete,
+                (None, None) => {
+                    if i < left.len() {
+                        i += 1;
+                    }
+                    if j < right.len() {
+                        j += 1;
+                    }
+                }
+            }
+        }
+        runs.push((old_start, i - old_start, new_start, j));
+        if runs.len() > MAX_RUNS {
+            // A genuinely dense rewrite has more changed runs than a
+            // replacement. Emit one full-range splice instead of unbounded
+            // per-run overhead.
+            ops.push(MetadataDeltaOp::Splice {
+                path: path.to_string(),
+                start: 0,
+                delete: left.len() as u64,
+                insert: right.to_vec(),
+            });
+            return;
+        }
+    }
+    let mut shift: isize = 0;
+    for (old_start, old_count, new_start, new_end) in runs {
+        let insert = right[new_start..new_end].to_vec();
+        let start = old_start as isize + shift;
+        debug_assert!(start >= 0);
+        ops.push(MetadataDeltaOp::Splice {
+            path: path.to_string(),
+            start: start as u64,
+            delete: old_count as u64,
+            insert,
+        });
+        shift += (new_end - new_start) as isize - old_count as isize;
     }
 }
 
@@ -1702,7 +1858,53 @@ fn apply_delta_op(value: &mut serde_json::Value, op: &MetadataDeltaOp) -> Result
             }
         }
         MetadataDeltaOp::Remove { path } => remove_json_pointer(value, path),
+        MetadataDeltaOp::Splice {
+            path,
+            start,
+            delete,
+            insert,
+        } => splice_json_array(value, path, *start, *delete, insert),
     }
+}
+
+fn splice_json_array(
+    value: &mut serde_json::Value,
+    path: &str,
+    start: u64,
+    delete: u64,
+    insert: &[serde_json::Value],
+) -> Result<()> {
+    let target = if path.is_empty() {
+        value
+    } else {
+        get_json_pointer_mut(value, path).ok_or_else(|| {
+            ArgosError::Invalid(format!(
+                "metadata delta splice target does not exist: {path}"
+            ))
+        })?
+    };
+    let items = target.as_array_mut().ok_or_else(|| {
+        ArgosError::Invalid(format!(
+            "metadata delta splice target is not an array: {path}"
+        ))
+    })?;
+    let start = usize::try_from(start).map_err(|_| {
+        ArgosError::Invalid(format!("metadata delta splice start overflows: {path}"))
+    })?;
+    let delete = usize::try_from(delete).map_err(|_| {
+        ArgosError::Invalid(format!("metadata delta splice delete overflows: {path}"))
+    })?;
+    let end = start.checked_add(delete).ok_or_else(|| {
+        ArgosError::Invalid(format!("metadata delta splice range overflows: {path}"))
+    })?;
+    if start > items.len() || end > items.len() {
+        return Err(ArgosError::Invalid(format!(
+            "metadata delta splice range {start}..{end} outside array length {}: {path}",
+            items.len()
+        )));
+    }
+    items.splice(start..end, insert.iter().cloned());
+    Ok(())
 }
 
 fn set_json_pointer(
