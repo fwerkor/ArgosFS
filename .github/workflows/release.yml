@@ -259,7 +259,7 @@ jobs:
             echo 'Missing repository secret AUR_SSH_PRIVATE_KEY. Add its public key to your AUR account.' >&2
             exit 1
           }
-      - uses: webfactory/ssh-agent@v0.9.1
+      - uses: webfactory/ssh-agent@v0.10.0
         with:
           ssh-private-key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
       - name: Configure verified AUR SSH host key
