@@ -2549,6 +2549,19 @@ fn read_latest_journal_metadata(
                             })
                             .1
                             .insert(sb.disk_id.clone());
+                        // A journal rollover resets the per-member log. When the
+                        // quorum-selected checkpoint is older than this member's
+                        // certified physical checkpoint, subsequent deltas must
+                        // chain from the latter, not from the older quorum base.
+                        // This matters when only one current slot survives and
+                        // the protected older slots form the physical quorum.
+                        if checkpoint
+                            && latest
+                                .as_ref()
+                                .is_none_or(|base| candidate.txid > base.txid)
+                        {
+                            latest = Some(candidate.clone());
+                        }
                         cursor += 36 + len as u64;
                         continue;
                     }
