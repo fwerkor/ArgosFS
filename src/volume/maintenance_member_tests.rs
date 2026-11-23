@@ -112,6 +112,96 @@ fn targeted_member_repair_rejects_unknown_and_transient_offline_members() {
 }
 
 #[test]
+fn targeted_member_repair_without_spare_is_deferred_and_retryable() {
+    let dir = tempdir().unwrap();
+    let fs = ArgosFs::create(
+        dir.path(),
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            compression: Compression::None,
+            chunk_size: 4096,
+            ..VolumeConfig::default()
+        },
+        3,
+        false,
+    )
+    .unwrap();
+    let payload = vec![0x5a; 8192];
+    fs.write_file("/recoverable", &payload, 0o600).unwrap();
+    let member = fs
+        .metadata_snapshot()
+        .inodes
+        .values()
+        .find(|inode| inode.kind == NodeKind::File)
+        .unwrap()
+        .blocks[0]
+        .shards[0]
+        .disk_id
+        .clone();
+    fs.mark_disk(&member, DiskStatus::Failed).unwrap();
+
+    let report = fs.repair_member_shards(&member, |_, _, _| {}).unwrap();
+    assert_eq!(report.files_checked, 1, "{report:?}");
+    assert_eq!(report.damaged_files, 1, "{report:?}");
+    assert_eq!(report.repaired_files, 0, "{report:?}");
+    assert_eq!(report.unrecoverable_files, 0, "{report:?}");
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|error| error.contains("repair deferred")
+                && error.contains("not enough online disks")),
+        "{report:?}"
+    );
+    assert_eq!(fs.read_file("/recoverable", false).unwrap(), payload);
+
+    fs.add_disk(
+        Some(dir.path().join("replacement")),
+        None,
+        None,
+        Some(64 * 1024 * 1024),
+        false,
+    )
+    .unwrap();
+    let retry = fs.repair_member_shards(&member, |_, _, _| {}).unwrap();
+    assert_eq!(retry.repaired_files, 1, "{retry:?}");
+    assert_eq!(retry.unrecoverable_files, 0, "{retry:?}");
+    assert_eq!(fs.read_file("/recoverable", false).unwrap(), payload);
+}
+
+#[test]
+fn targeted_member_repair_reports_insufficient_survivors_as_unrecoverable() {
+    let (_dir, fs) = redundant_host_volume();
+    fs.write_file("/lost", &[0x29; 8192], 0o600).unwrap();
+    let snapshot = fs.metadata_snapshot();
+    let block = &snapshot
+        .inodes
+        .values()
+        .find(|inode| inode.kind == NodeKind::File)
+        .unwrap()
+        .blocks[0];
+    let failed = &block.shards[0].disk_id;
+    let corrupt = &block.shards[1];
+    let path = fs.shard_path_locked(&snapshot, &corrupt.disk_id, &corrupt.relpath);
+    fs.mark_disk(failed, DiskStatus::Failed).unwrap();
+    std::fs::write(path, b"corrupted shard").unwrap();
+
+    let report = fs.repair_member_shards(failed, |_, _, _| {}).unwrap();
+    assert_eq!(report.files_checked, 1, "{report:?}");
+    assert_eq!(report.damaged_files, 1, "{report:?}");
+    assert_eq!(report.repaired_files, 0, "{report:?}");
+    assert_eq!(report.unrecoverable_files, 1, "{report:?}");
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|error| error.contains("unrecoverable stripe")),
+        "{report:?}"
+    );
+}
+
+#[test]
 fn full_scrub_progress_preserves_complete_verification() {
     let (_dir, fs) = redundant_host_volume();
     fs.write_file("/data", &[3_u8; 4096], 0o600).unwrap();

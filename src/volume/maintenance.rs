@@ -1382,10 +1382,20 @@ impl ArgosFs {
                         report.repaired_files += 1;
                     }
                     Ok(_) => {}
-                    Err(err) => {
+                    Err(err @ ArgosError::UnrecoverableStripe { .. }) => {
                         report.damaged_files += 1;
                         report.unrecoverable_files += 1;
                         report.errors.push(format!("inode {ino}: {err}"));
+                    }
+                    Err(err) => {
+                        // Only a proven unrecoverable stripe counts as data
+                        // loss. Placement, capacity and transient I/O errors
+                        // leave the degraded stripe available for a later
+                        // retry, as full scrub does for deferred repairs.
+                        report.damaged_files += 1;
+                        report
+                            .errors
+                            .push(format!("inode {ino}: repair deferred: {err}"));
                     }
                 }
             }

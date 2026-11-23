@@ -134,6 +134,11 @@ Both targeted and full scrubs emit JSON progress records to **stderr**,
 leaving the final JSON report on stdout. This allows callers to preserve
 completed-file, reconstructed-shard, write-byte and error counts if an
 external timeout terminates a long verification before its final report.
+Targeted recovery also emits its scope warning as a JSON `member-rebuild-start`
+event, so every line of the stderr stream can be parsed as JSONL.
+If enough verified shards survive but no spare member or capacity is available,
+the report records `repair deferred` in `errors` without incrementing
+`unrecoverable_files`; after adding capacity, rerun targeted recovery.
 It does not make an interrupted transaction recoverable by itself; the
 normal journal protocol remains authoritative.
 
