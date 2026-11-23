@@ -23,6 +23,107 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  release-packaging-changes:
+    name: Detect release packaging changes
+    runs-on: ubuntu-24.04
+    outputs:
+      run: ${{ steps.detect.outputs.run }}
+    steps:
+      - name: Checkout history for changed-file detection
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Check release packaging inputs
+        id: detect
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import subprocess
+
+          run = True  # Always test manual dispatches and unknown history.
+          base, head = os.environ.get("BASE_SHA", ""), os.environ["HEAD_SHA"]
+          if os.environ["GITHUB_EVENT_NAME"] != "workflow_dispatch" and base and set(base) != {"0"}:
+              try:
+                  if os.environ["GITHUB_EVENT_NAME"] == "pull_request":
+                      base = subprocess.check_output(
+                          ["git", "merge-base", base, head], text=True
+                      ).strip()
+                  changed = subprocess.check_output(
+                      ["git", "diff", "--name-only", base, head], text=True
+                  ).splitlines()
+              except subprocess.CalledProcessError:
+                  pass  # Missing ancestry should never silently skip validation.
+              else:
+                  inputs = {
+                      ".github/workflows/release.yml",
+                      ".github/workflows/release-packaging-ci.yml",
+                      ".github/workflows/rust-ci.yml",
+                      "flake.nix", "flake.lock", "Cargo.toml", "Cargo.lock",
+                  }
+                  run = any(path in inputs or path.startswith("scripts/release/")
+                            for path in changed)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              print(f"run={str(run).lower()}", file=output)
+          print(f"Release packaging validation required: {run}")
+          PY
+
+  release-metadata:
+    name: Release metadata and AUR manifests
+    needs: release-packaging-changes
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        if: needs.release-packaging-changes.outputs.run == 'true'
+      - name: Verify release helper tests
+        if: needs.release-packaging-changes.outputs.run == 'true'
+        run: python3 -m unittest discover -s scripts/release -p 'test_*.py' -v
+      - name: Render AUR packages from local artifact fixtures
+        if: needs.release-packaging-changes.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          version="$(python3 scripts/release/release.py check)"
+          mkdir -p dist
+          for name in \
+            "argosfs-${version}-source.tar.gz" \
+            "argosfs-${version}-x86_64-unknown-linux-gnu.tar.gz" \
+            "argosfs-${version}-aarch64-unknown-linux-gnu.tar.gz"; do
+            printf 'fixture: %s\n' "${name}" > "dist/${name}"
+          done
+          (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+          python3 scripts/release/release.py aur --version "${version}" --dist dist --out aur
+          for package in argosfs argosfs-bin; do
+            bash -n "aur/${package}/PKGBUILD"
+            docker run --rm -v "${PWD}/aur/${package}:/src:ro" archlinux:base-devel \
+              bash -c 'useradd -m builder && cp /src/PKGBUILD /home/builder/PKGBUILD && su builder -c "cd ~ && makepkg --printsrcinfo"' \
+              > "aur/${package}/.SRCINFO"
+            grep -Fq "pkgname = ${package}" "aur/${package}/.SRCINFO"
+            grep -Fq "pkgver = ${version}" "aur/${package}/.SRCINFO"
+          done
+
+  nix:
+    name: Nix flake build (x86_64 Linux)
+    needs: release-packaging-changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        if: needs.release-packaging-changes.outputs.run == 'true'
+      - uses: cachix/install-nix-action@v31
+        if: needs.release-packaging-changes.outputs.run == 'true'
+      - name: Validate Nix flake output structure
+        if: needs.release-packaging-changes.outputs.run == 'true'
+        run: nix flake check --no-build --show-trace
+      - name: Compile and test the Nix package
+        if: needs.release-packaging-changes.outputs.run == 'true'
+        run: nix build .#argosfs --print-build-logs --show-trace
+      - name: Smoke-test Nix executable
+        if: needs.release-packaging-changes.outputs.run == 'true'
+        run: ./result/bin/argosfs --help
+
   rust-style:
     name: Rust format, lint, docs
     runs-on: ubuntu-24.04
@@ -436,6 +537,9 @@ jobs:
       - security-validation
       - coverage-validation
       - performance-validation
+      - release-packaging-changes
+      - release-metadata
+      - nix
     if: always()
     steps:
       - name: Verify required Rust CI gates
