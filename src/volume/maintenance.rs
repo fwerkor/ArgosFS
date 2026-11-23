@@ -814,6 +814,7 @@ impl ArgosFs {
         cursor: Option<InodeId>,
     ) -> (FsckReport, Option<InodeId>) {
         let mut report = FsckReport::default();
+        let repair_before = self.repair_counters.snapshot();
         if max_files == 0 {
             return (report, cursor);
         }
@@ -878,6 +879,8 @@ impl ArgosFs {
             .read_recovered
             .load(std::sync::atomic::Ordering::Relaxed)
             .saturating_sub(recovered_before);
+        self.repair_counters
+            .add_to_report(&mut report, repair_before);
         (report, next_cursor)
     }
 
@@ -934,6 +937,7 @@ impl ArgosFs {
         remove_orphans: bool,
     ) -> Result<FsckReport> {
         let mut report = FsckReport::default();
+        let repair_before = self.repair_counters.snapshot();
         let retries_before = self
             .read_retries_seen
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -1123,66 +1127,31 @@ impl ArgosFs {
                     }
                     if !damaged_blocks.is_empty() {
                         report.damaged_files += 1;
-                        // Only reconstruct stripes that failed verification. A healthy
-                        // file must not be decoded in full: its logical size may be
-                        // arbitrarily larger than MAX_IN_MEMORY_IO_BYTES.
-                        // Check all damaged stripes before mutating the inode so an
-                        // unrecoverable stripe cannot cause a partial repair.
-                        let reconstruction = damaged_blocks.iter().try_for_each(|block| {
-                            let data =
-                                self.read_inode(ino, block.raw_offset, block.raw_size, false)?;
-                            if data.len() != block.raw_size {
-                                return Err(ArgosError::Invalid(format!(
-                                    "stripe {} decoded {} bytes, expected {}",
-                                    block.stripe_id,
-                                    data.len(),
-                                    block.raw_size
-                                )));
-                            }
-                            Ok(())
-                        });
-                        if let Err(err) = reconstruction {
-                            report.unrecoverable_files += 1;
-                            report.errors.push(format!("inode {ino}: {err}"));
-                            continue;
-                        }
+                        // Each damaged stripe was checked against its raw
+                        // checksum above. Publish only reconstructed physical
+                        // shards; never re-encode or replace healthy extents.
                         if repair {
-                            let file_size = usize::try_from(inode.size).map_err(|_| {
-                                ArgosError::Invalid(format!("inode {ino} size exceeds usize"))
-                            })?;
-                            for block in damaged_blocks {
-                                let data =
-                                    self.read_inode(ino, block.raw_offset, block.raw_size, false)?;
-                                let start = usize::try_from(block.raw_offset).map_err(|_| {
-                                    ArgosError::Invalid(format!(
-                                        "stripe {} offset exceeds usize",
-                                        block.stripe_id
-                                    ))
-                                })?;
-                                let end = start.checked_add(block.raw_size).ok_or_else(|| {
-                                    ArgosError::Invalid(format!(
-                                        "stripe {} offset overflow",
-                                        block.stripe_id
-                                    ))
-                                })?;
-                                maintenance_after_read_delay();
-                                let mut meta = self.meta.write();
-                                self.rewrite_inode_window_locked(
-                                    &mut meta,
-                                    ino,
-                                    start,
-                                    end,
-                                    file_size,
-                                    &data,
-                                    0,
-                                    false,
-                                    true,
-                                    "fsck-repair",
-                                    json!({"inode": ino, "stripe": block.stripe_id}),
-                                    None,
-                                )?;
+                            let stripes = damaged_blocks
+                                .iter()
+                                .map(|block| block.stripe_id.clone())
+                                .collect::<BTreeSet<_>>();
+                            maintenance_after_read_delay();
+                            let mut meta = self.meta.write();
+                            match self.repair_inode_shards_locked(
+                                &mut meta,
+                                ino,
+                                Some(&stripes),
+                                true,
+                                "fsck-repair",
+                            ) {
+                                Ok(count) if count > 0 => report.repaired_files += 1,
+                                Ok(_) => {}
+                                Err(err) => {
+                                    report
+                                        .errors
+                                        .push(format!("inode {ino}: repair deferred: {err}"));
+                                }
                             }
-                            report.repaired_files += 1;
                         }
                     }
                 }
@@ -1280,6 +1249,8 @@ impl ArgosFs {
             .read_recovered
             .load(std::sync::atomic::Ordering::Relaxed)
             .saturating_sub(recovered_before);
+        self.repair_counters
+            .add_to_report(&mut report, repair_before);
         Ok(report)
     }
 

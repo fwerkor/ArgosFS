@@ -405,6 +405,7 @@ impl ArgosFs {
         self.decode_inode_data_with_cache_policy_locked(meta, inode, BlockCachePolicy::Normal)
     }
 
+    #[cfg(test)]
     pub(super) fn decode_inode_data_with_cache_policy_locked(
         &self,
         meta: &Metadata,

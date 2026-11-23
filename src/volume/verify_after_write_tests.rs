@@ -281,6 +281,92 @@ fn redundant_pool_can_quarantine_one_corrupted_member_without_write_fence() {
 }
 
 #[test]
+fn repaired_raw_extent_is_verified_against_its_original_stripe() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..4)
+        .map(|index| dir.path().join(format!("member-{index}.img")))
+        .collect::<Vec<_>>();
+    let mut fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            ..VolumeConfig::default()
+        },
+        MIN_DEVICE_BYTES,
+        "verify-repair",
+        false,
+    )
+    .unwrap();
+    fs.write_file("/data", &vec![7u8; 4096], 0o600).unwrap();
+    let ino = fs.resolve_path("/data", true).unwrap();
+    let (stripe_id, removed_disk, slot) = {
+        let meta = fs.meta.read();
+        let block = &meta.inodes[&ino].blocks[0];
+        (
+            block.stripe_id.clone(),
+            block.shards[0].disk_id.clone(),
+            block.shards[0].slot,
+        )
+    };
+    fs.mark_disk(&removed_disk, DiskStatus::Removed).unwrap();
+
+    // Hold verification until the repair commits and its extent is corrupted.
+    let verifier = start(&fs, 60_000, 0);
+    fs.verify_written = Some(verifier.clone());
+    let report = fs.scrub().unwrap();
+    assert_eq!(report.reconstructed_shards, 1, "{report:?}");
+    let (disk_id, offset, generation, hash, size) = {
+        let meta = fs.meta.read();
+        let block = &meta.inodes[&ino].blocks[0];
+        assert_eq!(block.stripe_id, stripe_id);
+        let shard = block
+            .shards
+            .iter()
+            .find(|shard| shard.slot == slot)
+            .unwrap();
+        assert_ne!(shard.disk_id, removed_disk);
+        let Some(ShardLocation::RawExtent(extent)) = &shard.location else {
+            panic!("repaired shard must be a raw extent");
+        };
+        (
+            shard.disk_id.clone(),
+            extent.offset,
+            extent.generation,
+            shard.sha256.clone(),
+            shard.size,
+        )
+    };
+
+    {
+        let queue = verifier.queue.lock().unwrap();
+        assert_eq!(queue.pending.len(), 1);
+        let op = queue.pending.front().unwrap();
+        assert_eq!(op.stripe_id, stripe_id);
+        assert_eq!(op.disk_id, disk_id);
+        assert_eq!(op.offset, offset);
+        assert_eq!(op.generation, generation);
+        assert_eq!(op.hash, hash);
+    }
+
+    // Corruption in the newly allocated COW extent must still quarantine it.
+    fs.backend
+        .write_at(&disk_id, offset, &vec![0x5a; size])
+        .unwrap();
+    fs.backend.flush_device(&disk_id).unwrap();
+    {
+        let mut queue = verifier.queue.lock().unwrap();
+        queue.pending.front_mut().unwrap().due = Instant::now();
+    }
+    verifier.work.notify_one();
+    wait_for(&verifier, 1);
+    assert_eq!(verifier.failures(), 1);
+    assert!(fs.quarantined_devices.lock().contains(&disk_id));
+    verifier.stop();
+}
+
+#[test]
 fn shutting_down_verifier_does_not_skip_clean_unmount() {
     let (dir, mut fs, _stripe, _offset, _generation, _data) = fixture();
     let verifier = start(&fs, 10_000, 0);

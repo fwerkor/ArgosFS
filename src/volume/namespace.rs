@@ -581,7 +581,7 @@ impl ArgosFs {
         } else {
             BlockCachePolicy::Normal
         };
-        let (mut data, mut damaged) = self.decode_inode_range_with_cache_policy_locked(
+        let (data, damaged) = self.decode_inode_range_with_cache_policy_locked(
             &meta,
             &inode,
             start,
@@ -603,34 +603,29 @@ impl ArgosFs {
             )
         });
         if repair && has_repairable_damage {
-            let mut repair_damaged = damaged.clone();
-            let (full, full_damaged) = self.decode_inode_data_with_cache_policy_locked(
-                &meta,
-                &inode,
-                BlockCachePolicy::Bypass,
-            )?;
-            for entry in full_damaged {
-                if !repair_damaged.contains(&entry) {
-                    repair_damaged.push(entry);
-                }
-            }
-            damaged = repair_damaged;
-            let repair_result = self.replace_inode_data_locked(
+            // The bytes have already been verified and decoded. Repair only
+            // physical shard slots belonging to the requested stripes; never
+            // decode and rewrite the entire file or generate new encryption
+            // nonces for healthy shards.
+            let selected = inode
+                .blocks
+                .iter()
+                .filter(|block| {
+                    let block_start = block.raw_offset as usize;
+                    let block_end = block_start.saturating_add(block.raw_size);
+                    block_start < end && block_end > start
+                })
+                .map(|block| block.stripe_id.clone())
+                .collect::<BTreeSet<_>>();
+            match self.repair_inode_shards_locked(
                 &mut meta,
                 ino,
-                &full,
+                Some(&selected),
+                repair_offline,
                 "self-heal",
-                json!({"damaged": damaged}),
-                true,
-                &BTreeSet::new(),
-            );
-            match repair_result {
-                Ok(()) => {
-                    repaired = true;
-                    data = full[start..end].to_vec();
-                }
+            ) {
+                Ok(count) => repaired = count > 0,
                 Err(err) => {
-                    data = full[start..end].to_vec();
                     if self.ensure_block_backend_writable_locked(&meta).is_ok() {
                         self.journal_locked(
                             &meta,
