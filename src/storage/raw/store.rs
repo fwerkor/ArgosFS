@@ -33,6 +33,9 @@ const METADATA_FORMAT_TREE_ZSTD: u32 = 2;
 const METADATA_DECOMPRESSED_MAX: u64 = 4 * 1024 * 1024 * 1024;
 const CHECKPOINT_ZSTD_LEVEL: i32 = 3;
 const METADATA_PAGE_SIZE: usize = 4096;
+// Prepare contiguous writes once for all members and both checkpoint slots.
+// 1 MiB bounds transient buffers and keeps raw/USB requests manageable.
+const CHECKPOINT_BATCH_BYTES: usize = 1024 * 1024;
 const METADATA_INDEX_ENTRY_SIZE: usize = 48;
 const HASH_HEX_LEN: usize = 64;
 const HASH_BYTES_LEN: usize = 32;
@@ -2603,12 +2606,14 @@ fn metadata_tree_checkpoint_encoded(
     }
 
     let mut index = vec![0u8; index_len];
-    let mut body_writes = Vec::with_capacity(page_count + 1);
+    let mut body_writes = Vec::with_capacity(bytes.len().div_ceil(CHECKPOINT_BATCH_BYTES) + 1);
+    let mut batch_offset = 0u64;
+    let mut batch = Vec::with_capacity(CHECKPOINT_BATCH_BYTES);
     for page_index in 0..page_count {
         let start = page_index * METADATA_PAGE_SIZE;
         let end = (start + METADATA_PAGE_SIZE).min(bytes.len());
-        let page = bytes[start..end].to_vec();
-        let page_hash = Sha256::digest(&page);
+        let page = &bytes[start..end];
+        let page_hash = Sha256::digest(page);
         let entry_start = page_index * METADATA_INDEX_ENTRY_SIZE;
         let entry = &mut index[entry_start..entry_start + METADATA_INDEX_ENTRY_SIZE];
         entry[..HASH_BYTES_LEN].copy_from_slice(&page_hash);
@@ -2622,7 +2627,23 @@ fn metadata_tree_checkpoint_encoded(
             })?;
         put_u64(entry, 32, relative_offset);
         put_u32(entry, 40, page.len() as u32);
-        body_writes.push((relative_offset, page));
+        if batch.is_empty() {
+            batch_offset = relative_offset;
+        }
+        // Page boundaries remain unchanged in the on-disk index. The write
+        // batches are an I/O-only optimization; the reader still validates
+        // each individual 4 KiB page plus the full metadata checksum.
+        if !batch.is_empty()
+            && (batch_offset + batch.len() as u64 != relative_offset
+                || batch.len() + page.len() > CHECKPOINT_BATCH_BYTES)
+        {
+            body_writes.push((batch_offset, std::mem::take(&mut batch)));
+            batch_offset = relative_offset;
+        }
+        batch.extend_from_slice(page);
+    }
+    if !batch.is_empty() {
+        body_writes.push((batch_offset, batch));
     }
     let index_hash = sha256_hex(&index);
     body_writes.push((RAW_HEADER_SIZE as u64, index));

@@ -1183,7 +1183,11 @@ fn metadata_tree_checkpoint_covers_pages_headers_and_capacity_errors() {
     assert_eq!(get_u64(&checkpoint.header, 32).unwrap(), bytes.len() as u64);
     assert_eq!(get_u64(&checkpoint.header, 136).unwrap(), 8);
     assert_eq!(get_u64(&checkpoint.header, 152).unwrap(), 3);
-    assert_eq!(checkpoint.body_writes.len(), 4);
+    // Three metadata pages are written in one contiguous body batch, then
+    // the index is written separately before the header is made durable.
+    assert_eq!(checkpoint.body_writes.len(), 2);
+    let data_batch = &checkpoint.body_writes[0];
+    assert_eq!(data_batch.1, bytes);
     assert!(checkpoint
         .body_writes
         .iter()
@@ -1197,6 +1201,45 @@ fn metadata_tree_checkpoint_covers_pages_headers_and_capacity_errors() {
         metadata_tree_checkpoint("disk", 0, 0, &bytes, &hash, 4096),
         Err(ArgosError::DiskFull { .. })
     ));
+}
+
+#[test]
+fn checkpoint_batches_contiguous_pages_without_changing_recovery_bytes() {
+    let (_dir, images, _, superblocks) = quorum_fixture();
+    let backend = block_backend_for(&images);
+    // Cross multiple batch boundaries and end with a short partial page.
+    // No change to page offsets/digests on disk is permitted.
+    let bytes = (0..(2 * CHECKPOINT_BATCH_BYTES + 17))
+        .map(|index| (index as u64 * 31 % 251) as u8)
+        .collect::<Vec<_>>();
+    let hash = sha256_hex(&bytes);
+    let checkpoint = metadata_tree_checkpoint(
+        "disk",
+        777,
+        778,
+        &bytes,
+        &hash,
+        superblocks[0].metadata.length / 2,
+    )
+    .unwrap();
+    let data_batches = &checkpoint.body_writes[..checkpoint.body_writes.len() - 1];
+    assert_eq!(data_batches.len(), 3);
+    assert_eq!(data_batches[0].1.len(), CHECKPOINT_BATCH_BYTES);
+    assert_eq!(data_batches[1].1.len(), CHECKPOINT_BATCH_BYTES);
+    assert_eq!(data_batches[2].1.len(), 17);
+    let sb = &superblocks[0];
+    write_metadata_slot(&backend, sb, sb.metadata.offset, &checkpoint, None).unwrap();
+    assert_eq!(
+        read_tree_metadata_candidate(
+            &backend,
+            sb,
+            sb.metadata.offset,
+            sb.metadata.length / 2,
+            &checkpoint.header,
+        )
+        .unwrap(),
+        bytes,
+    );
 }
 
 #[test]
