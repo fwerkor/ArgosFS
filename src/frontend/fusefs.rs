@@ -1,3 +1,4 @@
+use super::fuse_directory_cache::{DirectoryListingCache, DirectoryRevision};
 use super::fuse_queue::FuseRequestExecutor;
 use super::metrics;
 use crate::acl;
@@ -63,6 +64,7 @@ pub struct ArgosFuseShared {
     volume: ArgosFs,
     writeback: Mutex<FuseWriteback>,
     handles: Mutex<FuseHandles>,
+    directory_cache: Mutex<DirectoryListingCache>,
     statfs_cache: Mutex<StatfsSnapshot>,
 }
 
@@ -364,6 +366,7 @@ impl ArgosFuse {
                 volume,
                 writeback: Mutex::new(FuseWriteback::default()),
                 handles: Mutex::new(FuseHandles::default()),
+                directory_cache: Mutex::new(DirectoryListingCache::default()),
                 statfs_cache: Mutex::new(snapshot),
             }),
             commit_worker,
@@ -392,6 +395,31 @@ impl ArgosFuse {
 }
 
 impl ArgosFuseShared {
+    fn directory_listing(&self, ino: InodeId) -> Result<Arc<Vec<crate::volume::DirEntry>>> {
+        let current = self.volume.attr_inode(ino)?;
+        if current.kind != NodeKind::Directory {
+            return Err(ArgosError::NotDirectory(format!("inode {ino}")));
+        }
+        if let Some(entries) = self
+            .directory_cache
+            .lock()
+            .get(ino, DirectoryRevision::from(&current))
+        {
+            return Ok(entries);
+        }
+        // Materialize outside the cache lock. Each listing is constructed
+        // from one metadata read snapshot; '.' carries its exact revision.
+        let entries = Arc::new(self.volume.readdir(ino)?);
+        if let Some(dot) = entries.first() {
+            self.directory_cache.lock().insert(
+                ino,
+                DirectoryRevision::from(&dot.attr),
+                Arc::clone(&entries),
+            );
+        }
+        Ok(entries)
+    }
+
     fn statfs_snapshot(&self) -> StatfsSnapshot {
         let unavailable = self.volume.runtime_unavailable_devices();
         if let Some(meta) = self.volume.try_metadata_snapshot() {
@@ -1981,10 +2009,14 @@ impl Filesystem for ArgosFuse {
             shared.flush_all_writeback_best_effort();
             match shared
                 .require_access(req, ino, libc::R_OK)
-                .and_then(|()| shared.volume.readdir(ino.0))
+                .and_then(|()| shared.directory_listing(ino.0))
             {
                 Ok(entries) => {
-                    for (idx, entry) in entries.into_iter().enumerate().skip(offset as usize) {
+                    for (idx, entry) in entries
+                        .iter()
+                        .enumerate()
+                        .skip(usize::try_from(offset).unwrap_or(usize::MAX))
+                    {
                         let full = reply.add(
                             INodeNo(entry.attr.ino),
                             (idx + 1) as u64,
@@ -2016,11 +2048,26 @@ impl Filesystem for ArgosFuse {
             shared.flush_all_writeback_best_effort();
             match shared
                 .require_access(req, ino, libc::R_OK | libc::X_OK)
-                .and_then(|()| shared.volume.readdir(ino.0))
+                .and_then(|()| shared.directory_listing(ino.0))
             {
                 Ok(entries) => {
-                    for (idx, entry) in entries.into_iter().enumerate().skip(offset as usize) {
-                        let attr = to_file_attr(&entry.attr);
+                    for (idx, entry) in entries
+                        .iter()
+                        .enumerate()
+                        .skip(usize::try_from(offset).unwrap_or(usize::MAX))
+                    {
+                        // Child sizes and timestamps can change without a
+                        // parent-directory mutation. Never cache a stale
+                        // readdirplus attribute with the directory listing.
+                        let current = match shared.visible_inode_attr(entry.attr.ino) {
+                            Ok(attr) => attr,
+                            Err(ArgosError::NotFound(_)) => continue,
+                            Err(err) => {
+                                reply.error(errno(&err));
+                                return;
+                            }
+                        };
+                        let attr = to_file_attr(&current);
                         let full = reply.add(
                             INodeNo(entry.attr.ino),
                             (idx + 1) as u64,
