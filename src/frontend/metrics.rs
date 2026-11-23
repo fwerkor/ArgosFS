@@ -225,6 +225,15 @@ fn emit_commit_metrics(volume: &ArgosFs, emitter: &mut MetricEmitter<'_>) {
             "counter",
         );
     }
+    for (strategy, attempts) in volume.commit_metrics().rollover_member_strategy_snapshots() {
+        emitter.typed_metric(
+            "argosfs_checkpoint_rollover_member_strategy_total",
+            "Attempted raw journal rollover member writes by checkpoint strategy",
+            attempts as f64,
+            &[("strategy", strategy)],
+            "counter",
+        );
+    }
     for (reason, attempts) in volume.commit_metrics().checkpoint_reason_snapshots() {
         emitter.typed_metric(
             "argosfs_checkpoint_reason_total",

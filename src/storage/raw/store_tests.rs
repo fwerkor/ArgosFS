@@ -2011,3 +2011,6 @@ fn v2_crash_after_quorum_commit_recovers_authenticated_delta() {
     assert_eq!(recovered.integrity.meta_hash, next.integrity.meta_hash);
     assert_eq!(recovered.raw_pool.pool_name, "v2-committed");
 }
+
+#[path = "store_tests/rollover_slot.rs"]
+mod rollover_slot;
