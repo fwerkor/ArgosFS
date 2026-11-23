@@ -81,7 +81,9 @@ fn protected_rollover_preserves_prior_checkpoint_and_halves_physical_bytes() {
     let backend = block_backend_for(&images);
     let next = next_metadata(&previous, "one-slot-rollover");
     force_small_rollover_journal(&backend, &mut superblocks);
-    let slots = protected_rollover_slot_targets(&backend, &superblocks, 2).unwrap();
+    let slots = protected_rollover_slot_targets(&backend, &superblocks, 2)
+        .unwrap()
+        .unwrap();
     assert_eq!(slots.len(), 3);
     let checkpoint = prepare_checkpoint_writes(&next, &superblocks).unwrap();
     let bytes_per_slot = RAW_HEADER_SIZE as u64
@@ -173,7 +175,9 @@ fn protected_rollover_verifies_old_bytes_and_falls_back_on_corrupt_member() {
             .write_at(&bad.disk_id, offset + first_data, &[0x7f])
             .unwrap();
     }
-    let targets = protected_rollover_slot_targets(&backend, &superblocks, 2).unwrap();
+    let targets = protected_rollover_slot_targets(&backend, &superblocks, 2)
+        .unwrap()
+        .unwrap();
     assert_eq!(targets.len(), 2);
     assert!(!targets.contains_key(&bad.disk_id));
     let next = next_metadata(&previous, "corrupt-member-fallback");
@@ -206,7 +210,9 @@ fn torn_new_slot_does_not_destroy_old_checkpoint_or_quorum_recovery() {
     let (_dir, images, previous, mut superblocks) = quorum_fixture();
     let backend = block_backend_for(&images);
     force_small_rollover_journal(&backend, &mut superblocks);
-    let targets = protected_rollover_slot_targets(&backend, &superblocks, 2).unwrap();
+    let targets = protected_rollover_slot_targets(&backend, &superblocks, 2)
+        .unwrap()
+        .unwrap();
     let sb = &superblocks[0];
     let slot = *targets.get(&sb.disk_id).unwrap();
     let slot_start = sb.metadata.offset + slot * (sb.metadata.length / 2);
@@ -308,7 +314,9 @@ fn compressed_large_metadata_rollover_keeps_verified_old_slot() {
             .unwrap();
         assert_eq!(get_u32(&header, 20).unwrap(), METADATA_FORMAT_TREE_ZSTD);
     }
-    let targets = protected_rollover_slot_targets(&backend, &superblocks, 2).unwrap();
+    let targets = protected_rollover_slot_targets(&backend, &superblocks, 2)
+        .unwrap()
+        .unwrap();
     assert_eq!(targets.len(), 3);
     let next = next_metadata(&previous, "compressed-protected-rollover");
     force_small_rollover_journal(&backend, &mut superblocks);
@@ -340,4 +348,109 @@ fn compressed_large_metadata_rollover_keeps_verified_old_slot() {
     let recovered = recover_metadata(&backend, &superblocks).unwrap();
     assert_eq!(recovered.txid, next.txid);
     assert_eq!(recovered.inodes.len(), previous.inodes.len());
+}
+
+#[test]
+fn rollover_refuses_to_erase_last_certified_replay_base() {
+    let (_dir, images, previous, mut superblocks) = quorum_fixture();
+    let backend = block_backend_for(&images);
+    let full_lengths = superblocks
+        .iter()
+        .map(|sb| sb.journal.length)
+        .collect::<Vec<_>>();
+    let checkpointed = next_metadata(&previous, "certified-checkpoint");
+    force_small_rollover_journal(&backend, &mut superblocks);
+    append_transaction_with_trusted_integrity_quorum(
+        &backend,
+        &superblocks,
+        &checkpointed,
+        Some(&previous),
+        "initial-rollover",
+        serde_json::json!({"payload": "x".repeat(64 * 1024)}),
+    )
+    .unwrap();
+    for (sb, full_len) in superblocks.iter_mut().zip(full_lengths) {
+        sb.journal.length = full_len;
+    }
+    let acknowledged = next_metadata(&checkpointed, "acknowledged-delta");
+    append_transaction_with_trusted_integrity_quorum(
+        &backend,
+        &superblocks,
+        &acknowledged,
+        Some(&checkpointed),
+        "acknowledged-delta",
+        serde_json::json!({"previous_meta_hash": checkpointed.integrity.meta_hash}),
+    )
+    .unwrap();
+
+    // Two current checkpoint bodies are corrupt. Their older slots still
+    // form a physical quorum, but only the third member can validate the
+    // newer checkpoint certificate and replay the acknowledged journal delta.
+    for sb in &superblocks[..2] {
+        let slot_len = sb.metadata.length / 2;
+        let new_slot = read_metadata_candidates(&backend, sb)
+            .unwrap()
+            .iter()
+            .position(|(candidate, _)| {
+                candidate
+                    .as_ref()
+                    .is_some_and(|m| m.txid == checkpointed.txid)
+            })
+            .unwrap();
+        let slot_offset = sb.metadata.offset + new_slot as u64 * slot_len;
+        let mut header = [0u8; RAW_HEADER_SIZE];
+        backend
+            .read_at(&sb.disk_id, slot_offset, &mut header)
+            .unwrap();
+        let data_offset = align_up(
+            RAW_HEADER_SIZE as u64 + get_u64(&header, 160).unwrap(),
+            METADATA_PAGE_SIZE as u64,
+        );
+        let mut byte = [0u8; 1];
+        backend
+            .read_at(&sb.disk_id, slot_offset + data_offset, &mut byte)
+            .unwrap();
+        byte[0] ^= 1;
+        backend
+            .write_at(&sb.disk_id, slot_offset + data_offset, &byte)
+            .unwrap();
+    }
+    assert_eq!(
+        recover_metadata(&backend, &superblocks).unwrap().txid,
+        acknowledged.txid
+    );
+    let survivor = superblocks[2].clone();
+    let before_slots = checkpoint_slot_txids(&backend, &survivor);
+    let before_journal = raw_journal_end(&backend, &survivor);
+
+    // A one-member rollover would overwrite the last current checkpoint and
+    // reset its journal. Refuse the write before touching *any* member even if
+    // the other two would fail all writes (quorum failure).
+    force_small_rollover_journal(&backend, &mut superblocks);
+    let failing = WriteFailBackend {
+        inner: block_backend_for(&images),
+        failed: BTreeSet::from([
+            superblocks[0].disk_id.clone(),
+            superblocks[1].disk_id.clone(),
+        ]),
+    };
+    let attempted = next_metadata(&acknowledged, "unsafe-next-rollover");
+    let result = append_transaction_with_trusted_integrity_quorum(
+        &failing,
+        &superblocks,
+        &attempted,
+        Some(&acknowledged),
+        "unsafe-next-rollover",
+        serde_json::json!({"payload": "x".repeat(64 * 1024)}),
+    );
+    assert!(
+        matches!(&result, Err(ArgosError::Conflict(message)) if message.contains("newer valid checkpoint lacks a quorum")),
+        "{result:?}"
+    );
+    assert_eq!(checkpoint_slot_txids(&backend, &survivor), before_slots);
+    assert_eq!(raw_journal_end(&backend, &survivor), before_journal);
+    assert_eq!(
+        recover_metadata(&backend, &superblocks).unwrap().txid,
+        acknowledged.txid
+    );
 }

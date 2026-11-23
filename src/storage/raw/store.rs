@@ -754,6 +754,9 @@ fn verify_preserved_checkpoint_pages(
 /// its verified checkpoint slot untouched until the new checkpoint is durable.
 /// If the selected old checkpoint cannot be independently verified on a
 /// quorum, the caller must use the historical two-slot rewrite instead.
+/// A newer valid but unquorate checkpoint must *not* be overwritten: it may
+/// be the only remaining certified replay base for acknowledged journal deltas.
+/// Refuse the rollover until recovery/repair restores a current quorum.
 ///
 /// The validation is intentionally read-only and runs before any checkpoint
 /// write or journal truncation. It verifies the stored full payload hash and
@@ -763,7 +766,7 @@ fn protected_rollover_slot_targets(
     backend: &dyn StorageBackend,
     superblocks: &[RawSuperblock],
     need: usize,
-) -> Option<BTreeMap<String, u64>> {
+) -> Result<Option<BTreeMap<String, u64>>> {
     type CheckpointKey = (u64, u64, String);
     type SlotHeader = (u64, [u8; RAW_HEADER_SIZE]);
     let mut candidates: BTreeMap<CheckpointKey, BTreeMap<String, Vec<SlotHeader>>> =
@@ -806,13 +809,15 @@ fn protected_rollover_slot_targets(
     }
 
     // Prefer the latest checkpoint already replicated on a physical quorum.
-    // A lone recent, unquorate checkpoint is never a recovery anchor. If a
-    // member missed that checkpoint, leave it on the conservative dual-slot
-    // path while verified quorum members preserve their common older image.
+    // A lone, physically valid newer checkpoint is not a quorum anchor, but
+    // it might be the only surviving certified base for later journal deltas.
+    // Never proceed to an older quorum and overwrite that newer copy.
+    let mut newer_unquorate_valid = false;
     for (_, members) in candidates.into_iter().rev() {
-        if members.len() < need {
-            continue;
-        }
+        // Validate minority checkpoints too. A surviving certified checkpoint
+        // may be present on just one member, with an older quorum below it.
+        // Overwriting that member and resetting its journal can erase the only
+        // replay base even if every other rollover write fails.
         // Each validator has a bounded 1 MiB read buffer. Overlap reads
         // across members so 9 slow devices do not serialize this I/O.
         let targets = std::thread::scope(|scope| {
@@ -842,10 +847,21 @@ fn protected_rollover_slot_targets(
                 .collect::<BTreeMap<_, _>>()
         });
         if targets.len() >= need {
-            return Some(targets);
+            if newer_unquorate_valid {
+                return Err(ArgosError::Conflict(
+                    "refusing journal rollover: a newer valid checkpoint lacks a quorum; overwriting its last replay base could lose acknowledged transactions".to_string(),
+                ));
+            }
+            return Ok(Some(targets));
         }
+        newer_unquorate_valid |= !targets.is_empty();
     }
-    None
+    if newer_unquorate_valid {
+        return Err(ArgosError::Conflict(
+            "refusing journal rollover: no safe checkpoint quorum exists; preserve the remaining replay bases".to_string(),
+        ));
+    }
+    Ok(None)
 }
 
 fn write_metadata_member(
@@ -1722,7 +1738,7 @@ fn append_journal_quorum(
             metrics.record_checkpoint_reason(CheckpointReason::JournalRollover);
         }
         let _rollover_timer = metrics.map(|metrics| metrics.timer(CommitPhase::JournalRollover));
-        let protected_targets = protected_rollover_slot_targets(backend, &eligible, need);
+        let protected_targets = protected_rollover_slot_targets(backend, &eligible, need)?;
         if let Some(metrics) = metrics {
             let single = protected_targets.as_ref().map_or(0, BTreeMap::len);
             metrics.record_rollover_member_strategy(single, eligible.len() - single);
