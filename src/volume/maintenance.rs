@@ -1,5 +1,7 @@
 use super::*;
 
+type FsckProgress<'a> = dyn FnMut(usize, usize, &FsckReport) + 'a;
+
 impl ArgosFs {
     pub fn set_io_policy(
         &self,
@@ -927,7 +929,17 @@ impl ArgosFs {
 
     pub fn fsck(&self, repair: bool, remove_orphans: bool) -> Result<FsckReport> {
         let inodes = self.metadata_snapshot().inodes.keys().copied().collect();
-        self.fsck_inodes(inodes, repair, remove_orphans)
+        self.fsck_inodes(inodes, repair, remove_orphans, None)
+    }
+
+    /// Full scrub with bounded progress callbacks. Unlike member recovery,
+    /// all files and all physical shards are checked, including healthy ones.
+    pub fn scrub_with_progress(
+        &self,
+        mut progress: impl FnMut(usize, usize, &FsckReport),
+    ) -> Result<FsckReport> {
+        let inodes = self.meta.read().inodes.keys().copied().collect();
+        self.fsck_inodes(inodes, true, true, Some(&mut progress))
     }
 
     fn fsck_inodes(
@@ -935,6 +947,7 @@ impl ArgosFs {
         inodes: Vec<InodeId>,
         repair: bool,
         remove_orphans: bool,
+        mut progress: Option<&mut FsckProgress<'_>>,
     ) -> Result<FsckReport> {
         let mut report = FsckReport::default();
         let repair_before = self.repair_counters.snapshot();
@@ -944,7 +957,15 @@ impl ArgosFs {
         let recovered_before = self
             .read_recovered
             .load(std::sync::atomic::Ordering::Relaxed);
-        for ino in inodes {
+        let total = inodes.len();
+        for (position, ino) in inodes.into_iter().enumerate() {
+            if position > 0 && position.is_multiple_of(1024) {
+                self.repair_counters
+                    .add_to_report(&mut report, repair_before);
+                if let Some(callback) = progress.as_mut() {
+                    callback(position, total, &report);
+                }
+            }
             let kind = self
                 .meta
                 .read()
@@ -1158,6 +1179,11 @@ impl ArgosFs {
                 Some(NodeKind::Symlink | NodeKind::Special) | None => {}
             }
         }
+        self.repair_counters
+            .add_to_report(&mut report, repair_before);
+        if let Some(callback) = progress.as_mut() {
+            callback(total, total, &report);
+        }
         let meta = self.meta.read();
         let refs = meta
             .inodes
@@ -1254,6 +1280,145 @@ impl ArgosFs {
         Ok(report)
     }
 
+    /// Rebuild only shards referenced on an unavailable member. This is a
+    /// targeted recovery operation, not a replacement for a complete scrub:
+    /// unrelated members and unreferenced/orphaned extents are not checked.
+    ///
+    /// Build a transient member-to-stripe worklist from one metadata snapshot.
+    /// This costs one in-memory namespace traversal, but avoids verifying all
+    /// other files and stripes on disk. Revalidate each inode under its lock:
+    /// another writer may replace its blocks after worklist construction.
+    pub fn repair_member_shards(
+        &self,
+        disk_id: &str,
+        mut progress: impl FnMut(usize, usize, &FsckReport),
+    ) -> Result<FsckReport> {
+        let targets = {
+            let meta = self.meta.read();
+            self.ensure_block_backend_writable_locked(&meta)?;
+            let member = meta
+                .disks
+                .get(disk_id)
+                .ok_or_else(|| ArgosError::NotFound(format!("disk {disk_id}")))?;
+            let offline_ready =
+                member.status == DiskStatus::Offline && offline_member_due_for_repair(member);
+            let quarantined_ready = meta.backend != BackendKind::Host
+                && self.is_device_quarantined(disk_id)
+                && self.quarantined_member_due_for_repair(disk_id);
+            if !matches!(member.status, DiskStatus::Failed | DiskStatus::Removed)
+                && !offline_ready
+                && !quarantined_ready
+            {
+                return Err(ArgosError::Invalid(format!(
+                    "member {disk_id} is not eligible for rebuild (online or within offline grace)"
+                )));
+            }
+            let mut targets = meta
+                .inodes
+                .iter()
+                .filter_map(|(ino, inode)| {
+                    if inode.kind != NodeKind::File {
+                        return None;
+                    }
+                    let stripes = inode
+                        .blocks
+                        .iter()
+                        .filter(|block| block.shards.iter().any(|shard| shard.disk_id == disk_id))
+                        .map(|block| block.stripe_id.clone())
+                        .collect::<BTreeSet<_>>();
+                    (!stripes.is_empty()).then_some((*ino, stripes))
+                })
+                .collect::<Vec<_>>();
+            targets.sort_unstable_by_key(|(ino, _)| *ino);
+            targets
+        };
+
+        let repair_before = self.repair_counters.snapshot();
+        let retries_before = self.read_retries_seen.load(Ordering::Relaxed);
+        let recovered_before = self.read_recovered.load(Ordering::Relaxed);
+        let mut report = FsckReport::default();
+        let total = targets.len();
+        for (index, (ino, stripes)) in targets.into_iter().enumerate() {
+            let lock = self.inode_lock(ino);
+            let _guard = lock.lock();
+            let mut meta = self.meta.write();
+            // A concurrent writer might have removed this file or moved a
+            // stripe: do not apply stale worklist entries to its new blocks.
+            let live = meta
+                .inodes
+                .get(&ino)
+                .filter(|inode| inode.kind == NodeKind::File);
+            let live_stripes = live
+                .map(|inode| {
+                    inode
+                        .blocks
+                        .iter()
+                        .filter(|block| {
+                            stripes.contains(&block.stripe_id)
+                                && block.shards.iter().any(|shard| shard.disk_id == disk_id)
+                        })
+                        .map(|block| block.stripe_id.clone())
+                        .collect::<BTreeSet<_>>()
+                })
+                .unwrap_or_default();
+            if !live_stripes.is_empty() {
+                report.files_checked += 1;
+                report.missing_shards += meta.inodes[&ino]
+                    .blocks
+                    .iter()
+                    .filter(|block| live_stripes.contains(&block.stripe_id))
+                    .flat_map(|block| &block.shards)
+                    .filter(|shard| shard.disk_id == disk_id)
+                    .count() as u64;
+                match self.repair_inode_shards_locked(
+                    &mut meta,
+                    ino,
+                    Some(&live_stripes),
+                    true,
+                    "member-rebuild",
+                ) {
+                    Ok(count) if count > 0 => {
+                        report.damaged_files += 1;
+                        report.repaired_files += 1;
+                    }
+                    Ok(_) => {}
+                    Err(err @ ArgosError::UnrecoverableStripe { .. }) => {
+                        report.damaged_files += 1;
+                        report.unrecoverable_files += 1;
+                        report.errors.push(format!("inode {ino}: {err}"));
+                    }
+                    Err(err) => {
+                        // Only a proven unrecoverable stripe counts as data
+                        // loss. Placement, capacity and transient I/O errors
+                        // leave the degraded stripe available for a later
+                        // retry, as full scrub does for deferred repairs.
+                        report.damaged_files += 1;
+                        report
+                            .errors
+                            .push(format!("inode {ino}: repair deferred: {err}"));
+                    }
+                }
+            }
+            drop(meta);
+            if (index + 1).is_multiple_of(128) || index + 1 == total {
+                self.repair_counters
+                    .add_to_report(&mut report, repair_before);
+                progress(index + 1, total, &report);
+            }
+        }
+        report.shard_read_retries = self
+            .read_retries_seen
+            .load(Ordering::Relaxed)
+            .saturating_sub(retries_before);
+        report.shard_read_recovered = self
+            .read_recovered
+            .load(Ordering::Relaxed)
+            .saturating_sub(recovered_before);
+        self.repair_counters
+            .add_to_report(&mut report, repair_before);
+        Ok(report)
+    }
+
     pub fn scrub(&self) -> Result<FsckReport> {
         self.fsck(true, true)
     }
@@ -1273,3 +1438,7 @@ fn maintenance_after_read_delay() {
 #[cfg(test)]
 #[path = "maintenance_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "maintenance_member_tests.rs"]
+mod member_tests;

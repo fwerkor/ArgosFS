@@ -718,7 +718,11 @@ pub fn run() -> Result<()> {
             }
             print_fsck_report(&report, json)?;
         }
-        Command::Scrub { root, storage } => {
+        Command::Scrub {
+            root,
+            storage,
+            member,
+        } => {
             let default_backend = if root.is_some() {
                 BackendKind::Host
             } else {
@@ -728,7 +732,50 @@ pub fn run() -> Result<()> {
             validate_root_backend(root.as_deref(), storage.backend)?;
             let fs = open_backend(root, storage.backend, storage.images, storage.devices, true)?;
             validate_requested_pool(&fs, storage.pool.as_deref())?;
-            let report = fs.scrub()?;
+            let report = if let Some(member_id) = member {
+                eprintln!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "member-rebuild-start",
+                        "member": member_id,
+                        "warning": "targeted member rebuild; other shards are not verified"
+                    })
+                );
+                fs.repair_member_shards(&member_id, |done, total, report| {
+                    // Flush one durable progress record per batch. Long repairs
+                    // retain useful counters even when an external timeout
+                    // terminates the process before final JSON is printed.
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "member-rebuild-progress",
+                            "member": member_id,
+                            "files_processed": done,
+                            "files_total": total,
+                            "files_repaired": report.repaired_files,
+                            "shards_reconstructed": report.reconstructed_shards,
+                            "repair_bytes_written": report.repair_bytes_written,
+                            "errors": report.errors.len()
+                        })
+                    );
+                })?
+            } else {
+                fs.scrub_with_progress(|done, total, report| {
+                    eprintln!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "full-scrub-progress",
+                            "inodes_processed": done,
+                            "inodes_total": total,
+                            "files_checked": report.files_checked,
+                            "files_repaired": report.repaired_files,
+                            "shards_reconstructed": report.reconstructed_shards,
+                            "repair_bytes_written": report.repair_bytes_written,
+                            "errors": report.errors.len()
+                        })
+                    );
+                })?
+            };
             fs.sync()?;
             print_fsck_report(&report, json)?;
         }
