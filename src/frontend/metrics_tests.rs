@@ -238,6 +238,8 @@ fn data_plane_byte_counters_are_live_and_scrapable_without_metadata_lock() {
                 .count(),
             1
         );
+        assert!(output.contains("argosfs_writeback_flushes_total{reason=\"read_fallback\"} 0"));
+        assert!(output.contains("argosfs_writeback_flush_errors_total{reason=\"sync\"} 0"));
         let clone = volume.clone();
         assert!(render_commit_metrics(&clone).contains("kind=\"range_accepted\"} 1024"));
     });

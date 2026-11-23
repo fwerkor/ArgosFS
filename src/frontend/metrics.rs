@@ -200,6 +200,22 @@ fn emit_commit_metrics(volume: &ArgosFs, emitter: &mut MetricEmitter<'_>) {
             "counter",
         );
     }
+    for (reason, count, errors) in volume.commit_metrics().writeback_flush_snapshots() {
+        emitter.typed_metric(
+            "argosfs_writeback_flushes_total",
+            "Dirty FUSE extent flush attempts by reason (full or prefix)",
+            count as f64,
+            &[("reason", reason)],
+            "counter",
+        );
+        emitter.typed_metric(
+            "argosfs_writeback_flush_errors_total",
+            "Failed dirty FUSE extent flush attempts by reason",
+            errors as f64,
+            &[("reason", reason)],
+            "counter",
+        );
+    }
     for (kind, bytes) in volume.commit_metrics().raw_write_byte_snapshots() {
         emitter.typed_metric(
             "argosfs_raw_metadata_write_bytes_total",

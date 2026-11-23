@@ -66,22 +66,34 @@ fn append_getattr_and_lookup_preserve_stripe_until_required_flush() {
 }
 
 #[test]
-fn only_eof_append_can_skip_writeback_flush_on_stat() {
+fn overwrite_and_sparse_writes_remain_visible_without_stat_flush() {
     let (_dir, volume, ino) = make_volume(2, 1, 4096);
     volume.write_file("/stream", b"persisted", 0o644).unwrap();
     let fuse = ArgosFuse::new(volume.clone());
 
-    // An overwrite changes the existing bytes, so the existing flush path
-    // is still required for the metadata and subsequent read semantics.
     assert!(fuse.queue_writeback(ino, 1, b"XY"));
     assert_eq!(fuse.visible_inode_attr(ino).unwrap().size, 9);
-    assert!(fuse.writeback.lock().dirty.is_empty());
-    assert_eq!(volume.read_file("/stream", true).unwrap(), b"pXYsisted");
+    assert_eq!(fuse.read_visible_inode(ino, 0, 9).unwrap(), b"pXYsisted");
+    assert_eq!(
+        fuse.lookup_after_access(1, OsStr::new("stream"))
+            .unwrap()
+            .size,
+        9
+    );
+    assert!(fuse.writeback.lock().dirty.contains_key(&ino));
+    assert_eq!(volume.read_file("/stream", true).unwrap(), b"persisted");
+    fuse.flush_inode_writeback(ino).unwrap();
 
-    // A sparse write cannot be modeled as a simple contiguous EOF append.
     assert!(fuse.queue_writeback(ino, 11, b"Z"));
     assert_eq!(fuse.visible_inode_attr(ino).unwrap().size, 12);
-    assert!(fuse.writeback.lock().dirty.is_empty());
+    assert_eq!(
+        fuse.read_visible_inode(ino, 0, 16).unwrap(),
+        b"pXYsisted\0\0Z"
+    );
+    assert_eq!(fuse.read_visible_inode(ino, 9, 3).unwrap(), b"\0\0Z");
+    assert!(fuse.writeback.lock().dirty.contains_key(&ino));
+    assert_eq!(volume.attr_inode(ino).unwrap().size, 9);
+    fuse.flush_inode_writeback(ino).unwrap();
     assert_eq!(
         volume.read_file("/stream", true).unwrap(),
         b"pXYsisted\0\0Z"

@@ -97,6 +97,50 @@ impl DataPlaneByteKind {
     }
 }
 
+/// What forced a dirty FUSE extent to be written. Only an actual attempted
+/// write is counted; observational reads/stat that use the overlay do not
+/// increment these counters.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum WritebackFlushReason {
+    ReadFallback,
+    StatFallback,
+    WritePressure,
+    Sync,
+    Release,
+    Metadata,
+    Bulk,
+    AppendStage,
+    Other,
+}
+
+impl WritebackFlushReason {
+    const ALL: [Self; 9] = [
+        Self::ReadFallback,
+        Self::StatFallback,
+        Self::WritePressure,
+        Self::Sync,
+        Self::Release,
+        Self::Metadata,
+        Self::Bulk,
+        Self::AppendStage,
+        Self::Other,
+    ];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::ReadFallback => "read_fallback",
+            Self::StatFallback => "stat_fallback",
+            Self::WritePressure => "write_pressure",
+            Self::Sync => "sync",
+            Self::Release => "release",
+            Self::Metadata => "metadata",
+            Self::Bulk => "bulk",
+            Self::AppendStage => "append_stage",
+            Self::Other => "other",
+        }
+    }
+}
+
 /// Successful raw metadata write_at payload bytes, excluding mount-time
 /// recovery (which runs before the mounted volume's counters exist).
 #[derive(Clone, Copy, Debug)]
@@ -183,6 +227,8 @@ pub(crate) struct PhaseSnapshot {
 pub(crate) struct CommitMetrics {
     phases: [PhaseCounters; CommitPhase::ALL.len()],
     data_plane_bytes: [AtomicU64; DataPlaneByteKind::ALL.len()],
+    writeback_flushes: [AtomicU64; WritebackFlushReason::ALL.len()],
+    writeback_flush_errors: [AtomicU64; WritebackFlushReason::ALL.len()],
     raw_write_bytes: [AtomicU64; RawWriteKind::ALL.len()],
     checkpoint_reasons: [AtomicU64; CheckpointReason::ALL.len()],
     // Member IDs are bounded by the volume's device set. The map lock is
@@ -215,6 +261,25 @@ impl CommitMetrics {
             (
                 kind.name(),
                 self.data_plane_bytes[kind as usize].load(Ordering::Relaxed),
+            )
+        })
+    }
+
+    pub(crate) fn record_writeback_flush(&self, reason: WritebackFlushReason, success: bool) {
+        self.writeback_flushes[reason as usize].fetch_add(1, Ordering::Relaxed);
+        if !success {
+            self.writeback_flush_errors[reason as usize].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn writeback_flush_snapshots(
+        &self,
+    ) -> impl Iterator<Item = (&'static str, u64, u64)> + '_ {
+        WritebackFlushReason::ALL.into_iter().map(|reason| {
+            (
+                reason.name(),
+                self.writeback_flushes[reason as usize].load(Ordering::Relaxed),
+                self.writeback_flush_errors[reason as usize].load(Ordering::Relaxed),
             )
         })
     }
