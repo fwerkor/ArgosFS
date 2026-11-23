@@ -535,3 +535,12 @@ fn mount_metrics_listener_is_explicit_opt_in() {
         }
     ));
 }
+
+#[test]
+fn targeted_scrub_member_flag_is_explicit() {
+    let cli = Cli::try_parse_from(["argosfs", "scrub", "--member", "disk-0012"]).unwrap();
+    match cli.command {
+        Command::Scrub { member, .. } => assert_eq!(member.as_deref(), Some("disk-0012")),
+        _ => panic!("unexpected command"),
+    }
+}

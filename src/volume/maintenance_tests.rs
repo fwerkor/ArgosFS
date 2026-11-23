@@ -787,7 +787,7 @@ fn fsck_uses_current_inode_after_initial_id_scan() {
     let path = fs.shard_path_locked(&fs.metadata_snapshot(), &shard.disk_id, &shard.relpath);
     std::fs::write(&path, b"corrupt").unwrap();
 
-    let report = fs.fsck_inodes(inode_ids, true, false).unwrap();
+    let report = fs.fsck_inodes(inode_ids, true, false, None).unwrap();
     assert_eq!(report.damaged_files, 1, "{report:?}");
     assert_eq!(report.repaired_files, 1, "{report:?}");
     assert_eq!(report.unrecoverable_files, 0, "{report:?}");

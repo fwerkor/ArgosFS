@@ -103,3 +103,40 @@ and physical write volume about 87% in this sample. The synthetic 64-KiB
 files are **not** equivalent to Vincecate's 151-file, 33.4-minute field
 workload, and no Borg/full-pool production benchmark has yet been performed.
 
+
+## Fast recovery of a known failed member
+
+For a degraded 4+4 pool with a known failed member, run a **targeted**
+reconstruction instead of full-scrub verification:
+
+```sh
+argosfs scrub --devices /dev/<member0> --devices /dev/<member1> ... \
+  --member disk-0003 --json 2>member-rebuild-progress.jsonl
+```
+
+Use the actual device selectors for the pool (the example paths are
+placeholders); the member ID comes from `inspect-pool`. In a host backend,
+provide the volume root instead of `--devices`.
+
+This path builds a transient index of files/stripes referencing the failed
+member with **one in-memory traversal** and visits only those candidates.
+It rechecks live inode mappings under the per-inode lock. Physical repair
+reconstructs and validates original encoded shards (and plaintext checksums)
+before publishing a journal transaction. The operation refuses an unknown,
+healthy, or newly offline member during its recovery grace period.
+
+The procedure is intentionally **not a full scrub**: it does not verify
+unrelated members, check every healthy stripe, or perform orphan reclamation.
+Run the usual `argosfs scrub` and `verify-journal` after member recovery when
+the pool can tolerate the full integrity pass.
+
+Both targeted and full scrubs emit JSON progress records to **stderr**,
+leaving the final JSON report on stdout. This allows callers to preserve
+completed-file, reconstructed-shard, write-byte and error counts if an
+external timeout terminates a long verification before its final report.
+It does not make an interrupted transaction recoverable by itself; the
+normal journal protocol remains authoritative.
+
+No on-disk format change is required, and the targeted procedure should be
+benchmarked on the same physical pool before claims about the 294k-inode
+8-hour rebuild can be made.

@@ -551,6 +551,10 @@ pub(super) enum Command {
         root: Option<PathBuf>,
         #[command(flatten)]
         storage: PoolArgs,
+        /// Only rebuild shards on this failed/expired-offline member. Other
+        /// members and unrelated files are not verified; run a full scrub later.
+        #[arg(long)]
+        member: Option<String>,
     },
     #[command(about = "Redistribute host-backend files across disks")]
     Rebalance { root: PathBuf },
