@@ -33,8 +33,6 @@ const METADATA_FORMAT_TREE_ZSTD: u32 = 2;
 const METADATA_DECOMPRESSED_MAX: u64 = 4 * 1024 * 1024 * 1024;
 const CHECKPOINT_ZSTD_LEVEL: i32 = 3;
 const METADATA_PAGE_SIZE: usize = 4096;
-// Keep recovery I/O bounded while avoiding one sysread per metadata page.
-const METADATA_READ_BATCH_BYTES: usize = 1024 * 1024;
 const METADATA_INDEX_ENTRY_SIZE: usize = 48;
 const HASH_HEX_LEN: usize = 64;
 const HASH_BYTES_LEN: usize = 32;
@@ -2039,6 +2037,9 @@ fn read_legacy_metadata_candidate(
     }
     Ok(bytes)
 }
+
+// Keep recovery I/O bounded while avoiding one sysread per metadata page.
+const METADATA_READ_BATCH_BYTES: usize = 1024 * 1024;
 
 fn read_tree_metadata_candidate(
     backend: &dyn StorageBackend,
