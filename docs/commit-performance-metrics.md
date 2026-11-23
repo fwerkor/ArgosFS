@@ -249,3 +249,40 @@ exclusive self-heal, and the read-only no-checkpoint guarantee from #251.
 It does not change FUSE `max_read`, the raw on-disk format, checkpoint quorum,
 or data durability. Physical Borg throughput still requires a matched device
 retest to confirm the CPU gain; no speedup is inferred from unit tests.
+
+
+### Bounded writeback merging and flush latency (#271)
+
+FUSE dirty extents are still bounded to 4 MiB per inode and 64 MiB per mount.
+In-place overwrites and contiguous appends now reuse their existing
+`Vec` capacity, rather than allocating/copying the full accumulated extent
+for every acknowledged small write. Earlier fixes preserve the non-EOF
+read/stat overlay and the full-stripe append staging. Prepending a dirty
+extent still copies its previous bytes once to preserve last-write-wins
+semantics. Fsync, fdatasync, release, O_SYNC, pressure and metadata mutation
+barriers are unchanged.
+
+The `/commit-metrics` endpoint now exposes a standard cumulative Prometheus
+histogram `argosfs_writeback_flush_duration_seconds`, with
+`_bucket{reason="...",le="..."}`, `_sum` and `_count` for each flush
+reason. It records attempts **including errors**, and measures elapsed
+wall time from entering the flush path through its underlying write, including
+time waiting on the dirty-extent lock. No per-request timing samples are kept.
+The bucket boundaries range from 1 ms to 8 s, plus `+Inf`. Example:
+
+```promql
+histogram_quantile(0.95,
+  sum by (le) (rate(argosfs_writeback_flush_duration_seconds_bucket{reason="sync"}[5m])))
+histogram_quantile(0.99,
+  sum by (le) (rate(argosfs_writeback_flush_duration_seconds_bucket[5m])))
+```
+
+The quantiles are **bucket-based estimates** for attempted writeback flushes,
+not p95/p99 of all FUSE reads or requests. Record separate request-level
+latencies and the device-level `/proc/diskstats` write sectors in a matched
+Borg run. Use `scripts/experiments/measure_write_amplification.py` to capture
+the data-plane and device counters. Its physical write delta includes journal,
+checkpoint and unrelated host writes; do not attribute the entire physical
+ratio to dirty-tail coalescing. Synthetic 4+4 tests demonstrate unchanged
+contents and fewer stripe encodes, but only the original physical fixture can
+establish field amplification, CPU, RSS and tail-latency improvements.

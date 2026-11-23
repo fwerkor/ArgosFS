@@ -223,12 +223,59 @@ pub(crate) struct PhaseSnapshot {
     pub(crate) max_ns: u64,
 }
 
+// Upper bounds in nanoseconds. A cumulative Prometheus histogram makes
+// p95/p99 flush stalls observable without storing per-request samples.
+pub(crate) const FLUSH_LATENCY_BUCKETS: [(&str, u64); 14] = [
+    ("0.001", 1_000_000),
+    ("0.002", 2_000_000),
+    ("0.004", 4_000_000),
+    ("0.008", 8_000_000),
+    ("0.016", 16_000_000),
+    ("0.032", 32_000_000),
+    ("0.064", 64_000_000),
+    ("0.128", 128_000_000),
+    ("0.256", 256_000_000),
+    ("0.512", 512_000_000),
+    ("1", 1_000_000_000),
+    ("2", 2_000_000_000),
+    ("4", 4_000_000_000),
+    ("8", 8_000_000_000),
+];
+
+#[derive(Default)]
+struct FlushDurationCounters {
+    // Last bucket is +Inf, equal to the number of attempted flushes.
+    buckets: [AtomicU64; FLUSH_LATENCY_BUCKETS.len() + 1],
+    total_ns: AtomicU64,
+}
+
+impl FlushDurationCounters {
+    fn observe(&self, elapsed: Duration) {
+        let ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
+        self.total_ns.fetch_add(ns, Ordering::Relaxed);
+        for (index, (_, limit)) in FLUSH_LATENCY_BUCKETS.iter().enumerate() {
+            if ns <= *limit {
+                self.buckets[index].fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.buckets[FLUSH_LATENCY_BUCKETS.len()].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> ([u64; FLUSH_LATENCY_BUCKETS.len() + 1], u64) {
+        (
+            std::array::from_fn(|index| self.buckets[index].load(Ordering::Relaxed)),
+            self.total_ns.load(Ordering::Relaxed),
+        )
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct CommitMetrics {
     phases: [PhaseCounters; CommitPhase::ALL.len()],
     data_plane_bytes: [AtomicU64; DataPlaneByteKind::ALL.len()],
     writeback_flushes: [AtomicU64; WritebackFlushReason::ALL.len()],
     writeback_flush_errors: [AtomicU64; WritebackFlushReason::ALL.len()],
+    writeback_flush_duration: [FlushDurationCounters; WritebackFlushReason::ALL.len()],
     raw_write_bytes: [AtomicU64; RawWriteKind::ALL.len()],
     checkpoint_reasons: [AtomicU64; CheckpointReason::ALL.len()],
     // Member IDs are bounded by the volume's device set. The map lock is
@@ -265,7 +312,13 @@ impl CommitMetrics {
         })
     }
 
-    pub(crate) fn record_writeback_flush(&self, reason: WritebackFlushReason, success: bool) {
+    pub(crate) fn record_writeback_flush(
+        &self,
+        reason: WritebackFlushReason,
+        success: bool,
+        elapsed: Duration,
+    ) {
+        self.writeback_flush_duration[reason as usize].observe(elapsed);
         self.writeback_flushes[reason as usize].fetch_add(1, Ordering::Relaxed);
         if !success {
             self.writeback_flush_errors[reason as usize].fetch_add(1, Ordering::Relaxed);
@@ -281,6 +334,16 @@ impl CommitMetrics {
                 self.writeback_flushes[reason as usize].load(Ordering::Relaxed),
                 self.writeback_flush_errors[reason as usize].load(Ordering::Relaxed),
             )
+        })
+    }
+
+    pub(crate) fn writeback_flush_duration_snapshots(
+        &self,
+    ) -> impl Iterator<Item = (&'static str, [u64; FLUSH_LATENCY_BUCKETS.len() + 1], u64)> + '_
+    {
+        WritebackFlushReason::ALL.into_iter().map(|reason| {
+            let (buckets, total_ns) = self.writeback_flush_duration[reason as usize].snapshot();
+            (reason.name(), buckets, total_ns)
         })
     }
 

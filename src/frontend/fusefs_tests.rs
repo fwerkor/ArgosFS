@@ -122,6 +122,49 @@ fn dirty_extent_merges_adjacent_and_overlapping_writes() {
 }
 
 #[test]
+fn dirty_extent_reuses_reserved_capacity_across_sequential_writes() {
+    let mut data = Vec::with_capacity(128 * 1024);
+    data.extend_from_slice(b"abcd");
+    let mut dirty = DirtyExtent {
+        offset: 64,
+        data,
+        written_at: 1.0,
+        seen_ctime: None,
+    };
+    let initial_ptr = dirty.data.as_ptr();
+    for index in 0..64 {
+        let bytes = vec![(index % 251) as u8; 1024];
+        assert!(dirty.try_merge(68 + (index * 1024) as u64, &bytes, 128 * 1024));
+        assert_eq!(
+            dirty.data.as_ptr(),
+            initial_ptr,
+            "unexpected full-buffer reallocation"
+        );
+    }
+    assert!(dirty.try_merge(66, b"ZZ", 128 * 1024));
+    assert_eq!(dirty.data.as_ptr(), initial_ptr);
+    assert_eq!(&dirty.data[..4], b"abZZ");
+    assert_eq!(dirty.offset, 64);
+    assert_eq!(dirty.data.len(), 4 + 64 * 1024);
+    assert!(!dirty.try_merge(500_000, b"gap", 128 * 1024));
+}
+
+#[test]
+fn dirty_extent_prepend_and_overlapping_extension_preserve_last_write() {
+    let mut dirty = DirtyExtent {
+        offset: 10,
+        data: b"34567".to_vec(),
+        written_at: 1.0,
+        seen_ctime: None,
+    };
+    assert!(dirty.try_merge(8, b"1234", 20));
+    assert_eq!(dirty.offset, 8);
+    assert_eq!(dirty.data, b"1234567");
+    assert!(dirty.try_merge(12, b"XYZ890", 20));
+    assert_eq!(dirty.data, b"1234XYZ890");
+}
+
+#[test]
 fn dirty_extent_rejects_gaps_and_oversized_merges() {
     let mut dirty = DirtyExtent {
         offset: 10,

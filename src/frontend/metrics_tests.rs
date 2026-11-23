@@ -240,6 +240,9 @@ fn data_plane_byte_counters_are_live_and_scrapable_without_metadata_lock() {
         );
         assert!(output.contains("argosfs_writeback_flushes_total{reason=\"read_fallback\"} 0"));
         assert!(output.contains("argosfs_writeback_flush_errors_total{reason=\"sync\"} 0"));
+        assert!(output.contains(
+            "argosfs_writeback_flush_duration_seconds_bucket{reason=\"sync\",le=\"+Inf\"} 0"
+        ));
         let clone = volume.clone();
         assert!(render_commit_metrics(&clone).contains("kind=\"range_accepted\"} 1024"));
     });
@@ -261,6 +264,36 @@ fn raw_checkpoint_causes_and_write_bytes_are_exposed_without_metadata_lock() {
         assert!(output.contains("argosfs_checkpoint_reason_total{reason=\"journal_rollover\"} 1"));
         assert!(output.contains("argosfs_checkpoint_reason_total{reason=\"recovery_or_format\"} 0"));
     });
+}
+
+#[test]
+fn writeback_flush_latency_histogram_is_cumulative_and_counts_failures() {
+    use crate::commit_metrics::{CommitMetrics, WritebackFlushReason};
+    let metrics = CommitMetrics::default();
+    metrics.record_writeback_flush(WritebackFlushReason::Sync, true, Duration::from_millis(1));
+    metrics.record_writeback_flush(WritebackFlushReason::Sync, false, Duration::from_millis(5));
+    metrics.record_writeback_flush(
+        WritebackFlushReason::Release,
+        true,
+        Duration::from_millis(9),
+    );
+    let (reason, buckets, ns) = metrics
+        .writeback_flush_duration_snapshots()
+        .find(|(name, _, _)| *name == "sync")
+        .unwrap();
+    assert_eq!(reason, "sync");
+    assert_eq!(buckets[0], 1); // <= 1 ms
+    assert_eq!(buckets[2], 1); // <= 4 ms
+    assert_eq!(buckets[3], 2); // <= 8 ms
+    assert_eq!(*buckets.last().unwrap(), 2); // +Inf
+    assert_eq!(ns, 6_000_000);
+    assert_eq!(
+        metrics
+            .writeback_flush_snapshots()
+            .find(|(name, _, _)| *name == "sync")
+            .unwrap(),
+        ("sync", 2, 1)
+    );
 }
 
 #[test]
