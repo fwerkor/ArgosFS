@@ -1925,12 +1925,10 @@ fn journal_replays_acked_delta_from_surviving_certified_checkpoint() {
     // The two deliberately damaged current copies cannot validate their
     // checkpoint certificate; the surviving third copy must still replay.
     assert_eq!(report.invalid_entries, 2, "{:?}", report.errors);
-    assert!(
-        report
-            .errors
-            .iter()
-            .all(|error| error.contains("has no local target state"))
-    );
+    assert!(report
+        .errors
+        .iter()
+        .all(|error| error.contains("has no local target state")));
     assert!(report.replayed);
 }
 
