@@ -278,6 +278,9 @@ pub(crate) struct CommitMetrics {
     writeback_flush_duration: [FlushDurationCounters; WritebackFlushReason::ALL.len()],
     raw_write_bytes: [AtomicU64; RawWriteKind::ALL.len()],
     checkpoint_reasons: [AtomicU64; CheckpointReason::ALL.len()],
+    // Attempted member checkpoint strategies during raw journal rollover.
+    // Values count member attempts, not successful writes or mount replay.
+    rollover_member_strategies: [AtomicU64; 2],
     // Member IDs are bounded by the volume's device set. The map lock is
     // independent of the global namespace lock and never spans device I/O.
     per_member: RwLock<BTreeMap<String, [PhaseCounters; 2]>>,
@@ -388,6 +391,25 @@ impl CommitMetrics {
                 self.checkpoint_reasons[reason as usize].load(Ordering::Relaxed),
             )
         })
+    }
+
+    pub(crate) fn record_rollover_member_strategy(&self, verified: usize, fallback: usize) {
+        self.rollover_member_strategies[0].fetch_add(verified as u64, Ordering::Relaxed);
+        self.rollover_member_strategies[1].fetch_add(fallback as u64, Ordering::Relaxed);
+    }
+
+    pub(crate) fn rollover_member_strategy_snapshots(
+        &self,
+    ) -> impl Iterator<Item = (&'static str, u64)> + '_ {
+        ["verified_single_slot", "conservative_dual_slot"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| {
+                (
+                    name,
+                    self.rollover_member_strategies[index].load(Ordering::Relaxed),
+                )
+            })
     }
 
     pub(crate) fn timer(&self, phase: CommitPhase) -> PhaseTimer<'_> {

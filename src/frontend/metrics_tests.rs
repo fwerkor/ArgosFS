@@ -256,12 +256,15 @@ fn raw_checkpoint_causes_and_write_bytes_are_exposed_without_metadata_lock() {
     metrics.add_raw_write_bytes(RawWriteKind::Checkpoint, 8192);
     metrics.add_raw_write_bytes(RawWriteKind::Journal, 1024);
     metrics.record_checkpoint_reason(CheckpointReason::JournalRollover);
+    metrics.record_rollover_member_strategy(3, 1);
     volume.test_with_metadata_write_lock(|| {
         let output = render_commit_metrics(&volume);
         assert!(output.contains("argosfs_raw_metadata_write_bytes_total{kind=\"checkpoint\"} 8192"));
         assert!(output.contains("argosfs_raw_metadata_write_bytes_total{kind=\"journal\"} 1024"));
         assert!(output.contains("argosfs_raw_metadata_write_bytes_total{kind=\"clean_state\"} 0"));
         assert!(output.contains("argosfs_checkpoint_reason_total{reason=\"journal_rollover\"} 1"));
+        assert!(output.contains("argosfs_checkpoint_rollover_member_strategy_total{strategy=\"verified_single_slot\"} 3"));
+        assert!(output.contains("argosfs_checkpoint_rollover_member_strategy_total{strategy=\"conservative_dual_slot\"} 1"));
         assert!(output.contains("argosfs_checkpoint_reason_total{reason=\"recovery_or_format\"} 0"));
     });
 }

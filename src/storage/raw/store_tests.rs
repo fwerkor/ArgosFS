@@ -1186,7 +1186,11 @@ fn metadata_tree_checkpoint_covers_pages_headers_and_capacity_errors() {
     assert_eq!(get_u64(&checkpoint.header, 32).unwrap(), bytes.len() as u64);
     assert_eq!(get_u64(&checkpoint.header, 136).unwrap(), 8);
     assert_eq!(get_u64(&checkpoint.header, 152).unwrap(), 3);
-    assert_eq!(checkpoint.body_writes.len(), 4);
+    // Three metadata pages are written in one contiguous body batch, then
+    // the index is written separately before the header is made durable.
+    assert_eq!(checkpoint.body_writes.len(), 2);
+    let data_batch = &checkpoint.body_writes[0];
+    assert_eq!(data_batch.1, bytes);
     assert!(checkpoint
         .body_writes
         .iter()
@@ -1200,6 +1204,45 @@ fn metadata_tree_checkpoint_covers_pages_headers_and_capacity_errors() {
         metadata_tree_checkpoint("disk", 0, 0, &bytes, &hash, 4096),
         Err(ArgosError::DiskFull { .. })
     ));
+}
+
+#[test]
+fn checkpoint_batches_contiguous_pages_without_changing_recovery_bytes() {
+    let (_dir, images, _, superblocks) = quorum_fixture();
+    let backend = block_backend_for(&images);
+    // Cross multiple batch boundaries and end with a short partial page.
+    // No change to page offsets/digests on disk is permitted.
+    let bytes = (0..(2 * CHECKPOINT_BATCH_BYTES + 17))
+        .map(|index| (index as u64 * 31 % 251) as u8)
+        .collect::<Vec<_>>();
+    let hash = sha256_hex(&bytes);
+    let checkpoint = metadata_tree_checkpoint(
+        "disk",
+        777,
+        778,
+        &bytes,
+        &hash,
+        superblocks[0].metadata.length / 2,
+    )
+    .unwrap();
+    let data_batches = &checkpoint.body_writes[..checkpoint.body_writes.len() - 1];
+    assert_eq!(data_batches.len(), 3);
+    assert_eq!(data_batches[0].1.len(), CHECKPOINT_BATCH_BYTES);
+    assert_eq!(data_batches[1].1.len(), CHECKPOINT_BATCH_BYTES);
+    assert_eq!(data_batches[2].1.len(), 17);
+    let sb = &superblocks[0];
+    write_metadata_slot(&backend, sb, sb.metadata.offset, &checkpoint, None).unwrap();
+    assert_eq!(
+        read_tree_metadata_candidate(
+            &backend,
+            sb,
+            sb.metadata.offset,
+            sb.metadata.length / 2,
+            &checkpoint.header,
+        )
+        .unwrap(),
+        bytes,
+    );
 }
 
 #[test]
@@ -1782,6 +1825,114 @@ fn journal_rollover_checkpoints_shared_state_and_recovers_after_reset() {
 }
 
 #[test]
+fn journal_replays_acked_delta_from_surviving_certified_checkpoint() {
+    let (_dir, images, previous, mut superblocks) = quorum_fixture();
+    let backend = block_backend_for(&images);
+    let rollover = next_metadata(&previous, "new-rollover-base");
+    let full_journal_lengths = superblocks
+        .iter()
+        .map(|sb| sb.journal.length)
+        .collect::<Vec<_>>();
+    // Force a checkpoint rollover, but leave room for the following small
+    // transaction and its quorum certificate after the journal resets.
+    for sb in &mut superblocks {
+        let used = raw_journal_end(&backend, sb);
+        sb.journal.length = used + 4096;
+    }
+    append_transaction_with_trusted_integrity_quorum(
+        &backend,
+        &superblocks,
+        &rollover,
+        Some(&previous),
+        "force-checkpoint-rollover",
+        serde_json::json!({"payload": "x".repeat(64 * 1024)}),
+    )
+    .unwrap();
+    // Only the first transaction should roll over. Restore the original
+    // journal capacity so the next transaction remains a journal delta.
+    for (sb, original_len) in superblocks.iter_mut().zip(full_journal_lengths) {
+        sb.journal.length = original_len;
+    }
+    let committed = next_metadata(&rollover, "acked-after-rollover");
+    append_transaction_with_trusted_integrity_quorum(
+        &backend,
+        &superblocks,
+        &committed,
+        Some(&rollover),
+        "after-checkpoint-rollover",
+        serde_json::json!({"previous_meta_hash": rollover.integrity.meta_hash}),
+    )
+    .unwrap();
+
+    // The last transaction must not have been written as another checkpoint.
+    for sb in &superblocks {
+        let candidates = read_metadata_candidates(&backend, sb).unwrap();
+        assert!(candidates.iter().all(|(metadata, _)| {
+            metadata
+                .as_ref()
+                .is_none_or(|metadata| metadata.txid != committed.txid)
+        }));
+    }
+    // A protected older checkpoint survives on every member. Corrupt the
+    // current checkpoint body on two members: the physical checkpoint quorum
+    // then selects the older state, although the third member still has a
+    // verified checkpoint and an authenticated post-rollover journal suffix.
+    for sb in &superblocks[..2] {
+        let slot_len = sb.metadata.length / 2;
+        let candidates = read_metadata_candidates(&backend, sb).unwrap();
+        let new_slot = candidates
+            .iter()
+            .position(|(metadata, _)| metadata.as_ref().is_some_and(|m| m.txid == rollover.txid))
+            .expect("one current checkpoint slot");
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|(metadata, _)| metadata.as_ref().is_some_and(|m| m.txid == rollover.txid))
+                .count(),
+            1,
+            "rollover should preserve the opposite older slot"
+        );
+        let offset = sb.metadata.offset + new_slot as u64 * slot_len;
+        let mut header = vec![0u8; RAW_HEADER_SIZE];
+        backend.read_at(&sb.disk_id, offset, &mut header).unwrap();
+        let body_start = align_up(
+            RAW_HEADER_SIZE as u64 + get_u64(&header, 160).unwrap(),
+            METADATA_PAGE_SIZE as u64,
+        );
+        let mut byte = [0u8; 1];
+        backend
+            .read_at(&sb.disk_id, offset + body_start, &mut byte)
+            .unwrap();
+        byte[0] ^= 1;
+        backend
+            .write_at(&sb.disk_id, offset + body_start, &byte)
+            .unwrap();
+    }
+    let catalog = superblocks
+        .iter()
+        .flat_map(|sb| {
+            read_metadata_candidates(&backend, sb)
+                .unwrap()
+                .into_iter()
+                .map(|(metadata, report)| (sb.disk_id.clone(), metadata, report))
+        })
+        .collect::<Vec<_>>();
+    let old_base = select_quorum_metadata_candidate(&catalog).unwrap().unwrap();
+    assert_eq!(old_base.txid, previous.txid);
+    let (recovered, report) = load_or_recover(&backend, &superblocks, false).unwrap();
+    assert_eq!(recovered.txid, committed.txid, "{:?}", report.errors);
+    assert_eq!(recovered.raw_pool.pool_name, "acked-after-rollover");
+    // The two deliberately damaged current copies cannot validate their
+    // checkpoint certificate; the surviving third copy must still replay.
+    assert_eq!(report.invalid_entries, 2, "{:?}", report.errors);
+    assert!(report
+        .errors
+        .iter()
+        .all(|error| error.contains("has no local target state")));
+    assert!(report.replayed);
+}
+
+#[test]
 fn prepared_v2_group_delta_survives_quorum_journal_replay() {
     let (_dir, images, previous, superblocks) = quorum_fixture();
     let backend = block_backend_for(&images);
@@ -1971,3 +2122,6 @@ fn v2_crash_after_quorum_commit_recovers_authenticated_delta() {
     assert_eq!(recovered.integrity.meta_hash, next.integrity.meta_hash);
     assert_eq!(recovered.raw_pool.pool_name, "v2-committed");
 }
+
+#[path = "store_tests/rollover_slot.rs"]
+mod rollover_slot;
