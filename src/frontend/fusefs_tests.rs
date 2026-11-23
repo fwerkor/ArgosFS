@@ -1086,3 +1086,58 @@ fn sequential_writeback_merges_four_mib_without_cross_inode_growth() {
     let state = fuse.writeback.lock();
     assert_eq!(state.dirty.get(&19).unwrap().data.len(), 1024 * 1024);
 }
+
+#[test]
+fn directory_listing_reuses_large_snapshot_and_invalidates_after_create() {
+    let tmp = tempfile::tempdir().unwrap();
+    let volume = ArgosFs::create(
+        tmp.path(),
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            chunk_size: 4096,
+            ..VolumeConfig::default()
+        },
+        1,
+        false,
+    )
+    .unwrap();
+    volume.mkdir("/bulk", 0o755).unwrap();
+    for index in 0..16 {
+        volume
+            .write_file(&format!("/bulk/item-{index:04}"), b"data", 0o600)
+            .unwrap();
+    }
+    let ino = volume.resolve_path("/bulk", true).unwrap();
+    let fuse = ArgosFuse::new(volume.clone());
+    let first = fuse.shared.directory_listing(ino).unwrap();
+    assert_eq!(first.len(), 18);
+    let second = fuse.shared.directory_listing(ino).unwrap();
+    assert!(Arc::ptr_eq(&first, &second));
+    assert!(fuse.shared.directory_cache.lock().used_bytes() > 0);
+
+    volume
+        .write_file("/bulk/new-file", b"added", 0o600)
+        .unwrap();
+    let third = fuse.shared.directory_listing(ino).unwrap();
+    assert_eq!(third.len(), 19);
+    assert!(!Arc::ptr_eq(&first, &third));
+    assert!(third.iter().any(|entry| entry.name == "new-file"));
+
+    // A write to a regular file changes its attr but not its parent listing:
+    // readdirplus must fetch current attributes, while readdir reuses names.
+    let file_ino = volume.resolve_path("/bulk/new-file", true).unwrap();
+    let cached_attr_size = third
+        .iter()
+        .find(|e| e.attr.ino == file_ino)
+        .unwrap()
+        .attr
+        .size;
+    volume
+        .write_file("/bulk/new-file", b"updated with a longer payload", 0o600)
+        .unwrap();
+    let again = fuse.shared.directory_listing(ino).unwrap();
+    assert!(Arc::ptr_eq(&again, &third));
+    let actual_attr = volume.attr_inode(file_ino).unwrap();
+    assert!(actual_attr.size > cached_attr_size);
+}
