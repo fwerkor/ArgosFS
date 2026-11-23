@@ -36,6 +36,10 @@ const METADATA_PAGE_SIZE: usize = 4096;
 // Prepare contiguous writes once for all members and both checkpoint slots.
 // 1 MiB bounds transient buffers and keeps raw/USB requests manageable.
 const CHECKPOINT_BATCH_BYTES: usize = 1024 * 1024;
+// Only preflight a reasonably sized stored checkpoint. If the old payload is
+// larger, retain the conservative dual-slot rollover. Streaming verification
+// can lift this bound without changing the on-disk format.
+const CHECKPOINT_PRESERVE_VALIDATION_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const METADATA_INDEX_ENTRY_SIZE: usize = 48;
 const HASH_HEX_LEN: usize = 64;
 const HASH_BYTES_LEN: usize = 32;
@@ -640,6 +644,208 @@ fn prepare_checkpoint_writes(
         u64::MAX,
         payload.original.as_ref(),
     )
+}
+
+/// Verify an existing tree checkpoint using bounded, contiguous reads.
+/// No JSON deserialization or decompression is needed: the authenticated
+/// stored payload hash and every indexed page digest are validated. Any
+/// unsupported/legacy page layout opts out of single-slot reuse.
+fn verify_preserved_checkpoint_pages(
+    backend: &dyn StorageBackend,
+    sb: &RawSuperblock,
+    offset: u64,
+    slot_len: u64,
+    header: &[u8; RAW_HEADER_SIZE],
+) -> Result<()> {
+    if !matches!(
+        get_u32(header, 20)?,
+        METADATA_FORMAT_TREE | METADATA_FORMAT_TREE_ZSTD
+    ) {
+        return Err(ArgosError::IncompatibleFormat(
+            "checkpoint slot does not use a verifiable tree layout".to_string(),
+        ));
+    }
+    let len = checked_usize(get_u64(header, 32)?, "checkpoint length")?;
+    if len == 0 || len as u64 > CHECKPOINT_PRESERVE_VALIDATION_MAX_BYTES {
+        return Err(ArgosError::CorruptedMetadata(
+            "checkpoint size exceeds protected rollover validation bound".to_string(),
+        ));
+    }
+    let page_size = checked_usize(get_u64(header, 144)?, "checkpoint page size")?;
+    if page_size != METADATA_PAGE_SIZE {
+        return Err(ArgosError::IncompatibleFormat(
+            "checkpoint uses an unsupported page size for batch verification".to_string(),
+        ));
+    }
+    let count = len.div_ceil(page_size);
+    let index_len = count
+        .checked_mul(METADATA_INDEX_ENTRY_SIZE)
+        .ok_or_else(|| {
+            ArgosError::CorruptedMetadata("checkpoint index size overflow".to_string())
+        })?;
+    if get_u64(header, 152)? != count as u64 || get_u64(header, 160)? != index_len as u64 {
+        return Err(ArgosError::CorruptedMetadata(
+            "checkpoint index header inconsistent".to_string(),
+        ));
+    }
+    let index_end = (RAW_HEADER_SIZE as u64)
+        .checked_add(index_len as u64)
+        .ok_or_else(|| ArgosError::CorruptedMetadata("checkpoint index overflow".to_string()))?;
+    let data_start = align_up(index_end, page_size as u64);
+    let data_end = data_start
+        .checked_add(align_up(len as u64, page_size as u64))
+        .ok_or_else(|| ArgosError::CorruptedMetadata("checkpoint data overflow".to_string()))?;
+    if data_end > slot_len {
+        return Err(ArgosError::CorruptedMetadata(
+            "checkpoint data exceeds target slot".to_string(),
+        ));
+    }
+    let mut index = vec![0u8; index_len];
+    backend.read_at(&sb.disk_id, offset + RAW_HEADER_SIZE as u64, &mut index)?;
+    if sha256_hex(&index) != get_fixed_hex(header, 168, HASH_HEX_LEN)? {
+        return Err(ArgosError::Checksum(
+            "protected checkpoint index digest mismatch".to_string(),
+        ));
+    }
+    let mut digest = Sha256::new();
+    let mut batch = vec![0u8; CHECKPOINT_BATCH_BYTES];
+    let pages_per_batch = CHECKPOINT_BATCH_BYTES / page_size;
+    for first_page in (0..count).step_by(pages_per_batch) {
+        let last_page = (first_page + pages_per_batch).min(count);
+        let bytes_begin = first_page * page_size;
+        let bytes_end = (last_page * page_size).min(len);
+        let batch_len = bytes_end - bytes_begin;
+        backend.read_at(
+            &sb.disk_id,
+            offset + data_start + bytes_begin as u64,
+            &mut batch[..batch_len],
+        )?;
+        for page in first_page..last_page {
+            let entry_start = page * METADATA_INDEX_ENTRY_SIZE;
+            let entry = &index[entry_start..entry_start + METADATA_INDEX_ENTRY_SIZE];
+            let expected_page_offset = data_start + (page * page_size) as u64;
+            let expected_len = (len - page * page_size).min(page_size);
+            if get_u64(entry, 32)? != expected_page_offset
+                || get_u32(entry, 40)? as usize != expected_len
+                || Sha256::digest(
+                    &batch[(page - first_page) * page_size
+                        ..(page - first_page) * page_size + expected_len],
+                )
+                .as_slice()
+                    != &entry[..HASH_BYTES_LEN]
+            {
+                return Err(ArgosError::Checksum(
+                    "protected checkpoint page digest mismatch".to_string(),
+                ));
+            }
+        }
+        digest.update(&batch[..batch_len]);
+    }
+    if hex::encode(digest.finalize()) != get_fixed_hex(header, 64, HASH_HEX_LEN)? {
+        return Err(ArgosError::Checksum(
+            "protected checkpoint payload digest mismatch".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Plan a one-slot rollover only if *a quorum* of members has the same
+/// physically verified prior checkpoint. Every member in this map retains
+/// its verified checkpoint slot untouched until the new checkpoint is durable.
+/// If the selected old checkpoint cannot be independently verified on a
+/// quorum, the caller must use the historical two-slot rewrite instead.
+///
+/// The validation is intentionally read-only and runs before any checkpoint
+/// write or journal truncation. It verifies the stored full payload hash and
+/// every on-disk page hash, not just the header's txid; a torn or bitrotted
+/// slot must never be treated as a safe recovery anchor.
+fn protected_rollover_slot_targets(
+    backend: &dyn StorageBackend,
+    superblocks: &[RawSuperblock],
+    need: usize,
+) -> Option<BTreeMap<String, u64>> {
+    type CheckpointKey = (u64, u64, String);
+    type SlotHeader = (u64, [u8; RAW_HEADER_SIZE]);
+    let mut candidates: BTreeMap<CheckpointKey, BTreeMap<String, Vec<SlotHeader>>> =
+        BTreeMap::new();
+    for sb in superblocks {
+        for slot in 0..2u64 {
+            let offset = sb.metadata.offset + slot * (sb.metadata.length / 2);
+            let mut header = [0u8; RAW_HEADER_SIZE];
+            if backend.read_at(&sb.disk_id, offset, &mut header).is_err()
+                || &header[..16] != METADATA_MAGIC
+            {
+                continue;
+            }
+            let Ok(format) = get_u32(&header, 20) else {
+                continue;
+            };
+            if !matches!(
+                format,
+                METADATA_FORMAT_LEGACY | METADATA_FORMAT_TREE | METADATA_FORMAT_TREE_ZSTD
+            ) {
+                continue;
+            }
+            let (Ok(txid), Ok(generation), Ok(size)) = (
+                get_u64(&header, 24),
+                get_u64(&header, 136),
+                get_u64(&header, 32),
+            ) else {
+                continue;
+            };
+            if size == 0 || size > CHECKPOINT_PRESERVE_VALIDATION_MAX_BYTES {
+                continue;
+            }
+            candidates
+                .entry((txid, generation, sha256_hex(&header)))
+                .or_default()
+                .entry(sb.disk_id.clone())
+                .or_default()
+                .push((slot, header));
+        }
+    }
+
+    // Prefer the latest checkpoint already replicated on a physical quorum.
+    // A lone recent, unquorate checkpoint is never a recovery anchor. If a
+    // member missed that checkpoint, leave it on the conservative dual-slot
+    // path while verified quorum members preserve their common older image.
+    for (_, members) in candidates.into_iter().rev() {
+        if members.len() < need {
+            continue;
+        }
+        // Each validator has a bounded 1 MiB read buffer. Overlap reads
+        // across members so 9 slow devices do not serialize this I/O.
+        let targets = std::thread::scope(|scope| {
+            let jobs = superblocks
+                .iter()
+                .map(|sb| {
+                    let members = &members;
+                    scope.spawn(move || {
+                        let slots = members.get(&sb.disk_id)?;
+                        let slot_len = sb.metadata.length / 2;
+                        for (slot, header) in slots {
+                            let offset = sb.metadata.offset + slot * slot_len;
+                            if verify_preserved_checkpoint_pages(
+                                backend, sb, offset, slot_len, header,
+                            )
+                            .is_ok()
+                            {
+                                return Some((sb.disk_id.clone(), 1 - slot));
+                            }
+                        }
+                        None
+                    })
+                })
+                .collect::<Vec<_>>();
+            jobs.into_iter()
+                .filter_map(|job| job.join().expect("checkpoint verifier panicked"))
+                .collect::<BTreeMap<_, _>>()
+        });
+        if targets.len() >= need {
+            return Some(targets);
+        }
+    }
+    None
 }
 
 fn write_metadata_member(
@@ -1368,9 +1574,14 @@ fn append_journal_with_previous_validation(
     }
     if rollover {
         let checkpoint = prepare_checkpoint_writes(metadata, superblocks)?;
-        for (_, result) in
-            checkpoint_members_and_reset_parallel(backend, superblocks, metadata, &checkpoint, None)
-        {
+        for (_, result) in checkpoint_members_and_reset_parallel(
+            backend,
+            superblocks,
+            metadata,
+            &checkpoint,
+            None,
+            None,
+        ) {
             result?;
         }
         return Ok(());
@@ -1511,12 +1722,18 @@ fn append_journal_quorum(
             metrics.record_checkpoint_reason(CheckpointReason::JournalRollover);
         }
         let _rollover_timer = metrics.map(|metrics| metrics.timer(CommitPhase::JournalRollover));
+        let protected_targets = protected_rollover_slot_targets(backend, &eligible, need);
+        if let Some(metrics) = metrics {
+            let single = protected_targets.as_ref().map_or(0, BTreeMap::len);
+            metrics.record_rollover_member_strategy(single, eligible.len() - single);
+        }
         for (disk_id, result) in checkpoint_members_and_reset_parallel(
             backend,
             &eligible,
             metadata,
             &checkpoint,
             metrics,
+            protected_targets.as_ref(),
         ) {
             match result {
                 Ok(()) => {
@@ -1636,6 +1853,7 @@ fn checkpoint_members_and_reset_parallel(
     metadata: &Metadata,
     checkpoint: &MetadataTreeCheckpoint,
     metrics: Option<&CommitMetrics>,
+    protected_targets: Option<&BTreeMap<String, u64>>,
 ) -> Vec<(String, Result<()>)> {
     std::thread::scope(|scope| {
         let jobs: Vec<_> = superblocks
@@ -1646,9 +1864,32 @@ fn checkpoint_members_and_reset_parallel(
                         metrics.member_timer(CommitPhase::CheckpointMemberIo, &sb.disk_id)
                     });
                     let result = (|| {
-                        write_metadata_member(backend, sb, metadata, checkpoint, metrics)?;
-                        // Never discard the old journal before both checkpoint
-                        // slots have been flushed and their headers committed.
+                        if let Some(&slot) =
+                            protected_targets.and_then(|targets| targets.get(&sb.disk_id))
+                        {
+                            // Never touch the quorum-verified recovery slot.
+                            if checkpoint.required_len > sb.metadata.length / 2 {
+                                return Err(ArgosError::DiskFull {
+                                    disk_id: sb.disk_id.clone(),
+                                    required: checkpoint.required_len,
+                                    available: sb.metadata.length / 2,
+                                });
+                            }
+                            write_metadata_slot(
+                                backend,
+                                sb,
+                                sb.metadata.offset + slot * (sb.metadata.length / 2),
+                                checkpoint,
+                                metrics,
+                            )?;
+                        } else {
+                            // Missing/unverified members still receive both
+                            // copies, as before. The protected subset by
+                            // itself must contain a quorum.
+                            write_metadata_member(backend, sb, metadata, checkpoint, metrics)?;
+                        }
+                        // Reset this member's journal only after its new
+                        // checkpoint is physically flushed and published.
                         initialize_journal_region(backend, &sb.disk_id, sb)?;
                         if let Some(metrics) = metrics {
                             metrics.add_raw_write_bytes(RawWriteKind::Journal, RAW_HEADER_SIZE);
