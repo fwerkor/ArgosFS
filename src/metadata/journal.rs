@@ -1468,6 +1468,80 @@ fn diff_json(
                 }
             }
         }
+        // The raw free-extent list (and file block lists) can contain
+        // hundreds of thousands of entries. Replacing the *whole* JSON array
+        // for a single allocation unnecessarily fills the 8 MiB journal and
+        // forces a full multi-member checkpoint. Use only legacy JSON pointer
+        // operations so existing on-disk journals remain compatible.
+        (serde_json::Value::Array(left), serde_json::Value::Array(right)) => {
+            let prefix = left
+                .iter()
+                .zip(right)
+                .take_while(|(a, b)| json_values_identical(a, b))
+                .count();
+            if prefix == left.len() && prefix == right.len() {
+                return;
+            }
+            let suffix = left
+                .len()
+                .saturating_sub(prefix)
+                .min(right.len().saturating_sub(prefix));
+            let suffix = (0..suffix)
+                .take_while(|i| {
+                    json_values_identical(&left[left.len() - 1 - i], &right[right.len() - 1 - i])
+                })
+                .count();
+            let old_end = left.len() - suffix;
+            let new_end = right.len() - suffix;
+            let old_middle = old_end - prefix;
+            let new_middle = new_end - prefix;
+            // Each array removal moves the following entries. A wide deletion
+            // would make thousands of repeated shifts (quadratic replay); a
+            // single full replacement is then safer and often smaller.
+            if old_middle.saturating_sub(new_middle) > 64 {
+                ops.push(MetadataDeltaOp::Replace {
+                    path: path.to_string(),
+                    value: next.clone(),
+                });
+                return;
+            }
+            if new_middle > old_middle && suffix != 0 {
+                // An insertion before a retained suffix is not representable
+                // by legacy JSON Add (it replaces array elements, not inserts).
+                // Fall back rather than constructing a subtly invalid delta.
+                ops.push(MetadataDeltaOp::Replace {
+                    path: path.to_string(),
+                    value: next.clone(),
+                });
+                return;
+            }
+            for index in prefix..(prefix + old_middle.min(new_middle)) {
+                diff_json(
+                    &push_json_pointer(path, &index.to_string()),
+                    &left[index],
+                    &right[index],
+                    ops,
+                );
+            }
+            // Remove surplus elements at one stable index; each removal shifts
+            // the suffix left, preserving its exact values and byte ordering.
+            for _ in new_middle..old_middle {
+                ops.push(MetadataDeltaOp::Remove {
+                    path: push_json_pointer(path, &(prefix + new_middle).to_string()),
+                });
+            }
+            for (index, value) in right
+                .iter()
+                .enumerate()
+                .take(new_end)
+                .skip(prefix + old_middle)
+            {
+                ops.push(MetadataDeltaOp::Add {
+                    path: push_json_pointer(path, &index.to_string()),
+                    value: value.clone(),
+                });
+            }
+        }
         // Value::PartialEq treats -0.0 and +0.0 as equal, although those
         // serialize to distinct bytes and therefore change the metadata hash.
         _ if !json_values_identical(previous, next) => ops.push(MetadataDeltaOp::Replace {
@@ -1493,6 +1567,14 @@ fn json_values_identical(a: &serde_json::Value, b: &serde_json::Value) -> bool {
                     .iter()
                     .zip(right)
                     .all(|(a, b)| json_values_identical(a, b))
+        }
+        (serde_json::Value::Object(left), serde_json::Value::Object(right)) => {
+            left.len() == right.len()
+                && left.iter().all(|(key, value)| {
+                    right
+                        .get(key)
+                        .is_some_and(|other| json_values_identical(value, other))
+                })
         }
         _ => a == b,
     }
@@ -1692,6 +1774,9 @@ fn missing_or_invalid_copy(report: &TransactionReport) -> bool {
         .any(|candidate| !candidate.present || !candidate.valid)
 }
 
+#[cfg(test)]
+#[path = "journal_array_delta_tests.rs"]
+mod array_delta_tests;
 #[cfg(test)]
 #[path = "journal_tests.rs"]
 mod tests;

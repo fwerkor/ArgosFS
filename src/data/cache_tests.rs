@@ -491,3 +491,62 @@ fn cache_copy_range_microbench() {
         before.as_secs_f64() / after.as_secs_f64()
     );
 }
+
+#[test]
+fn direct_copy_byte_counters_cover_hits_only_and_l2_promotion() {
+    let dir = tempdir().unwrap();
+    let block = vec![0x6a; 8192];
+    let hash = crate::util::content_hash_hex(&block);
+    let writer = BlockCache::new(dir.path(), 0, 128 * 1024);
+    writer.put("stripe", &block).unwrap();
+    let cache = BlockCache::new(dir.path(), 128 * 1024, 128 * 1024);
+    let mut buffer = vec![0; 512];
+    assert!(cache.copy_range("stripe", Some(&hash), block.len(), 17, &mut buffer));
+    assert_eq!(buffer, block[17..529]);
+    assert!(cache.copy_range("stripe", Some(&hash), block.len(), 128, &mut buffer));
+    assert_eq!(buffer, block[128..640]);
+    assert!(!cache.copy_range("stripe", Some(&hash), block.len(), 8000, &mut buffer));
+    assert_eq!(cache.stats()["direct_copy_bytes"], 1024);
+    assert_eq!(cache.stats()["l2_read_bytes"], 8192);
+    assert_eq!(cache.stats()["l2_hits"], 1);
+    assert_eq!(cache.stats()["hits"], 1);
+    assert_eq!(cache.stats()["memory_bytes"], 8192);
+    cache.remove("stripe");
+    assert!(!cache.copy_range("stripe", Some(&hash), block.len(), 0, &mut buffer));
+    assert_eq!(cache.stats()["direct_copy_bytes"], 1024);
+}
+
+#[test]
+fn concurrent_read_cache_copy_is_bounded_and_byte_accounted() {
+    use std::sync::Arc;
+    let dir = tempdir().unwrap();
+    let cache = Arc::new(BlockCache::new(dir.path(), 64 * 1024, 0));
+    let block = (0..16384)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let digest = crate::util::content_hash_hex(&block);
+    cache.put("immutable", &block).unwrap();
+    std::thread::scope(|scope| {
+        for thread_id in 0..8 {
+            let cache = Arc::clone(&cache);
+            let block = &block;
+            let digest = &digest;
+            scope.spawn(move || {
+                let mut output = vec![0; 128];
+                for i in 0..128 {
+                    let offset = (i * 97 + thread_id * 17) % (block.len() - output.len());
+                    assert!(cache.copy_range(
+                        "immutable",
+                        Some(digest),
+                        block.len(),
+                        offset,
+                        &mut output
+                    ));
+                    assert_eq!(&output, &block[offset..offset + 128]);
+                }
+            });
+        }
+    });
+    assert_eq!(cache.stats()["direct_copy_bytes"], 8 * 128 * 128);
+    assert_eq!(cache.stats()["memory_bytes"], block.len());
+}

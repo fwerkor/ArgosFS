@@ -26,3 +26,43 @@ cargo test --lib cache_subrange_microbench -- --ignored --nocapture
 ```
 
 This microbenchmark isolates **only the decoded-block cache hotspot**. It is not a prediction of end-to-end Borg throughput; a reliable field comparison needs the same nine-member pool, benchmark repository, cold/warm cache state, and release binary, with daemon CPU, physical reads, and checkpoint counts captured. Other remaining costs include per-request metadata locking/snapshot copies and full metadata journal rollovers.
+
+
+## Profiling the remaining warm/cold FUSE path (#270)
+
+Since this follow-up, both `/metrics` and the metadata-lock-independent
+`/commit-metrics` report decoded-block cache telemetry:
+
+| Series | Interpretation |
+| --- | --- |
+| `argosfs_read_cache_requests_total{result="memory_hit"}` | Verified L1 hits (including direct subranges) |
+| `argosfs_read_cache_requests_total{result="l2_hit"}` | Verified L2 promotions |
+| `argosfs_read_cache_requests_total{result="miss"}` | Misses or rejected L2 objects |
+| `argosfs_read_cache_direct_copy_bytes_total` | Verified bytes copied into a caller's read buffer using the direct-hit fast path |
+| `argosfs_read_cache_l2_read_bytes_total` | Full encoded L2 cache-file bytes loaded before integrity validation |
+| `argosfs_read_cache_memory_bytes` / `_items` | Currently resident L1 payload and entries |
+| `argosfs_read_cache_l2_bytes` / `_items` | Currently indexed L2 disk payload and entries |
+
+All counters reset on volume open. The copy-byte counter covers only successful
+`copy_range` calls; it excludes misses, the physical shard reads, data assembled
+after RS reconstruction, and FUSE/kernel copies. A cache hit still checks the
+expected immutable checksum and length. Encrypted files and uncompressed
+single-shard direct-range reads intentionally bypass this fast path.
+
+To reproduce the physical Borg measurement, pin identical releases, pool
+geometry (including the 4+4 layout), repository, FUSE options and worker
+count; collect samples before and after **each** workload rather than comparing
+cumulative mount totals. For cold runs start with an empty decoded-block L1/L2
+cache and a controlled OS page cache on a dedicated test host; for warm runs
+prime both builds with the same verified repository. Never drop the shared host
+page cache on a production machine. Collect `/proc/diskstats` sector-read
+deltas for **all physical members**, the daemon's per-thread and total
+`/proc/<pid>/stat` CPU, peak RSS (`VmHWM`), wall time and cache-metric deltas.
+Repeat runs in alternating build order and report medians and variance. Keep
+`fsck`, `verify-journal`, degraded reconstruction and encrypted remount
+checks separate from performance runs.
+
+The cache metrics enable attributing a warm CPU regression to L1, L2 or
+verified decode activity; they do **not** themselves constitute a physical
+Borg performance comparison. Physical-device numbers require the reporter's
+test hardware and fixture.

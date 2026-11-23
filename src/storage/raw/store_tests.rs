@@ -10,6 +10,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
+#[path = "store_tests/recovery_batch.rs"]
+mod recovery_batch;
+
 struct FailingBackend {
     inner: FileBlockBackend,
     failed: BTreeSet<String>,

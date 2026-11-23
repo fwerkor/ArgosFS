@@ -129,3 +129,115 @@ fn allocator_coalesces_adjacent_overlapping_and_partial_free_extents() {
     assert_eq!(state.free_extents[0].offset, 8192);
     assert_eq!(state.free_extents[0].length, 2 * 4096);
 }
+
+#[test]
+fn allocator_validates_large_fragmented_namespace_in_linear_scan() {
+    // Vincecate's 294k-inode pool had 270,879 free extents. The old nested
+    // validation loop required >70 billion interval comparisons per member.
+    const COUNT: u64 = 270_879;
+    let mut state = init_allocator(4096, (COUNT * 2 + 2) * 4096, 4096);
+    state.free_extents = (0..COUNT)
+        .map(|i| RawFreeExtent {
+            offset: (2 * i + 2) * 4096,
+            length: 4096,
+        })
+        .collect();
+    let allocated = (0..COUNT)
+        .map(|i| PhysicalExtent {
+            disk_id: "disk-0000".into(),
+            offset: (2 * i + 1) * 4096,
+            length: 4096,
+            generation: 1,
+            flags: 0,
+        })
+        .collect::<Vec<_>>();
+    assert!(validate_allocations(&state, allocated.clone()).is_ok());
+    // An overlap near the end must still be caught after scanning almost
+    // all extents (not just the first few entries).
+    let mut damaged = allocated;
+    damaged[COUNT as usize - 1].offset += 4096;
+    assert!(matches!(
+        validate_allocations(&state, damaged),
+        Err(ArgosError::CorruptedMetadata(_))
+    ));
+}
+
+#[test]
+fn allocator_linear_sweep_preserves_overlapping_range_detection() {
+    let mut state = init_allocator(4096, 64 * 4096, 4096);
+    state.free_extents = vec![
+        RawFreeExtent {
+            offset: 40 * 4096,
+            length: 3 * 4096,
+        },
+        RawFreeExtent {
+            offset: 6 * 4096,
+            length: 2 * 4096,
+        },
+    ];
+    let example = |offset: u64, length: u64| PhysicalExtent {
+        disk_id: "disk-0000".into(),
+        offset,
+        length,
+        generation: 1,
+        flags: 0,
+    };
+    assert!(validate_allocations(
+        &state,
+        vec![example(4 * 4096, 4096), example(10 * 4096, 4096)]
+    )
+    .is_ok());
+    for (offset, length) in [
+        (5 * 4096, 2 * 4096),  // intersects first free region at right edge
+        (7 * 4096, 4096),      // entirely inside free region
+        (39 * 4096, 2 * 4096), // intersects second free region at left edge
+        (42 * 4096, 4096),     // final page of second free region
+    ] {
+        assert!(matches!(
+            validate_allocations(&state, vec![example(offset, length)]),
+            Err(ArgosError::CorruptedMetadata(_))
+        ));
+    }
+}
+
+#[test]
+fn allocator_sweep_matches_reference_overlap_check_at_boundaries() {
+    let mut state = init_allocator(4096, 64 * 4096, 4096);
+    state.free_extents = vec![
+        RawFreeExtent {
+            offset: 11 * 4096,
+            length: 2 * 4096,
+        },
+        RawFreeExtent {
+            offset: 37 * 4096,
+            length: 5 * 4096,
+        },
+        RawFreeExtent {
+            offset: 24 * 4096,
+            length: 4096,
+        },
+    ];
+    for offset in (4096..(64 * 4096)).step_by(1024) {
+        for length in [0, 1, 1024, 4096, 8192, 65536] {
+            if offset + length > state.data_end {
+                continue;
+            }
+            let original_overlap = state.free_extents.iter().any(|free| {
+                offset < free.offset.saturating_add(free.length)
+                    && free.offset < offset.saturating_add(length)
+            });
+            let candidate = PhysicalExtent {
+                disk_id: "disk-0000".into(),
+                offset,
+                length,
+                generation: 1,
+                flags: 0,
+            };
+            assert_eq!(
+                validate_allocations(&state, vec![candidate]).is_err(),
+                original_overlap,
+                "offset={offset}, length={length}"
+            );
+        }
+    }
+}

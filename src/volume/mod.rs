@@ -790,6 +790,12 @@ impl ArgosFs {
         &self.root
     }
 
+    /// Lock-free with respect to metadata commits. Safe to expose alongside
+    /// /commit-metrics while profiling warm/cold FUSE reads.
+    pub(crate) fn read_cache_stats(&self) -> BTreeMap<String, serde_json::Value> {
+        self.cache.stats()
+    }
+
     pub(crate) fn commit_metrics(&self) -> &CommitMetrics {
         &self.commit_metrics
     }
