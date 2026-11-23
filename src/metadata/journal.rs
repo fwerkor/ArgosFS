@@ -1485,12 +1485,12 @@ fn diff_json(
             if array_ops.is_empty() {
                 return;
             }
-            // A sparse delta wins when only a few elements change. When most
-            // of a large array changes, one pointer operation per element
-            // repeats the path and the operation envelope and can serialize
-            // *larger* than replacing the array once. That regressed the
-            // 2026-11-23 Borg write from 12 to 90 journal rollovers. Pick the
-            // smaller encoding instead of assuming sparsity.
+            // A sparse delta wins when only a few elements change. Do not
+            // assume sparsity: a dense mutation repeats the path and the
+            // operation envelope for every element, and a whole-array
+            // fallback reserializes every entry. The 2026-11-23 Borg write
+            // hit both shapes and regressed from 12 to 90 journal rollovers.
+            // Pick the smaller encoding.
             if sparse_array_delta_is_not_smaller(path, next, &array_ops) {
                 ops.push(MetadataDeltaOp::Replace {
                     path: path.to_string(),

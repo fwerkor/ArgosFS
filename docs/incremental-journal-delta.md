@@ -41,10 +41,11 @@ suffix:
   two serialized forms and keeps the smaller one.
 
 The 2026-11-23 Borg run showed 1.90 MB whole-array replacements of a 47,289
-entry free-extents list in single group commits, which drove the journal from
-12 to 90 rollovers. The insertion and bulk-removal paths keep those commits
-sparse; the size guard bounds the dense case. This changes only delta
-construction: the legacy operation set and replay semantics are unchanged.
+entry free-extents list in single group commits, consistent with the journal
+payload growth behind the 12-to-90 rollover regression. The insertion and
+bulk-removal paths keep those commits sparse; the size guard bounds the dense
+case. This changes only delta construction: the legacy operation set and
+replay semantics are unchanged.
 
 ## Raw delta-integrity v2 (Issue #230; explicit upgrade)
 
