@@ -234,6 +234,10 @@ fn emit_commit_metrics(volume: &ArgosFs, emitter: &mut MetricEmitter<'_>) {
             "counter",
         );
     }
+    for (reason, buckets, total_ns) in volume.commit_metrics().writeback_flush_duration_snapshots()
+    {
+        emitter.writeback_flush_histogram(reason, &buckets, total_ns);
+    }
     for (phase, snapshot) in volume.commit_metrics().snapshots() {
         let labels = [("phase", phase)];
         emitter.typed_metric(
@@ -324,6 +328,34 @@ impl<'a> MetricEmitter<'a> {
 
     fn metric(&mut self, name: &str, help: &str, value: f64, labels: &[(&str, &str)]) {
         self.typed_metric(name, help, value, labels, "gauge");
+    }
+
+    fn writeback_flush_histogram(
+        &mut self,
+        reason: &str,
+        buckets: &[u64; crate::commit_metrics::FLUSH_LATENCY_BUCKETS.len() + 1],
+        total_ns: u64,
+    ) {
+        let base = "argosfs_writeback_flush_duration_seconds";
+        if self.emitted.insert(base.to_string()) {
+            self.out.push_str(
+                "# HELP argosfs_writeback_flush_duration_seconds Writeback flush duration including per-inode queue wait\n# TYPE argosfs_writeback_flush_duration_seconds histogram\n",
+            );
+        }
+        for (index, (le, _)) in crate::commit_metrics::FLUSH_LATENCY_BUCKETS
+            .iter()
+            .enumerate()
+        {
+            self.out.push_str(&format!(
+                "{base}_bucket{{reason=\"{reason}\",le=\"{le}\"}} {}\n",
+                buckets[index]
+            ));
+        }
+        let count = buckets[crate::commit_metrics::FLUSH_LATENCY_BUCKETS.len()];
+        self.out.push_str(&format!(
+            "{base}_bucket{{reason=\"{reason}\",le=\"+Inf\"}} {count}\n{base}_count{{reason=\"{reason}\"}} {count}\n{base}_sum{{reason=\"{reason}\"}} {}\n",
+            total_ns as f64 / 1e9
+        ));
     }
 
     fn typed_metric(

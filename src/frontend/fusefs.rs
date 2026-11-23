@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const TTL: Duration = Duration::from_secs(5);
 // The kernel still sends at most 1 MiB per request. Accumulating up to four
@@ -301,13 +301,24 @@ impl DirtyExtent {
         else {
             return false;
         };
-        let mut merged = vec![0; merged_len];
-        let old_start = (self.offset - merged_start) as usize;
-        merged[old_start..old_start + self.data.len()].copy_from_slice(&self.data);
-        let new_start = (offset - merged_start) as usize;
-        merged[new_start..new_start + data.len()].copy_from_slice(data);
-        self.offset = merged_start;
-        self.data = merged;
+        if merged_start == self.offset {
+            // Appends and in-place overwrites are the common path. Reuse Vec's
+            // amortized capacity instead of copying the whole dirty stripe on
+            // every small FUSE write (quadratic cumulative copy volume).
+            self.data.resize(merged_len, 0);
+            let start = (offset - self.offset) as usize;
+            self.data[start..start + data.len()].copy_from_slice(data);
+        } else {
+            // A prepend still needs to move the existing bytes. The merge
+            // bounds guarantee that there is no uninitialised gap.
+            let mut merged = vec![0; merged_len];
+            let old_start = (self.offset - merged_start) as usize;
+            merged[old_start..old_start + self.data.len()].copy_from_slice(&self.data);
+            let new_start = (offset - merged_start) as usize;
+            merged[new_start..new_start + data.len()].copy_from_slice(data);
+            self.offset = merged_start;
+            self.data = merged;
+        }
         self.written_at = now_f64();
         true
     }
@@ -526,6 +537,7 @@ impl ArgosFuseShared {
     /// The same guard serializes this with reads, attrs, fsync and inode writes.
     /// On error, no acknowledged dirty bytes are discarded.
     fn flush_complete_stripes_for_append(&self, ino: InodeId, next_offset: u64) -> Result<bool> {
+        let started = Instant::now();
         let mut writeback = self.writeback.lock();
         let Some(dirty) = writeback.dirty.get(&ino) else {
             return Ok(false);
@@ -559,6 +571,7 @@ impl ArgosFuseShared {
         self.volume.commit_metrics().record_writeback_flush(
             WritebackFlushReason::AppendStage,
             matches!(&result, Ok(written) if *written == prefix_len),
+            started.elapsed(),
         );
         match result {
             Ok(written) if written == prefix_len => {
@@ -715,6 +728,7 @@ impl ArgosFuseShared {
         ino: InodeId,
         reason: WritebackFlushReason,
     ) -> Result<()> {
+        let started = Instant::now();
         let mut writeback = self.writeback.lock();
         let Some(dirty) = writeback.remove_dirty(ino) else {
             let reap_after_flush = writeback.reap_after_flush.remove(&ino);
@@ -737,6 +751,7 @@ impl ArgosFuseShared {
         self.volume.commit_metrics().record_writeback_flush(
             reason,
             matches!(&result, Ok(written) if *written == dirty.data.len()),
+            started.elapsed(),
         );
         let reap_after_flush = match result {
             Ok(written) if written == dirty.data.len() => writeback.reap_after_flush.remove(&ino),
