@@ -111,6 +111,7 @@ mod data_plane;
 mod deferred_flush_tests;
 mod helpers;
 mod maintenance;
+mod maintenance_key;
 mod metadata_budget;
 mod namespace;
 mod read_advisory;

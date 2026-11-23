@@ -240,7 +240,7 @@ pub struct Nfs4Acl {
     pub entries: Vec<Nfs4Ace>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct EncryptionConfig {
     pub enabled: bool,
     pub kdf: String,
