@@ -1,5 +1,7 @@
 use super::*;
 
+use super::maintenance_key::FsckKeyCache;
+
 type FsckProgress<'a> = dyn FnMut(usize, usize, &FsckReport) + 'a;
 
 impl ArgosFs {
@@ -950,6 +952,10 @@ impl ArgosFs {
         mut progress: Option<&mut FsckProgress<'_>>,
     ) -> Result<FsckReport> {
         let mut report = FsckReport::default();
+        // The filesystem encryption configuration is stable during a scrub.
+        // Argon2id derivation is intentionally amortized over encrypted files,
+        // while every stripe still validates its own authenticated contents.
+        let mut decrypt_key_cache = FsckKeyCache::default();
         let repair_before = self.repair_counters.snapshot();
         let retries_before = self
             .read_retries_seen
@@ -1014,11 +1020,15 @@ impl ArgosFs {
                             continue;
                         }
                     }
-                    // Argon2 key derivation is expensive; perform it once per
-                    // inode, outside the metadata write lock, for all stripes.
+                    // Derive once per encryption configuration during this
+                    // scrub, rather than repeating Argon2id for each inode.
+                    // Keep the derivation outside the metadata write lock.
+                    // A changed encryption configuration invalidates the key.
                     let decrypt_key = if inode.blocks.iter().any(|block| block.encrypted) {
                         let meta = self.meta.read();
-                        match self.encryption_key_locked(&meta) {
+                        match decrypt_key_cache.get_or_derive(&meta.encryption, &meta.uuid, || {
+                            self.encryption_key_locked(&meta)
+                        }) {
                             Ok(key) => Some(key),
                             Err(err) => {
                                 report.unrecoverable_files += 1;
@@ -1127,7 +1137,7 @@ impl ArgosFs {
                         if let Err(err) = self.decode_block_locked(
                             &mut meta,
                             block,
-                            decrypt_key.as_ref(),
+                            decrypt_key,
                             &mut decode_damage,
                         ) {
                             unrecoverable_blocks.push(format!("stripe {}: {err}", block.stripe_id));
@@ -1337,6 +1347,9 @@ impl ArgosFs {
         let retries_before = self.read_retries_seen.load(Ordering::Relaxed);
         let recovered_before = self.read_recovered.load(Ordering::Relaxed);
         let mut report = FsckReport::default();
+        // Like full fsck, a targeted recovery shares one authenticated
+        // volume key among all affected encrypted files in this pass.
+        let mut decrypt_key_cache = FsckKeyCache::default();
         let total = targets.len();
         for (index, (ino, stripes)) in targets.into_iter().enumerate() {
             let lock = self.inode_lock(ino);
@@ -1370,13 +1383,30 @@ impl ArgosFs {
                     .flat_map(|block| &block.shards)
                     .filter(|shard| shard.disk_id == disk_id)
                     .count() as u64;
-                match self.repair_inode_shards_locked(
-                    &mut meta,
-                    ino,
-                    Some(&live_stripes),
-                    true,
-                    "member-rebuild",
-                ) {
+                let needs_key = meta.inodes[&ino]
+                    .blocks
+                    .iter()
+                    .any(|block| live_stripes.contains(&block.stripe_id) && block.encrypted);
+                let repair = (|| -> Result<u64> {
+                    let key = if needs_key {
+                        Some(decrypt_key_cache.get_or_derive(
+                            &meta.encryption,
+                            &meta.uuid,
+                            || self.encryption_key_locked(&meta),
+                        )?)
+                    } else {
+                        None
+                    };
+                    self.repair_inode_shards_with_key_locked(
+                        &mut meta,
+                        ino,
+                        Some(&live_stripes),
+                        true,
+                        "member-rebuild",
+                        key,
+                    )
+                })();
+                match repair {
                     Ok(count) if count > 0 => {
                         report.damaged_files += 1;
                         report.repaired_files += 1;

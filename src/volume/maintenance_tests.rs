@@ -929,6 +929,37 @@ fn fsck_reports_unknown_layout_and_continues_to_other_files() {
 }
 
 #[test]
+fn full_scrub_derives_one_encryption_key_for_multiple_files() {
+    let _guard = env_lock();
+    let previous = std::env::var_os("ARGOSFS_KEY");
+    let (_dir, fs) = redundant_host_volume();
+    fs.enable_encryption("full-scrub-shared-key").unwrap();
+    unsafe { std::env::set_var("ARGOSFS_KEY", "full-scrub-shared-key") };
+    for index in 0..4 {
+        fs.write_file(&format!("/encrypted-{index}"), &[index as u8; 8192], 0o600)
+            .unwrap();
+    }
+    super::maintenance_key::reset_derivation_attempts();
+    let report = fs.fsck(false, false).unwrap();
+    assert_eq!(report.files_checked, 4, "{report:?}");
+    assert_eq!(report.unrecoverable_files, 0, "{report:?}");
+    assert_eq!(report.checksum_errors, 0, "{report:?}");
+    assert_eq!(super::maintenance_key::derivation_attempts(), 1);
+
+    // The key is scoped to one scrub: next invocation validates ARGOSFS_KEY.
+    super::maintenance_key::reset_derivation_attempts();
+    let report_again = fs.fsck(false, false).unwrap();
+    assert_eq!(report_again.unrecoverable_files, 0, "{report_again:?}");
+    assert_eq!(super::maintenance_key::derivation_attempts(), 1);
+
+    if let Some(key) = previous {
+        unsafe { std::env::set_var("ARGOSFS_KEY", key) };
+    } else {
+        unsafe { std::env::remove_var("ARGOSFS_KEY") };
+    }
+}
+
+#[test]
 fn fsck_validates_encrypted_multistripe_files_and_reports_missing_key() {
     let _guard = env_lock();
     let (_dir, fs) = redundant_host_volume();
