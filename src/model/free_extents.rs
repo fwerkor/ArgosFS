@@ -69,16 +69,7 @@ impl FreeExtents {
         length: u64,
         alignment: u64,
     ) -> Option<Option<(usize, RawFreeExtent)>> {
-        if self.fit_index.get().is_none() && (self.extents.len() < 1024 || !self.is_normalized()) {
-            return None;
-        }
-        let index = self.fit_index.get_or_init(|| {
-            let mut index = FitIndex::default();
-            for extent in &self.extents {
-                index.insert(extent);
-            }
-            index
-        });
+        let index = self.fit_index()?;
         let Some(offset) = index.first_fit(length, alignment) else {
             return Some(None);
         };
@@ -94,6 +85,36 @@ impl FreeExtents {
         }
         // Defensive fallback; should be impossible with trusted mutations.
         None
+    }
+
+    fn fit_index(&self) -> Option<&FitIndex> {
+        if self.fit_index.get().is_none() && (self.extents.len() < 1024 || !self.is_normalized()) {
+            return None;
+        }
+        Some(self.fit_index.get_or_init(|| {
+            let mut index = FitIndex::default();
+            for extent in &self.extents {
+                index.insert(extent);
+            }
+            index
+        }))
+    }
+
+    /// Exact aligned capacity from the length buckets already maintained by
+    /// allocator operations. Avoid revisiting every fragmented extent on
+    /// each statfs publication. Invalid/unordered legacy lists use the old
+    /// scan and therefore retain its accounting semantics.
+    pub(crate) fn aligned_free_bytes(&self, block: u64) -> u64 {
+        let block = block.max(1);
+        if let Some(index) = self.fit_index() {
+            index.by_length.iter().fold(0u64, |sum, (length, offsets)| {
+                sum.saturating_add((length / block * block).saturating_mul(offsets.len() as u64))
+            })
+        } else {
+            self.extents.iter().fold(0u64, |sum, extent| {
+                sum.saturating_add(extent.length / block * block)
+            })
+        }
     }
 
     pub(crate) fn take_fit_index(&mut self) -> Option<FitIndex> {

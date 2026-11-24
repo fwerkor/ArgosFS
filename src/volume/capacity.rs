@@ -125,9 +125,7 @@ pub(crate) fn statfs_bytes(
 fn raw_allocator_free_bytes(allocator: &RawAllocatorState) -> u64 {
     let block = allocator.block_size.max(4096);
     let tail = allocator.data_end.saturating_sub(allocator.next_offset) / block * block;
-    allocator.free_extents.iter().fold(tail, |total, extent| {
-        total.saturating_add(extent.length / block * block)
-    })
+    tail.saturating_add(allocator.free_extents.aligned_free_bytes(block))
 }
 
 pub(crate) fn max_stripe_units(per_disk: &[u64], width: usize) -> u64 {

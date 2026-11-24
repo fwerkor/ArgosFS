@@ -562,3 +562,40 @@ fn benchmark_indexed_late_first_fit() {
     assert_eq!(old.free_extents, base.free_extents);
     println!("47000 extents, 1000 late first-fits: linear={linear:?}, indexed={indexed:?}, speedup={:.1}x",linear.as_secs_f64()/indexed.as_secs_f64());
 }
+
+#[test]
+fn indexed_capacity_matches_scan_after_mutations_and_legacy_edits() {
+    let mut state = init_allocator(4096, 4096 * 300_000, 4096);
+    state.free_extents = (0..5000)
+        .map(|i| RawFreeExtent {
+            offset: (i * 16 + 1) * 4096,
+            length: (i % 7 + 1) * 4096,
+        })
+        .collect();
+    state.next_offset = 100_000 * 4096;
+    fn check(state: &RawAllocatorState) {
+        for block in [4096, 8192] {
+            let expected = state
+                .free_extents
+                .iter()
+                .map(|e| e.length / block * block)
+                .sum::<u64>();
+            assert_eq!(state.free_extents.aligned_free_bytes(block), expected);
+        }
+    }
+    check(&state);
+    let snapshot = state.clone();
+    for n in 0..100 {
+        let extent = allocate(&mut state, "disk", (n % 8 + 1) * 4096, n).unwrap();
+        check(&state);
+        if n % 2 == 0 {
+            free(&mut state, &extent).unwrap();
+            check(&state);
+        }
+    }
+    check(&snapshot);
+    state.free_extents[0].length += 4096;
+    check(&state);
+    state.free_extents = state.free_extents.iter().rev().cloned().collect();
+    check(&state);
+}
