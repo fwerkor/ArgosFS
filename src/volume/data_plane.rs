@@ -1221,24 +1221,36 @@ impl ArgosFs {
                     required_bytes: shard_size as u64,
                 },
             )?;
-            let mut shards = Vec::new();
-            for (slot, shard_data) in encoded.iter().enumerate() {
-                let integrity = if slot == 0 {
-                    single_raw_shard_integrity.as_ref()
-                } else {
-                    None
-                };
-                let shard = self.write_shard_locked(
-                    meta,
-                    &placements[slot],
-                    &stripe_id,
-                    slot,
-                    shard_data,
-                    integrity,
-                )?;
-                created_shards.push(shard.clone());
-                shards.push(shard);
-            }
+            let shards = if meta.backend != BackendKind::Host
+                && encoded.len() > 1
+                && !journal::crash_injection_configured()
+                && placements.iter().collect::<BTreeSet<_>>().len() == placements.len()
+            {
+                let shards =
+                    self.write_raw_stripe_locked(meta, &placements, &stripe_id, &encoded)?;
+                created_shards.extend(shards.iter().cloned());
+                shards
+            } else {
+                let mut shards = Vec::new();
+                for (slot, shard_data) in encoded.iter().enumerate() {
+                    let integrity = if slot == 0 {
+                        single_raw_shard_integrity.as_ref()
+                    } else {
+                        None
+                    };
+                    let shard = self.write_shard_locked(
+                        meta,
+                        &placements[slot],
+                        &stripe_id,
+                        slot,
+                        shard_data,
+                        integrity,
+                    )?;
+                    created_shards.push(shard.clone());
+                    shards.push(shard);
+                }
+                shards
+            };
             let raw_offset = index
                 .checked_mul(stripe_raw_size)
                 .and_then(|offset| u64::try_from(offset).ok())
@@ -1260,6 +1272,109 @@ impl ArgosFs {
             });
         }
         Ok(blocks)
+    }
+
+    /// Reserve COW extents under the metadata lock, write independent members
+    /// concurrently, and publish shard descriptors only after every worker
+    /// has completed. encode_data_locked owns the pre-allocation rollback
+    /// snapshot; on error no worker can still write a reclaimed extent.
+    fn write_raw_stripe_locked(
+        &self,
+        meta: &mut Metadata,
+        placements: &[String],
+        stripe_id: &str,
+        encoded: &[Vec<u8>],
+    ) -> Result<Vec<Shard>> {
+        self.ensure_block_backend_writable_locked(meta)?;
+        let mut reservations = Vec::with_capacity(encoded.len());
+        for (slot, (disk_id, data)) in placements.iter().zip(encoded).enumerate() {
+            self.ensure_disk_capacity_locked(meta, disk_id, data.len() as u64)?;
+            let allocator = meta
+                .raw_pool
+                .allocators
+                .get_mut(disk_id)
+                .ok_or_else(|| ArgosError::MissingDevice(disk_id.clone()))?;
+            let extent = allocator::allocate(allocator, disk_id, data.len() as u64, meta.txid + 1)?;
+            reservations.push((slot, extent, data));
+        }
+        let flush = !bulk_import_enabled() && !meta.config.defer_data_flush;
+        let snapshot = &*meta;
+        let writes = std::thread::scope(|scope| {
+            let jobs = reservations
+                .into_iter()
+                .map(|(slot, extent, data)| {
+                    scope.spawn(move || -> Result<(Shard, f64)> {
+                        let sha256 = content_hash_hex(data);
+                        let start = Instant::now();
+                        self.backend_write_at_locked(
+                            snapshot,
+                            &extent.disk_id,
+                            extent.offset,
+                            data,
+                        )?;
+                        if flush {
+                            self.backend_flush_locked(snapshot, &extent.disk_id)?;
+                        }
+                        let elapsed = start.elapsed().as_secs_f64();
+                        self.commit_metrics.add_data_plane_bytes(
+                            DataPlaneByteKind::ShardPayloadWritten,
+                            data.len(),
+                        );
+                        Ok((
+                            Shard {
+                                slot,
+                                disk_id: extent.disk_id.clone(),
+                                location: Some(ShardLocation::RawExtent(extent)),
+                                relpath: PathBuf::new(),
+                                sha256,
+                                checksum_block_size: 0,
+                                subblock_sha256: Vec::new(),
+                                size: data.len(),
+                            },
+                            elapsed,
+                        ))
+                    })
+                })
+                .collect::<Vec<_>>();
+            // Join all writers even if one failed, before rollback can reuse
+            // any reserved extent. Return the first error in slot order.
+            jobs.into_iter()
+                .map(|job| job.join().expect("raw shard writer panicked"))
+                .collect::<Vec<_>>()
+        });
+        let written = writes.into_iter().collect::<Result<Vec<_>>>()?;
+        let mut shards = Vec::with_capacity(written.len());
+        for (shard, elapsed) in written {
+            self.record_raw_shard_locked(meta, stripe_id, &shard, elapsed);
+            shards.push(shard);
+        }
+        Ok(shards)
+    }
+
+    fn record_raw_shard_locked(
+        &self,
+        meta: &mut Metadata,
+        stripe_id: &str,
+        shard: &Shard,
+        elapsed: f64,
+    ) {
+        let Some(ShardLocation::RawExtent(extent)) = &shard.location else {
+            unreachable!("raw shard required")
+        };
+        if let Some(disk) = meta.disks.get_mut(&shard.disk_id) {
+            disk.used_bytes = disk.used_bytes.saturating_add(extent.length);
+        }
+        self.update_write_latency_locked(meta, &shard.disk_id, shard.size as u64, elapsed);
+        if let Some(verify) = &self.verify_written {
+            verify.enqueue(
+                &shard.disk_id,
+                extent.offset,
+                extent.generation,
+                shard.size,
+                &shard.sha256,
+                stripe_id,
+            );
+        }
     }
 
     pub(super) fn write_shard_locked(
@@ -1310,28 +1425,7 @@ impl ArgosFs {
                 }
                 return Err(err);
             }
-            if let Some(disk) = meta.disks.get_mut(disk_id) {
-                disk.used_bytes = disk.used_bytes.saturating_add(extent.length);
-            }
-            self.update_write_latency_locked(
-                meta,
-                disk_id,
-                data.len() as u64,
-                start.elapsed().as_secs_f64(),
-            );
-            self.commit_metrics
-                .add_data_plane_bytes(DataPlaneByteKind::ShardPayloadWritten, data.len());
-            if let Some(verify) = &self.verify_written {
-                verify.enqueue(
-                    disk_id,
-                    extent.offset,
-                    extent.generation,
-                    data.len(),
-                    &sha256,
-                    stripe_id,
-                );
-            }
-            return Ok(Shard {
+            let shard = Shard {
                 slot,
                 disk_id: disk_id.to_string(),
                 location: Some(ShardLocation::RawExtent(extent)),
@@ -1340,7 +1434,11 @@ impl ArgosFs {
                 checksum_block_size,
                 subblock_sha256,
                 size: data.len(),
-            });
+            };
+            self.record_raw_shard_locked(meta, stripe_id, &shard, start.elapsed().as_secs_f64());
+            self.commit_metrics
+                .add_data_plane_bytes(DataPlaneByteKind::ShardPayloadWritten, data.len());
+            return Ok(shard);
         }
         let subdir = &stripe_id[stripe_id.len().saturating_sub(2)..];
         let relpath = PathBuf::from(format!("shards/{subdir}/{stripe_id}.{slot:03}.blk"));
