@@ -33,12 +33,19 @@ static ACTIVE_PREPARATIONS: AtomicUsize = AtomicUsize::new(0);
 struct PreparationPermit(&'static AtomicUsize);
 impl PreparationPermit {
     fn acquire(counter: &'static AtomicUsize) -> Option<Self> {
-        counter
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < MAX_PREPARED_WRITES).then_some(n + 1)
-            })
-            .ok()?;
-        Some(Self(counter))
+        let mut current = counter.load(Ordering::Acquire);
+        while current < MAX_PREPARED_WRITES {
+            match counter.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self(counter)),
+                Err(observed) => current = observed,
+            }
+        }
+        None
     }
 }
 impl Drop for PreparationPermit {
