@@ -1188,13 +1188,13 @@ fn metadata_tree_checkpoint_covers_pages_headers_and_capacity_errors() {
     assert_eq!(get_u64(&checkpoint.header, 152).unwrap(), 3);
     // Three metadata pages are written in one contiguous body batch, then
     // the index is written separately before the header is made durable.
-    assert_eq!(checkpoint.body_writes.len(), 2);
-    let data_batch = &checkpoint.body_writes[0];
+    let body_writes = checkpoint.body_writes().collect::<Vec<_>>();
+    assert_eq!(body_writes.len(), 2);
+    let data_batch = &body_writes[0];
     assert_eq!(data_batch.1, bytes);
     assert!(checkpoint
-        .body_writes
-        .iter()
-        .any(|(offset, data)| *offset == RAW_HEADER_SIZE as u64
+        .body_writes()
+        .any(|(offset, data)| offset == RAW_HEADER_SIZE as u64
             && data.len() == 3 * METADATA_INDEX_ENTRY_SIZE));
     assert!(matches!(
         metadata_tree_checkpoint("disk", 0, 0, &[], &sha256_hex(&[]), 64 * 1024),
@@ -1225,7 +1225,14 @@ fn checkpoint_batches_contiguous_pages_without_changing_recovery_bytes() {
         superblocks[0].metadata.length / 2,
     )
     .unwrap();
-    let data_batches = &checkpoint.body_writes[..checkpoint.body_writes.len() - 1];
+    let data_batches = checkpoint.body_writes().take(3).collect::<Vec<_>>();
+    // The payload batches are direct slices, not another set of allocations.
+    assert_eq!(data_batches[0].1.as_ptr(), checkpoint.payload.as_ptr());
+    assert_eq!(
+        data_batches[1].1.as_ptr(),
+        checkpoint.payload[CHECKPOINT_BATCH_BYTES..].as_ptr()
+    );
+    assert_eq!(checkpoint.body_writes().count(), 4);
     assert_eq!(data_batches.len(), 3);
     assert_eq!(data_batches[0].1.len(), CHECKPOINT_BATCH_BYTES);
     assert_eq!(data_batches[1].1.len(), CHECKPOINT_BATCH_BYTES);
@@ -1734,7 +1741,7 @@ fn checkpoint_uses_old_encoding_when_it_fits() {
         "test",
         metadata.txid,
         metadata.integrity.generation,
-        &payload.bytes,
+        payload.bytes.clone(),
         &sha256_hex(&payload.bytes),
         superblocks[0].metadata.length / 2,
         payload.original.as_ref(),
