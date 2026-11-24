@@ -107,6 +107,9 @@ pub(crate) const MAX_IN_MEMORY_IO_BYTES: usize = 256 * 1024 * 1024;
 
 mod autopilot;
 mod data_plane;
+mod metadata_lock;
+mod raw_parallel_write;
+use metadata_lock::MetadataLock;
 #[cfg(test)]
 mod deferred_flush_tests;
 mod helpers;
@@ -259,7 +262,7 @@ pub struct ArgosFs {
     backend: Arc<dyn StorageBackend>,
     backend_writable: bool,
     raw_superblocks: Arc<Vec<RawSuperblock>>,
-    meta: Arc<RwLock<Metadata>>,
+    meta: Arc<MetadataLock>,
     quota_runtime: Arc<RwLock<QuotaRuntime>>,
     deferred_commit: Arc<Mutex<DeferredCommitState>>,
     read_advisory: Arc<read_advisory::ReadAdvisory>,
@@ -529,7 +532,7 @@ impl ArgosFs {
             quarantine_since: Arc::new(Mutex::new(BTreeMap::new())),
             write_fence: Arc::new(Mutex::new(None)),
             quota_runtime: Arc::new(RwLock::new(QuotaRuntime::from_metadata(&meta)?)),
-            meta: Arc::new(RwLock::new(meta)),
+            meta: Arc::new(MetadataLock::new(meta)),
             dirty_host_shards: Arc::new(Mutex::new(BTreeSet::new())),
             inode_locks: Arc::new(Mutex::new(BTreeMap::new())),
             cache: Arc::new(cache),
@@ -732,7 +735,7 @@ impl ArgosFs {
                     && journal::canonical_metadata_hash(&meta)? != meta.integrity.meta_hash));
         let quarantined_devices = Arc::new(Mutex::new(BTreeSet::new()));
         let write_fence = Arc::new(Mutex::new(None));
-        let meta = Arc::new(RwLock::new(meta));
+        let meta = Arc::new(MetadataLock::new(meta));
         let deferred_commit = Arc::new(Mutex::new(DeferredCommitState::new_with_raw_dirty(
             &meta.read(),
             raw_uncommitted_metadata_dirty,

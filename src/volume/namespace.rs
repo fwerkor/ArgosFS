@@ -735,6 +735,21 @@ impl ArgosFs {
         } else {
             None
         };
+        if let Some(result) = self.try_parallel_raw_append(
+            ino,
+            start,
+            data,
+            clear_setid,
+            write_time,
+            prepared.as_ref(),
+        ) {
+            result?;
+            self.commit_metrics
+                .add_data_plane_bytes(DataPlaneByteKind::RangeAccepted, data.len());
+            self.commit_metrics
+                .add_data_plane_bytes(DataPlaneByteKind::RangeAlignedAppend, data.len());
+            return Ok(data.len());
+        }
         let mut meta = self.meta.write();
         if let Some((uid, gid)) = access {
             let inode = meta

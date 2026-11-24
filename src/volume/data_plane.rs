@@ -74,18 +74,19 @@ impl EncodingGeometry {
     }
 }
 
-struct PreparedStripe {
-    raw_sha256: String,
-    codec: Compression,
-    compressed_size: usize,
-    shard_size: usize,
-    encoded: Vec<Vec<u8>>,
+pub(super) struct PreparedStripe {
+    pub(super) raw_sha256: String,
+    pub(super) codec: Compression,
+    pub(super) compressed_size: usize,
+    pub(super) shard_size: usize,
+    pub(super) encoded: Vec<Vec<u8>>,
+    pub(super) shard_hashes: Vec<String>,
 }
 
 pub(super) struct PreparedWrite<'a> {
     geometry: EncodingGeometry,
     input: &'a [u8],
-    stripes: Vec<PreparedStripe>,
+    pub(super) stripes: Vec<PreparedStripe>,
     _permit: PreparationPermit,
 }
 
@@ -135,6 +136,10 @@ impl<'a> PreparedWrite<'a> {
                 codec,
                 compressed_size,
                 shard_size,
+                shard_hashes: encoded
+                    .iter()
+                    .map(|shard| content_hash_hex(shard))
+                    .collect(),
                 encoded,
             });
         }
@@ -146,7 +151,7 @@ impl<'a> PreparedWrite<'a> {
         })
     }
 
-    fn matches(&self, meta: &Metadata, data: &[u8]) -> bool {
+    pub(super) fn matches(&self, meta: &Metadata, data: &[u8]) -> bool {
         std::ptr::eq(self.input, data)
             && EncodingGeometry::from_meta(meta).as_ref() == Some(&self.geometry)
     }
