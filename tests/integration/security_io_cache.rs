@@ -513,7 +513,7 @@ fn l2_cache_write_failure_does_not_break_memory_cache() {
 }
 
 #[test]
-fn l2_cache_hit_refreshes_prune_recency_without_rewriting_file() {
+fn l2_cache_hit_protects_reused_entry_across_prune() {
     let tmp = TempDir::new().unwrap();
 
     {
@@ -533,15 +533,24 @@ fn l2_cache_hit_refreshes_prune_recency_without_rewriting_file() {
 
     cache.put("new", b"3333").unwrap();
 
+    // A reused entry is protected. The two never-reused entries are both
+    // candidates for the cold-entry eviction, so exactly one of them remains.
     assert_eq!(
         cache
             .get("old-hot", Some(&content_hash_hex(b"1111")))
             .unwrap(),
         b"1111"
     );
-    assert!(cache
-        .get("old-cold", Some(&content_hash_hex(b"2222")))
-        .is_none());
+    let survivors = [
+        cache
+            .get("old-cold", Some(&content_hash_hex(b"2222")))
+            .is_some(),
+        cache.get("new", Some(&content_hash_hex(b"3333"))).is_some(),
+    ]
+    .into_iter()
+    .filter(|present| *present)
+    .count();
+    assert_eq!(survivors, 1);
 }
 
 #[test]

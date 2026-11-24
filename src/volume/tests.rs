@@ -1749,10 +1749,19 @@ fn v2_added_block_members_inherit_required_features_and_survive_recovery() {
     );
     for path in &images {
         let (sb, _) = raw_store::inspect_device(BackendKind::LoopBlock, path.clone()).unwrap();
-        assert_ne!(
-            sb.required_feature_flags & raw_format::REQUIRED_FEATURE_DELTA_INTEGRITY,
-            0
-        );
+        let required = raw_format::REQUIRED_FEATURE_DELTA_INTEGRITY
+            | raw_format::REQUIRED_FEATURE_ARRAY_SPLICE;
+        assert_eq!(sb.required_feature_flags & required, required);
+        let image = std::fs::File::open(path).unwrap();
+        for offset in [
+            raw_format::PRIMARY_SUPERBLOCK_OFFSET,
+            sb.backup_superblock_offset,
+        ] {
+            let mut data = [0u8; raw_format::SUPERBLOCK_SIZE];
+            std::os::unix::fs::FileExt::read_exact_at(&image, &mut data, offset).unwrap();
+            let copy = raw_format::RawSuperblock::decode(&data).unwrap();
+            assert_eq!(copy.required_feature_flags & required, required);
+        }
     }
     drop(fs);
     let recovered = ArgosFs::open_loop(&images, false).unwrap();
