@@ -579,6 +579,7 @@ fn write_metadata_copies_quorum_impl(
 struct CheckpointPayload {
     bytes: Vec<u8>,
     original: Option<(u64, String)>,
+    has_catalog: bool,
 }
 
 fn checkpoint_fits(bytes: usize, slot_len: u64) -> bool {
@@ -646,11 +647,35 @@ fn prepare_checkpoint_payload(
     metadata: &Metadata,
     superblocks: &[RawSuperblock],
 ) -> Result<CheckpointPayload> {
-    use std::io::Write;
     let wire = CheckpointWire {
         metadata,
         checkpoint_member_catalog: metadata.inodes.checkpoint_catalog(),
     };
+    // This is an advisory index, not authoritative metadata. Never require
+    // additional disk space (or a larger expansion limit) to commit merely
+    // because the optional index is large. Preserve the original payload
+    // path when the catalog-bearing payload cannot fit the existing slots.
+    match encode_checkpoint_payload(&wire, superblocks, true) {
+        Ok(payload)
+            if superblocks
+                .iter()
+                .all(|sb| checkpoint_fits(payload.bytes.len(), sb.metadata.length / 2)) =>
+        {
+            Ok(payload)
+        }
+        Ok(_) | Err(ArgosError::Invalid(_)) => {
+            encode_checkpoint_payload(metadata, superblocks, false)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn encode_checkpoint_payload(
+    wire: &impl Serialize,
+    superblocks: &[RawSuperblock],
+    has_catalog: bool,
+) -> Result<CheckpointPayload> {
+    use std::io::Write;
     let mut probe = CheckpointProbe {
         len: 0,
         hash: Sha256::new(),
@@ -658,7 +683,7 @@ fn prepare_checkpoint_payload(
     };
     {
         let mut writer = std::io::BufWriter::with_capacity(64 * 1024, &mut probe);
-        serde_json::to_writer(&mut writer, &wire)?;
+        serde_json::to_writer(&mut writer, wire)?;
         writer.flush()?;
     }
     let len = checked_usize(probe.len, "checkpoint expanded length")?;
@@ -671,9 +696,10 @@ fn prepare_checkpoint_payload(
         return Ok(CheckpointPayload {
             bytes: match probe.small {
                 Some(bytes) => bytes,
-                None => serde_json::to_vec(&wire)?,
+                None => serde_json::to_vec(wire)?,
             },
             original: None,
+            has_catalog,
         });
     }
     if probe.len > METADATA_DECOMPRESSED_MAX {
@@ -691,7 +717,7 @@ fn prepare_checkpoint_payload(
         // identical. No expanded JSON Vec is retained for the compressed path.
         let encoder = zstd::stream::write::Encoder::new(Vec::new(), CHECKPOINT_ZSTD_LEVEL)?;
         let mut writer = std::io::BufWriter::with_capacity(64 * 1024, encoder);
-        serde_json::to_writer(&mut writer, &wire)?;
+        serde_json::to_writer(&mut writer, wire)?;
         writer.flush()?;
         writer
             .into_inner()
@@ -701,6 +727,7 @@ fn prepare_checkpoint_payload(
     Ok(CheckpointPayload {
         bytes: compressed,
         original: Some(original),
+        has_catalog,
     })
 }
 
@@ -720,8 +747,10 @@ fn prepare_checkpoint_writes(
         u64::MAX,
         payload.original.as_ref(),
     )?;
-    checkpoint.header[CHECKPOINT_CATALOG_OFFSET..CHECKPOINT_CATALOG_OFFSET + 8]
-        .copy_from_slice(CHECKPOINT_CATALOG_MAGIC);
+    if payload.has_catalog {
+        checkpoint.header[CHECKPOINT_CATALOG_OFFSET..CHECKPOINT_CATALOG_OFFSET + 8]
+            .copy_from_slice(CHECKPOINT_CATALOG_MAGIC);
+    }
     Ok(checkpoint)
 }
 

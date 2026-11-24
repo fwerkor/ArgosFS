@@ -434,6 +434,23 @@ fn next_metadata(previous: &Metadata, pool_name: &str) -> Metadata {
 }
 
 #[test]
+fn optional_checkpoint_catalog_does_not_require_extra_slot_capacity() {
+    let (_dir, _images, metadata, mut superblocks) = quorum_fixture();
+    for sb in &mut superblocks {
+        sb.metadata.length = 0;
+    }
+    let payload = prepare_checkpoint_payload(&metadata, &superblocks).unwrap();
+    assert!(!payload.has_catalog);
+    let expanded = zstd::stream::decode_all(payload.bytes.as_slice()).unwrap();
+    assert_eq!(expanded, serde_json::to_vec(&metadata).unwrap());
+    let checkpoint = prepare_checkpoint_writes(&metadata, &superblocks).unwrap();
+    assert_ne!(
+        &checkpoint.header[CHECKPOINT_CATALOG_OFFSET..CHECKPOINT_CATALOG_OFFSET + 8],
+        CHECKPOINT_CATALOG_MAGIC
+    );
+}
+
+#[test]
 fn persisted_member_stripe_catalog_is_verified_and_stale_hint_falls_back() {
     let (_dir, images, metadata, superblocks) = quorum_fixture();
     let backend = block_backend_for(&images);
