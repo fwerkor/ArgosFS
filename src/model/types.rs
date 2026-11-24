@@ -649,7 +649,9 @@ pub struct RawAllocatorState {
     pub data_end: u64,
     pub next_offset: u64,
     #[serde(default)]
-    pub free_extents: Vec<RawFreeExtent>,
+    /// Persistent sequence: snapshots share unchanged extent chunks. Serde
+    /// continues to encode the same JSON array in the same order.
+    pub free_extents: imbl::Vector<RawFreeExtent>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -8,7 +8,7 @@ pub fn init_allocator(data_start: u64, data_length: u64, block_size: u64) -> Raw
         data_start,
         data_end: data_start.saturating_add(data_length),
         next_offset: data_start,
-        free_extents: Vec::new(),
+        free_extents: imbl::Vector::new(),
     }
 }
 
@@ -86,10 +86,11 @@ pub fn free(state: &mut RawAllocatorState, extent: &PhysicalExtent) -> Result<()
     // old normalization semantics for these exceptional inputs; generated
     // free lists are sorted and strictly separated after every mutation.
     if !free
-        .windows(2)
-        .all(|pair| pair[0].offset.saturating_add(pair[0].length) < pair[1].offset)
+        .iter()
+        .zip(free.iter().skip(1))
+        .all(|(left, right)| left.offset.saturating_add(left.length) < right.offset)
     {
-        free.push(RawFreeExtent {
+        free.push_back(RawFreeExtent {
             offset: start,
             length: extent.length,
         });
@@ -99,7 +100,18 @@ pub fn free(state: &mut RawAllocatorState, extent: &PhysicalExtent) -> Result<()
     // Only neighbors intersecting or touching the new range need merging.
     // Reuse the existing allocation instead of sorting and rebuilding a
     // potentially hundreds-of-thousands-entry free list on each reclamation.
-    let first = free.partition_point(|entry| entry.offset.saturating_add(entry.length) < start);
+    let mut low = 0;
+    let mut high = free.len();
+    while low < high {
+        let middle = low + (high - low) / 2;
+        let entry = &free[middle];
+        if entry.offset.saturating_add(entry.length) < start {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    let first = low;
     let mut last = first;
     while let Some(entry) = free.get(last) {
         if entry.offset > end {
@@ -109,13 +121,20 @@ pub fn free(state: &mut RawAllocatorState, extent: &PhysicalExtent) -> Result<()
         end = end.max(entry.offset.saturating_add(entry.length));
         last += 1;
     }
-    free.splice(
-        first..last,
-        std::iter::once(RawFreeExtent {
-            offset: start,
-            length: end.saturating_sub(start),
-        }),
-    );
+    let replacement = RawFreeExtent {
+        offset: start,
+        length: end.saturating_sub(start),
+    };
+    if last == first + 1 {
+        free[first] = replacement;
+    } else if first == last {
+        free.insert(first, replacement);
+    } else {
+        let right = free.split_off(last);
+        free.truncate(first);
+        free.push_back(replacement);
+        free.append(right);
+    }
     Ok(())
 }
 
@@ -142,7 +161,7 @@ pub fn validate_allocations(
         }
         previous_end = extent.offset.saturating_add(extent.length);
     }
-    let mut free_extents = state.free_extents.clone();
+    let mut free_extents = state.free_extents.iter().cloned().collect::<Vec<_>>();
     free_extents.sort_by_key(|extent| extent.offset);
     let mut previous_free_end = state.data_start;
     for free in &free_extents {
@@ -189,9 +208,12 @@ pub fn validate_allocations(
 }
 
 fn coalesce(state: &mut RawAllocatorState) {
-    state.free_extents.sort_by_key(|extent| extent.offset);
+    let mut extents = std::mem::take(&mut state.free_extents)
+        .into_iter()
+        .collect::<Vec<_>>();
+    extents.sort_by_key(|extent| extent.offset);
     let mut merged: Vec<RawFreeExtent> = Vec::new();
-    for extent in state.free_extents.drain(..) {
+    for extent in extents {
         if let Some(last) = merged.last_mut() {
             let last_end = last.offset.saturating_add(last.length);
             if extent.offset <= last_end {
@@ -202,7 +224,7 @@ fn coalesce(state: &mut RawAllocatorState) {
         }
         merged.push(extent);
     }
-    state.free_extents = merged;
+    state.free_extents = merged.into_iter().collect();
 }
 
 #[cfg(test)]
