@@ -1785,7 +1785,26 @@ fn append_journal_quorum(
             superblocks.len(),
         ));
     }
-    let _splice_guard = journal::allow_array_splice(array_splice_feature_enabled(superblocks));
+    // Do not introduce a new encoding during a partial feature upgrade or
+    // degraded mount: every active member must have been fenced first.
+    let active = metadata
+        .disks
+        .values()
+        .filter(|disk| disk.status != crate::types::DiskStatus::Removed)
+        .count();
+    let splice_enabled = superblocks.len() == active && array_splice_feature_enabled(superblocks);
+    if !splice_enabled
+        && prepared_delta.as_ref().is_some_and(|delta| {
+            delta
+                .iter()
+                .any(|op| matches!(op, journal::MetadataDeltaOp::Splice { .. }))
+        })
+    {
+        return Err(ArgosError::IncompatibleFormat(
+            "array splice journal delta requires all active members to be upgraded".into(),
+        ));
+    }
+    let _splice_guard = journal::allow_array_splice(splice_enabled);
     let (entry, target_record_hash) = build_journal_entry_measured(
         metadata,
         previous_metadata,

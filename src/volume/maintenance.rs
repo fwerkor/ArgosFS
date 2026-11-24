@@ -196,10 +196,8 @@ impl ArgosFs {
         // A member joining an upgraded pool must reject older writers from
         // its very first persistent superblock. This includes both backup
         // and primary copies written by initialize_pool below.
-        if self.raw_superblocks.iter().any(|member| {
-            member.required_feature_flags & raw_format::REQUIRED_FEATURE_DELTA_INTEGRITY != 0
-        }) {
-            sb.required_feature_flags |= raw_format::REQUIRED_FEATURE_DELTA_INTEGRITY;
+        for member in &self.metadata_superblocks_locked(&meta)? {
+            sb.required_feature_flags |= member.required_feature_flags;
         }
         let new_backend_with_id =
             FileBlockBackend::open_with_ids(kind, vec![(id.clone(), path.clone())], true)?;
