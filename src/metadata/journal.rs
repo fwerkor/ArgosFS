@@ -1117,15 +1117,29 @@ fn has_valid_checkpoint(root: &Path) -> Result<bool> {
     Ok(false)
 }
 
+#[path = "journal_allocator.rs"]
+mod allocator_delta;
+
 /// Build a JSON-compatible journal delta without materializing the full
 /// previous/next metadata trees. Existing journal records remain readable.
 pub fn metadata_delta(previous: &Metadata, next: &Metadata) -> Result<Vec<MetadataDeltaOp>> {
     let mut ops = Vec::new();
-    // HeaderPage contains all Metadata fields except disks/inodes. Its size
-    // is bounded independently of the namespace (allocator lists excluded).
-    let previous_header = serde_json::to_value(MetadataHeaderPage::from(previous))?;
-    let next_header = serde_json::to_value(MetadataHeaderPage::from(next))?;
-    diff_json("", &previous_header, &next_header, &mut ops);
+    // Keep large persistent allocator arrays out of the general header JSON.
+    let mut previous_header = MetadataHeaderPage::from(previous);
+    let mut next_header = MetadataHeaderPage::from(next);
+    previous_header.raw_pool.allocators.clear();
+    next_header.raw_pool.allocators.clear();
+    diff_json(
+        "",
+        &serde_json::to_value(previous_header)?,
+        &serde_json::to_value(next_header)?,
+        &mut ops,
+    );
+    allocator_delta::diff(
+        &previous.raw_pool.allocators,
+        &next.raw_pool.allocators,
+        &mut ops,
+    )?;
 
     diff_metadata_map("/disks", &previous.disks, &next.disks, &mut ops)?;
     diff_inodes(&previous.inodes, &next.inodes, &mut ops)?;
@@ -1215,6 +1229,7 @@ pub fn apply_metadata_delta(previous: &Metadata, delta: &[MetadataDeltaOp]) -> R
     // implementation expanded every inode into serde_json::Value, mutated a
     // handful of entries, then built an entirely new HAMT on every record.
     let mut metadata = previous.clone();
+    let typed_allocators = allocator_delta::replay(&previous.raw_pool.allocators, delta);
     let mut header: Option<serde_json::Value> = None;
     // The delta writer groups changes to a given inode. Keep at most one
     // expanded inode (and disk) while applying successive nested operations;
@@ -1223,6 +1238,9 @@ pub fn apply_metadata_delta(previous: &Metadata, delta: &[MetadataDeltaOp]) -> R
     let mut pending_disk: Option<(String, serde_json::Value)> = None;
     for op in delta {
         let tokens = json_pointer_tokens(delta_path(op))?;
+        if typed_allocators.is_some() && allocator_delta::is_allocator_path(&tokens) {
+            continue;
+        }
         match tokens.as_slice() {
             [root, key, tail @ ..] if root == "inodes" => {
                 flush_pending_disk(&mut metadata, &mut pending_disk)?;
@@ -1329,7 +1347,11 @@ pub fn apply_metadata_delta(previous: &Metadata, delta: &[MetadataDeltaOp]) -> R
                 let value = match header.as_mut() {
                     Some(value) => value,
                     None => {
-                        header.insert(serde_json::to_value(MetadataHeaderPage::from(&metadata))?)
+                        let mut page = MetadataHeaderPage::from(&metadata);
+                        if typed_allocators.is_some() {
+                            page.raw_pool.allocators.clear();
+                        }
+                        header.insert(serde_json::to_value(page)?)
                     }
                 };
                 apply_delta_op(value, op)?;
@@ -1359,6 +1381,9 @@ pub fn apply_metadata_delta(previous: &Metadata, delta: &[MetadataDeltaOp]) -> R
         metadata.reshape = h.reshape;
         metadata.encryption = h.encryption;
         metadata.integrity = h.integrity;
+    }
+    if let Some(allocators) = typed_allocators {
+        metadata.raw_pool.allocators = allocators;
     }
     if metadata.integrity.hash_scheme == Some(DELTA_INTEGRITY_SCHEME) {
         let hash = delta_integrity_hash(previous, &metadata, delta)?;
