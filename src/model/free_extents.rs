@@ -1,9 +1,53 @@
 //! Copy-on-write free extent sequence with a cached ordering proof.
 use super::types::RawFreeExtent;
-use imbl::Vector;
+use imbl::{OrdMap, OrdSet, Vector};
 use serde::{Deserialize, Serialize};
 use std::ops::{Deref, DerefMut};
 use std::sync::OnceLock;
+
+/// Persistent length -> offsets index for normalized free lists. Exact
+/// length buckets retain first-fit placement, not best-fit placement.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct FitIndex {
+    by_length: OrdMap<u64, OrdSet<u64>>,
+}
+
+impl FitIndex {
+    pub(crate) fn insert(&mut self, extent: &RawFreeExtent) {
+        self.by_length
+            .entry(extent.length)
+            .or_default()
+            .insert(extent.offset);
+    }
+
+    pub(crate) fn remove(&mut self, extent: &RawFreeExtent) {
+        if let Some(offsets) = self.by_length.get_mut(&extent.length) {
+            offsets.remove(&extent.offset);
+            if offsets.is_empty() {
+                self.by_length.remove(&extent.length);
+            }
+        }
+    }
+
+    fn first_fit(&self, length: u64, alignment: u64) -> Option<u64> {
+        self.by_length
+            .range(length..)
+            .filter_map(|(_, offsets)| {
+                offsets
+                    .iter()
+                    .find(|offset| **offset % alignment == 0)
+                    .copied()
+            })
+            .min()
+    }
+
+    pub(crate) fn max_length(&self) -> u64 {
+        self.by_length
+            .iter()
+            .next_back()
+            .map_or(0, |(length, _)| *length)
+    }
+}
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(transparent)]
@@ -13,9 +57,54 @@ pub struct FreeExtents {
     normalized: OnceLock<bool>,
     #[serde(skip)]
     length_upper_bound: OnceLock<u64>,
+    #[serde(skip)]
+    fit_index: OnceLock<FitIndex>,
 }
 
 impl FreeExtents {
+    /// Some(None) means an indexed search proved that no extent fits;
+    /// None means use the original linear search (small/legacy lists).
+    pub(crate) fn indexed_fit(
+        &self,
+        length: u64,
+        alignment: u64,
+    ) -> Option<Option<(usize, RawFreeExtent)>> {
+        if self.fit_index.get().is_none() && (self.extents.len() < 1024 || !self.is_normalized()) {
+            return None;
+        }
+        let index = self.fit_index.get_or_init(|| {
+            let mut index = FitIndex::default();
+            for extent in &self.extents {
+                index.insert(extent);
+            }
+            index
+        });
+        let Some(offset) = index.first_fit(length, alignment) else {
+            return Some(None);
+        };
+        let (mut lo, mut hi) = (0, self.extents.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let extent = &self.extents[mid];
+            match extent.offset.cmp(&offset) {
+                std::cmp::Ordering::Less => lo = mid + 1,
+                std::cmp::Ordering::Greater => hi = mid,
+                std::cmp::Ordering::Equal => return Some(Some((mid, extent.clone()))),
+            }
+        }
+        // Defensive fallback; should be impossible with trusted mutations.
+        None
+    }
+
+    pub(crate) fn take_fit_index(&mut self) -> Option<FitIndex> {
+        self.fit_index.take()
+    }
+
+    pub(crate) fn restore_fit_index(&mut self, index: FitIndex) {
+        self.mark_length_upper_bound(index.max_length());
+        self.fit_index = OnceLock::from(index);
+    }
+
     pub(crate) fn is_normalized(&self) -> bool {
         *self.normalized.get_or_init(|| {
             self.extents
@@ -59,6 +148,7 @@ impl DerefMut for FreeExtents {
         // whole-vector replacement) invalidate the ordering proof first.
         self.normalized.take();
         self.length_upper_bound.take();
+        self.fit_index.take();
         &mut self.extents
     }
 }
@@ -82,6 +172,7 @@ impl FromIterator<RawFreeExtent> for FreeExtents {
             extents: items.into_iter().collect(),
             normalized: OnceLock::new(),
             length_upper_bound: OnceLock::new(),
+            fit_index: OnceLock::new(),
         }
     }
 }
