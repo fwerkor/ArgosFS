@@ -461,10 +461,11 @@ mod splice_tests {
         let tail = right.split_off(20_000);
         right.truncate(12_000);
         right.append(tail);
+        let last_offset = right[29_999].offset + 8192;
         right.insert(
             30_000,
             RawFreeExtent {
-                offset: right[29_999].offset + 8192,
+                offset: last_offset,
                 length: 4096,
             },
         );
