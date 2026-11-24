@@ -83,6 +83,51 @@ fn l2_hits_promote_to_memory_and_remove_cleans_index() {
 }
 
 #[test]
+fn l2_scan_keeps_a_reusable_sample_and_protects_reused_entries() {
+    let dir = tempdir().unwrap();
+    let block_size = 1024usize;
+    let limit = 512 * block_size as u64;
+    let cache = BlockCache::new(dir.path(), 0, limit);
+    let blocks = (0..2_048)
+        .map(|index| vec![(index % 251) as u8; block_size])
+        .collect::<Vec<_>>();
+
+    // Cold sequential pass: the cache cannot hold the whole stream.
+    for (index, block) in blocks.iter().enumerate() {
+        cache.put(&format!("stream:{index}"), block).unwrap();
+    }
+    assert!(cache.stats()["l2_bytes"].as_u64().unwrap() <= limit);
+
+    // Warm pass in the same order: the retained random sample must survive
+    // until it is read, instead of being only an LRU tail evicted up front.
+    let mut hits = 0;
+    let mut hit_key = None;
+    for (index, block) in blocks.iter().enumerate() {
+        let key = format!("stream:{index}");
+        if cache.get(&key, None).is_some() {
+            hits += 1;
+            hit_key.get_or_insert(key);
+        } else {
+            cache.put(&key, block).unwrap();
+        }
+    }
+    assert!(
+        hits >= 100,
+        "warm sequential pass should hit a reusable sample, got {hits}"
+    );
+
+    // A reused entry is protected while colder entries remain.
+    let protected = hit_key.expect("warm scan hit at least one entry");
+    assert!(cache.get(&protected, None).is_some());
+    for index in 0..8 {
+        cache
+            .put(&format!("new:{index}"), &vec![0xee; block_size])
+            .unwrap();
+    }
+    assert!(cache.get(&protected, None).is_some());
+}
+
+#[test]
 fn l2_limit_resolution_honors_disable_override_and_invalid_values() {
     assert_eq!(resolve_l2_limit(123, None, None), 123);
     assert_eq!(resolve_l2_limit(123, None, Some("456".into())), 456);
