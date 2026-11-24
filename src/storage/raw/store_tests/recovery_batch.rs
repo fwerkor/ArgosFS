@@ -144,3 +144,66 @@ fn recovery_rejects_invalid_page_index_before_body_read() {
         Err(ArgosError::CorruptedMetadata(_))
     ));
 }
+
+#[test]
+fn journal_tip_scans_all_records_using_bounded_contiguous_reads() {
+    let (_dir, images, metadata, superblocks) = quorum_fixture();
+    let backend = block_backend_for(&images);
+    let sb = &superblocks[0];
+    let (record, _) = build_journal_entry(
+        &metadata,
+        None,
+        "tip-batch",
+        serde_json::json!({"payload": "x".repeat(4096)}),
+        true,
+    )
+    .unwrap();
+    let (large, _) = build_journal_entry(
+        &metadata,
+        None,
+        "large-tip-batch",
+        serde_json::json!({"payload": "y".repeat(JOURNAL_TIP_BATCH_BYTES + 17)}),
+        true,
+    )
+    .unwrap();
+    let count = JOURNAL_TIP_BATCH_BYTES * 2 / record.len() + 3;
+    let mut body = record.repeat(count);
+    body.extend_from_slice(&large);
+    assert!(body.len() as u64 + RAW_HEADER_SIZE as u64 <= sb.journal.length);
+    initialize_journal_region(&backend, &sb.disk_id, sb).unwrap();
+    let start = sb.journal.offset + RAW_HEADER_SIZE as u64;
+    backend.write_at(&sb.disk_id, start, &body).unwrap();
+    let mut header = [0; RAW_HEADER_SIZE];
+    backend
+        .read_at(&sb.disk_id, sb.journal.offset, &mut header)
+        .unwrap();
+    put_u64(&mut header, 24, RAW_HEADER_SIZE as u64 + body.len() as u64);
+    backend
+        .write_at(&sb.disk_id, sb.journal.offset, &header)
+        .unwrap();
+    let counted = CountingRecoveryReads {
+        inner: block_backend_for(&images),
+        device: sb.disk_id.clone(),
+        first_body_byte: start,
+        last_body_byte: start + body.len() as u64,
+        body_calls: AtomicUsize::new(0),
+    };
+    assert_eq!(
+        journal_tip_identity(&counted, sb).unwrap(),
+        Some((metadata.txid, metadata.integrity.meta_hash.clone()))
+    );
+    assert_eq!(
+        counted.body_calls.load(Ordering::Relaxed),
+        body.len().div_ceil(JOURNAL_TIP_BATCH_BYTES)
+    );
+    assert!(body.len().div_ceil(JOURNAL_TIP_BATCH_BYTES) * 20 < (count + 1) * 2);
+    // Corrupt a prefix record, not the final record. A fast tip read must
+    // still detect corruption before any new transaction can be appended.
+    backend
+        .write_at(&sb.disk_id, start + 36, &[body[36] ^ 1])
+        .unwrap();
+    assert!(matches!(
+        journal_tip_identity(&counted, sb),
+        Err(ArgosError::Checksum(_))
+    ));
+}
