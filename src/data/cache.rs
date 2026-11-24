@@ -135,7 +135,10 @@ impl CacheInner {
             } else {
                 self.l2_low_reuse_windows = self.l2_low_reuse_windows.saturating_add(1);
             }
-            if self.l2_low_reuse_windows >= 8 && self.l2_hot_bytes > 0 {
+            if self.l2_low_reuse_windows >= 8 {
+                // Keep cold priorities stable across pruning batches, rotating
+                // only after sustained low reuse so a new workload can adapt.
+                self.l2_evict_seed = self.l2_evict_seed.wrapping_add(1);
                 for entry in self.l2_index.values_mut() {
                     entry.reused = false;
                 }
@@ -210,7 +213,9 @@ struct L2Entry {
 
 fn eviction_score(path: &Path, seed: u64) -> u64 {
     let mut hasher = DefaultHasher::new();
-    path.hash(&mut hasher);
+    // The filename is the digest of the cache key; installation paths must
+    // not influence which logical blocks survive a scan.
+    path.file_name().hash(&mut hasher);
     seed.hash(&mut hasher);
     hasher.finish()
 }
@@ -588,12 +593,11 @@ impl BlockCache {
         }
         // Prune with hysteresis so a scan does not sort and evict on every
         // admission. Cold entries are evicted in a deterministic hash order
-        // (effectively a uniform random sample of the scanned stream), while
+        // (a stable priority sample within each reuse epoch), while
         // entries that have already been reused are kept until no cold entry
         // remains. This lets a second sequential pass hit a useful sample of
         // the first pass instead of finding only an already-evicted LRU tail.
         let target = self.l2_limit.saturating_sub(self.l2_limit / 16).max(1);
-        inner.l2_evict_seed = inner.l2_evict_seed.wrapping_add(1);
         let seed = inner.l2_evict_seed;
         let mut cold = Vec::new();
         let mut hot = Vec::new();
