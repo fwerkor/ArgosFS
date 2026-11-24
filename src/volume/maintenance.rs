@@ -1294,9 +1294,9 @@ impl ArgosFs {
     /// targeted recovery operation, not a replacement for a complete scrub:
     /// unrelated members and unreferenced/orphaned extents are not checked.
     ///
-    /// Build a transient member-to-stripe worklist from one metadata snapshot.
-    /// This costs one in-memory namespace traversal, but avoids verifying all
-    /// other files and stripes on disk. Revalidate each inode under its lock:
+    /// Select candidate inodes from the mount's incrementally maintained
+    /// member catalog, including uncommitted edits. Inspect only their blocks
+    /// to construct the stripe worklist. Revalidate each inode under its lock:
     /// another writer may replace its blocks after worklist construction.
     pub fn repair_member_shards(
         &self,
@@ -1323,10 +1323,12 @@ impl ArgosFs {
                     "member {disk_id} is not eligible for rebuild (online or within offline grace)"
                 )));
             }
-            let mut targets = meta
+            let targets = meta
                 .inodes
-                .iter()
-                .filter_map(|(ino, inode)| {
+                .member_inode_ids(disk_id)
+                .into_iter()
+                .filter_map(|ino| {
+                    let inode = meta.inodes.get(&ino)?;
                     if inode.kind != NodeKind::File {
                         return None;
                     }
@@ -1336,10 +1338,9 @@ impl ArgosFs {
                         .filter(|block| block.shards.iter().any(|shard| shard.disk_id == disk_id))
                         .map(|block| block.stripe_id.clone())
                         .collect::<BTreeSet<_>>();
-                    (!stripes.is_empty()).then_some((*ino, stripes))
+                    (!stripes.is_empty()).then_some((ino, stripes))
                 })
                 .collect::<Vec<_>>();
-            targets.sort_unstable_by_key(|(ino, _)| *ino);
             targets
         };
 
