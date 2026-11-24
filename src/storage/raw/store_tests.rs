@@ -1618,6 +1618,16 @@ fn compressed_checkpoint_quorum_round_trip_and_corruption_checks() {
         sb.metadata.length = 1024 * 1024;
     }
     let payload = prepare_checkpoint_payload(&next, &superblocks).unwrap();
+    let exact = serde_json::to_vec(&next).unwrap();
+    assert!(exact.len() > CHECKPOINT_PROBE_BYTES);
+    assert_eq!(
+        payload.original.as_ref().unwrap(),
+        &(exact.len() as u64, sha256_hex(&exact))
+    );
+    assert_eq!(
+        zstd::stream::decode_all(payload.bytes.as_slice()).unwrap(),
+        exact
+    );
     assert!(
         payload.original.is_some(),
         "full JSON should not fit the test slot"

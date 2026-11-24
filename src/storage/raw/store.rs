@@ -600,28 +600,90 @@ fn checkpoint_fits(bytes: usize, slot_len: u64) -> bool {
         .is_some_and(|end| end <= slot_len)
 }
 
+// Retain small checkpoints directly, but do not allocate a full expanded
+// JSON image just to decide whether it must be compressed. The probe streams
+// the exact legacy serialization into a digest and a bounded prefix buffer.
+const CHECKPOINT_PROBE_BYTES: usize = 1024 * 1024;
+
+struct CheckpointProbe {
+    len: u64,
+    hash: Sha256,
+    small: Option<Vec<u8>>,
+}
+
+impl std::io::Write for CheckpointProbe {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.len = self
+            .len
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| std::io::Error::other("checkpoint size overflow"))?;
+        self.hash.update(bytes);
+        if let Some(small) = &mut self.small {
+            if self.len <= CHECKPOINT_PROBE_BYTES as u64 {
+                small.extend_from_slice(bytes);
+            } else {
+                self.small = None;
+            }
+        }
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn prepare_checkpoint_payload(
     metadata: &Metadata,
     superblocks: &[RawSuperblock],
 ) -> Result<CheckpointPayload> {
-    let bytes = serde_json::to_vec(metadata)?;
+    use std::io::Write;
+    let mut probe = CheckpointProbe {
+        len: 0,
+        hash: Sha256::new(),
+        small: Some(Vec::new()),
+    };
+    {
+        let mut writer = std::io::BufWriter::with_capacity(64 * 1024, &mut probe);
+        serde_json::to_writer(&mut writer, metadata)?;
+        writer.flush()?;
+    }
+    let len = checked_usize(probe.len, "checkpoint expanded length")?;
     if superblocks
         .iter()
-        .all(|sb| checkpoint_fits(bytes.len(), sb.metadata.length / 2))
+        .all(|sb| checkpoint_fits(len, sb.metadata.length / 2))
     {
+        // Large uncompressed images need their exact legacy bytes anyway.
+        // Preserve that encoding and COW page reuse instead of forcing zstd.
         return Ok(CheckpointPayload {
-            bytes,
+            bytes: match probe.small {
+                Some(bytes) => bytes,
+                None => serde_json::to_vec(metadata)?,
+            },
             original: None,
         });
     }
-    if bytes.len() as u64 > METADATA_DECOMPRESSED_MAX {
+    if probe.len > METADATA_DECOMPRESSED_MAX {
         return Err(ArgosError::Invalid(format!(
             "metadata checkpoint exceeds {}-byte supported expansion limit",
             METADATA_DECOMPRESSED_MAX
         )));
     }
-    let original = (bytes.len() as u64, sha256_hex(&bytes));
-    let compressed = zstd::stream::encode_all(bytes.as_slice(), CHECKPOINT_ZSTD_LEVEL)?;
+    let original = (probe.len, hex::encode(probe.hash.finalize()));
+    let compressed = if let Some(bytes) = probe.small {
+        zstd::stream::encode_all(bytes.as_slice(), CHECKPOINT_ZSTD_LEVEL)?
+    } else {
+        // Stream the second serialization directly into the compressor. The
+        // immutable snapshot and deterministic inode ordering make both passes
+        // identical. No expanded JSON Vec is retained for the compressed path.
+        let encoder = zstd::stream::write::Encoder::new(Vec::new(), CHECKPOINT_ZSTD_LEVEL)?;
+        let mut writer = std::io::BufWriter::with_capacity(64 * 1024, encoder);
+        serde_json::to_writer(&mut writer, metadata)?;
+        writer.flush()?;
+        writer
+            .into_inner()
+            .map_err(|err| err.into_error())?
+            .finish()?
+    };
     Ok(CheckpointPayload {
         bytes: compressed,
         original: Some(original),
