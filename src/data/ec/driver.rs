@@ -330,6 +330,12 @@ pub(crate) fn reconstruct_impl<S: AsRef<[u8]> + AsMut<[u8]>>(
                 return Err(Error::SingularMatrix);
             }
 
+            // Pack the right-hand side once per cache miss. The identity
+            // columns are no longer needed; dense rows permit fused recovery.
+            for row in 0..missing {
+                system.copy_within(row * cols + missing..(row + 1) * cols, row * data_shards);
+            }
+            workspace.system.truncate(missing * data_shards);
             workspace.key = Some(key);
             #[cfg(test)]
             {
@@ -338,9 +344,38 @@ pub(crate) fn reconstruct_impl<S: AsRef<[u8]> + AsMut<[u8]>>(
         }
         let system = &workspace.system;
         let input_indices = &inputs[..data_shards];
-        for (u, &out_index) in missing_data[..missing].iter().enumerate() {
-            let coeffs = &system[u * cols + missing..(u + 1) * cols];
-            combine_in_place(kernel, shards, out_index as usize, coeffs, input_indices);
+        if missing == 1 {
+            combine_in_place(
+                kernel,
+                shards,
+                missing_data[0] as usize,
+                system,
+                input_indices,
+            );
+        } else {
+            // Inputs and outputs are sorted, disjoint indices. Borrow each
+            // shard exactly once, with no payload copies or heap allocation.
+            let mut sources: [&[u8]; MAX_SHARDS] = [&[]; MAX_SHARDS];
+            let mut outputs: [&mut [u8]; MAX_SHARDS] = core::array::from_fn(|_| &mut [][..]);
+            let mut input = 0;
+            let mut output = 0;
+            for (i, shard) in shards.iter_mut().enumerate() {
+                if input_indices.get(input).copied() == Some(i as u8) {
+                    sources[input] = <S as AsRef<[u8]>>::as_ref(&*shard);
+                    input += 1;
+                } else if missing_data[..missing].get(output).copied() == Some(i as u8) {
+                    outputs[output] = <S as AsMut<[u8]>>::as_mut(shard);
+                    output += 1;
+                }
+            }
+            debug_assert_eq!(input, data_shards);
+            debug_assert_eq!(output, missing);
+            kernel.mul_rows(
+                system,
+                data_shards,
+                &sources[..input],
+                &mut outputs[..output],
+            );
         }
     }
 
@@ -360,6 +395,36 @@ pub(crate) fn reconstruct_impl<S: AsRef<[u8]> + AsMut<[u8]>>(
 mod tests {
     use super::*;
     use crate::data::ec::Codec;
+
+    #[test]
+    fn fused_recovery_matches_reference_for_all_supported_kernels() {
+        for (k, m) in [(4, 2), (8, 4), (16, 8)] {
+            let reference = Codec::with_kernel(Kernel::SCALAR, k, m).unwrap();
+            let mut original: Vec<_> = (0..k + m)
+                .map(|j| (0..4173).map(|i| (i * 17 + j * 41) as u8).collect())
+                .collect();
+            reference.encode_all(&mut original).unwrap();
+            for kernel in Kernel::supported() {
+                let codec = Codec::with_kernel(kernel, k, m).unwrap();
+                let mut workspace = DecodeWorkspace::new();
+                for missing in [2, m] {
+                    let mut present = ShardMask::all_present(k + m);
+                    let mut shards = original.clone();
+                    for j in 0..missing {
+                        let index = j * k / missing;
+                        present.remove(index);
+                        shards[index].fill(0x77);
+                    }
+                    for _ in 0..2 {
+                        codec
+                            .reconstruct_data(&mut shards, &present, &mut workspace)
+                            .unwrap();
+                        assert_eq!(shards, original, "{kernel}: {k}+{m}, {missing} erasures");
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn recovery_plan_is_reused_and_keyed_by_geometry_and_presence() {

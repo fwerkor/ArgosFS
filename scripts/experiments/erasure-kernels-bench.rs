@@ -66,6 +66,28 @@ mod data {
                     "{k}+{m},{len},decode,vendor-{},{dec:.3}",
                     old.kernel().name()
                 );
+                if m >= 2 {
+                    let count = m.min(4);
+                    let mut mask = reed_solomon_engine::ShardMask::all_present(k + m);
+                    for (index, shard) in shards.iter_mut().take(count).enumerate() {
+                        mask.remove(index);
+                        shard.fill(0);
+                    }
+                    old.reconstruct_data(&mut shards, &mask, &mut old_ws)
+                        .unwrap();
+                    assert_eq!(shards, original);
+                    let rate = speed(
+                        || {
+                            old.reconstruct_data(black_box(&mut shards), &mask, &mut old_ws)
+                                .unwrap()
+                        },
+                        count * len,
+                    );
+                    println!(
+                        "{k}+{m},{len},decode{count},vendor-{},{rate:.3}",
+                        old.kernel().name()
+                    );
+                }
                 let mut mask = ShardMask::all_present(k + m);
                 mask.remove(0);
                 for kernel in Kernel::supported() {
@@ -93,6 +115,27 @@ mod data {
                         len,
                     );
                     println!("{k}+{m},{len},decode,{},{dec:.3}", kernel.name());
+                    if m >= 2 {
+                        let count = m.min(4);
+                        let mut mask = ShardMask::all_present(k + m);
+                        for (index, shard) in shards.iter_mut().take(count).enumerate() {
+                            mask.remove(index);
+                            shard.fill(0);
+                        }
+                        native
+                            .reconstruct_data(&mut shards, &mask, &mut ws)
+                            .unwrap();
+                        assert_eq!(shards, original);
+                        let rate = speed(
+                            || {
+                                native
+                                    .reconstruct_data(black_box(&mut shards), &mask, &mut ws)
+                                    .unwrap()
+                            },
+                            count * len,
+                        );
+                        println!("{k}+{m},{len},decode{count},{},{rate:.3}", kernel.name());
+                    }
                 }
             }
         }

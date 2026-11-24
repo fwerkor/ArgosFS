@@ -24,6 +24,9 @@ pub(crate) mod tables;
 #[cfg(target_arch = "aarch64")]
 mod neon;
 
+#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+mod sve;
+
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod x86;
 
@@ -31,7 +34,11 @@ mod x86;
 mod wide_x86;
 
 /// Keep a tile of all source and parity shards in a modest private cache.
-#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+#[cfg(any(
+    all(target_arch = "aarch64", target_os = "linux"),
+    target_arch = "x86",
+    target_arch = "x86_64"
+))]
 fn encode_tile_size(k: usize, m: usize) -> usize {
     (256 * 1024 / (k + m)).clamp(4096, 65536) & !63
 }
@@ -54,6 +61,10 @@ enum Isa {
     Scalar,
     #[cfg(target_arch = "aarch64")]
     Neon,
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    Sve,
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    Sve2,
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     Ssse3,
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -82,6 +93,10 @@ const COMPILED_IN: &[Kernel] = &[
     Kernel(Isa::Avx2),
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     Kernel(Isa::Ssse3),
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    Kernel(Isa::Sve2),
+    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+    Kernel(Isa::Sve),
     #[cfg(target_arch = "aarch64")]
     Kernel(Isa::Neon),
     Kernel(Isa::Scalar),
@@ -117,6 +132,10 @@ impl Kernel {
             Isa::Scalar => true,
             #[cfg(target_arch = "aarch64")]
             Isa::Neon => std::arch::is_aarch64_feature_detected!("neon"),
+            #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+            Isa::Sve => sve::supported::<false>(),
+            #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+            Isa::Sve2 => sve::supported::<true>(),
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             Isa::Ssse3 => x86::ssse3_supported(),
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -137,6 +156,10 @@ impl Kernel {
             Isa::Scalar => "scalar",
             #[cfg(target_arch = "aarch64")]
             Isa::Neon => "neon",
+            #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+            Isa::Sve => "sve",
+            #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+            Isa::Sve2 => "sve2",
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             Isa::Ssse3 => "ssse3",
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -165,6 +188,10 @@ impl Kernel {
             // the only paths that produce it (`detect` and `supported`) gate
             // on `is_supported`, which checks NEON at runtime.
             Isa::Neon => unsafe { neon::mul_slice(c, src, dst) },
+            #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+            Isa::Sve => unsafe { sve::apply::<false, false>(c, src, dst) },
+            #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+            Isa::Sve2 => unsafe { sve::apply::<true, false>(c, src, dst) },
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             // SAFETY: `Isa::Ssse3` is unconstructible outside this module, and
             // the only paths that produce it (`detect` and `supported`) gate
@@ -193,6 +220,10 @@ impl Kernel {
             #[cfg(target_arch = "aarch64")]
             // SAFETY: as above.
             Isa::Neon => unsafe { neon::mul_add_slice(c, src, dst) },
+            #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+            Isa::Sve => unsafe { sve::apply::<false, true>(c, src, dst) },
+            #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+            Isa::Sve2 => unsafe { sve::apply::<true, true>(c, src, dst) },
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             // SAFETY: as above.
             Isa::Ssse3 => unsafe { x86::ssse3::mul_add_slice(c, src, dst) },
@@ -244,6 +275,10 @@ impl Kernel {
             #[cfg(target_arch = "aarch64")]
             // SAFETY: as above.
             Isa::Neon => unsafe { neon::mul_rows(matrix, data_shards, srcs, outs) },
+            #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+            Isa::Sve => unsafe { sve::mul_rows::<false, S, O>(matrix, data_shards, srcs, outs) },
+            #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+            Isa::Sve2 => unsafe { sve::mul_rows::<true, S, O>(matrix, data_shards, srcs, outs) },
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             // SAFETY: as above.
             Isa::Ssse3 => unsafe { x86::ssse3::mul_rows(matrix, data_shards, srcs, outs) },
@@ -284,6 +319,14 @@ impl core::fmt::Display for Kernel {
 #[cfg(target_arch = "aarch64")]
 #[inline]
 fn detect_arch() -> Option<Kernel> {
+    #[cfg(target_os = "linux")]
+    if sve::wide_supported() {
+        for isa in [Isa::Sve2, Isa::Sve] {
+            if Kernel(isa).is_supported() {
+                return Some(Kernel(isa));
+            }
+        }
+    }
     Kernel(Isa::Neon)
         .is_supported()
         .then_some(Kernel(Isa::Neon))
@@ -341,17 +384,12 @@ mod tests {
     ///
     /// These are *rotated* through the parity and length sweeps rather than
     /// crossed with them; [`data_count_for`] says why.
-    const DATA_COUNTS: &[usize] = &[1, 2, 5];
+    const DATA_COUNTS: &[usize] = &[1, 2, 4, 5];
 
     /// The source count to use at a given point in the parity-by-length sweep.
     ///
-    /// Crossing all three source counts with all eleven parity counts and all
-    /// twenty-six lengths triples the work and reaches no path the rotation
-    /// misses: `LENGTHS` has 26 entries, so for every parity count the rotation
-    /// still hits all three source counts, and every source count is still seen
-    /// at every length. What it does not do is run the vector loops three times
-    /// over, which matters because CI interprets these two tests under Miri on
-    /// a macOS runner, where the full cross costs about 37 minutes against 12.
+    /// Rotate source counts through the lengths to cover each group size
+    /// and fixed geometry without a full Cartesian product.
     fn data_count_for(parity_index: usize, length_index: usize) -> usize {
         DATA_COUNTS[(parity_index + length_index) % DATA_COUNTS.len()]
     }

@@ -11,7 +11,7 @@ thread_local! {
 }
 
 /// Wire-compatible GF(2^8)/0x11D codec. The native implementation selects
-/// GFNI, AVX-512, AVX2, SSSE3, NEON or scalar after checking CPU capabilities.
+/// GFNI, AVX-512, AVX2, SSSE3, SVE/SVE2, NEON or scalar after checking CPU capabilities.
 pub struct RsCodec {
     inner: Option<Codec>,
     k: usize,

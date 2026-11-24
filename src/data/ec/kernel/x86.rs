@@ -56,8 +56,8 @@ pub(super) fn avx2_supported() -> bool {
 /// than assumed.
 pub(super) mod ssse3 {
     use super::arch::{
-        __m128i, _mm_and_si128, _mm_loadu_si128, _mm_set1_epi8, _mm_shuffle_epi8, _mm_srli_epi64,
-        _mm_storeu_si128, _mm_xor_si128,
+        __m128i, _mm_and_si128, _mm_loadu_si128, _mm_set1_epi8, _mm_setzero_si128,
+        _mm_shuffle_epi8, _mm_srli_epi64, _mm_storeu_si128, _mm_xor_si128,
     };
     use crate::data::ec::kernel::{scalar, tables};
     use crate::data::ec::shards::ShardSource;
@@ -200,6 +200,75 @@ pub(super) mod ssse3 {
         scalar::mul_add_slice(c, &src[i..], &mut dst[i..]);
     }
 
+    // Two independent output rows share each loaded source and its nibble
+    // indices. Four accumulators fit in the narrow x86 register file.
+    #[target_feature(enable = "ssse3")]
+    unsafe fn fused_pair<S: ShardSource + ?Sized>(
+        rows: [&[u8]; 2],
+        srcs: &S,
+        mut outs: [&mut [u8]; 2],
+        start: usize,
+        end: usize,
+    ) {
+        let mut i = start;
+        let zero = _mm_setzero_si128();
+        while i + 2 * LANES <= end {
+            let mut a = [zero; 2];
+            let mut b = [zero; 2];
+            for (j, &c0) in rows[0].iter().enumerate() {
+                let src = &srcs.shard(j)[i..i + 2 * LANES];
+                // SAFETY: the checked source window contains two full vectors.
+                unsafe {
+                    let x = _mm_loadu_si128(src.as_ptr().cast());
+                    let y = _mm_loadu_si128(src.as_ptr().add(LANES).cast());
+                    let mask = _mm_set1_epi8(15);
+                    let lx = _mm_and_si128(x, mask);
+                    let hx = _mm_and_si128(_mm_srli_epi64(x, 4), mask);
+                    let ly = _mm_and_si128(y, mask);
+                    let hy = _mm_and_si128(_mm_srli_epi64(y, 4), mask);
+                    for r in 0..2 {
+                        let t = shuffles(if r == 0 { c0 } else { rows[1][j] });
+                        a[r] = _mm_xor_si128(
+                            a[r],
+                            _mm_xor_si128(
+                                _mm_shuffle_epi8(t.low, lx),
+                                _mm_shuffle_epi8(t.high, hx),
+                            ),
+                        );
+                        b[r] = _mm_xor_si128(
+                            b[r],
+                            _mm_xor_si128(
+                                _mm_shuffle_epi8(t.low, ly),
+                                _mm_shuffle_epi8(t.high, hy),
+                            ),
+                        );
+                    }
+                }
+            }
+            for r in 0..2 {
+                let out = &mut outs[r][i..i + 2 * LANES];
+                // SAFETY: the checked output window contains two full vectors.
+                unsafe {
+                    _mm_storeu_si128(out.as_mut_ptr().cast(), a[r]);
+                    _mm_storeu_si128(out.as_mut_ptr().add(LANES).cast(), b[r]);
+                }
+            }
+            i += 2 * LANES;
+        }
+        if i < end {
+            for (r, out) in outs.iter_mut().enumerate() {
+                let out = &mut out[i..end];
+                // SAFETY: the same ISA is enabled in this function.
+                unsafe {
+                    mul_slice(rows[r][0], &srcs.shard(0)[i..end], out);
+                    for (j, &c) in rows[r].iter().enumerate().skip(1) {
+                        mul_add_slice(c, &srcs.shard(j)[i..end], out);
+                    }
+                }
+            }
+        }
+    }
+
     /// `outs[t] = sum over j of matrix[t * data_shards + j] * srcs.shard(j)`,
     /// for every `t`.
     ///
@@ -215,7 +284,26 @@ pub(super) mod ssse3 {
         let tile = crate::data::ec::kernel::encode_tile_size(data_shards, outs.len());
         for start in (0..len).step_by(tile) {
             let end = (start + tile).min(len);
-            for (row, out) in outs.iter_mut().enumerate() {
+            let mut row = 0;
+            if data_shards >= 4 && end - start >= 2 * LANES {
+                for pair in outs.chunks_exact_mut(2) {
+                    let (left, right) = pair.split_at_mut(1);
+                    let coeffs = &matrix[row * data_shards..(row + 2) * data_shards];
+                    let (r0, r1) = coeffs.split_at(data_shards);
+                    // SAFETY: same ISA as the fused helper.
+                    unsafe {
+                        fused_pair(
+                            [r0, r1],
+                            srcs,
+                            [left[0].as_mut(), right[0].as_mut()],
+                            start,
+                            end,
+                        )
+                    };
+                    row += 2;
+                }
+            }
+            for (row, out) in outs.iter_mut().enumerate().skip(row) {
                 let coeffs = &matrix[row * data_shards..(row + 1) * data_shards];
                 let out = &mut out.as_mut()[start..end];
                 // SAFETY: this function requires `ssse3`, which is what
@@ -240,8 +328,8 @@ pub(super) mod ssse3 {
 pub(super) mod avx2 {
     use super::arch::{
         __m256i, _mm256_and_si256, _mm256_broadcastsi128_si256, _mm256_loadu_si256,
-        _mm256_set1_epi8, _mm256_shuffle_epi8, _mm256_srli_epi64, _mm256_storeu_si256,
-        _mm256_xor_si256, _mm_loadu_si128,
+        _mm256_set1_epi8, _mm256_setzero_si256, _mm256_shuffle_epi8, _mm256_srli_epi64,
+        _mm256_storeu_si256, _mm256_xor_si256, _mm_loadu_si128,
     };
     use crate::data::ec::kernel::{scalar, tables};
     use crate::data::ec::shards::ShardSource;
@@ -405,6 +493,75 @@ pub(super) mod avx2 {
         scalar::mul_add_slice(c, &src[i..], &mut dst[i..]);
     }
 
+    // Two independent output rows share each loaded source and its nibble
+    // indices. Four accumulators fit in the narrow x86 register file.
+    #[target_feature(enable = "avx2")]
+    unsafe fn fused_pair<S: ShardSource + ?Sized>(
+        rows: [&[u8]; 2],
+        srcs: &S,
+        mut outs: [&mut [u8]; 2],
+        start: usize,
+        end: usize,
+    ) {
+        let mut i = start;
+        let zero = _mm256_setzero_si256();
+        while i + 2 * LANES <= end {
+            let mut a = [zero; 2];
+            let mut b = [zero; 2];
+            for (j, &c0) in rows[0].iter().enumerate() {
+                let src = &srcs.shard(j)[i..i + 2 * LANES];
+                // SAFETY: the checked source window contains two full vectors.
+                unsafe {
+                    let x = _mm256_loadu_si256(src.as_ptr().cast());
+                    let y = _mm256_loadu_si256(src.as_ptr().add(LANES).cast());
+                    let mask = _mm256_set1_epi8(15);
+                    let lx = _mm256_and_si256(x, mask);
+                    let hx = _mm256_and_si256(_mm256_srli_epi64(x, 4), mask);
+                    let ly = _mm256_and_si256(y, mask);
+                    let hy = _mm256_and_si256(_mm256_srli_epi64(y, 4), mask);
+                    for r in 0..2 {
+                        let t = shuffles(if r == 0 { c0 } else { rows[1][j] });
+                        a[r] = _mm256_xor_si256(
+                            a[r],
+                            _mm256_xor_si256(
+                                _mm256_shuffle_epi8(t.low, lx),
+                                _mm256_shuffle_epi8(t.high, hx),
+                            ),
+                        );
+                        b[r] = _mm256_xor_si256(
+                            b[r],
+                            _mm256_xor_si256(
+                                _mm256_shuffle_epi8(t.low, ly),
+                                _mm256_shuffle_epi8(t.high, hy),
+                            ),
+                        );
+                    }
+                }
+            }
+            for r in 0..2 {
+                let out = &mut outs[r][i..i + 2 * LANES];
+                // SAFETY: the checked output window contains two full vectors.
+                unsafe {
+                    _mm256_storeu_si256(out.as_mut_ptr().cast(), a[r]);
+                    _mm256_storeu_si256(out.as_mut_ptr().add(LANES).cast(), b[r]);
+                }
+            }
+            i += 2 * LANES;
+        }
+        if i < end {
+            for (r, out) in outs.iter_mut().enumerate() {
+                let out = &mut out[i..end];
+                // SAFETY: the same ISA is enabled in this function.
+                unsafe {
+                    mul_slice(rows[r][0], &srcs.shard(0)[i..end], out);
+                    for (j, &c) in rows[r].iter().enumerate().skip(1) {
+                        mul_add_slice(c, &srcs.shard(j)[i..end], out);
+                    }
+                }
+            }
+        }
+    }
+
     /// `outs[t] = sum over j of matrix[t * data_shards + j] * srcs.shard(j)`,
     /// for every `t`.
     ///
@@ -420,7 +577,26 @@ pub(super) mod avx2 {
         let tile = crate::data::ec::kernel::encode_tile_size(data_shards, outs.len());
         for start in (0..len).step_by(tile) {
             let end = (start + tile).min(len);
-            for (row, out) in outs.iter_mut().enumerate() {
+            let mut row = 0;
+            if data_shards >= 4 && end - start >= 2 * LANES {
+                for pair in outs.chunks_exact_mut(2) {
+                    let (left, right) = pair.split_at_mut(1);
+                    let coeffs = &matrix[row * data_shards..(row + 2) * data_shards];
+                    let (r0, r1) = coeffs.split_at(data_shards);
+                    // SAFETY: same ISA as the fused helper.
+                    unsafe {
+                        fused_pair(
+                            [r0, r1],
+                            srcs,
+                            [left[0].as_mut(), right[0].as_mut()],
+                            start,
+                            end,
+                        )
+                    };
+                    row += 2;
+                }
+            }
+            for (row, out) in outs.iter_mut().enumerate().skip(row) {
                 let coeffs = &matrix[row * data_shards..(row + 1) * data_shards];
                 let out = &mut out.as_mut()[start..end];
                 // SAFETY: this function requires `avx2`, which is what `mul_slice`

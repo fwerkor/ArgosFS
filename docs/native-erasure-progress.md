@@ -87,3 +87,44 @@ overhead, cache behavior and architecture-specific row grouping before
 claiming parity or enabling new NEON optimizations. SSSE3/AVX2 fusion,
 scalar multiplication optimization, adaptive dispatch, SVE2 hardware
 validation and the full CI/integration acceptance remain open.
+
+## Full SIMD implementation and multi-erasure iteration (2026-11-24)
+
+- Added fixed-coefficient scalar table, SSSE3/AVX2 two-row fusion, and
+  NEON specialized 2+1 / 4+2 register loops, source validation hoisting
+  and two-row groups. The previous Kunpeng narrow-layout regression is
+  resolved in the measured cases.
+- Linux SVE and SVE2 backend uses stable Rust global assembly with runtime
+  feature detection and width-based dispatch. QEMU confirmed all sixteen
+  128–2048-bit vector lengths and the non-SVE fallback, including fused
+  recovery. Added the reproducible test script and CI step.
+- Dense cached recovery matrix now drives the same SIMD multi-output
+  kernel for multiple missing data shards, with disjoint safe borrows
+  and no payload allocations. Added cross-backend, multi-erasure and
+  cache-hit regression tests. The benchmark includes recovery of 2 or 4
+  missing data shards.
+- Final kernel/driver tests and paired vendor comparisons passed on
+  Xeon 6138, Ryzen AI Max+ 395 and Kunpeng 920. See permanent codec
+  documentation for representative final throughput.
+- Local formatting, Clippy, rustdoc and data-filtered suite (109 passed,
+  4 ignored) succeeded on this revision. Layout I/O, repair-autopilot
+  (12 passed), raw read-only regression (5 passed) and package file list
+  also passed. Earlier full library run passed 568 tests (4 ignored)
+  before the final multi-erasure change; do not count that as a final
+  full-suite run.
+
+### Remaining acceptance blockers
+
+- GitHub required checks were all queued; full final integration and
+  packaged-source checks still need completed CI results.
+- No physical SVE/SVE2 hardware; QEMU validates semantics and bounds,
+  not speed or dispatch optimality. Do not claim hardware acceptance.
+- Real file write/degraded-read/repair throughput and mixed concurrency
+  against the same original baseline are not yet measured; kernel
+  microbenchmarks do not replace this gate.
+- Minimum Rust 1.89 toolchain verification, fuzz and release cross-target
+  acceptance remain open. Layout/CPU-specific autotuning, multi-entry
+  plans, parallel encoding and transactional incremental parity remain
+  experiments rather than production guarantees. Do not add incremental
+  parity without a proven transaction/recovery contract.
+- Retain this progress document until these gates are closed.

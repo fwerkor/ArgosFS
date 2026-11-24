@@ -207,6 +207,13 @@ jobs:
           RS_REQUIRE_KERNELS: ${{ matrix.arch == 'arm64' && 'neon,scalar' || 'ssse3,avx2,scalar' }}
         run: cargo test --all-targets --all-features -- --test-threads=1
 
+      - name: Test SVE and SVE2 vector lengths
+        if: matrix.arch == 'x86_64'
+        run: |
+          sudo apt-get install -y qemu-user
+          rustup target add aarch64-unknown-linux-musl
+          scripts/ci/test-erasure-sve.sh
+
       - name: Build release binary
         run: cargo build --release --all-targets --all-features
 
