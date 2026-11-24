@@ -1188,13 +1188,13 @@ fn metadata_tree_checkpoint_covers_pages_headers_and_capacity_errors() {
     assert_eq!(get_u64(&checkpoint.header, 152).unwrap(), 3);
     // Three metadata pages are written in one contiguous body batch, then
     // the index is written separately before the header is made durable.
-    assert_eq!(checkpoint.body_writes.len(), 2);
-    let data_batch = &checkpoint.body_writes[0];
+    let body_writes = checkpoint.body_writes().collect::<Vec<_>>();
+    assert_eq!(body_writes.len(), 2);
+    let data_batch = &body_writes[0];
     assert_eq!(data_batch.1, bytes);
     assert!(checkpoint
-        .body_writes
-        .iter()
-        .any(|(offset, data)| *offset == RAW_HEADER_SIZE as u64
+        .body_writes()
+        .any(|(offset, data)| offset == RAW_HEADER_SIZE as u64
             && data.len() == 3 * METADATA_INDEX_ENTRY_SIZE));
     assert!(matches!(
         metadata_tree_checkpoint("disk", 0, 0, &[], &sha256_hex(&[]), 64 * 1024),
@@ -1225,7 +1225,14 @@ fn checkpoint_batches_contiguous_pages_without_changing_recovery_bytes() {
         superblocks[0].metadata.length / 2,
     )
     .unwrap();
-    let data_batches = &checkpoint.body_writes[..checkpoint.body_writes.len() - 1];
+    let data_batches = checkpoint.body_writes().take(3).collect::<Vec<_>>();
+    // The payload batches are direct slices, not another set of allocations.
+    assert_eq!(data_batches[0].1.as_ptr(), checkpoint.payload.as_ptr());
+    assert_eq!(
+        data_batches[1].1.as_ptr(),
+        checkpoint.payload[CHECKPOINT_BATCH_BYTES..].as_ptr()
+    );
+    assert_eq!(checkpoint.body_writes().count(), 4);
     assert_eq!(data_batches.len(), 3);
     assert_eq!(data_batches[0].1.len(), CHECKPOINT_BATCH_BYTES);
     assert_eq!(data_batches[1].1.len(), CHECKPOINT_BATCH_BYTES);
@@ -1255,10 +1262,26 @@ fn quorum_selection_uses_distinct_devices_and_highest_supported_generation() {
     second.integrity.meta_hash = journal::canonical_metadata_hash(&second).unwrap();
     let report = MetadataCandidateReport::default();
     let candidates = vec![
-        (member.clone(), Some(first.clone()), report.clone()),
-        ("orphan".to_string(), Some(first.clone()), report.clone()),
-        (member.clone(), Some(second.clone()), report.clone()),
-        ("orphan".to_string(), Some(second.clone()), report.clone()),
+        (
+            member.clone(),
+            Some(Arc::new(first.clone())),
+            report.clone(),
+        ),
+        (
+            "orphan".to_string(),
+            Some(Arc::new(first.clone())),
+            report.clone(),
+        ),
+        (
+            member.clone(),
+            Some(Arc::new(second.clone())),
+            report.clone(),
+        ),
+        (
+            "orphan".to_string(),
+            Some(Arc::new(second.clone())),
+            report.clone(),
+        ),
         ("missing".to_string(), None, report),
     ];
     let selected = select_quorum_metadata_candidate(&candidates)
@@ -1267,7 +1290,7 @@ fn quorum_selection_uses_distinct_devices_and_highest_supported_generation() {
     assert_eq!(selected.txid, second.txid);
     assert_eq!(metadata_quorum_requirement(&selected), 1);
 
-    let mut multi = selected.clone();
+    let mut multi = selected.as_ref().clone();
     let template: Disk = multi.disks.values().next().unwrap().clone();
     for index in 1..4 {
         let mut disk = template.clone();
@@ -1282,7 +1305,7 @@ fn quorum_selection_uses_distinct_devices_and_highest_supported_generation() {
     assert_eq!(metadata_quorum_requirement(&multi), 2);
     assert!(select_quorum_metadata_candidate(&[(
         member,
-        Some(multi),
+        Some(Arc::new(multi)),
         MetadataCandidateReport::default()
     )])
     .unwrap()
@@ -1302,8 +1325,16 @@ fn recovery_quorum_ignores_orphan_supporters_and_replay_targets() {
     let report = MetadataCandidateReport::default();
     assert!(
         select_quorum_metadata_candidate(&[
-            (real_a.clone(), Some(candidate.clone()), report.clone()),
-            (orphan.clone(), Some(candidate.clone()), report.clone()),
+            (
+                real_a.clone(),
+                Some(Arc::new(candidate.clone())),
+                report.clone()
+            ),
+            (
+                orphan.clone(),
+                Some(Arc::new(candidate.clone())),
+                report.clone()
+            ),
         ])
         .unwrap()
         .is_none(),
@@ -1317,8 +1348,8 @@ fn recovery_quorum_ignores_orphan_supporters_and_replay_targets() {
         .unwrap()
         .clone();
     assert!(select_quorum_metadata_candidate(&[
-        (real_a, Some(candidate.clone()), report.clone()),
-        (real_b, Some(candidate.clone()), report),
+        (real_a, Some(Arc::new(candidate.clone())), report.clone()),
+        (real_b, Some(Arc::new(candidate.clone())), report),
     ])
     .unwrap()
     .is_some());
@@ -1734,7 +1765,7 @@ fn checkpoint_uses_old_encoding_when_it_fits() {
         "test",
         metadata.txid,
         metadata.integrity.generation,
-        &payload.bytes,
+        payload.bytes.clone(),
         &sha256_hex(&payload.bytes),
         superblocks[0].metadata.length / 2,
         payload.original.as_ref(),
@@ -1754,6 +1785,10 @@ fn recovery_validates_each_slot_but_decodes_identical_checkpoints_once() {
     for sb in &superblocks {
         let reports = read_metadata_candidates_cached(&backend, sb, &mut decoded).unwrap();
         assert_eq!(reports.len(), 2);
+        let shared = decoded.values().next().unwrap();
+        for (candidate, _) in &reports {
+            assert!(Arc::ptr_eq(candidate.as_ref().unwrap(), shared));
+        }
         assert!(
             reports.iter().all(|(_, report)| report.valid),
             "{reports:?}"

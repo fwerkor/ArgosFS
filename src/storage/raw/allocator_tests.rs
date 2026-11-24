@@ -241,3 +241,67 @@ fn allocator_sweep_matches_reference_overlap_check_at_boundaries() {
         }
     }
 }
+
+#[test]
+fn local_free_coalescing_matches_full_sort_and_merge() {
+    let mut state = init_allocator(4096, 4096 * 8192, 4096);
+    state.free_extents = (0..2048)
+        .map(|i| RawFreeExtent {
+            offset: (i * 3 + 1) * 4096,
+            length: 4096,
+        })
+        .collect();
+    let mut reference = state.clone();
+    // Exercise insertions, bridges, double frees, and ranges covering many
+    // neighbors, with deterministic pseudo-random placement.
+    let mut rng = 0x1234_5678_u64;
+    for i in 0..512 {
+        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let extent = PhysicalExtent {
+            disk_id: "disk".into(),
+            offset: ((rng >> 32) % 6000 + 1) * 4096,
+            length: (i % 17 + 1) * 4096,
+            generation: 1,
+            flags: 0,
+        };
+        if i == 200 {
+            // Legacy unsorted input takes the full normalization fallback.
+            state.free_extents.reverse();
+            reference.free_extents.reverse();
+        }
+        free(&mut state, &extent).unwrap();
+        reference.free_extents.push(RawFreeExtent {
+            offset: extent.offset,
+            length: extent.length,
+        });
+        coalesce(&mut reference);
+        assert_eq!(state.free_extents, reference.free_extents, "step {i}");
+    }
+}
+
+#[test]
+fn fragmented_free_reuses_existing_vector_storage() {
+    let mut state = init_allocator(4096, 4096 * 150_000, 4096);
+    state.free_extents = (0..47_000)
+        .map(|i| RawFreeExtent {
+            offset: (i * 3 + 1) * 4096,
+            length: 4096,
+        })
+        .collect();
+    state.free_extents.reserve(1);
+    let ptr = state.free_extents.as_ptr();
+    free(
+        &mut state,
+        &PhysicalExtent {
+            disk_id: "disk".into(),
+            offset: 2 * 4096,
+            length: 2 * 4096,
+            generation: 1,
+            flags: 0,
+        },
+    )
+    .unwrap();
+    assert_eq!(state.free_extents.as_ptr(), ptr);
+    assert_eq!(state.free_extents.len(), 46_999);
+    assert_eq!(state.free_extents[0].length, 4 * 4096);
+}

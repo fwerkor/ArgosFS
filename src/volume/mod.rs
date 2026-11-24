@@ -812,6 +812,24 @@ impl ArgosFs {
             .unwrap_or(0)
     }
 
+    /// Finish the delayed verifier before producing an offline maintenance
+    /// report. Call only after all repairs have completed and sync succeeded.
+    pub fn finish_maintenance_verification(&self, report: &mut FsckReport) {
+        if let Some(verify) = &self.verify_written {
+            verify.drain();
+            report.write_verify_checks = verify.checks();
+            report.write_verify_retries = verify.retries();
+            report.write_verify_failures = verify.failures();
+            report.write_verify_skipped = verify.skipped();
+            if report.write_verify_failures != 0 {
+                report.errors.push(format!(
+                    "read-after-write verification failed for {} shard(s)",
+                    report.write_verify_failures
+                ));
+            }
+        }
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
     }

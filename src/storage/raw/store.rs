@@ -639,7 +639,7 @@ fn prepare_checkpoint_writes(
         "checkpoint",
         metadata.txid,
         metadata.integrity.generation,
-        &payload.bytes,
+        payload.bytes,
         &hash,
         u64::MAX,
         payload.original.as_ref(),
@@ -898,7 +898,7 @@ fn write_metadata_slot(
     checkpoint: &MetadataTreeCheckpoint,
     metrics: Option<&CommitMetrics>,
 ) -> Result<()> {
-    for (relative_offset, data) in &checkpoint.body_writes {
+    for (relative_offset, data) in checkpoint.body_writes() {
         backend.write_at(&sb.disk_id, offset + relative_offset, data)?;
         if let Some(metrics) = metrics {
             metrics.add_raw_write_bytes(RawWriteKind::Checkpoint, data.len());
@@ -931,7 +931,7 @@ fn write_metadata_slot_differential(
     metrics: Option<&CommitMetrics>,
 ) -> Result<()> {
     let mut old = vec![0u8; CHECKPOINT_BATCH_BYTES];
-    for (relative, data) in &checkpoint.body_writes {
+    for (relative, data) in checkpoint.body_writes() {
         for (chunk_index, chunk) in data.chunks(CHECKPOINT_BATCH_BYTES).enumerate() {
             let absolute = offset + relative + (chunk_index * CHECKPOINT_BATCH_BYTES) as u64;
             let readable = backend
@@ -1516,6 +1516,52 @@ fn journal_append_position(
     Ok((header, write_offset, end.unwrap_or_default(), rollover))
 }
 
+// Scan the complete journal prefix as before, but fetch bounded contiguous
+// ranges rather than two tiny device requests for every record. This preserves
+// physical checksum/record hash validation on every append (including stale
+// prefixes) and avoids trusting an unverified cached tip.
+const JOURNAL_TIP_BATCH_BYTES: usize = 256 * 1024;
+
+struct JournalTipReader<'a> {
+    backend: &'a dyn StorageBackend,
+    sb: &'a RawSuperblock,
+    offset: u64,
+    end: u64,
+    buffer: Vec<u8>,
+    consumed: usize,
+}
+
+impl JournalTipReader<'_> {
+    fn read_exact(&mut self, mut output: &mut [u8]) -> Result<()> {
+        while !output.is_empty() {
+            if self.consumed == self.buffer.len() {
+                let count = self
+                    .end
+                    .saturating_sub(self.offset)
+                    .min(JOURNAL_TIP_BATCH_BYTES as u64) as usize;
+                if count == 0 {
+                    return Err(ArgosError::CorruptedMetadata(
+                        "truncated raw journal tip".into(),
+                    ));
+                }
+                self.buffer.resize(count, 0);
+                self.backend.read_at(
+                    &self.sb.disk_id,
+                    self.sb.journal.offset + self.offset,
+                    &mut self.buffer,
+                )?;
+                self.offset += count as u64;
+                self.consumed = 0;
+            }
+            let count = output.len().min(self.buffer.len() - self.consumed);
+            output[..count].copy_from_slice(&self.buffer[self.consumed..self.consumed + count]);
+            self.consumed += count;
+            output = &mut output[count..];
+        }
+        Ok(())
+    }
+}
+
 fn journal_tip_identity(
     backend: &dyn StorageBackend,
     sb: &RawSuperblock,
@@ -1527,10 +1573,18 @@ fn journal_tip_identity(
     }
     let end = get_u64(&header, 24)?.min(sb.journal.length);
     let mut cursor = RAW_HEADER_SIZE as u64;
+    let mut reader = JournalTipReader {
+        backend,
+        sb,
+        offset: cursor,
+        end,
+        buffer: Vec::new(),
+        consumed: 0,
+    };
     let mut tip = None;
     while cursor + 36 <= end {
         let mut entry_header = [0u8; 36];
-        backend.read_at(&sb.disk_id, sb.journal.offset + cursor, &mut entry_header)?;
+        reader.read_exact(&mut entry_header)?;
         let len = u32::from_le_bytes(entry_header[..4].try_into().unwrap()) as usize;
         if len == 0 || cursor + 36 + len as u64 > end {
             return Err(ArgosError::CorruptedMetadata(format!(
@@ -1539,7 +1593,7 @@ fn journal_tip_identity(
             )));
         }
         let mut bytes = vec![0u8; len];
-        backend.read_at(&sb.disk_id, sb.journal.offset + cursor + 36, &mut bytes)?;
+        reader.read_exact(&mut bytes)?;
         if hex::encode(&entry_header[4..36]) != sha256_hex(&bytes) {
             return Err(ArgosError::Checksum(format!(
                 "raw journal payload checksum mismatch at {}:{}",
@@ -2047,7 +2101,7 @@ fn load_or_recover(
         backend,
         superblocks,
         &mut report,
-        best.as_ref(),
+        best.as_deref(),
         &candidates,
     )?;
     if let Some(journal_meta) = journal_best {
@@ -2065,6 +2119,10 @@ fn load_or_recover(
             "no valid raw metadata checkpoint or journal record found".to_string(),
         ));
     };
+    // The selected snapshot is the only state needed from this point. Drop
+    // physical slot votes before any recovery checkpoint serialization.
+    drop(candidates);
+    let metadata = Arc::unwrap_or_clone(metadata);
     if !matches!(
         metadata.integrity.hash_scheme,
         None | Some(journal::DELTA_INTEGRITY_SCHEME)
@@ -2144,10 +2202,10 @@ fn metadata_member_superblocks(
 }
 
 fn select_quorum_metadata_candidate(
-    candidates: &[(String, Option<Metadata>, MetadataCandidateReport)],
-) -> Result<Option<Metadata>> {
+    candidates: &[(String, Option<Arc<Metadata>>, MetadataCandidateReport)],
+) -> Result<Option<Arc<Metadata>>> {
     let mut supported =
-        BTreeMap::<(u64, u64, String), (Metadata, std::collections::BTreeSet<String>)>::new();
+        BTreeMap::<(u64, u64, String), (Arc<Metadata>, std::collections::BTreeSet<String>)>::new();
     for (disk_id, metadata, _) in candidates {
         let Some(metadata) = metadata else {
             continue;
@@ -2238,7 +2296,7 @@ fn indeterminate_commit(operation: &str, need: usize, durable: usize) -> ArgosEr
 fn read_metadata_candidates(
     backend: &dyn StorageBackend,
     sb: &RawSuperblock,
-) -> Result<Vec<(Option<Metadata>, MetadataCandidateReport)>> {
+) -> Result<Vec<(Option<Arc<Metadata>>, MetadataCandidateReport)>> {
     read_metadata_candidates_cached(backend, sb, &mut BTreeMap::new())
 }
 
@@ -2248,8 +2306,8 @@ fn read_metadata_candidates(
 fn read_metadata_candidates_cached(
     backend: &dyn StorageBackend,
     sb: &RawSuperblock,
-    decoded: &mut BTreeMap<String, Metadata>,
-) -> Result<Vec<(Option<Metadata>, MetadataCandidateReport)>> {
+    decoded: &mut BTreeMap<String, Arc<Metadata>>,
+) -> Result<Vec<(Option<Arc<Metadata>>, MetadataCandidateReport)>> {
     let slot_len = sb.metadata.length / 2;
     let mut out = Vec::new();
     for slot in 0..2u64 {
@@ -2265,14 +2323,14 @@ fn read_metadata_candidates_cached(
                 // A matching header is not evidence of valid physical data.
                 // read_metadata_payload checks its stored checksum and every
                 // page checksum before a member can vote for this checkpoint.
-                let candidate = (|| -> Result<Metadata> {
+                let candidate = (|| -> Result<Arc<Metadata>> {
                     let bytes = read_metadata_payload(backend, sb, offset, slot_len, &header)?;
                     let key = sha256_hex(&header);
                     if let Some(metadata) = decoded.get(&key) {
                         return Ok(metadata.clone());
                     }
-                    let metadata = decode_metadata_payload(&header, &bytes)?;
-                    decoded.insert(key, metadata.clone());
+                    let metadata = Arc::new(decode_metadata_payload(&header, &bytes)?);
+                    decoded.insert(key, Arc::clone(&metadata));
                     Ok(metadata)
                 })();
                 match candidate {
@@ -2514,12 +2572,16 @@ fn read_latest_journal_metadata(
     superblocks: &[RawSuperblock],
     report: &mut TransactionReport,
     base_metadata: Option<&Metadata>,
-    checkpoint_catalog: &[(String, Option<Metadata>, MetadataCandidateReport)],
-) -> Result<Option<Metadata>> {
+    checkpoint_catalog: &[(String, Option<Arc<Metadata>>, MetadataCandidateReport)],
+) -> Result<Option<Arc<Metadata>>> {
+    // Candidate indexes and replay tips all point at immutable states. An
+    // inode map clone is cheap, but cloning Metadata also deep-copies every
+    // allocator free extent; share each validated state across the indexes.
+    let base_snapshot = base_metadata.cloned().map(Arc::new);
     let mut supported =
-        BTreeMap::<(u64, u64, String), (Metadata, std::collections::BTreeSet<String>)>::new();
+        BTreeMap::<(u64, u64, String), (Arc<Metadata>, std::collections::BTreeSet<String>)>::new();
     let mut certified =
-        BTreeMap::<(u64, u64, String), (Metadata, std::collections::BTreeSet<String>)>::new();
+        BTreeMap::<(u64, u64, String), (Arc<Metadata>, std::collections::BTreeSet<String>)>::new();
     let mut members = Vec::new();
     for sb in superblocks {
         let valid_before = report.valid_entries;
@@ -2528,10 +2590,10 @@ fn read_latest_journal_metadata(
             disk_id: sb.disk_id.clone(),
             ..RawJournalMemberReport::default()
         };
-        let mut latest = base_metadata.cloned();
-        let mut member_candidates = BTreeMap::<(u64, u64, String), Metadata>::new();
-        let mut record_candidates = BTreeMap::<String, Metadata>::new();
-        let mut checkpoint_candidates = BTreeMap::<String, Metadata>::new();
+        let mut latest = base_snapshot.clone();
+        let mut member_candidates = BTreeMap::<(u64, u64, String), Arc<Metadata>>::new();
+        let mut record_candidates = BTreeMap::<String, Arc<Metadata>>::new();
+        let mut checkpoint_candidates = BTreeMap::<String, Arc<Metadata>>::new();
         for (_, candidate, _) in checkpoint_catalog
             .iter()
             .filter(|(disk_id, _, _)| disk_id == &sb.disk_id)
@@ -2791,7 +2853,8 @@ fn read_latest_journal_metadata(
                     let Some(candidate) = candidate else {
                         break;
                     };
-                    record_candidates.insert(record.record_hash.clone(), candidate.clone());
+                    let candidate = Arc::new(candidate);
+                    record_candidates.insert(record.record_hash.clone(), Arc::clone(&candidate));
                     if latest
                         .as_ref()
                         .map(|metadata| candidate.txid <= metadata.txid)
@@ -2931,8 +2994,31 @@ fn metadata_hash_for_replay(metadata: &Metadata) -> Result<String> {
 
 struct MetadataTreeCheckpoint {
     header: [u8; RAW_HEADER_SIZE],
-    body_writes: Vec<(u64, Vec<u8>)>,
+    // Own the encoded payload once. Each member borrows the same bytes in
+    // bounded contiguous batches; the index is the only extra full-size
+    // allocation (48 bytes per 4 KiB page).
+    payload: Vec<u8>,
+    index: Vec<u8>,
+    data_start: u64,
     required_len: u64,
+}
+
+impl MetadataTreeCheckpoint {
+    fn body_writes(&self) -> impl Iterator<Item = (u64, &[u8])> {
+        self.payload
+            .chunks(CHECKPOINT_BATCH_BYTES)
+            .enumerate()
+            .map(|(batch, bytes)| {
+                (
+                    self.data_start + (batch * CHECKPOINT_BATCH_BYTES) as u64,
+                    bytes,
+                )
+            })
+            .chain(std::iter::once((
+                RAW_HEADER_SIZE as u64,
+                self.index.as_slice(),
+            )))
+    }
 }
 
 #[cfg(test)]
@@ -2944,14 +3030,22 @@ fn metadata_tree_checkpoint(
     hash: &str,
     slot_len: u64,
 ) -> Result<MetadataTreeCheckpoint> {
-    metadata_tree_checkpoint_encoded(disk_id, txid, generation, bytes, hash, slot_len, None)
+    metadata_tree_checkpoint_encoded(
+        disk_id,
+        txid,
+        generation,
+        bytes.to_vec(),
+        hash,
+        slot_len,
+        None,
+    )
 }
 
 fn metadata_tree_checkpoint_encoded(
     disk_id: &str,
     txid: u64,
     generation: u64,
-    bytes: &[u8],
+    bytes: Vec<u8>,
     hash: &str,
     slot_len: u64,
     original: Option<&(u64, String)>,
@@ -2995,9 +3089,6 @@ fn metadata_tree_checkpoint_encoded(
     }
 
     let mut index = vec![0u8; index_len];
-    let mut body_writes = Vec::with_capacity(bytes.len().div_ceil(CHECKPOINT_BATCH_BYTES) + 1);
-    let mut batch_offset = 0u64;
-    let mut batch = Vec::with_capacity(CHECKPOINT_BATCH_BYTES);
     for page_index in 0..page_count {
         let start = page_index * METADATA_PAGE_SIZE;
         let end = (start + METADATA_PAGE_SIZE).min(bytes.len());
@@ -3016,26 +3107,8 @@ fn metadata_tree_checkpoint_encoded(
             })?;
         put_u64(entry, 32, relative_offset);
         put_u32(entry, 40, page.len() as u32);
-        if batch.is_empty() {
-            batch_offset = relative_offset;
-        }
-        // Page boundaries remain unchanged in the on-disk index. The write
-        // batches are an I/O-only optimization; the reader still validates
-        // each individual 4 KiB page plus the full metadata checksum.
-        if !batch.is_empty()
-            && (batch_offset + batch.len() as u64 != relative_offset
-                || batch.len() + page.len() > CHECKPOINT_BATCH_BYTES)
-        {
-            body_writes.push((batch_offset, std::mem::take(&mut batch)));
-            batch_offset = relative_offset;
-        }
-        batch.extend_from_slice(page);
-    }
-    if !batch.is_empty() {
-        body_writes.push((batch_offset, batch));
     }
     let index_hash = sha256_hex(&index);
-    body_writes.push((RAW_HEADER_SIZE as u64, index));
 
     let mut out = [0u8; RAW_HEADER_SIZE];
     out[..16].copy_from_slice(METADATA_MAGIC);
@@ -3063,7 +3136,9 @@ fn metadata_tree_checkpoint_encoded(
     put_fixed_str(&mut out, 168, HASH_HEX_LEN, &index_hash);
     Ok(MetadataTreeCheckpoint {
         header: out,
-        body_writes,
+        payload: bytes,
+        index,
+        data_start,
         required_len: data_end,
     })
 }
