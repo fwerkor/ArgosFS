@@ -4,9 +4,9 @@ use super::metrics;
 use crate::acl;
 use crate::commit_metrics::WritebackFlushReason;
 use crate::error::{ArgosError, Result};
-use crate::types::{CapacitySource, DiskStatus, InodeId, NodeKind};
+use crate::types::{InodeId, NodeKind};
 use crate::util::now_f64;
-use crate::volume::{ArgosFs, NodeAttr, RenamePolicy};
+use crate::volume::{ArgosFs, CapacitySnapshot, NodeAttr, RenamePolicy};
 use fuser::{
     AccessFlags, BsdFileFlags, Config, CopyFileRangeFlags, Errno, FileAttr, FileHandle, FileType,
     Filesystem, FopenFlags, Generation, INodeNo, InitFlags, KernelConfig, LockOwner, MountOption,
@@ -20,8 +20,7 @@ use std::ffi::{CString, OsStr};
 use std::io::Read;
 use std::ops::Deref;
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -65,7 +64,7 @@ pub struct ArgosFuseShared {
     writeback: Mutex<FuseWriteback>,
     handles: Mutex<FuseHandles>,
     directory_cache: Mutex<DirectoryListingCache>,
-    statfs_cache: Mutex<StatfsSnapshot>,
+    statfs_cache: Mutex<CapacitySnapshot>,
 }
 
 impl Deref for ArgosFuse {
@@ -73,34 +72,6 @@ impl Deref for ArgosFuse {
 
     fn deref(&self) -> &Self::Target {
         &self.shared
-    }
-}
-
-/// Advisory space accounting, independent of the metadata checkpoint I/O lock.
-/// The last published value remains usable while a slow checkpoint is written.
-#[derive(Clone, Debug)]
-struct StatfsSnapshot {
-    usable_bytes: u64,
-    free_bytes: u64,
-    inode_count: u64,
-    block_size: u64,
-    unavailable: BTreeSet<String>,
-}
-
-impl StatfsSnapshot {
-    fn from_metadata(
-        volume: &ArgosFs,
-        meta: &crate::types::Metadata,
-        unavailable: BTreeSet<String>,
-    ) -> Self {
-        let (usable_bytes, free_bytes) = statfs_bytes(meta, volume.root(), &unavailable);
-        Self {
-            usable_bytes,
-            free_bytes,
-            inode_count: meta.inodes.len() as u64,
-            block_size: (meta.config.chunk_size as u64).max(4096),
-            unavailable,
-        }
     }
 }
 
@@ -358,8 +329,11 @@ impl ArgosFuse {
         // Seed the snapshot before the first FUSE request, so statfs never
         // needs to block on a metadata write lock even during the first commit.
         let unavailable = volume.runtime_unavailable_devices();
-        let snapshot =
-            StatfsSnapshot::from_metadata(&volume, &volume.metadata_snapshot(), unavailable);
+        let snapshot = CapacitySnapshot::from_metadata(
+            volume.root(),
+            &volume.metadata_snapshot(),
+            unavailable,
+        );
         let commit_worker = DeferredCommitWorker::start(&volume)?;
         Ok(Self {
             shared: Arc::new(ArgosFuseShared {
@@ -420,17 +394,23 @@ impl ArgosFuseShared {
         Ok(entries)
     }
 
-    fn statfs_snapshot(&self) -> StatfsSnapshot {
+    fn statfs_snapshot(&self) -> CapacitySnapshot {
         let unavailable = self.volume.runtime_unavailable_devices();
         if let Some(meta) = self.volume.try_metadata_snapshot() {
-            let snapshot = StatfsSnapshot::from_metadata(&self.volume, &meta, unavailable);
+            let snapshot = CapacitySnapshot::from_metadata(self.volume.root(), &meta, unavailable);
             *self.statfs_cache.lock() = snapshot.clone();
             return snapshot;
         }
-        // A checkpoint is holding the metadata writer lock. Do not wait, and
-        // never advertise cached free capacity when additional members have
-        // been quarantined since the last observation.
-        let mut cached = self.statfs_cache.lock().clone();
+        // A checkpoint is holding the metadata writer lock. Do not wait.
+        // Prefer the snapshot the volume republishes after every durable
+        // commit: it advances while a long checkpoint is in flight, unlike a
+        // value cached only by earlier statfs calls.
+        let mut cached = self
+            .volume
+            .published_capacity_snapshot()
+            .unwrap_or_else(|| self.statfs_cache.lock().clone());
+        // Never advertise cached free capacity when additional members have
+        // been quarantined since the snapshot was taken.
         if !unavailable.is_subset(&cached.unavailable) {
             cached.free_bytes = 0;
         }
@@ -2096,150 +2076,6 @@ fn is_owner_managed_xattr(name: &str) -> bool {
             | acl::ARGOS_POSIX_ACL_ACCESS_XATTR
             | acl::ARGOS_POSIX_ACL_DEFAULT_XATTR
     )
-}
-
-fn statfs_bytes(
-    meta: &crate::types::Metadata,
-    root: &Path,
-    unavailable: &BTreeSet<String>,
-) -> (u64, u64) {
-    if meta.backend != crate::types::BackendKind::Host && !meta.raw_pool.allocators.is_empty() {
-        let width = meta.config.k.saturating_add(meta.config.m);
-        if meta.config.k == 0 || width == 0 {
-            return (0, 0);
-        }
-        let mut capacities = Vec::new();
-        let mut free = Vec::new();
-        for (disk_id, allocator) in &meta.raw_pool.allocators {
-            if unavailable.contains(disk_id) {
-                continue;
-            }
-            let Some(disk) = meta.disks.get(disk_id) else {
-                continue;
-            };
-            if !matches!(
-                disk.status,
-                DiskStatus::Online | DiskStatus::Degraded | DiskStatus::Draining
-            ) {
-                continue;
-            }
-            capacities.push(allocator.data_end.saturating_sub(allocator.data_start));
-            if disk.status == DiskStatus::Online {
-                free.push(raw_allocator_free_bytes(allocator));
-            }
-        }
-        let usable = max_stripe_units(&capacities, width).saturating_mul(meta.config.k as u64);
-        let available = max_stripe_units(&free, width).saturating_mul(meta.config.k as u64);
-        return (usable, available.min(usable));
-    }
-
-    let (explicit_capacity, grouped_capacity) = meta
-        .disks
-        .values()
-        .filter(|disk| disk.status == DiskStatus::Online && !unavailable.contains(&disk.id))
-        .fold((0u64, BTreeMap::<String, u64>::new()), |mut acc, disk| {
-            if disk.capacity_source == CapacitySource::UserOverride {
-                acc.0 = acc.0.saturating_add(disk.capacity_bytes);
-            } else if let Some(fs_id) = disk.backing_fs_id.as_ref() {
-                let entry = acc.1.entry(fs_id.clone()).or_default();
-                *entry = (*entry).max(disk.capacity_bytes);
-            } else {
-                acc.0 = acc.0.saturating_add(disk.capacity_bytes);
-            }
-            acc
-        });
-    let configured_capacity =
-        explicit_capacity.saturating_add(grouped_capacity.values().sum::<u64>());
-    let width = meta.config.k.saturating_add(meta.config.m).max(1) as u64;
-    if configured_capacity > 0 {
-        let logical_used = meta
-            .inodes
-            .values()
-            .filter(|inode| inode.kind == NodeKind::File)
-            .map(|inode| inode.size)
-            .sum::<u64>();
-        let usable = configured_capacity.saturating_mul(meta.config.k as u64) / width;
-        return (usable, usable.saturating_sub(logical_used));
-    }
-    let (capacity, free) = fallback_statfs_capacity(
-        root,
-        meta.disks
-            .values()
-            .filter(|disk| !unavailable.contains(&disk.id))
-            .map(|disk| {
-                if disk.path.is_absolute() {
-                    disk.path.clone()
-                } else {
-                    root.join(&disk.path)
-                }
-            }),
-    );
-    (
-        capacity.saturating_mul(meta.config.k as u64) / width,
-        free.saturating_mul(meta.config.k as u64) / width,
-    )
-}
-
-fn raw_allocator_free_bytes(allocator: &crate::types::RawAllocatorState) -> u64 {
-    let block = allocator.block_size.max(4096);
-    let tail = allocator.data_end.saturating_sub(allocator.next_offset) / block * block;
-    allocator.free_extents.iter().fold(tail, |total, extent| {
-        total.saturating_add(extent.length / block * block)
-    })
-}
-
-fn max_stripe_units(per_disk: &[u64], width: usize) -> u64 {
-    if width == 0 || per_disk.len() < width {
-        return 0;
-    }
-    let mut low = 0u64;
-    let mut high = per_disk.iter().copied().sum::<u64>() / width as u64;
-    while low < high {
-        let mid = low + (high - low).div_ceil(2);
-        let support = per_disk
-            .iter()
-            .map(|value| (*value).min(mid) as u128)
-            .sum::<u128>();
-        if support >= mid as u128 * width as u128 {
-            low = mid;
-        } else {
-            high = mid - 1;
-        }
-    }
-    low
-}
-
-fn fallback_statfs_capacity(root: &Path, paths: impl IntoIterator<Item = PathBuf>) -> (u64, u64) {
-    let mut capacity = 0u64;
-    let mut free = 0u64;
-    let mut seen = std::collections::BTreeSet::new();
-    for path in std::iter::once(root.to_path_buf()).chain(paths) {
-        let Some((fs_id, blocks, available)) = statvfs_capacity(&path) else {
-            continue;
-        };
-        if seen.insert(fs_id) {
-            capacity = capacity.saturating_add(blocks);
-            free = free.saturating_add(available);
-        }
-    }
-    (capacity, free)
-}
-
-fn statvfs_capacity(path: &Path) -> Option<(String, u64, u64)> {
-    let c_path = CString::new(path.as_os_str().as_bytes()).ok()?;
-    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-    let rc = unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) };
-    if rc != 0 {
-        return None;
-    }
-    let stat = unsafe { stat.assume_init() };
-    let block_size = stat.f_frsize.max(stat.f_bsize);
-    let fs_id = format!("{}:{}", stat.f_fsid, block_size);
-    Some((
-        fs_id,
-        stat.f_blocks.saturating_mul(block_size),
-        stat.f_bavail.saturating_mul(block_size),
-    ))
 }
 
 fn to_file_attr(attr: &NodeAttr) -> FileAttr {
