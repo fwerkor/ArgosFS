@@ -286,7 +286,7 @@ pub(super) mod ssse3 {
             let end = (start + tile).min(len);
             let mut row = 0;
             if data_shards >= 4 && end - start >= 2 * LANES {
-                for pair in outs.chunks_exact_mut(2) {
+                for pair in outs.as_chunks_mut::<2>().0 {
                     let (left, right) = pair.split_at_mut(1);
                     let coeffs = &matrix[row * data_shards..(row + 2) * data_shards];
                     let (r0, r1) = coeffs.split_at(data_shards);
@@ -579,7 +579,7 @@ pub(super) mod avx2 {
             let end = (start + tile).min(len);
             let mut row = 0;
             if data_shards >= 4 && end - start >= 2 * LANES {
-                for pair in outs.chunks_exact_mut(2) {
+                for pair in outs.as_chunks_mut::<2>().0 {
                     let (left, right) = pair.split_at_mut(1);
                     let coeffs = &matrix[row * data_shards..(row + 2) * data_shards];
                     let (r0, r1) = coeffs.split_at(data_shards);

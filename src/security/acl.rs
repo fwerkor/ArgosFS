@@ -135,7 +135,7 @@ fn parse_posix_acl_binary(value: &[u8]) -> Result<PosixAcl> {
         ));
     }
     let mut entries = Vec::new();
-    for chunk in value[4..].chunks_exact(8) {
+    for chunk in value[4..].as_chunks::<8>().0 {
         let raw_tag = u16::from_le_bytes([chunk[0], chunk[1]]);
         let raw_perms = u16::from_le_bytes([chunk[2], chunk[3]]);
         if raw_perms & !0o7 != 0 {

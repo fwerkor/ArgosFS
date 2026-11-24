@@ -30,9 +30,7 @@ pub(crate) const fn gauss_jordan(m: &mut [u8], n: usize, cols: usize) -> bool {
         if pivot_row != col {
             let mut j = 0;
             while j < cols {
-                let tmp = m[col * cols + j];
-                m[col * cols + j] = m[pivot_row * cols + j];
-                m[pivot_row * cols + j] = tmp;
+                m.swap(col * cols + j, pivot_row * cols + j);
                 j += 1;
             }
         }
