@@ -2399,12 +2399,6 @@ impl ArgosFs {
                 self.account_blocks_locked(meta, std::slice::from_ref(block), false);
                 self.delete_blocks_locked(meta, std::slice::from_ref(block));
             }
-            if !state.pending_reclaims.is_empty() {
-                // Deletion can free a lot of space before a slow journal or
-                // data flush finishes. Publish now so df advances during the
-                // commit instead of waiting for the writer lock to be released.
-                self.publish_capacity_snapshot_locked(meta);
-            }
             let mut prepared_delta = None;
             {
                 let _integrity_timer = self.commit_metrics.timer(CommitPhase::Integrity);
@@ -2552,7 +2546,8 @@ impl ArgosFs {
                     meta.integrity = before_integrity;
                 }
                 self.rebuild_quota_runtime_locked(meta)?;
-                self.publish_capacity_snapshot_locked(meta);
+                // The failed transaction did not make reclaimed space durable.
+                // Retain the previous published snapshot.
                 self.fence_on_quorum_loss(&err);
                 state.last_error = Some(err.to_string());
                 Err(err)
