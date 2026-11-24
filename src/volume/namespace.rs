@@ -728,6 +728,28 @@ impl ArgosFs {
 
         let inode_lock = self.inode_lock(ino);
         let _inode_guard = inode_lock.lock();
+        // Permission and geometry are rechecked under the writer lock.
+        // Avoid speculative work for explicit access checks.
+        let prepared = if access.is_none() {
+            self.prepare_write(ino, data, Some(start))
+        } else {
+            None
+        };
+        if let Some(result) = self.try_parallel_raw_append(
+            ino,
+            start,
+            data,
+            clear_setid,
+            write_time,
+            prepared.as_ref(),
+        ) {
+            result?;
+            self.commit_metrics
+                .add_data_plane_bytes(DataPlaneByteKind::RangeAccepted, data.len());
+            self.commit_metrics
+                .add_data_plane_bytes(DataPlaneByteKind::RangeAlignedAppend, data.len());
+            return Ok(data.len());
+        }
         let mut meta = self.meta.write();
         if let Some((uid, gid)) = access {
             let inode = meta
@@ -746,7 +768,15 @@ impl ArgosFs {
             return Ok(0);
         }
         if start == old_size && start % stripe_raw_size == 0 {
-            self.append_inode_data_locked(&mut meta, ino, start, data, clear_setid, write_time)?;
+            self.append_inode_data_locked(
+                &mut meta,
+                ino,
+                start,
+                data,
+                clear_setid,
+                write_time,
+                prepared,
+            )?;
             self.commit_metrics
                 .add_data_plane_bytes(DataPlaneByteKind::RangeAccepted, data.len());
             self.commit_metrics
@@ -808,6 +838,7 @@ impl ArgosFs {
         Ok(data.len())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn append_inode_data_locked(
         &self,
         meta: &mut Metadata,
@@ -816,6 +847,7 @@ impl ArgosFs {
         data: &[u8],
         clear_setid: bool,
         write_time: Option<BufferedWriteTime>,
+        prepared: Option<super::data_plane::PreparedWrite<'_>>,
     ) -> Result<()> {
         let rollback = self.commit_previous_with_advisory_locked(meta);
         let (storage_class, boot_critical, old_size, existing_inline, had_blocks) = {
@@ -872,13 +904,14 @@ impl ArgosFs {
                 };
                 (blocks, inline_payload, full_data.len())
             } else {
-                let blocks = self.encode_data_locked(
+                let blocks = self.encode_data_prepared_locked(
                     meta,
                     data,
                     offset as u64,
                     storage_class,
                     boot_critical,
                     &BTreeSet::new(),
+                    prepared,
                 )?;
                 let new_size = offset
                     .checked_add(data.len())
