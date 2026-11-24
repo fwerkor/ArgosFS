@@ -46,7 +46,7 @@ fn checksum_mismatch_removes_memory_and_l2_entries() {
 }
 
 #[test]
-fn l2_index_loads_existing_files_and_prunes_oldest_entries() {
+fn l2_index_loads_existing_files_and_prunes_to_limit() {
     let dir = tempdir().unwrap();
     let cache = BlockCache::new(dir.path(), 0, 5);
     let first = cache.l2_path("first");
@@ -80,6 +80,108 @@ fn l2_hits_promote_to_memory_and_remove_cleans_index() {
     assert_eq!(stats["memory_items"], 1);
     cache.remove("key");
     assert!(cache.get("key", None).is_none());
+}
+
+#[test]
+fn l2_scan_keeps_a_reusable_sample_and_protects_reused_entries() {
+    let dir = tempdir().unwrap();
+    let block_size = 1024usize;
+    let limit = 512 * block_size as u64;
+    let cache = BlockCache::new(dir.path(), 0, limit);
+    let blocks = (0..2_048)
+        .map(|index| vec![(index % 251) as u8; block_size])
+        .collect::<Vec<_>>();
+
+    // Cold sequential pass: the cache cannot hold the whole stream.
+    for (index, block) in blocks.iter().enumerate() {
+        cache.put(&format!("stream:{index}"), block).unwrap();
+    }
+    assert!(cache.stats()["l2_bytes"].as_u64().unwrap() <= limit);
+
+    // Warm pass in the same order: the retained random sample must survive
+    // until it is read, instead of being only an LRU tail evicted up front.
+    let mut hits = 0;
+    let mut hit_key = None;
+    for (index, block) in blocks.iter().enumerate() {
+        let key = format!("stream:{index}");
+        if cache.get(&key, None).is_some() {
+            hits += 1;
+            hit_key.get_or_insert(key);
+        } else {
+            cache.put(&key, block).unwrap();
+        }
+    }
+    assert!(
+        hits >= 100,
+        "warm sequential pass should hit a reusable sample, got {hits}"
+    );
+
+    // A reused entry is protected while colder entries remain.
+    let protected = hit_key.expect("warm scan hit at least one entry");
+    assert!(cache.get(&protected, None).is_some());
+    for index in 0..8 {
+        cache
+            .put(&format!("new:{index}"), &vec![0xee; block_size])
+            .unwrap();
+    }
+    assert!(cache.get(&protected, None).is_some());
+}
+
+#[test]
+fn l2_eviction_priorities_are_stable_across_prunes_and_cache_roots() {
+    let first = tempdir().unwrap();
+    let second = tempdir().unwrap();
+    let a = BlockCache::new(first.path(), 0, 64 * 1024);
+    let b = BlockCache::new(second.path(), 0, 64 * 1024);
+    for index in 0..256 {
+        let key = format!("stream:{index}");
+        a.put(&key, &[0; 1024]).unwrap();
+        b.put(&key, &[0; 1024]).unwrap();
+    }
+    let a_inner = a.inner.lock();
+    let b_inner = b.inner.lock();
+    assert_eq!(a_inner.l2_evict_seed, 0);
+    assert_eq!(b_inner.l2_evict_seed, 0);
+    let names = |inner: &CacheInner| {
+        inner
+            .l2_index
+            .keys()
+            .map(|p| p.file_name().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names(&a_inner), names(&b_inner));
+}
+
+#[test]
+fn l2_frozen_cache_preserves_sample_and_adapts_to_a_new_working_set() {
+    let dir = tempdir().unwrap();
+    let cache = BlockCache::new(dir.path(), 0, 10);
+    cache.put("hot-a", b"aaaa").unwrap();
+    cache.put("hot-b", b"bbbb").unwrap();
+    for _ in 0..32 {
+        assert!(cache.get("hot-a", None).is_some());
+        assert!(cache.get("hot-b", None).is_some());
+    }
+    assert_eq!(cache.stats()["l2_stream_frozen"], 1);
+    assert_eq!(cache.stats()["l2_hot_bytes"], 8);
+    // There is spare space, but not enough to admit this block without
+    // pruning the protected sample.
+    cache.put("cold", b"cccc").unwrap();
+    assert_eq!(cache.stats()["l2_bytes"], 8);
+    assert_eq!(cache.stats()["l2_writes"], 2);
+    for n in 0..(8 * 64) {
+        assert!(cache.get(&format!("miss:{n}"), None).is_none());
+    }
+    assert_eq!(cache.stats()["l2_stream_frozen"], 0);
+    assert_eq!(cache.stats()["l2_hot_bytes"], 0);
+    // One oversized block must not evict the entire existing cache.
+    cache.put("oversized", &[0; 11]).unwrap();
+    assert_eq!(cache.stats()["l2_bytes"], 8);
+    for n in 0..32 {
+        cache.put(&format!("next:{n}"), b"next").unwrap();
+    }
+    assert!(cache.stats()["l2_bytes"].as_u64().unwrap() <= 10);
+    assert!((0..32).any(|n| cache.get(&format!("next:{n}"), None).is_some()));
 }
 
 #[test]

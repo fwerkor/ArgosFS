@@ -2403,6 +2403,13 @@ impl ArgosFs {
         let checkpoint = checkpoint
             || state.raw_checkpoint_required
             || (state.raw_uncommitted_metadata_dirty && !incremental_integrity_enabled);
+        let array_splice_enabled = incremental_integrity_enabled
+            && current_members.iter().all(|sb| {
+                sb.required_feature_flags & raw_format::REQUIRED_FEATURE_ARRAY_SPLICE != 0
+            });
+        // The prepared delta is built before append_transaction; keep the
+        // feature decision active for both stages.
+        let _splice_guard = journal::allow_array_splice(array_splice_enabled);
 
         // The committed image is shared rather than cloned for every group commit.
         // A full rollback image is only needed if reclaiming old extents changes

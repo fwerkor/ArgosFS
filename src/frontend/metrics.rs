@@ -227,6 +227,9 @@ fn emit_read_cache_metrics(volume: &ArgosFs, emitter: &mut MetricEmitter<'_>) {
         ("argosfs_read_cache_memory_items", "memory_items"),
         ("argosfs_read_cache_l2_bytes", "l2_bytes"),
         ("argosfs_read_cache_l2_items", "l2_items"),
+        ("argosfs_read_cache_l2_hot_bytes", "l2_hot_bytes"),
+        ("argosfs_read_cache_l2_hot_items", "l2_hot_items"),
+        ("argosfs_read_cache_l2_stream_frozen", "l2_stream_frozen"),
     ] {
         if let Some(value) = cache.get(key).and_then(serde_json::Value::as_u64) {
             emitter.metric(
