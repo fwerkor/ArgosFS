@@ -128,6 +128,31 @@ fn l2_scan_keeps_a_reusable_sample_and_protects_reused_entries() {
 }
 
 #[test]
+fn l2_eviction_priorities_are_stable_across_prunes_and_cache_roots() {
+    let first = tempdir().unwrap();
+    let second = tempdir().unwrap();
+    let a = BlockCache::new(first.path(), 0, 64 * 1024);
+    let b = BlockCache::new(second.path(), 0, 64 * 1024);
+    for index in 0..256 {
+        let key = format!("stream:{index}");
+        a.put(&key, &[0; 1024]).unwrap();
+        b.put(&key, &[0; 1024]).unwrap();
+    }
+    let a_inner = a.inner.lock();
+    let b_inner = b.inner.lock();
+    assert_eq!(a_inner.l2_evict_seed, 0);
+    assert_eq!(b_inner.l2_evict_seed, 0);
+    let names = |inner: &CacheInner| {
+        inner
+            .l2_index
+            .keys()
+            .map(|p| p.file_name().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names(&a_inner), names(&b_inner));
+}
+
+#[test]
 fn l2_frozen_cache_preserves_sample_and_adapts_to_a_new_working_set() {
     let dir = tempdir().unwrap();
     let cache = BlockCache::new(dir.path(), 0, 10);
