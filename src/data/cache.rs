@@ -63,6 +63,7 @@ struct CacheInner {
     l2_evict_seed: u64,
     l2_window_requests: u64,
     l2_window_hits: u64,
+    l2_low_reuse_windows: u8,
     l2_freeze_stream: bool,
     hits: u64,
     misses: u64,
@@ -126,6 +127,21 @@ impl CacheInner {
         if self.l2_window_requests >= WINDOW {
             let ratio = self.l2_window_hits as f64 / self.l2_window_requests as f64;
             self.l2_freeze_stream = ratio >= FREEZE_RATIO;
+            // A working set that has stopped reusing L2 must be able to
+            // replace historically hot entries. Otherwise every cold
+            // admission can evict itself forever when the cache is all hot.
+            if self.l2_freeze_stream {
+                self.l2_low_reuse_windows = 0;
+            } else {
+                self.l2_low_reuse_windows = self.l2_low_reuse_windows.saturating_add(1);
+            }
+            if self.l2_low_reuse_windows >= 8 && self.l2_hot_bytes > 0 {
+                for entry in self.l2_index.values_mut() {
+                    entry.reused = false;
+                }
+                self.l2_hot_bytes = 0;
+                self.l2_low_reuse_windows = 0;
+            }
             self.l2_window_requests = 0;
             self.l2_window_hits = 0;
         }
@@ -475,9 +491,10 @@ impl BlockCache {
             // rest of the second pass can read it. Freeze cold admissions at
             // that point; existing keys can always be refreshed. A different
             // workload with a low hit ratio eventually unfreezes the cache.
-            if inner.l2_bytes >= self.l2_limit
-                && inner.l2_freeze_stream
-                && !inner.l2_index.contains_key(&path)
+            if !inner.l2_index.contains_key(&path)
+                && (data.len() as u64 > self.l2_limit
+                    || (inner.l2_freeze_stream
+                        && inner.l2_bytes.saturating_add(data.len() as u64) > self.l2_limit))
             {
                 return Ok(());
             }
