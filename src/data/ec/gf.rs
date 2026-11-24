@@ -98,6 +98,7 @@ pub const fn inv(a: u8) -> u8 {
 /// Vandermonde matrix `[1, 0, 0, ...]`, and it is what the reference
 /// implementations this crate is wire-compatible with do.
 #[inline]
+#[cfg(test)]
 pub const fn pow(a: u8, n: u32) -> u8 {
     if n == 0 {
         return 1;

@@ -1,29 +1,27 @@
 # Reed–Solomon codec compatibility and dispatch
 
-ArgosFS uses a vendored copy of reed-solomon-engine 0.2.0
-(https://crates.io/crates/reed-solomon-engine/0.2.0), with a byte-stable
-GF(2^8) systematic Vandermonde generator matrix and reduction polynomial
-0x11D. This replaces the previous production dependency on erase 4.0.0.
-The old implementation remains a test-only compatibility oracle so future
-changes cannot silently alter stored parity or reconstructed bytes.
+ArgosFS owns a native Reed–Solomon codec under `src/data/ec/` with a
+byte-stable GF(2^8) systematic Vandermonde matrix and polynomial 0x11D.
+The test-only erase 4.0.0 oracle checks persisted parity and recovery.
 
 ## Deployment and CPU compatibility
 
-The engine chooses AVX2, SSSE3, ARM64 NEON or the portable scalar reference
+The engine chooses GFNI-512, GFNI-256, AVX-512BW, AVX2, SSSE3, ARM64 NEON or the portable scalar reference
 using capabilities of the running CPU. The default build does not set
 -march=native or require a C compiler for Reed–Solomon. Portable binaries
 must be built without external target-cpu=native / target-feature flags:
 explicitly targeting a newer CPU can bypass runtime feature detection.
-Codecs are immutable; each reconstruction owns its scratch buffer, so
-readers need no shared codec mutex.
+Codecs are immutable; each worker reuses a bounded single-entry recovery plan
+keyed by geometry and presence mask, with scratch sized to the actual number
+of missing data shards. Data-only reads do not allocate missing parity.
+Encoding uses owned shard buffers and reuses the matrix across a write.
+On x86, cache-sized tiles (4–64 KiB) keep source and output data local;
+GFNI applies a precomputed affine transform over the legacy 0x11D field
+rather than GFNI's AES-field multiplication instruction.
 
-Source provenance: reed-solomon-engine 0.2.0, crates.io archive SHA-256:
-5d902386f55ac0890d3d0f56c932daa0b80b55bcf56631565eed76f0f7f54b6f.
-The vendored copy includes license notices and wire-format documentation;
-upstream development examples, benchmarks and tests are omitted because
-ArgosFS runs its own compatibility regressions. Cargo uses the local path
-with an exact version requirement. All 15 production Rust source files are
-byte-identical to the 0.2.0 registry archive; their hashes are checked in CI.
+The optimized arithmetic and SIMD kernels were adapted from
+reed-solomon-engine 0.2.0. See the retained provenance and license notices in
+`src/data/ec/THIRD_PARTY.md` and [wire format](erasure-wire-format.md).
 
 ## Disk format and upgrade safety
 
@@ -67,28 +65,20 @@ pool the bottleneck is mostly outside Reed–Solomon; the primary benefits are
 portable runtime dispatch and removal of C SIMD toolchain maintenance.
 
 
-## Packaging and upstream updates
+## Packaging and maintenance
 
-Cargo resolves a dependency declared with both path and version differently
-during development and distribution:
+The native codec is included in both the checkout and the crates.io archive;
+there is no production Reed–Solomon crate dependency. CI runs the independent
+legacy oracle on the source and packaged crate. Changes must preserve the
+wire contract, validate each supported SIMD backend, and exercise recovery
+and fuzz tests. Benchmark changes on representative stripe geometries.
 
-- Repository checkout: compile the pinned vendored source.
-- Published ArgosFS crate: resolve exactly reed-solomon-engine 0.2.0 from
-  crates.io. The upstream crate source is not bundled with ArgosFS.
+## Performance measurements
 
-Every CI build checks the vendor SHA-256 manifest, compiles a publishable
-ArgosFS package using the real registry dependency, and reruns the legacy
-parity oracle from the packaged source. Both deployment paths must pass.
-For local formatting, use cargo fmt --package argosfs -- --check; do not
-reformat third-party source or silently change pinned hashes.
-
-An upstream update must be deliberate: review advisories and release changes,
-verify the new crate archive checksum, re-import production sources and legal
-notices, update Cargo's explicit version and source fingerprints, and rerun
-local-vendor plus packaged-registry parity tests. Cross-arch, raw pool recovery,
-and CapOS CI remain mandatory. Dependabot remains enabled for this dependency
-so that potential version and security updates are visible. A Dependabot PR
-that only edits its registry version MUST fail the pinned manifest check;
-reviewers should treat such a PR as a request to perform a complete vetted
-vendor refresh, not as a safe automatic version bump. Keep security advisory
-notifications and dependency audits enabled for the pinned release.
+Run `scripts/experiments/bench-erasure-kernels.sh` for isolated,
+single-threaded encode and one-erasure data recovery measurements against
+the original vendored implementation. It builds the original source from
+the pinned Git revision in a temporary directory; the baseline is not a
+dependency of ArgosFS. Throughput is data bytes for encode and recovered
+bytes for decode, in GiB/s. Results depend on CPU, stripe geometry and cache
+residency; they are not end-to-end disk throughput.

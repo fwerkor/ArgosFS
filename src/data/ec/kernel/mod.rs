@@ -4,37 +4,12 @@
 //! GF(2^8) whose "elements" are whole shards, and the operations below are the
 //! entirety of its inner loop. Essentially all of the runtime is here.
 //!
-//! There are three of them, and the third is a fusion of the first two rather
-//! than anything new:
-//!
-//! ```text
-//! mul_slice(c, src, dst)         dst  = c * src
-//! mul_add_slice(c, src, dst)     dst ^= c * src
-//! mul_rows(matrix, k, srcs, outs)  outs[t] = sum over j of matrix[t*k + j] * srcs[j]
-//! ```
-//!
-//! `mul_rows` exists because encode drives many output rows over the same
-//! sources, and an implementation free to see all of them at once can hold
-//! several rows' accumulators in registers and split each source byte's nibbles
-//! once for all of them instead of once per row. On aarch64 that is worth 1.19x
-//! at 4+4, 1.32x at 8+4 and about 1.45x from 16+8 up. It blocks only in groups
-//! of eight and four, and computes the one to three rows that can be left over
-//! the old way; `neon.rs` has the accounting and the measurements that set that
-//! rule, including the narrower groups it rejected for being slower than what
-//! they replaced. Every other implementation of it is a plain loop over the
-//! first two operations, which is what the codec used to run itself, so the
-//! differential oracle is exact. Decode does *not* use it: at one or two
-//! erasures there is nothing to block over.
-//!
-//! [`scalar`] is the reference implementation: written for obvious
-//! correctness, never optimized, never deleted. Every other implementation in
-//! this module must produce byte-identical output, which the `tests` module at
-//! the bottom of this file enforces over every scalar, every shard length in a
-//! range covering all alignment and tail cases, every parity count that
-//! reaches a different blocking path, and every kernel the machine running the
-//! tests supports.
+//! Multiplication, XOR accumulation and multi-row encoding share a scalar
+//! reference. ARM uses fused rows; x86 uses cache-sized tiles and vector
+//! shuffles or GFNI affine transformations. Every backend is tested against
+//! the same GF(256)/0x11D arithmetic and persisted parity format.
 
-use crate::shards::ShardSource;
+use crate::data::ec::shards::ShardSource;
 
 pub(crate) mod scalar;
 
@@ -52,6 +27,15 @@ mod neon;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod x86;
 
+#[cfg(target_arch = "x86_64")]
+mod wide_x86;
+
+/// Keep a tile of all source and parity shards in a modest private cache.
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn encode_tile_size(k: usize, m: usize) -> usize {
+    (256 * 1024 / (k + m)).clamp(4096, 65536) & !63
+}
+
 /// Which implementation of the inner kernel to use.
 ///
 /// A `Kernel` can only be obtained from [`Kernel::SCALAR`], [`Kernel::detect`]
@@ -60,20 +44,6 @@ mod x86;
 /// convenience: the SIMD kernels are `unsafe` and rely on the ISA being
 /// present, so the variants are deliberately not public to construct.
 ///
-/// ```
-/// use reed_solomon_engine::Kernel;
-///
-/// // Whatever this machine does best.
-/// let best = Kernel::detect();
-///
-/// // Everything this build can run here, most capable first. Useful for
-/// // benchmarking one against another, and for forcing the reference.
-/// for kernel in Kernel::supported() {
-///     println!("{}", kernel.name());
-/// }
-/// assert!(Kernel::supported().any(|k| k == Kernel::SCALAR));
-/// # let _ = best;
-/// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Kernel(Isa);
 
@@ -88,14 +58,26 @@ enum Isa {
     Ssse3,
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     Avx2,
+    #[cfg(target_arch = "x86_64")]
+    Avx512,
+    #[cfg(target_arch = "x86_64")]
+    Gfni256,
+    #[cfg(target_arch = "x86_64")]
+    Gfni512,
 }
 
 /// Every kernel compiled into this build, most capable first. Some may not be
 /// runnable on the current CPU; [`Kernel::is_supported`] is the filter.
 ///
-/// The order is the preference order: [`Kernel::detect`] takes the first entry
-/// that passes the filter, so AVX2 beats SSSE3 and both beat the reference.
+/// Runtime dispatch prefers GFNI, wide shuffles, then narrow shuffles.
+#[cfg(test)]
 const COMPILED_IN: &[Kernel] = &[
+    #[cfg(target_arch = "x86_64")]
+    Kernel(Isa::Gfni512),
+    #[cfg(target_arch = "x86_64")]
+    Kernel(Isa::Gfni256),
+    #[cfg(target_arch = "x86_64")]
+    Kernel(Isa::Avx512),
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     Kernel(Isa::Avx2),
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -112,31 +94,7 @@ impl Kernel {
     /// kernel ever disagrees with it, the SIMD kernel is wrong.
     pub const SCALAR: Kernel = Kernel(Isa::Scalar);
 
-    /// The fastest kernel this build contains that the current CPU can run.
-    ///
-    /// On x86 the preference order is AVX2, then SSSE3, then
-    /// [`SCALAR`](Self::SCALAR).
-    ///
-    /// On aarch64 and on `no_std` targets this resolves at compile time and
-    /// costs nothing. On x86 with the `std` feature it consults
-    /// `is_x86_feature_detected!`, which caches its answer after the first
-    /// call. Without `std` there is no runtime CPU detection available, so
-    /// selection falls back to whatever `-C target-feature` enabled at compile
-    /// time, and building with `-C target-feature=+avx2` or a `-C target-cpu`
-    /// that implies it is how a `no_std` caller opts in.
-    ///
-    /// A `no_std` build with no such flag gets whatever the target's baseline
-    /// declares, which is not always [`SCALAR`](Self::SCALAR): the
-    /// `x86_64-unknown-linux-gnu` and `*-pc-windows-*` targets stop at SSE2
-    /// and do get scalar, but `x86_64-apple-darwin` has SSSE3 in its baseline
-    /// and gets the SSSE3 kernel.
-    ///
-    /// Note that `-C target-feature` overrides detection under `std` too, not
-    /// just under `no_std`. `is_x86_feature_detected!` expands to
-    /// `cfg!(target_feature = ...) || <runtime check>`, so the flag short
-    /// circuits CPUID. That is correct, because the flag is a promise about
-    /// the machine that LLVM has already acted on crate-wide, but it means
-    /// `std` is not a safety net against building for a CPU you do not have.
+    /// Select the best supported runtime backend.
     #[inline]
     pub fn detect() -> Self {
         detect_arch().unwrap_or(Kernel::SCALAR)
@@ -147,6 +105,7 @@ impl Kernel {
     ///
     /// Always yields at least [`SCALAR`](Self::SCALAR).
     #[inline]
+    #[cfg(test)]
     pub fn supported() -> impl Iterator<Item = Kernel> + Clone {
         COMPILED_IN.iter().copied().filter(|k| k.is_supported())
     }
@@ -157,11 +116,17 @@ impl Kernel {
         match self.0 {
             Isa::Scalar => true,
             #[cfg(target_arch = "aarch64")]
-            Isa::Neon => cfg!(target_feature = "neon"),
+            Isa::Neon => std::arch::is_aarch64_feature_detected!("neon"),
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             Isa::Ssse3 => x86::ssse3_supported(),
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             Isa::Avx2 => x86::avx2_supported(),
+            #[cfg(target_arch = "x86_64")]
+            Isa::Avx512 => wide_x86::avx512_supported(),
+            #[cfg(target_arch = "x86_64")]
+            Isa::Gfni256 => wide_x86::gfni256_supported(),
+            #[cfg(target_arch = "x86_64")]
+            Isa::Gfni512 => wide_x86::gfni512_supported(),
         }
     }
 
@@ -176,6 +141,12 @@ impl Kernel {
             Isa::Ssse3 => "ssse3",
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             Isa::Avx2 => "avx2",
+            #[cfg(target_arch = "x86_64")]
+            Isa::Avx512 => "avx512",
+            #[cfg(target_arch = "x86_64")]
+            Isa::Gfni256 => "gfni256",
+            #[cfg(target_arch = "x86_64")]
+            Isa::Gfni512 => "gfni512",
         }
     }
 
@@ -192,7 +163,7 @@ impl Kernel {
             #[cfg(target_arch = "aarch64")]
             // SAFETY: `Isa::Neon` is unconstructible outside this module, and
             // the only paths that produce it (`detect` and `supported`) gate
-            // on `is_supported`, which requires `target_feature = "neon"`.
+            // on `is_supported`, which checks NEON at runtime.
             Isa::Neon => unsafe { neon::mul_slice(c, src, dst) },
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             // SAFETY: `Isa::Ssse3` is unconstructible outside this module, and
@@ -203,6 +174,12 @@ impl Kernel {
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             // SAFETY: as above, via `x86::avx2_supported`.
             Isa::Avx2 => unsafe { x86::avx2::mul_slice(c, src, dst) },
+            #[cfg(target_arch = "x86_64")]
+            Isa::Avx512 => unsafe { wide_x86::avx512::mul_slice(c, src, dst) },
+            #[cfg(target_arch = "x86_64")]
+            Isa::Gfni256 => unsafe { wide_x86::gfni256::mul_slice(c, src, dst) },
+            #[cfg(target_arch = "x86_64")]
+            Isa::Gfni512 => unsafe { wide_x86::gfni512::mul_slice(c, src, dst) },
         }
     }
 
@@ -222,6 +199,12 @@ impl Kernel {
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             // SAFETY: as above.
             Isa::Avx2 => unsafe { x86::avx2::mul_add_slice(c, src, dst) },
+            #[cfg(target_arch = "x86_64")]
+            Isa::Avx512 => unsafe { wide_x86::avx512::mul_add_slice(c, src, dst) },
+            #[cfg(target_arch = "x86_64")]
+            Isa::Gfni256 => unsafe { wide_x86::gfni256::mul_add_slice(c, src, dst) },
+            #[cfg(target_arch = "x86_64")]
+            Isa::Gfni512 => unsafe { wide_x86::gfni512::mul_add_slice(c, src, dst) },
         }
     }
 
@@ -267,6 +250,12 @@ impl Kernel {
             #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
             // SAFETY: as above.
             Isa::Avx2 => unsafe { x86::avx2::mul_rows(matrix, data_shards, srcs, outs) },
+            #[cfg(target_arch = "x86_64")]
+            Isa::Avx512 => unsafe { wide_x86::avx512::mul_rows(matrix, data_shards, srcs, outs) },
+            #[cfg(target_arch = "x86_64")]
+            Isa::Gfni256 => unsafe { wide_x86::gfni256::mul_rows(matrix, data_shards, srcs, outs) },
+            #[cfg(target_arch = "x86_64")]
+            Isa::Gfni512 => unsafe { wide_x86::gfni512::mul_rows(matrix, data_shards, srcs, outs) },
         }
     }
 }
@@ -291,16 +280,16 @@ impl core::fmt::Display for Kernel {
 /// The arms below are mutually exclusive and between them cover every target,
 /// so exactly one is compiled whatever the build.
 ///
-/// NEON is mandatory on aarch64, so there is nothing to ask and nothing to
-/// branch on.
-#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+/// Check NEON explicitly before selecting the ARM backend.
+#[cfg(target_arch = "aarch64")]
 #[inline]
 fn detect_arch() -> Option<Kernel> {
-    Some(Kernel(Isa::Neon))
+    Kernel(Isa::Neon)
+        .is_supported()
+        .then_some(Kernel(Isa::Neon))
 }
 
-/// Neither SSSE3 nor AVX2 is in any x86 baseline this crate can assume, so
-/// both are asked about, widest first.
+/// SIMD feature detection is mandatory before entering any x86 kernel.
 ///
 /// Every answer comes from [`Kernel::is_supported`], which is what makes the
 /// result sound: this function cannot name a kernel that same check would
@@ -308,6 +297,12 @@ fn detect_arch() -> Option<Kernel> {
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 #[inline]
 fn detect_arch() -> Option<Kernel> {
+    #[cfg(target_arch = "x86_64")]
+    for isa in [Isa::Gfni512, Isa::Gfni256, Isa::Avx512] {
+        if Kernel(isa).is_supported() {
+            return Some(Kernel(isa));
+        }
+    }
     if Kernel(Isa::Avx2).is_supported() {
         Some(Kernel(Isa::Avx2))
     } else if Kernel(Isa::Ssse3).is_supported() {
@@ -318,11 +313,7 @@ fn detect_arch() -> Option<Kernel> {
 }
 
 /// Every other target has no SIMD kernel here yet.
-#[cfg(not(any(
-    all(target_arch = "aarch64", target_feature = "neon"),
-    target_arch = "x86",
-    target_arch = "x86_64"
-)))]
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")))]
 #[inline]
 fn detect_arch() -> Option<Kernel> {
     None
@@ -331,7 +322,7 @@ fn detect_arch() -> Option<Kernel> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gf;
+    use crate::data::ec::gf;
 
     /// Shard lengths that cover every vector width, every tail remainder and
     /// the degenerate ends.
@@ -366,7 +357,9 @@ mod tests {
     }
 
     fn pattern(len: usize, seed: u8) -> std::vec::Vec<u8> {
-        (0..len).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)).collect()
+        (0..len)
+            .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+            .collect()
     }
 
     /// A pseudo-random coefficient matrix, `rows * cols` bytes, row-major.
@@ -398,7 +391,9 @@ mod tests {
 
     /// `data_shards` distinct source shards of `len` bytes.
     fn sources(data_shards: usize, len: usize) -> std::vec::Vec<std::vec::Vec<u8>> {
-        (0..data_shards).map(|j| pattern(len, (j as u8).wrapping_mul(53).wrapping_add(3))).collect()
+        (0..data_shards)
+            .map(|j| pattern(len, (j as u8).wrapping_mul(53).wrapping_add(3)))
+            .collect()
     }
 
     #[test]
@@ -534,8 +529,9 @@ mod tests {
                     let srcs: std::vec::Vec<&[u8]> =
                         owned.iter().map(std::vec::Vec::as_slice).collect();
 
-                    let mut buffers: std::vec::Vec<std::vec::Vec<u8>> =
-                        (0..parity_shards).map(|_| std::vec![0xEDu8; len + CANARY]).collect();
+                    let mut buffers: std::vec::Vec<std::vec::Vec<u8>> = (0..parity_shards)
+                        .map(|_| std::vec![0xEDu8; len + CANARY])
+                        .collect();
                     {
                         let mut outs: std::vec::Vec<&mut [u8]> =
                             buffers.iter_mut().map(|b| &mut b[..len]).collect();
@@ -567,7 +563,9 @@ mod tests {
     #[test]
     fn the_kernels_the_environment_requires_are_all_supported() {
         // Unset, as on any ordinary machine, this test asserts nothing.
-        let Ok(required) = std::env::var(REQUIRED_KERNELS) else { return };
+        let Ok(required) = std::env::var(REQUIRED_KERNELS) else {
+            return;
+        };
 
         let available: std::vec::Vec<&str> = Kernel::supported().map(|k| k.name()).collect();
         for name in required.split(',').map(str::trim).filter(|s| !s.is_empty()) {

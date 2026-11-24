@@ -5,10 +5,7 @@
 //! [`super::tables`]. Two shuffles and an XOR replace 16 field
 //! multiplications.
 //!
-//! NEON is part of the mandatory aarch64 baseline, so there is no runtime
-//! detection here and none is needed: [`Kernel::is_supported`] gates on
-//! `cfg!(target_feature = "neon")`, which is enabled by default on every
-//! aarch64 target this crate builds for.
+//! The dispatcher checks NEON support at runtime before entering this module.
 //!
 //! [`mul_rows`] is the same shuffle, blocked over several output shards at
 //! once. Section "Why `mul_rows` is blocked" below explains why that is worth a
@@ -32,7 +29,7 @@ use core::arch::aarch64::{
 };
 
 use super::{scalar, tables};
-use crate::shards::ShardSource;
+use crate::data::ec::shards::ShardSource;
 
 /// Bytes per vector register.
 const LANES: usize = 16;
@@ -235,7 +232,10 @@ fn take_group<'r, const W: usize, O: AsMut<[u8]>>(
     *rest = tail;
     let mut shards = head.iter_mut();
     Some(core::array::from_fn(|_| {
-        shards.next().expect("split_at_mut(W) yields exactly W shards").as_mut()
+        shards
+            .next()
+            .expect("split_at_mut(W) yields exactly W shards")
+            .as_mut()
     }))
 }
 
@@ -289,7 +289,12 @@ unsafe fn group<const G: usize, S: ShardSource + ?Sized>(
             let (l0, h0, l1, h1) = unsafe {
                 let s0 = vld1q_u8(window.as_ptr());
                 let s1 = vld1q_u8(window.as_ptr().add(LANES));
-                (vandq_u8(s0, mask), vshrq_n_u8(s0, 4), vandq_u8(s1, mask), vshrq_n_u8(s1, 4))
+                (
+                    vandq_u8(s0, mask),
+                    vshrq_n_u8(s0, 4),
+                    vandq_u8(s1, mask),
+                    vshrq_n_u8(s1, 4),
+                )
             };
             for (t, row) in coeffs.iter().enumerate() {
                 let table = tables::SPLIT.get(row[j]);
@@ -430,7 +435,9 @@ pub(super) unsafe fn mul_rows<S: ShardSource + ?Sized, O: AsRef<[u8]> + AsMut<[u
     srcs: &S,
     outs: &mut [O],
 ) {
-    let Some(first_out) = outs.first() else { return };
+    let Some(first_out) = outs.first() else {
+        return;
+    };
     let len = first_out.as_ref().len();
 
     let mut rest: &mut [O] = outs;

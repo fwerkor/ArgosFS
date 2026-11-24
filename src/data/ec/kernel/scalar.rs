@@ -8,8 +8,8 @@
 //! correctness and is never optimized: it is the specification that every
 //! future SIMD path must reproduce byte for byte.
 
-use crate::gf;
-use crate::shards::ShardSource;
+use crate::data::ec::gf;
+use crate::data::ec::shards::ShardSource;
 
 /// `dst = c * src`
 ///

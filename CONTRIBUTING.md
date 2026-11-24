@@ -47,7 +47,6 @@ the local equivalents of the core Rust CI checks:
 
 ```sh
 cargo fmt --package argosfs -- --check
-python3 scripts/ci/verify-vendored-codec.py
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features -- --test-threads=1
 RUSTDOCFLAGS='-D warnings' cargo doc --all-features --no-deps
@@ -90,13 +89,12 @@ operations, repair, and fault injection can overwrite or remove data. Do not
 run them on valuable block devices. Privileged test scripts must be reviewed
 before pointing them at real devices.
 
-### Vendored code and dependencies
+### Erasure coding and dependencies
 
-`vendor/reed-solomon-engine/` is a pinned upstream codec copy. Do not edit
-vendored sources or update the codec version as an incidental part of an
-unrelated PR. Codec changes must preserve the legacy parity/reconstruction
-contract, pass `scripts/ci/verify-vendored-codec.py`, and validate package
-resolution from crates.io. See [docs/erasure-codec.md](docs/erasure-codec.md).
+The native codec under `src/data/ec/` preserves the existing on-disk
+parity and reconstruction contract. Changes must pass the legacy oracle,
+SIMD differential tests and packaged-source tests. Preserve the third-party
+notices alongside adapted code. See [docs/erasure-codec.md](docs/erasure-codec.md).
 
 Keep dependency and lockfile changes intentional and include them in review.
 

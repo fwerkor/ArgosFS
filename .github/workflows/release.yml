@@ -63,9 +63,8 @@ jobs:
       - name: Install Rust
         run: scripts/ci/install-rust.sh stable
       - uses: Swatinem/rust-cache@v2
-      - name: Verify vendored codec and release helper
+      - name: Verify release helper
         run: |
-          python3 scripts/ci/verify-vendored-codec.py
           python3 -m unittest discover -s scripts/release -p 'test_*.py' -v
       - name: Run library tests
         run: cargo test --locked --lib
@@ -73,7 +72,7 @@ jobs:
         run: |
           cargo package --locked
           version="$(python3 scripts/release/release.py check)"
-          cargo test --manifest-path "target/package/argosfs-${version}/Cargo.toml" --lib data::erasure::tests -- --test-threads=1
+          cargo test --manifest-path "target/package/argosfs-${version}/Cargo.toml" --lib data:: -- --test-threads=1
 
   binaries:
     name: Linux ${{ matrix.arch }} release

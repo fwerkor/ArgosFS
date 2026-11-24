@@ -41,7 +41,7 @@ artifact-generation workflows.
 ArgosFS is implemented in Rust for memory safety and future kernel-adjacent
 reuse. The data plane uses mature crates rather than hand-rolled primitives:
 
-- Vendored reed-solomon-engine for portable runtime-dispatched Reed–Solomon layouts.
+- Native GF(256) Reed–Solomon engine with portable runtime-dispatched SIMD.
 - `fuser`/libfuse3 for the Linux filesystem mount frontend.
 - `zstd` and `lz4_flex` for transparent block compression.
 - `chacha20poly1305` and `argon2` for built-in authenticated encryption.
@@ -124,7 +124,7 @@ system permissions and FUSE/kernel support.
 
 ## Build
 
-ArgosFS requires Rust 1.87 or newer. The FUSE frontend also needs libfuse3
+ArgosFS requires Rust 1.89 or newer. The FUSE frontend also needs libfuse3
 headers and `pkg-config` at build time.
 
 Install the required system packages:

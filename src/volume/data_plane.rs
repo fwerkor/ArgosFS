@@ -845,6 +845,7 @@ impl ArgosFs {
         } else {
             None
         };
+        let rs = RsCodec::new(layout.k, layout.m)?;
         for (index, raw) in data.chunks(stripe_raw_size).enumerate() {
             let stripe_id = format!("s{:016x}", meta.next_stripe);
             meta.next_stripe = meta
@@ -921,21 +922,24 @@ impl ArgosFs {
             } else {
                 (transformed, false, String::new())
             };
+            let compressed_size = payload.len();
             let (shard_size, encoded) = if layout.k == 1 && layout.m == 0 {
-                (payload.len().max(1), vec![payload.clone()])
+                (payload.len().max(1), vec![payload])
             } else {
-                let codec = RsCodec::new(layout.k, layout.m)?;
                 let shard_size = payload.len().max(1).div_ceil(layout.k);
-                let mut padded = payload.clone();
                 let padded_len = shard_size.checked_mul(layout.k).ok_or_else(|| {
                     ArgosError::Invalid("encoded shard size overflow".to_string())
                 })?;
-                padded.resize(padded_len, 0);
-                let data_shards = padded
-                    .chunks(shard_size)
-                    .map(|chunk| chunk.to_vec())
-                    .collect::<Vec<_>>();
-                (shard_size, codec.encode(&data_shards)?)
+                let mut data_shards = Vec::with_capacity(layout.k);
+                for chunk in payload.chunks(shard_size) {
+                    let mut shard = Vec::with_capacity(shard_size);
+                    shard.extend_from_slice(chunk);
+                    shard.resize(shard_size, 0);
+                    data_shards.push(shard);
+                }
+                debug_assert_eq!(padded_len / shard_size, layout.k);
+                data_shards.resize_with(layout.k, || vec![0; shard_size]);
+                (shard_size, rs.encode_owned(data_shards)?)
             };
             let single_raw_shard_integrity =
                 if layout.k == 1 && layout.m == 0 && !encrypted && codec == Compression::None {
@@ -990,7 +994,7 @@ impl ArgosFs {
                 codec,
                 encrypted,
                 nonce_hex,
-                compressed_size: payload.len(),
+                compressed_size,
                 shard_size,
                 shards,
                 storage_class,
