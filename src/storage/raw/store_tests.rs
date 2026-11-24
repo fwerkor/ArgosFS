@@ -1618,7 +1618,11 @@ fn compressed_checkpoint_quorum_round_trip_and_corruption_checks() {
         sb.metadata.length = 1024 * 1024;
     }
     let payload = prepare_checkpoint_payload(&next, &superblocks).unwrap();
-    let exact = serde_json::to_vec(&next).unwrap();
+    let exact = serde_json::to_vec(&CheckpointWire {
+        metadata: &next,
+        checkpoint_member_catalog: next.inodes.checkpoint_catalog(),
+    })
+    .unwrap();
     assert!(exact.len() > CHECKPOINT_PROBE_BYTES);
     assert_eq!(
         payload.original.as_ref().unwrap(),
@@ -2142,3 +2146,91 @@ fn v2_crash_after_quorum_commit_recovers_authenticated_delta() {
 
 #[path = "store_tests/rollover_slot.rs"]
 mod rollover_slot;
+
+#[test]
+fn persisted_member_stripe_catalog_is_verified_and_stale_hint_falls_back() {
+    let (_dir, images, metadata, superblocks) = quorum_fixture();
+    let backend = block_backend_for(&images);
+    let member = metadata.disks.keys().next().unwrap();
+    let expected = metadata.inodes.member_stripes(member);
+    assert!(!expected.is_empty());
+    let checkpoint = prepare_checkpoint_writes(&metadata, &superblocks).unwrap();
+    assert_eq!(
+        &checkpoint.header[CHECKPOINT_CATALOG_OFFSET..CHECKPOINT_CATALOG_OFFSET + 8],
+        CHECKPOINT_CATALOG_MAGIC
+    );
+    let sb = &superblocks[0];
+    write_metadata_slot(&backend, sb, sb.metadata.offset, &checkpoint, None).unwrap();
+    let recovered = read_metadata_candidate(
+        &backend,
+        sb,
+        sb.metadata.offset,
+        sb.metadata.length / 2,
+        &checkpoint.header,
+    )
+    .unwrap();
+    assert!(recovered.inodes.has_member_catalog());
+    assert_eq!(recovered.inodes.member_stripes(member), expected);
+    assert!(recovered.checkpoint_member_catalog.is_none());
+    assert_eq!(
+        journal::canonical_metadata_hash(&metadata).unwrap(),
+        journal::canonical_metadata_hash(&recovered).unwrap()
+    );
+    // A validly checksummed but incomplete derived extension must never
+    // suppress a live stripe. Old readers also ignore the extra JSON field.
+    let mut catalog = serde_json::to_value(metadata.inodes.checkpoint_catalog()).unwrap();
+    catalog["members"].as_object_mut().unwrap().remove(member);
+    let wire = CheckpointWire {
+        metadata: &metadata,
+        checkpoint_member_catalog: serde_json::from_value(catalog).unwrap(),
+    };
+    let bytes = serde_json::to_vec(&wire).unwrap();
+    let hash = sha256_hex(&bytes);
+    let mut stale = metadata_tree_checkpoint_encoded(
+        "test",
+        metadata.txid,
+        metadata.integrity.generation,
+        bytes,
+        &hash,
+        sb.metadata.length / 2,
+        None,
+    )
+    .unwrap();
+    stale.header[CHECKPOINT_CATALOG_OFFSET..CHECKPOINT_CATALOG_OFFSET + 8]
+        .copy_from_slice(CHECKPOINT_CATALOG_MAGIC);
+    write_metadata_slot(&backend, sb, sb.metadata.offset, &stale, None).unwrap();
+    let recovered = read_metadata_candidate(
+        &backend,
+        sb,
+        sb.metadata.offset,
+        sb.metadata.length / 2,
+        &stale.header,
+    )
+    .unwrap();
+    assert!(!recovered.inodes.has_member_catalog());
+    assert_eq!(recovered.inodes.member_stripes(member), expected);
+    // A legacy payload remains readable without the extension or proof.
+    let bytes = serde_json::to_vec(&metadata).unwrap();
+    let hash = sha256_hex(&bytes);
+    let old = metadata_tree_checkpoint_encoded(
+        "test",
+        metadata.txid,
+        metadata.integrity.generation,
+        bytes,
+        &hash,
+        sb.metadata.length / 2,
+        None,
+    )
+    .unwrap();
+    write_metadata_slot(&backend, sb, sb.metadata.offset, &old, None).unwrap();
+    let recovered = read_metadata_candidate(
+        &backend,
+        sb,
+        sb.metadata.offset,
+        sb.metadata.length / 2,
+        &old.header,
+    )
+    .unwrap();
+    assert!(!recovered.inodes.has_member_catalog());
+    assert_eq!(recovered.inodes.member_stripes(member), expected);
+}

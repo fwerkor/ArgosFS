@@ -486,6 +486,7 @@ impl ArgosFs {
             integrity: MetadataIntegrity::default(),
             disks,
             inodes: inodes.into_iter().collect(),
+            checkpoint_member_catalog: None,
         };
         let mut meta = meta;
         normalize_metadata_layouts(&mut meta);
@@ -683,6 +684,7 @@ impl ArgosFs {
             integrity: MetadataIntegrity::default(),
             disks,
             inodes: inodes.into_iter().collect(),
+            checkpoint_member_catalog: None,
         };
         normalize_metadata_layouts(&mut meta);
         journal::prepare_metadata_integrity_for_external_store(&mut meta)?;

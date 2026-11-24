@@ -3,39 +3,58 @@
 //! The in-memory representation is independent of the serialized Metadata
 //! format: JSON always writes keys in increasing inode order.
 use super::types::{Inode, InodeId};
-use imbl::{HashMap, OrdSet};
+use imbl::{HashMap, OrdMap, OrdSet};
 use serde::de::Deserializer;
 use serde::ser::{SerializeMap, Serializer};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Index;
 use std::sync::{Arc, OnceLock};
 
-/// Derived index of physical member references. It is deliberately not part
-/// of the wire format or integrity digest; the inode table is authoritative.
-/// A committed COW baseline makes incremental removal/replacement exact even
-/// when get_mut callers change arbitrary blocks through an ordinary &mut Inode.
+/// A checkpoint-only derived extension. The normal Metadata serializer
+/// deliberately omits it, so legacy integrity identities remain unchanged.
+type MemberStripes = BTreeMap<String, OrdMap<InodeId, OrdSet<String>>>;
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct CheckpointMemberCatalog {
+    version: u32,
+    members: MemberStripes,
+}
+
 #[derive(Clone, Debug)]
 struct MemberCatalog {
     base: HashMap<InodeId, Inode>,
-    members: BTreeMap<String, OrdSet<InodeId>>,
+    members: MemberStripes,
 }
 
-fn inode_members(inode: Option<&Inode>) -> BTreeSet<&str> {
-    inode
-        .into_iter()
-        .flat_map(|inode| &inode.blocks)
-        .flat_map(|block| &block.shards)
-        .map(|shard| shard.disk_id.as_str())
-        .collect()
+fn inode_references(inode: Option<&Inode>) -> BTreeMap<&str, BTreeSet<&str>> {
+    let mut references = BTreeMap::<&str, BTreeSet<&str>>::new();
+    for block in inode.into_iter().flat_map(|inode| &inode.blocks) {
+        for shard in &block.shards {
+            references
+                .entry(&shard.disk_id)
+                .or_default()
+                .insert(&block.stripe_id);
+        }
+    }
+    references
+}
+
+fn own_stripes(stripes: &BTreeSet<&str>) -> OrdSet<String> {
+    stripes.iter().map(|stripe| (*stripe).to_owned()).collect()
 }
 
 impl MemberCatalog {
     fn from_map(map: &HashMap<InodeId, Inode>) -> Self {
-        let mut members = BTreeMap::<String, OrdSet<InodeId>>::new();
+        let mut members = MemberStripes::new();
         for (ino, inode) in map {
-            for disk_id in inode_members(Some(inode)) {
-                members.entry(disk_id.to_owned()).or_default().insert(*ino);
+            for (disk_id, stripes) in inode_references(Some(inode)) {
+                members
+                    .entry(disk_id.to_owned())
+                    .or_default()
+                    .insert(*ino, own_stripes(&stripes));
             }
         }
         Self {
@@ -46,9 +65,9 @@ impl MemberCatalog {
 
     fn advance(&mut self, map: &HashMap<InodeId, Inode>, dirty: &BTreeSet<InodeId>) {
         for ino in dirty {
-            let previous = inode_members(self.base.get(ino));
-            let current = inode_members(map.get(ino));
-            for disk_id in previous.difference(&current) {
+            let previous = inode_references(self.base.get(ino));
+            let current = inode_references(map.get(ino));
+            for disk_id in previous.keys().filter(|disk| !current.contains_key(*disk)) {
                 if let Some(inodes) = self.members.get_mut(*disk_id) {
                     inodes.remove(ino);
                     if inodes.is_empty() {
@@ -56,15 +75,98 @@ impl MemberCatalog {
                     }
                 }
             }
-            for disk_id in current.difference(&previous) {
-                self.members
-                    .entry((*disk_id).to_owned())
-                    .or_default()
-                    .insert(*ino);
+            for (disk_id, stripes) in &current {
+                if previous.get(disk_id) != Some(stripes) {
+                    self.members
+                        .entry((*disk_id).to_owned())
+                        .or_default()
+                        .insert(*ino, own_stripes(stripes));
+                }
             }
         }
         self.base = map.clone();
     }
+}
+
+// Check the derived catalog against the authoritative inode stream while it
+// is decoded, avoiding a second full walk of the loaded namespace. Both sides
+// hash ordered, length-delimited (inode, stripe) references per member.
+type ReferenceProof = BTreeMap<String, [u8; 32]>;
+#[derive(Default)]
+struct ProofBuilder {
+    digests: BTreeMap<String, Sha256>,
+    last: Option<InodeId>,
+    unordered: bool,
+}
+fn hash_references<'a>(
+    hash: &mut Sha256,
+    ino: InodeId,
+    count: usize,
+    stripes: impl Iterator<Item = &'a str>,
+) {
+    hash.update(ino.to_le_bytes());
+    hash.update((count as u64).to_le_bytes());
+    for stripe in stripes {
+        hash.update((stripe.len() as u64).to_le_bytes());
+        hash.update(stripe.as_bytes());
+    }
+}
+impl ProofBuilder {
+    fn observe(&mut self, ino: InodeId, inode: &Inode) {
+        if self.last.is_some_and(|last| last >= ino) {
+            self.unordered = true;
+        }
+        self.last = Some(ino);
+        for (disk, stripes) in inode_references(Some(inode)) {
+            hash_references(
+                self.digests.entry(disk.to_owned()).or_default(),
+                ino,
+                stripes.len(),
+                stripes.into_iter(),
+            );
+        }
+    }
+    fn finish(self) -> Option<ReferenceProof> {
+        (!self.unordered).then(|| {
+            self.digests
+                .into_iter()
+                .map(|(disk, hash)| (disk, hash.finalize().into()))
+                .collect()
+        })
+    }
+}
+fn catalog_proof(members: &MemberStripes) -> Option<ReferenceProof> {
+    let mut proof = ReferenceProof::new();
+    for (member, inodes) in members {
+        if inodes.is_empty() {
+            return None;
+        }
+        let mut hash = Sha256::new();
+        for (ino, stripes) in inodes {
+            if stripes.is_empty() {
+                return None;
+            }
+            hash_references(
+                &mut hash,
+                *ino,
+                stripes.len(),
+                stripes.iter().map(String::as_str),
+            );
+        }
+        proof.insert(member.clone(), hash.finalize().into());
+    }
+    Some(proof)
+}
+
+thread_local! { static CAPTURE_CHECKPOINT_PROOF: Cell<bool> = const { Cell::new(false) }; }
+pub(crate) struct CheckpointProofGuard(bool);
+impl Drop for CheckpointProofGuard {
+    fn drop(&mut self) {
+        CAPTURE_CHECKPOINT_PROOF.with(|flag| flag.set(self.0));
+    }
+}
+pub(crate) fn capture_checkpoint_proof(enabled: bool) -> CheckpointProofGuard {
+    CheckpointProofGuard(CAPTURE_CHECKPOINT_PROOF.with(|flag| flag.replace(enabled)))
 }
 
 #[derive(Clone, Debug)]
@@ -75,6 +177,7 @@ pub struct TrackedInodes {
     // Distinct baselines require a full comparison, never a dirty-only diff.
     baseline: Arc<()>,
     member_catalog: OnceLock<MemberCatalog>,
+    checkpoint_proof: Option<ReferenceProof>,
 }
 
 impl Default for TrackedInodes {
@@ -84,6 +187,7 @@ impl Default for TrackedInodes {
             dirty: BTreeSet::new(),
             baseline: Arc::new(()),
             member_catalog: OnceLock::new(),
+            checkpoint_proof: None,
         }
     }
 }
@@ -154,10 +258,66 @@ impl TrackedInodes {
             .get_or_init(|| MemberCatalog::from_map(&self.map));
     }
 
-    /// Sorted inode candidates for a member, including uncommitted mutations.
-    /// The committed index is shared across COW snapshots. Overlay only dirty
-    /// inodes, so deletions, repairs, rollback and deferred writes cannot leave
-    /// missing or stale candidates. Callers still revalidate actual stripes.
+    #[cfg(test)]
+    pub(crate) fn has_member_catalog(&self) -> bool {
+        self.member_catalog.get().is_some()
+    }
+
+    /// Encode the exact current reference index, including uncommitted edits.
+    pub(crate) fn checkpoint_catalog(&self) -> CheckpointMemberCatalog {
+        let mut catalog = self
+            .member_catalog
+            .get_or_init(|| MemberCatalog::from_map(&self.map))
+            .clone();
+        catalog.advance(&self.map, &self.dirty);
+        CheckpointMemberCatalog {
+            version: 1,
+            members: catalog.members,
+        }
+    }
+
+    /// The payload checksums protect the bytes; this proof additionally
+    /// prevents a validly checksummed but stale/incomplete derived index from
+    /// hiding a live shard. Legacy or malformed hints take the normal path.
+    pub(crate) fn restore_checkpoint_catalog(
+        &mut self,
+        catalog: Option<CheckpointMemberCatalog>,
+    ) -> bool {
+        let proof = self.checkpoint_proof.take();
+        let Some(catalog) = catalog else {
+            return false;
+        };
+        if catalog.version != 1 || proof.is_none() || catalog_proof(&catalog.members) != proof {
+            return false;
+        }
+        self.member_catalog = OnceLock::from(MemberCatalog {
+            base: self.map.clone(),
+            members: catalog.members,
+        });
+        true
+    }
+
+    /// Sorted member worklist, including modifications since the last commit.
+    pub(crate) fn member_stripes(&self, disk_id: &str) -> Vec<(InodeId, BTreeSet<String>)> {
+        let catalog = self
+            .member_catalog
+            .get_or_init(|| MemberCatalog::from_map(&self.map));
+        let mut refs = catalog
+            .members
+            .get(disk_id)
+            .into_iter()
+            .flat_map(|inodes| inodes.iter())
+            .filter(|(ino, _)| !self.dirty.contains(ino))
+            .map(|(ino, stripes)| (*ino, stripes.iter().cloned().collect::<BTreeSet<_>>()))
+            .collect::<BTreeMap<_, _>>();
+        for ino in &self.dirty {
+            if let Some(stripes) = inode_references(self.map.get(ino)).get(disk_id) {
+                refs.insert(*ino, stripes.iter().map(|id| (*id).to_owned()).collect());
+            }
+        }
+        refs.into_iter().collect()
+    }
+
     pub(crate) fn member_inode_ids(&self, disk_id: &str) -> Vec<InodeId> {
         let catalog = self
             .member_catalog
@@ -166,7 +326,7 @@ impl TrackedInodes {
             .members
             .get(disk_id)
             .into_iter()
-            .flat_map(|set| set.iter());
+            .flat_map(|inodes| inodes.keys());
         if self.dirty.is_empty() {
             return committed.copied().collect();
         }
@@ -257,12 +417,36 @@ impl Serialize for TrackedInodes {
 
 impl<'de> Deserialize<'de> for TrackedInodes {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let map = HashMap::<InodeId, Inode>::deserialize(deserializer)?;
-        Ok(Self {
-            map,
-            dirty: BTreeSet::new(),
-            baseline: Arc::new(()),
-            member_catalog: OnceLock::new(),
-        })
+        if !CAPTURE_CHECKPOINT_PROOF.with(Cell::get) {
+            let map = HashMap::<InodeId, Inode>::deserialize(deserializer)?;
+            return Ok(Self {
+                map,
+                ..Self::default()
+            });
+        }
+        struct InodesVisitor;
+        impl<'de> serde::de::Visitor<'de> for InodesVisitor {
+            type Value = TrackedInodes;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("inode map")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut entries: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut map = HashMap::new();
+                let mut proof = ProofBuilder::default();
+                while let Some((ino, inode)) = entries.next_entry::<InodeId, Inode>()? {
+                    proof.observe(ino, &inode);
+                    map.insert(ino, inode);
+                }
+                Ok(TrackedInodes {
+                    map,
+                    checkpoint_proof: proof.finish(),
+                    ..TrackedInodes::default()
+                })
+            }
+        }
+        deserializer.deserialize_map(InodesVisitor)
     }
 }
