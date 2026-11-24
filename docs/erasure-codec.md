@@ -38,6 +38,8 @@ a separate compiler or library. All sixteen legal vector lengths
 (128–2048 bits in 128-bit increments) and the NEON fallback are tested
 by `scripts/ci/test-erasure-sve.sh` using QEMU. Real SVE hardware
 performance remains unmeasured; dispatch is width-based, not autotuned.
+Physical-hardware benchmarking and tuning are tracked in
+[issue #326](https://github.com/fwerkor/ArgosFS/issues/326).
 
 The optimized arithmetic and SIMD kernels were adapted from
 reed-solomon-engine 0.2.0. See the retained provenance and license notices in
