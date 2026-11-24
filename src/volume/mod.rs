@@ -106,8 +106,6 @@ const INLINE_DATA_MAX: usize = 512;
 pub(crate) const MAX_IN_MEMORY_IO_BYTES: usize = 256 * 1024 * 1024;
 
 mod autopilot;
-#[cfg(test)]
-mod data_fanout_tests;
 mod data_plane;
 #[cfg(test)]
 mod deferred_flush_tests;
@@ -131,6 +129,10 @@ mod read_checkpoint_tests;
 mod read_fast_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[path = "data_fanout_tests.rs"]
+mod stripe_fanout_tests;
 
 pub use autopilot::{AutopilotConfig, ReshapeReport};
 use helpers::*;
