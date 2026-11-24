@@ -1815,28 +1815,32 @@ fn append_journal_quorum(
     let mut positions = Vec::with_capacity(superblocks.len());
     let mut rollover = false;
     let discovered = parallel_journal_members(superblocks, |sb| {
-        let result = (|| -> Result<_> {
-            let accepts = {
-                let _tip_timer = metrics.map(|metrics| metrics.timer(CommitPhase::JournalTip));
-                journal_tip_accepts_transaction(backend, sb, metadata, allow_same_txid)?
-            };
-            if !accepts {
-                return Err(ArgosError::Conflict(format!(
+        let tip_accepts = {
+            let _tip_timer = metrics.map(|metrics| metrics.timer(CommitPhase::JournalTip));
+            journal_tip_accepts_transaction(backend, sb, metadata, allow_same_txid)
+        };
+        let position = matches!(&tip_accepts, Ok(true))
+            .then(|| journal_append_position(backend, sb, entry.len()));
+        (sb, tip_accepts, position)
+    });
+    for (sb, tip_accepts, position) in discovered {
+        match tip_accepts {
+            Ok(true) => match position.expect("accepted member has append position") {
+                Ok(position) => {
+                    let certificate_end = position.2.checked_add(journal_certificate.len() as u64);
+                    rollover |=
+                        position.3 || certificate_end.is_none_or(|end| end > sb.journal.length);
+                    positions.push((sb, position));
+                }
+                Err(err) => report.record_failure(&sb.disk_id, &err),
+            },
+            Ok(false) => report.record_failure(
+                &sb.disk_id,
+                &ArgosError::Conflict(format!(
                     "raw journal tip on {} does not chain from the selected durable metadata",
                     sb.disk_id
-                )));
-            }
-            journal_append_position(backend, sb, entry.len())
-        })();
-        (sb, result)
-    });
-    for (sb, result) in discovered {
-        match result {
-            Ok(position) => {
-                let certificate_end = position.2.checked_add(journal_certificate.len() as u64);
-                rollover |= position.3 || certificate_end.is_none_or(|end| end > sb.journal.length);
-                positions.push((sb, position));
-            }
+                )),
+            ),
             Err(err) => report.record_failure(&sb.disk_id, &err),
         }
     }
