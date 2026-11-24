@@ -106,6 +106,8 @@ const INLINE_DATA_MAX: usize = 512;
 pub(crate) const MAX_IN_MEMORY_IO_BYTES: usize = 256 * 1024 * 1024;
 
 mod autopilot;
+#[cfg(test)]
+mod data_fanout_tests;
 mod data_plane;
 #[cfg(test)]
 mod deferred_flush_tests;

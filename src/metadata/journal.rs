@@ -648,6 +648,13 @@ pub fn thread_crash_point(point: &str) -> ThreadCrashPointGuard {
     ThreadCrashPointGuard { previous }
 }
 
+/// Multi-member data I/O must preserve the caller-thread fault injection
+/// semantics, including process abort at an exact partial-write boundary.
+pub(crate) fn crash_injection_configured() -> bool {
+    THREAD_CRASH_POINT.with(|value| value.borrow().is_some())
+        || std::env::var_os("ARGOSFS_CRASH_POINT").is_some()
+}
+
 pub fn thread_checkpoint_interval(interval: u64) -> ThreadCheckpointIntervalGuard {
     let previous = THREAD_CHECKPOINT_INTERVAL.with(|value| value.replace(Some(interval.max(1))));
     ThreadCheckpointIntervalGuard { previous }
