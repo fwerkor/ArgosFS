@@ -274,7 +274,9 @@ impl VerifyAfterWrite {
 
     fn live_in_metadata(meta: &Metadata, op: &VerifyOp) -> bool {
         meta.inodes
-            .values()
+            .member_inode_ids(&op.disk_id)
+            .into_iter()
+            .filter_map(|ino| meta.inodes.get(&ino))
             .flat_map(|inode| &inode.blocks)
             .filter(|block| block.stripe_id == op.stripe_id)
             .flat_map(|block| &block.shards)

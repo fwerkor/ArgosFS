@@ -508,6 +508,7 @@ impl ArgosFs {
         }
         let _ = RsCodec::new(meta.config.k, meta.config.m)?;
         harden_host_storage_permissions(&root, &meta)?;
+        meta.inodes.initialize_member_catalog();
         let cache = BlockCache::new(
             root.join(".argosfs/cache/l2"),
             64 * 1024 * 1024,
@@ -728,6 +729,9 @@ impl ArgosFs {
                     && journal::canonical_metadata_hash(&meta)? != meta.integrity.meta_hash));
         let quarantined_devices = Arc::new(Mutex::new(BTreeSet::new()));
         let write_fence = Arc::new(Mutex::new(None));
+        if backend_writable {
+            meta.inodes.initialize_member_catalog();
+        }
         let meta = Arc::new(RwLock::new(meta));
         let deferred_commit = Arc::new(Mutex::new(DeferredCommitState::new_with_raw_dirty(
             &meta.read(),
