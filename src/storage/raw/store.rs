@@ -2047,7 +2047,7 @@ fn load_or_recover(
         backend,
         superblocks,
         &mut report,
-        best.as_ref(),
+        best.as_deref(),
         &candidates,
     )?;
     if let Some(journal_meta) = journal_best {
@@ -2065,6 +2065,10 @@ fn load_or_recover(
             "no valid raw metadata checkpoint or journal record found".to_string(),
         ));
     };
+    // The selected snapshot is the only state needed from this point. Drop
+    // physical slot votes before any recovery checkpoint serialization.
+    drop(candidates);
+    let metadata = Arc::unwrap_or_clone(metadata);
     if !matches!(
         metadata.integrity.hash_scheme,
         None | Some(journal::DELTA_INTEGRITY_SCHEME)
@@ -2144,10 +2148,10 @@ fn metadata_member_superblocks(
 }
 
 fn select_quorum_metadata_candidate(
-    candidates: &[(String, Option<Metadata>, MetadataCandidateReport)],
-) -> Result<Option<Metadata>> {
+    candidates: &[(String, Option<Arc<Metadata>>, MetadataCandidateReport)],
+) -> Result<Option<Arc<Metadata>>> {
     let mut supported =
-        BTreeMap::<(u64, u64, String), (Metadata, std::collections::BTreeSet<String>)>::new();
+        BTreeMap::<(u64, u64, String), (Arc<Metadata>, std::collections::BTreeSet<String>)>::new();
     for (disk_id, metadata, _) in candidates {
         let Some(metadata) = metadata else {
             continue;
@@ -2238,7 +2242,7 @@ fn indeterminate_commit(operation: &str, need: usize, durable: usize) -> ArgosEr
 fn read_metadata_candidates(
     backend: &dyn StorageBackend,
     sb: &RawSuperblock,
-) -> Result<Vec<(Option<Metadata>, MetadataCandidateReport)>> {
+) -> Result<Vec<(Option<Arc<Metadata>>, MetadataCandidateReport)>> {
     read_metadata_candidates_cached(backend, sb, &mut BTreeMap::new())
 }
 
@@ -2248,8 +2252,8 @@ fn read_metadata_candidates(
 fn read_metadata_candidates_cached(
     backend: &dyn StorageBackend,
     sb: &RawSuperblock,
-    decoded: &mut BTreeMap<String, Metadata>,
-) -> Result<Vec<(Option<Metadata>, MetadataCandidateReport)>> {
+    decoded: &mut BTreeMap<String, Arc<Metadata>>,
+) -> Result<Vec<(Option<Arc<Metadata>>, MetadataCandidateReport)>> {
     let slot_len = sb.metadata.length / 2;
     let mut out = Vec::new();
     for slot in 0..2u64 {
@@ -2265,14 +2269,14 @@ fn read_metadata_candidates_cached(
                 // A matching header is not evidence of valid physical data.
                 // read_metadata_payload checks its stored checksum and every
                 // page checksum before a member can vote for this checkpoint.
-                let candidate = (|| -> Result<Metadata> {
+                let candidate = (|| -> Result<Arc<Metadata>> {
                     let bytes = read_metadata_payload(backend, sb, offset, slot_len, &header)?;
                     let key = sha256_hex(&header);
                     if let Some(metadata) = decoded.get(&key) {
                         return Ok(metadata.clone());
                     }
-                    let metadata = decode_metadata_payload(&header, &bytes)?;
-                    decoded.insert(key, metadata.clone());
+                    let metadata = Arc::new(decode_metadata_payload(&header, &bytes)?);
+                    decoded.insert(key, Arc::clone(&metadata));
                     Ok(metadata)
                 })();
                 match candidate {
@@ -2514,12 +2518,16 @@ fn read_latest_journal_metadata(
     superblocks: &[RawSuperblock],
     report: &mut TransactionReport,
     base_metadata: Option<&Metadata>,
-    checkpoint_catalog: &[(String, Option<Metadata>, MetadataCandidateReport)],
-) -> Result<Option<Metadata>> {
+    checkpoint_catalog: &[(String, Option<Arc<Metadata>>, MetadataCandidateReport)],
+) -> Result<Option<Arc<Metadata>>> {
+    // Candidate indexes and replay tips all point at immutable states. An
+    // inode map clone is cheap, but cloning Metadata also deep-copies every
+    // allocator free extent; share each validated state across the indexes.
+    let base_snapshot = base_metadata.cloned().map(Arc::new);
     let mut supported =
-        BTreeMap::<(u64, u64, String), (Metadata, std::collections::BTreeSet<String>)>::new();
+        BTreeMap::<(u64, u64, String), (Arc<Metadata>, std::collections::BTreeSet<String>)>::new();
     let mut certified =
-        BTreeMap::<(u64, u64, String), (Metadata, std::collections::BTreeSet<String>)>::new();
+        BTreeMap::<(u64, u64, String), (Arc<Metadata>, std::collections::BTreeSet<String>)>::new();
     let mut members = Vec::new();
     for sb in superblocks {
         let valid_before = report.valid_entries;
@@ -2528,10 +2536,10 @@ fn read_latest_journal_metadata(
             disk_id: sb.disk_id.clone(),
             ..RawJournalMemberReport::default()
         };
-        let mut latest = base_metadata.cloned();
-        let mut member_candidates = BTreeMap::<(u64, u64, String), Metadata>::new();
-        let mut record_candidates = BTreeMap::<String, Metadata>::new();
-        let mut checkpoint_candidates = BTreeMap::<String, Metadata>::new();
+        let mut latest = base_snapshot.clone();
+        let mut member_candidates = BTreeMap::<(u64, u64, String), Arc<Metadata>>::new();
+        let mut record_candidates = BTreeMap::<String, Arc<Metadata>>::new();
+        let mut checkpoint_candidates = BTreeMap::<String, Arc<Metadata>>::new();
         for (_, candidate, _) in checkpoint_catalog
             .iter()
             .filter(|(disk_id, _, _)| disk_id == &sb.disk_id)
@@ -2791,7 +2799,8 @@ fn read_latest_journal_metadata(
                     let Some(candidate) = candidate else {
                         break;
                     };
-                    record_candidates.insert(record.record_hash.clone(), candidate.clone());
+                    let candidate = Arc::new(candidate);
+                    record_candidates.insert(record.record_hash.clone(), Arc::clone(&candidate));
                     if latest
                         .as_ref()
                         .map(|metadata| candidate.txid <= metadata.txid)
