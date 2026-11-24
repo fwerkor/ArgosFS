@@ -187,7 +187,7 @@ impl ArgosFs {
                         ),
                     });
                 }
-                let restored = RsCodec::new(layout.k, layout.m)?.reconstruct(present)?;
+                let restored = RsCodec::reconstruct_cached(layout.k, layout.m, present)?;
 
                 // Before publishing ANY reconstructed extent, validate the
                 // original ciphertext -> plaintext -> uncompressed raw checksum.

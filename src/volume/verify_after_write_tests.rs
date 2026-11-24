@@ -412,3 +412,49 @@ fn final_clone_stops_verifier_and_marks_clean() {
         crate::raw_store::inspect_device(crate::types::BackendKind::LoopBlock, image).unwrap();
     assert!(sb.clean);
 }
+
+#[test]
+fn maintenance_drains_delayed_shard_checks_and_reports_failures() {
+    let (_dir, mut fs, stripe, offset, generation, data) = fixture();
+    let verifier = start(&fs, 3_600_000, 1);
+    fs.verify_written = Some(verifier.clone());
+    fs.backend
+        .write_at(&"disk-0000".to_string(), offset, &vec![9; data.len()])
+        .unwrap();
+    fs.backend.flush_device(&"disk-0000".to_string()).unwrap();
+    verifier.enqueue(
+        "disk-0000",
+        offset,
+        generation,
+        data.len(),
+        &content_hash_hex(&data),
+        &stripe,
+    );
+    let mut report = crate::types::FsckReport::default();
+    fs.finish_maintenance_verification(&mut report);
+    assert_eq!(report.write_verify_checks, 2);
+    assert_eq!(report.write_verify_retries, 1);
+    assert_eq!(report.write_verify_failures, 1);
+    assert_eq!(report.write_verify_skipped, 0);
+    assert!(!report.errors.is_empty());
+    assert!(verifier.queue.lock().unwrap().pending.is_empty());
+}
+
+#[test]
+fn maintenance_drains_valid_pending_shards_without_waiting_for_delay() {
+    let (_dir, fs, stripe, offset, generation, data) = fixture();
+    let verifier = start(&fs, 3_600_000, 0);
+    verifier.enqueue(
+        "disk-0000",
+        offset,
+        generation,
+        data.len(),
+        &content_hash_hex(&data),
+        &stripe,
+    );
+    verifier.drain();
+    assert_eq!(verifier.checks(), 1);
+    assert_eq!(verifier.failures(), 0);
+    assert_eq!(verifier.skipped(), 0);
+    assert!(verifier.queue.lock().unwrap().active.is_empty());
+}

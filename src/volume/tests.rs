@@ -1958,3 +1958,63 @@ fn deferred_commit_reports_real_journal_and_checkpoint_phases() {
         b"forced checkpoint"
     );
 }
+
+#[test]
+fn upgraded_immediate_transactions_use_delta_and_incremental_durability() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|i| dir.path().join(format!("immediate-v2-{i}.img")))
+        .collect::<Vec<_>>();
+    let mut fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            compression: Compression::None,
+            ..VolumeConfig::default()
+        },
+        64 * 1024 * 1024,
+        "immediate-v2",
+        false,
+    )
+    .unwrap();
+    fs.upgrade_delta_integrity().unwrap();
+    for i in 0..8 {
+        fs.write_file(&format!("/file-{i}"), &vec![i as u8; 8192], 0o600)
+            .unwrap();
+    }
+    assert_eq!(
+        fs.metadata_snapshot().integrity.hash_scheme,
+        Some(journal::DELTA_INTEGRITY_SCHEME)
+    );
+    fs.read_file("/file-0", false).unwrap();
+    fs.mkdir("/directory", 0o755).unwrap();
+    let snapshot = fs.metadata_snapshot();
+    assert_eq!(
+        snapshot.integrity.hash_scheme,
+        Some(journal::DELTA_INTEGRITY_SCHEME)
+    );
+    // A directory transaction need not revalidate all existing data blocks.
+    assert!(
+        fs.deferred_commit
+            .lock()
+            .durability_cache
+            .as_ref()
+            .unwrap()
+            .last_scanned_blocks
+            <= 1
+    );
+    fs.sync().unwrap();
+    drop(fs);
+    let reopened = ArgosFs::open_loop(&images, false).unwrap();
+    for i in 0..8 {
+        assert_eq!(
+            reopened.read_file(&format!("/file-{i}"), false).unwrap(),
+            vec![i as u8; 8192]
+        );
+    }
+    assert!(reopened.metadata_snapshot().inodes[&1]
+        .entries
+        .contains_key("directory"));
+}

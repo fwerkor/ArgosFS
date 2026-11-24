@@ -36,6 +36,7 @@ const FUSE_WRITEBACK_MAX_BYTES: usize = 4 * 1024 * 1024;
 // synchronous fallback without evicting another inode's acknowledged data.
 const FUSE_WRITEBACK_MAX_MOUNT_BYTES: usize = 64 * 1024 * 1024;
 const FUSE_WRITEBACK_MAX_INODES: usize = 4096;
+const WRITEBACK_LOCK_STRIPES: usize = 128;
 // The small FUSE reader pool does not run blocking I/O. The execution pool
 // follows available CPU parallelism and both pools are independently tunable.
 fn fuse_thread_count(variable: &str, min: usize, max: usize) -> usize {
@@ -62,6 +63,7 @@ pub struct ArgosFuse {
 pub struct ArgosFuseShared {
     volume: ArgosFs,
     writeback: Mutex<FuseWriteback>,
+    writeback_locks: [Mutex<()>; WRITEBACK_LOCK_STRIPES],
     handles: Mutex<FuseHandles>,
     directory_cache: Mutex<DirectoryListingCache>,
     statfs_cache: Mutex<CapacitySnapshot>,
@@ -299,21 +301,21 @@ impl DirtyExtent {
 
 #[derive(Default)]
 struct FuseWriteback {
-    dirty: BTreeMap<InodeId, DirtyExtent>,
+    dirty: BTreeMap<InodeId, Arc<DirtyExtent>>,
     reap_after_flush: BTreeSet<InodeId>,
     pending_bytes: usize,
 }
 
 impl FuseWriteback {
     fn insert_dirty(&mut self, ino: InodeId, dirty: DirtyExtent) {
-        let old = self.dirty.insert(ino, dirty);
+        let old = self.dirty.insert(ino, Arc::new(dirty));
         if let Some(old) = old {
             self.pending_bytes -= old.data.len();
         }
         self.pending_bytes += self.dirty[&ino].data.len();
     }
 
-    fn remove_dirty(&mut self, ino: InodeId) -> Option<DirtyExtent> {
+    fn remove_dirty(&mut self, ino: InodeId) -> Option<Arc<DirtyExtent>> {
         let dirty = self.dirty.remove(&ino)?;
         self.pending_bytes -= dirty.data.len();
         Some(dirty)
@@ -339,6 +341,7 @@ impl ArgosFuse {
             shared: Arc::new(ArgosFuseShared {
                 volume,
                 writeback: Mutex::new(FuseWriteback::default()),
+                writeback_locks: std::array::from_fn(|_| Mutex::new(())),
                 handles: Mutex::new(FuseHandles::default()),
                 directory_cache: Mutex::new(DirectoryListingCache::default()),
                 statfs_cache: Mutex::new(snapshot),
@@ -497,10 +500,19 @@ impl ArgosFuseShared {
         Ok(())
     }
 
+    // The fixed lock stripes bound lock memory independently of inode count.
+    // A stripe protects acknowledged bytes and their persisted generation;
+    // the mount-wide writeback mutex protects only map/accounting changes.
+    fn writeback_lock(&self, ino: InodeId) -> &Mutex<()> {
+        &self.writeback_locks[(ino as usize) % WRITEBACK_LOCK_STRIPES]
+    }
+
     fn queue_writeback(&self, ino: InodeId, offset: u64, data: &[u8]) -> bool {
         if data.len() > FUSE_WRITEBACK_MAX_BYTES {
             return false;
         }
+        let _inode_guard = self.writeback_lock(ino).lock();
+        let seen_ctime = self.volume.attr_inode(ino).ok().map(|attr| attr.ctime);
         let mut writeback = self.writeback.lock();
         if let Some(dirty) = writeback.dirty.get(&ino) {
             let old_len = dirty.data.len();
@@ -512,8 +524,7 @@ impl ArgosFuseShared {
             if writeback.pending_bytes - old_len + merged_len > FUSE_WRITEBACK_MAX_MOUNT_BYTES {
                 return false;
             }
-            let seen_ctime = self.volume.attr_inode(ino).ok().map(|attr| attr.ctime);
-            let dirty = writeback.dirty.get_mut(&ino).expect("existing dirty inode");
+            let dirty = Arc::make_mut(writeback.dirty.get_mut(&ino).expect("existing dirty inode"));
             if !dirty.try_merge(offset, data, FUSE_WRITEBACK_MAX_BYTES) {
                 return false;
             }
@@ -526,7 +537,6 @@ impl ArgosFuseShared {
         {
             return false;
         }
-        let seen_ctime = self.volume.attr_inode(ino).ok().map(|attr| attr.ctime);
         writeback.insert_dirty(
             ino,
             DirtyExtent {
@@ -546,8 +556,8 @@ impl ArgosFuseShared {
     /// On error, no acknowledged dirty bytes are discarded.
     fn flush_complete_stripes_for_append(&self, ino: InodeId, next_offset: u64) -> Result<bool> {
         let started = Instant::now();
-        let mut writeback = self.writeback.lock();
-        let Some(dirty) = writeback.dirty.get(&ino) else {
+        let _inode_guard = self.writeback_lock(ino).lock();
+        let Some(dirty) = self.writeback.lock().dirty.get(&ino).cloned() else {
             return Ok(false);
         };
         // This optimization is only for strictly sequential EOF appends.
@@ -583,7 +593,10 @@ impl ArgosFuseShared {
         );
         match result {
             Ok(written) if written == prefix_len => {
-                let dirty = writeback.dirty.get_mut(&ino).expect("locked dirty inode");
+                drop(dirty);
+                let mut writeback = self.writeback.lock();
+                let dirty =
+                    Arc::make_mut(writeback.dirty.get_mut(&ino).expect("locked dirty inode"));
                 dirty.offset += prefix_len as u64;
                 dirty.data.drain(..prefix_len);
                 // Vec::drain retains the original (up to 4 MiB) capacity.
@@ -624,9 +637,10 @@ impl ArgosFuseShared {
     /// The writeback lock serializes observation with persistence; the inode
     /// cannot publish a stale size or timestamps halfway through a flush.
     fn visible_inode_attr(&self, ino: InodeId) -> Result<NodeAttr> {
-        let writeback = self.writeback.lock();
+        let inode_guard = self.writeback_lock(ino).lock();
+        let dirty = self.writeback.lock().dirty.get(&ino).cloned();
         let mut attr = self.volume.attr_inode(ino)?;
-        let Some(dirty) = writeback.dirty.get(&ino) else {
+        let Some(dirty) = dirty else {
             return Ok(attr);
         };
         if attr.kind == NodeKind::File {
@@ -641,7 +655,8 @@ impl ArgosFuseShared {
                 return Ok(attr);
             }
         }
-        drop(writeback);
+        drop(dirty);
+        drop(inode_guard);
         self.flush_inode_writeback_reason(ino, WritebackFlushReason::StatFallback)?;
         self.volume.attr_inode(ino)
     }
@@ -652,22 +667,24 @@ impl ArgosFuseShared {
     /// zero. A damaged persisted prefix still fails closed via the normal
     /// decoder, while a failed commit retains the original dirty extent.
     ///
-    /// Holding the writeback lock across metadata/read/overlay is necessary:
+    /// Holding the per-inode writeback lock across metadata/read/overlay is necessary:
     /// a concurrent flush must not mix two inode generations in one reply.
     fn read_visible_inode(&self, ino: InodeId, offset: u64, size: usize) -> Result<Vec<u8>> {
-        let writeback = self.writeback.lock();
-        let Some(dirty) = writeback.dirty.get(&ino) else {
-            drop(writeback);
+        let inode_guard = self.writeback_lock(ino).lock();
+        let dirty = self.writeback.lock().dirty.get(&ino).cloned();
+        let Some(dirty) = dirty else {
             return self.volume.read_inode(ino, offset, size, true);
         };
         let attr = self.volume.attr_inode(ino)?;
         let Some(dirty_end) = dirty.end() else {
-            drop(writeback);
+            drop(dirty);
+            drop(inode_guard);
             self.flush_inode_writeback_reason(ino, WritebackFlushReason::ReadFallback)?;
             return self.volume.read_inode(ino, offset, size, true);
         };
         if attr.kind != NodeKind::File {
-            drop(writeback);
+            drop(dirty);
+            drop(inode_guard);
             self.flush_inode_writeback_reason(ino, WritebackFlushReason::ReadFallback)?;
             return self.volume.read_inode(ino, offset, size, true);
         }
@@ -737,10 +754,12 @@ impl ArgosFuseShared {
         reason: WritebackFlushReason,
     ) -> Result<()> {
         let started = Instant::now();
-        let mut writeback = self.writeback.lock();
-        let Some(dirty) = writeback.remove_dirty(ino) else {
-            let reap_after_flush = writeback.reap_after_flush.remove(&ino);
-            drop(writeback);
+        let _inode_guard = self.writeback_lock(ino).lock();
+        // Keep acknowledged bytes in the map and charged to the mount budget
+        // until persistence succeeds; failures never need to reinsert them.
+        let dirty = self.writeback.lock().dirty.get(&ino).cloned();
+        let Some(dirty) = dirty else {
+            let reap_after_flush = self.writeback.lock().reap_after_flush.remove(&ino);
             if reap_after_flush {
                 if let Err(err) = self.volume.reap_unlinked_inode(ino) {
                     self.writeback.lock().reap_after_flush.insert(ino);
@@ -762,19 +781,19 @@ impl ArgosFuseShared {
             started.elapsed(),
         );
         let reap_after_flush = match result {
-            Ok(written) if written == dirty.data.len() => writeback.reap_after_flush.remove(&ino),
+            Ok(written) if written == dirty.data.len() => {
+                drop(dirty);
+                let mut writeback = self.writeback.lock();
+                writeback.remove_dirty(ino);
+                writeback.reap_after_flush.remove(&ino)
+            }
             Ok(written) => {
-                writeback.insert_dirty(ino, dirty);
                 return Err(ArgosError::Invalid(format!(
                     "short writeback flush for inode {ino}: wrote {written} bytes"
                 )));
             }
-            Err(err) => {
-                writeback.insert_dirty(ino, dirty);
-                return Err(err);
-            }
+            Err(err) => return Err(err),
         };
-        drop(writeback);
         if reap_after_flush {
             if let Err(err) = self.volume.reap_unlinked_inode(ino) {
                 self.writeback.lock().reap_after_flush.insert(ino);
@@ -818,6 +837,7 @@ impl ArgosFuseShared {
     }
 
     fn discard_inode_writeback(&self, ino: InodeId) {
+        let _inode_guard = self.writeback_lock(ino).lock();
         let mut writeback = self.writeback.lock();
         writeback.remove_dirty(ino);
         writeback.reap_after_flush.remove(&ino);

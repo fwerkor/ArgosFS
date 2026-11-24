@@ -796,6 +796,16 @@ pub struct FsckReport {
     /// selected metadata checkpoint.  Set by `fsck --repair`.
     #[serde(default)]
     pub journals_reset: u64,
+    /// Physical read-after-write attempts, including retries.
+    #[serde(default)]
+    pub write_verify_checks: u64,
+    #[serde(default)]
+    pub write_verify_retries: u64,
+    #[serde(default)]
+    pub write_verify_failures: u64,
+    /// Includes stale/reclaimed extents and queue overflow; not known damage.
+    #[serde(default)]
+    pub write_verify_skipped: u64,
     pub errors: Vec<String>,
 }
 

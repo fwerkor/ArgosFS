@@ -317,3 +317,37 @@ fn cached_data_decoder_keeps_full_reconstruction_errors() {
         Err(ArgosError::Erasure(_))
     ));
 }
+
+#[test]
+fn cached_repair_decoder_reconstructs_data_and_parity_across_layout_changes() {
+    std::thread::scope(|scope| {
+        for _ in 0..4 {
+            scope.spawn(|| {
+                for (k, m) in [(4, 4), (2, 1), (3, 2), (4, 4), (1, 0)] {
+                    let codec = RsCodec::new(k, m).unwrap();
+                    let data = (0..k).map(|i| fill_shard(i, 4097)).collect::<Vec<_>>();
+                    let encoded = codec.encode(&data).unwrap();
+                    for lost in 0..(k + m) {
+                        let mut shards = encoded.iter().cloned().map(Some).collect::<Vec<_>>();
+                        if m > 0 {
+                            shards[lost] = None;
+                        }
+                        assert_eq!(
+                            RsCodec::reconstruct_data_cached(k, m, shards.clone()).unwrap(),
+                            data
+                        );
+                        assert_eq!(RsCodec::reconstruct_cached(k, m, shards).unwrap(), encoded);
+                    }
+                }
+            });
+        }
+    });
+    assert!(matches!(
+        RsCodec::reconstruct_cached(2, 1, vec![Some(vec![1]), None]),
+        Err(ArgosError::Invalid(_))
+    ));
+    assert!(matches!(
+        RsCodec::reconstruct_cached(2, 1, vec![Some(vec![1]), None, None]),
+        Err(ArgosError::Erasure(_))
+    ));
+}
