@@ -144,3 +144,92 @@ fn recovery_rejects_invalid_page_index_before_body_read() {
         Err(ArgosError::CorruptedMetadata(_))
     ));
 }
+
+#[test]
+fn recovery_materializes_older_quorum_winner_without_retaining_full_history() {
+    let (_dir, images, base, superblocks) = quorum_fixture();
+    let backend = block_backend_for(&images);
+    // Both voting members support a committed prefix; a lone newer tail
+    // must not displace it. No commit certificates are needed for this case.
+    let mut previous = base.clone();
+    for i in 0..12 {
+        let next = next_metadata(&previous, &format!("history-{i}"));
+        let (entry, _) = build_journal_entry(
+            &next,
+            Some(&previous),
+            "history",
+            serde_json::json!({}),
+            true,
+        )
+        .unwrap();
+        for sb in &superblocks[..2] {
+            let (header, offset, end, rollover) =
+                journal_append_position(&backend, sb, entry.len()).unwrap();
+            assert!(!rollover);
+            append_journal_member(
+                &backend,
+                sb,
+                header,
+                offset,
+                end,
+                &entry,
+                JournalMemberWriteOptions {
+                    flush: true,
+                    metrics: None,
+                },
+            )
+            .unwrap();
+        }
+        previous = next;
+    }
+    let winner = previous;
+    let tail = next_metadata(&winner, "uncommitted-tail");
+    let (entry, _) =
+        build_journal_entry(&tail, Some(&winner), "history", serde_json::json!({}), true).unwrap();
+    let sb = &superblocks[0];
+    let (header, offset, end, rollover) =
+        journal_append_position(&backend, sb, entry.len()).unwrap();
+    assert!(!rollover);
+    append_journal_member(
+        &backend,
+        sb,
+        header,
+        offset,
+        end,
+        &entry,
+        JournalMemberWriteOptions {
+            flush: true,
+            metrics: None,
+        },
+    )
+    .unwrap();
+    let mut report = TransactionReport::default();
+    let scan =
+        scan_journal_metadata(&backend, &superblocks, &mut report, Some(&base), &[], None).unwrap();
+    assert_eq!(
+        scan.winner,
+        Some((
+            winner.txid,
+            winner.integrity.generation,
+            winner.integrity.meta_hash.clone()
+        ))
+    );
+    assert!(
+        scan.retained.is_none(),
+        "older winner should be reconstructed, not held in the history map"
+    );
+    let expected_valid = report.valid_entries;
+    let mut report = TransactionReport::default();
+    let recovered =
+        read_latest_journal_metadata(&backend, &superblocks, &mut report, Some(&base), &[])
+            .unwrap()
+            .unwrap();
+    assert_eq!(recovered.txid, winner.txid);
+    assert_eq!(recovered.integrity.meta_hash, winner.integrity.meta_hash);
+    assert_eq!(
+        report.valid_entries, expected_valid,
+        "second pass must not double-count report entries"
+    );
+    let actual = recover_metadata(&backend, &superblocks).unwrap();
+    assert_eq!(actual.integrity.meta_hash, winner.integrity.meta_hash);
+}

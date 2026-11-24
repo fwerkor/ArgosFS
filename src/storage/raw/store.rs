@@ -2513,6 +2513,44 @@ fn read_tree_metadata_candidate(
     Ok(bytes)
 }
 
+type ReplayKey = (u64, u64, String);
+
+#[derive(Clone)]
+struct ReplayProof {
+    key: ReplayKey,
+    need: usize,
+    voting_member: bool,
+    present_quorum: bool,
+}
+
+impl ReplayProof {
+    fn from_metadata(metadata: &Metadata, member: &str, present: &BTreeSet<&str>) -> Result<Self> {
+        let need = metadata_quorum_requirement(metadata);
+        Ok(Self {
+            key: (
+                metadata.txid,
+                metadata.integrity.generation,
+                metadata_hash_for_replay(metadata)?,
+            ),
+            need,
+            voting_member: metadata_has_voting_member(metadata, member),
+            present_quorum: metadata
+                .disks
+                .iter()
+                .filter(|(id, disk)| {
+                    disk.status != DiskStatus::Removed && present.contains(id.as_str())
+                })
+                .count()
+                >= need,
+        })
+    }
+}
+
+struct ReplayScan {
+    winner: Option<ReplayKey>,
+    retained: Option<Arc<Metadata>>,
+}
+
 fn read_latest_journal_metadata(
     backend: &dyn StorageBackend,
     superblocks: &[RawSuperblock],
@@ -2520,14 +2558,61 @@ fn read_latest_journal_metadata(
     base_metadata: Option<&Metadata>,
     checkpoint_catalog: &[(String, Option<Arc<Metadata>>, MetadataCandidateReport)],
 ) -> Result<Option<Arc<Metadata>>> {
-    // Candidate indexes and replay tips all point at immutable states. An
-    // inode map clone is cheap, but cloning Metadata also deep-copies every
-    // allocator free extent; share each validated state across the indexes.
+    let first = scan_journal_metadata(
+        backend,
+        superblocks,
+        report,
+        base_metadata,
+        checkpoint_catalog,
+        None,
+    )?;
+    let Some(winner) = first.winner else {
+        return Ok(None);
+    };
+    if let Some(metadata) = first.retained {
+        return Ok(Some(metadata));
+    }
+    // A divergent/uncertified tail can make an older transaction the quorum
+    // winner. Materialize that exact authenticated identity in a second pass
+    // rather than holding every full historical state in RAM. Recheck the
+    // quorum decision; never silently publish a different state if media changed.
+    let mut second_report = TransactionReport::default();
+    let second = scan_journal_metadata(
+        backend,
+        superblocks,
+        &mut second_report,
+        base_metadata,
+        checkpoint_catalog,
+        Some(&winner),
+    )?;
+    if second.winner.as_ref() != Some(&winner) || second.retained.is_none() {
+        return Err(ArgosError::CorruptedMetadata(
+            "raw journal quorum changed during recovery replay".into(),
+        ));
+    }
+    Ok(second.retained)
+}
+
+fn scan_journal_metadata(
+    backend: &dyn StorageBackend,
+    superblocks: &[RawSuperblock],
+    report: &mut TransactionReport,
+    base_metadata: Option<&Metadata>,
+    checkpoint_catalog: &[(String, Option<Arc<Metadata>>, MetadataCandidateReport)],
+    wanted: Option<&ReplayKey>,
+) -> Result<ReplayScan> {
+    // Full metadata ownership is bounded by the current member replay tip,
+    // the best retained tip, and an optional explicitly requested state.
+    // Historical record/candidate indexes contain only identities and votes.
     let base_snapshot = base_metadata.cloned().map(Arc::new);
-    let mut supported =
-        BTreeMap::<(u64, u64, String), (Arc<Metadata>, std::collections::BTreeSet<String>)>::new();
-    let mut certified =
-        BTreeMap::<(u64, u64, String), (Arc<Metadata>, std::collections::BTreeSet<String>)>::new();
+    let present = superblocks
+        .iter()
+        .map(|sb| sb.disk_id.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut supported = BTreeMap::<ReplayKey, (usize, BTreeSet<String>)>::new();
+    let mut certified = BTreeSet::<ReplayKey>::new();
+    let mut best_tip: Option<(ReplayKey, Arc<Metadata>)> = None;
+    let mut requested = None;
     let mut members = Vec::new();
     for sb in superblocks {
         let valid_before = report.valid_entries;
@@ -2537,8 +2622,8 @@ fn read_latest_journal_metadata(
             ..RawJournalMemberReport::default()
         };
         let mut latest = base_snapshot.clone();
-        let mut member_candidates = BTreeMap::<(u64, u64, String), Arc<Metadata>>::new();
-        let mut record_candidates = BTreeMap::<String, Arc<Metadata>>::new();
+        let mut member_candidates = BTreeMap::<ReplayKey, usize>::new();
+        let mut record_candidates = BTreeMap::<String, ReplayProof>::new();
         let mut checkpoint_candidates = BTreeMap::<String, Arc<Metadata>>::new();
         for (_, candidate, _) in checkpoint_catalog
             .iter()
@@ -2625,12 +2710,21 @@ fn read_latest_journal_metadata(
                             .get("checkpoint")
                             .and_then(serde_json::Value::as_bool)
                             .unwrap_or(false);
-                        let certified_candidate = if checkpoint {
-                            checkpoint_candidates.get(&record.meta_hash)
+                        let physical_checkpoint = checkpoint
+                            .then(|| checkpoint_candidates.get(&record.meta_hash))
+                            .flatten();
+                        let proof = if checkpoint {
+                            physical_checkpoint
+                                .map(|candidate| {
+                                    ReplayProof::from_metadata(candidate, &sb.disk_id, &present)
+                                })
+                                .transpose()?
                         } else {
-                            target_record_hash.and_then(|hash| record_candidates.get(hash))
+                            target_record_hash
+                                .and_then(|hash| record_candidates.get(hash))
+                                .cloned()
                         };
-                        let Some(candidate) = certified_candidate else {
+                        let Some(proof) = proof else {
                             report.invalid_entries += 1;
                             report.errors.push(format!(
                                 "raw quorum certificate at {}:{} has no local target state",
@@ -2638,20 +2732,16 @@ fn read_latest_journal_metadata(
                             ));
                             break;
                         };
-                        let candidate_hash = metadata_hash_for_replay(candidate)?;
                         let claimed_need = record
                             .details
                             .get("quorum_need")
                             .and_then(serde_json::Value::as_u64)
                             .and_then(|value| usize::try_from(value).ok());
-                        if candidate.txid != record.txid
-                            || candidate.integrity.generation != record.generation
-                            || candidate_hash != record.meta_hash
-                            || claimed_need != Some(metadata_quorum_requirement(candidate))
-                            || candidate
-                                .disks
-                                .get(&sb.disk_id)
-                                .is_none_or(|disk| disk.status == DiskStatus::Removed)
+                        if proof.key.0 != record.txid
+                            || proof.key.1 != record.generation
+                            || proof.key.2 != record.meta_hash
+                            || claimed_need != Some(proof.need)
+                            || !proof.voting_member
                         {
                             report.invalid_entries += 1;
                             report.errors.push(format!(
@@ -2660,29 +2750,21 @@ fn read_latest_journal_metadata(
                             ));
                             break;
                         }
-                        certified
-                            .entry((
-                                candidate.txid,
-                                candidate.integrity.generation,
-                                candidate_hash,
-                            ))
-                            .or_insert_with(|| {
-                                (candidate.clone(), std::collections::BTreeSet::new())
-                            })
-                            .1
-                            .insert(sb.disk_id.clone());
-                        // A journal rollover resets the per-member log. When the
-                        // quorum-selected checkpoint is older than this member's
-                        // certified physical checkpoint, subsequent deltas must
-                        // chain from the latter, not from the older quorum base.
-                        // This matters when only one current slot survives and
-                        // the protected older slots form the physical quorum.
-                        if checkpoint
-                            && latest
+                        if proof.present_quorum {
+                            certified.insert(proof.key.clone());
+                        }
+                        if let Some(candidate) = physical_checkpoint {
+                            if wanted == Some(&proof.key) {
+                                requested = Some(candidate.clone());
+                            }
+                            // A certified physical checkpoint may be newer than
+                            // the selected quorum checkpoint after rollover.
+                            if latest
                                 .as_ref()
                                 .is_none_or(|base| candidate.txid > base.txid)
-                        {
-                            latest = Some(candidate.clone());
+                            {
+                                latest = Some(candidate.clone());
+                            }
                         }
                         cursor += 36 + len as u64;
                         continue;
@@ -2800,24 +2882,21 @@ fn read_latest_journal_metadata(
                         break;
                     };
                     let candidate = Arc::new(candidate);
-                    record_candidates.insert(record.record_hash.clone(), Arc::clone(&candidate));
+                    let proof = ReplayProof::from_metadata(&candidate, &sb.disk_id, &present)?;
+                    if wanted == Some(&proof.key) {
+                        requested = Some(candidate.clone());
+                    }
+                    record_candidates.insert(record.record_hash.clone(), proof.clone());
                     if latest
                         .as_ref()
-                        .map(|metadata| candidate.txid <= metadata.txid)
-                        .unwrap_or(false)
+                        .is_some_and(|metadata| candidate.txid <= metadata.txid)
                     {
                         cursor += 36 + len as u64;
                         continue;
                     }
-                    let candidate_hash = metadata_hash_for_replay(&candidate)?;
-                    member_candidates.insert(
-                        (
-                            candidate.txid,
-                            candidate.integrity.generation,
-                            candidate_hash,
-                        ),
-                        candidate.clone(),
-                    );
+                    if proof.voting_member {
+                        member_candidates.insert(proof.key, proof.need);
+                    }
                     latest = Some(candidate);
                 }
                 Err(err) => {
@@ -2834,54 +2913,43 @@ fn read_latest_journal_metadata(
         member.valid_entries = report.valid_entries.saturating_sub(valid_before);
         member.invalid_entries = report.invalid_entries.saturating_sub(invalid_before);
         if member.invalid_entries == 0 {
-            for (key, metadata) in member_candidates {
-                if !metadata_has_voting_member(&metadata, &sb.disk_id) {
-                    continue;
-                }
+            for (key, need) in member_candidates {
                 supported
                     .entry(key)
-                    .or_insert_with(|| (metadata, std::collections::BTreeSet::new()))
+                    .or_insert_with(|| (need, BTreeSet::new()))
                     .1
                     .insert(sb.disk_id.clone());
+            }
+        }
+        if let Some(metadata) = latest {
+            let key = (
+                metadata.txid,
+                metadata.integrity.generation,
+                metadata_hash_for_replay(&metadata)?,
+            );
+            if best_tip.as_ref().is_none_or(|(old, _)| key > *old) {
+                best_tip = Some((key, metadata));
             }
         }
         members.push(member);
     }
     let best_supported = supported
         .into_iter()
-        .filter(|(_, (metadata, member_ids))| {
-            member_ids.len() >= metadata_quorum_requirement(metadata)
-        })
+        .filter(|(_, (need, ids))| ids.len() >= *need)
         .max_by_key(|((txid, generation, _), _)| (*txid, *generation))
-        .map(|(_, (metadata, _))| metadata);
-    let present = superblocks
-        .iter()
-        .map(|sb| sb.disk_id.as_str())
-        .collect::<BTreeSet<_>>();
+        .map(|(key, _)| key);
     let best_certified = certified
         .into_iter()
-        .filter(|(_, (metadata, certificate_members))| {
-            !certificate_members.is_empty()
-                && metadata
-                    .disks
-                    .iter()
-                    .filter(|(disk_id, disk)| {
-                        disk.status != DiskStatus::Removed && present.contains(disk_id.as_str())
-                    })
-                    .count()
-                    >= metadata_quorum_requirement(metadata)
-        })
-        .max_by_key(|((txid, generation, _), _)| (*txid, *generation))
-        .map(|(_, (metadata, _))| metadata);
+        .max_by_key(|(txid, generation, _)| (*txid, *generation));
     let best = match (best_supported, best_certified) {
         (Some(left), Some(right)) => {
-            if (right.txid, right.integrity.generation) > (left.txid, left.integrity.generation) {
+            if (right.0, right.1) > (left.0, left.1) {
                 Some(right)
             } else {
                 Some(left)
             }
         }
-        (Some(metadata), None) | (None, Some(metadata)) => Some(metadata),
+        (Some(key), None) | (None, Some(key)) => Some(key),
         (None, None) => None,
     };
     let total_members = base_metadata
@@ -2895,7 +2963,15 @@ fn read_latest_journal_metadata(
         .unwrap_or(superblocks.len());
     report.raw_journal_quorum = Some(raw_journal_quorum(&members, total_members) || best.is_some());
     report.raw_journal_members = members;
-    Ok(best)
+    let retained = requested.or_else(|| {
+        best_tip
+            .filter(|(key, _)| Some(key) == best.as_ref())
+            .map(|(_, metadata)| metadata)
+    });
+    Ok(ReplayScan {
+        winner: best,
+        retained,
+    })
 }
 
 fn raw_journal_quorum(members: &[RawJournalMemberReport], total_members: usize) -> bool {
