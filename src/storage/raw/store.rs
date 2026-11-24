@@ -1610,6 +1610,28 @@ fn append_journal_member(
     Ok(())
 }
 
+/// Device phases are independent, but every phase joins all workers before
+/// the next quorum/flush barrier. Preserve input order for error reporting.
+fn parallel_journal_members<T: Send, R: Send>(
+    items: impl IntoIterator<Item = T>,
+    work: impl Fn(T) -> R + Sync,
+) -> Vec<R> {
+    let items = items.into_iter().collect::<Vec<_>>();
+    if items.len() <= 1 {
+        return items.into_iter().map(work).collect();
+    }
+    std::thread::scope(|scope| {
+        let work = &work;
+        let jobs = items
+            .into_iter()
+            .map(|item| scope.spawn(move || work(item)))
+            .collect::<Vec<_>>();
+        jobs.into_iter()
+            .map(|job| job.join().expect("journal member worker panicked"))
+            .collect()
+    })
+}
+
 fn append_quorum_commit_certificate(
     backend: &dyn StorageBackend,
     superblocks: &[RawSuperblock],
@@ -1619,14 +1641,22 @@ fn append_quorum_commit_certificate(
     report: &mut QuorumWriteReport,
     metrics: Option<&CommitMetrics>,
 ) -> Result<()> {
-    let mut durable = 0usize;
-    for sb in superblocks {
-        if !eligible.contains(&sb.disk_id) {
-            continue;
-        }
-        match journal_append_position(backend, sb, certificate.len()) {
-            Ok((header, write_offset, end, false)) => {
-                match append_journal_member(
+    let results = parallel_journal_members(
+        superblocks
+            .iter()
+            .filter(|sb| eligible.contains(&sb.disk_id)),
+        |sb| {
+            let result = (|| -> Result<()> {
+                let (header, write_offset, end, rollover) =
+                    journal_append_position(backend, sb, certificate.len())?;
+                if rollover {
+                    return Err(ArgosError::DiskFull {
+                        disk_id: sb.disk_id.clone(),
+                        required: certificate.len() as u64,
+                        available: sb.journal.length,
+                    });
+                }
+                append_journal_member(
                     backend,
                     sb,
                     header,
@@ -1637,19 +1667,15 @@ fn append_quorum_commit_certificate(
                         flush: true,
                         metrics,
                     },
-                ) {
-                    Ok(()) => durable += 1,
-                    Err(err) => report.record_failure(&sb.disk_id, &err),
-                }
-            }
-            Ok((_, _, _, true)) => report.record_failure(
-                &sb.disk_id,
-                &ArgosError::DiskFull {
-                    disk_id: sb.disk_id.clone(),
-                    required: certificate.len() as u64,
-                    available: sb.journal.length,
-                },
-            ),
+                )
+            })();
+            (sb, result)
+        },
+    );
+    let mut durable = 0usize;
+    for (sb, result) in results {
+        match result {
+            Ok(()) => durable += 1,
             Err(err) => report.record_failure(&sb.disk_id, &err),
         }
     }
@@ -1788,28 +1814,29 @@ fn append_journal_quorum(
     let mut report = QuorumWriteReport::default();
     let mut positions = Vec::with_capacity(superblocks.len());
     let mut rollover = false;
-    for sb in superblocks {
-        let tip_accepts = {
-            let _tip_timer = metrics.map(|metrics| metrics.timer(CommitPhase::JournalTip));
-            journal_tip_accepts_transaction(backend, sb, metadata, allow_same_txid)
-        };
-        match tip_accepts {
-            Ok(true) => match journal_append_position(backend, sb, entry.len()) {
-                Ok(position) => {
-                    let certificate_end = position.2.checked_add(journal_certificate.len() as u64);
-                    rollover |=
-                        position.3 || certificate_end.is_none_or(|end| end > sb.journal.length);
-                    positions.push((sb, position));
-                }
-                Err(err) => report.record_failure(&sb.disk_id, &err),
-            },
-            Ok(false) => report.record_failure(
-                &sb.disk_id,
-                &ArgosError::Conflict(format!(
+    let discovered = parallel_journal_members(superblocks, |sb| {
+        let result = (|| -> Result<_> {
+            let accepts = {
+                let _tip_timer = metrics.map(|metrics| metrics.timer(CommitPhase::JournalTip));
+                journal_tip_accepts_transaction(backend, sb, metadata, allow_same_txid)?
+            };
+            if !accepts {
+                return Err(ArgosError::Conflict(format!(
                     "raw journal tip on {} does not chain from the selected durable metadata",
                     sb.disk_id
-                )),
-            ),
+                )));
+            }
+            journal_append_position(backend, sb, entry.len())
+        })();
+        (sb, result)
+    });
+    for (sb, result) in discovered {
+        match result {
+            Ok(position) => {
+                let certificate_end = position.2.checked_add(journal_certificate.len() as u64);
+                rollover |= position.3 || certificate_end.is_none_or(|end| end > sb.journal.length);
+                positions.push((sb, position));
+            }
             Err(err) => report.record_failure(&sb.disk_id, &err),
         }
     }
@@ -1887,13 +1914,12 @@ fn append_journal_quorum(
         return Ok(report);
     }
 
-    let position_count = positions.len();
     let mut appended = BTreeSet::new();
-    for (index, (sb, (header, write_offset, end, _))) in positions.into_iter().enumerate() {
-        let member_result = {
+    let append =
+        |(sb, (header, write_offset, end, _)): (&RawSuperblock, (Vec<u8>, u64, u64, bool))| {
             let _member_timer = metrics
                 .map(|metrics| metrics.member_timer(CommitPhase::JournalMemberIo, &sb.disk_id));
-            append_journal_member(
+            let result = append_journal_member(
                 backend,
                 sb,
                 header,
@@ -1904,27 +1930,44 @@ fn append_journal_quorum(
                     flush: !metadata.config.defer_journal_flush,
                     metrics,
                 },
-            )
+            );
+            (sb.disk_id.clone(), result)
         };
-        match member_result {
-            Ok(()) => {
-                appended.insert(sb.disk_id.clone());
-                if appended.len() < need && index + 1 < position_count {
-                    journal::inject_crash(FaultPoint::AfterPartialJournalFanout.as_str())?;
+    if journal::crash_point_requested(FaultPoint::AfterPartialJournalFanout.as_str()) {
+        // Fault injection deliberately stops below quorum. Keep this path
+        // serial so a test/process abort cannot accidentally publish quorum.
+        let position_count = positions.len();
+        for (index, position) in positions.into_iter().enumerate() {
+            let (disk_id, result) = append(position);
+            match result {
+                Ok(()) => {
+                    appended.insert(disk_id);
+                    if appended.len() < need && index + 1 < position_count {
+                        journal::inject_crash(FaultPoint::AfterPartialJournalFanout.as_str())?;
+                    }
                 }
+                Err(err) => report.record_failure(&disk_id, &err),
             }
-            Err(err) => report.record_failure(&sb.disk_id, &err),
+        }
+    } else {
+        for (disk_id, result) in parallel_journal_members(positions, append) {
+            match result {
+                Ok(()) => {
+                    appended.insert(disk_id);
+                }
+                Err(err) => report.record_failure(&disk_id, &err),
+            }
         }
     }
-
     let durable = if metadata.config.defer_journal_flush {
         let mut durable = BTreeSet::new();
-        for disk_id in appended {
-            let flush_result = {
-                let _flush_timer = metrics.map(|metrics| metrics.timer(CommitPhase::JournalFlush));
-                backend.flush_device(&disk_id)
-            };
-            match flush_result {
+        let flushes = parallel_journal_members(appended, |disk_id| {
+            let _flush_timer = metrics.map(|metrics| metrics.timer(CommitPhase::JournalFlush));
+            let result = backend.flush_device(&disk_id);
+            (disk_id, result)
+        });
+        for (disk_id, result) in flushes {
+            match result {
                 Ok(()) => {
                     durable.insert(disk_id);
                 }

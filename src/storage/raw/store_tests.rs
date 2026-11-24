@@ -2125,3 +2125,6 @@ fn v2_crash_after_quorum_commit_recovers_authenticated_delta() {
 
 #[path = "store_tests/rollover_slot.rs"]
 mod rollover_slot;
+
+#[path = "store_tests/journal_parallel.rs"]
+mod journal_parallel;
