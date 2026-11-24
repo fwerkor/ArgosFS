@@ -2559,13 +2559,56 @@ impl ArgosFs {
         meta.txid += 1;
         meta.updated_at = now_f64();
         if meta.backend != BackendKind::Host {
-            journal::prepare_metadata_integrity_with_previous(meta, previous_meta_hash.clone())?;
-            if bulk_import_enabled() {
-                return Ok(());
-            }
             let superblocks = self.metadata_superblocks_locked(meta)?;
+            // The committed baseline excludes advisory read counters and all
+            // uncommitted namespace mutations. Use it even for callers that
+            // only supplied an inode-local rollback image (or none at all).
+            let active_members = meta
+                .disks
+                .values()
+                .filter(|disk| disk.status != DiskStatus::Removed)
+                .count();
+            let v2_base = {
+                let state = self.deferred_commit.lock();
+                (!state.raw_checkpoint_required
+                    && !state.raw_uncommitted_metadata_dirty
+                    && active_members > 0
+                    && superblocks.len() == active_members
+                    && superblocks.iter().all(|sb| {
+                        sb.required_feature_flags & raw_format::REQUIRED_FEATURE_DELTA_INTEGRITY
+                            != 0
+                    }))
+                .then(|| state.durable_metadata.clone())
+                .flatten()
+                .filter(|base| {
+                    base.txid == previous_txid
+                        && base.integrity.meta_hash == previous_meta_hash
+                        && previous_meta_hash.len() == 64
+                })
+            };
+            let mut prepared_delta = {
+                let _integrity_timer = self.commit_metrics.timer(CommitPhase::Integrity);
+                if let Some(base) = v2_base.as_deref() {
+                    Some(journal::prepare_delta_integrity_with_delta(meta, base)?)
+                } else {
+                    journal::prepare_metadata_integrity_with_previous(
+                        meta,
+                        previous_meta_hash.clone(),
+                    )?;
+                    None
+                }
+            };
             let unavailable = self.quarantined_devices.lock().clone();
-            if let Err(precommit_err) = self.validate_data_durability_locked(meta, &unavailable) {
+            let validation = {
+                let _timer = self.commit_metrics.timer(CommitPhase::DurabilityValidation);
+                let mut state = self.deferred_commit.lock();
+                Self::validate_deferred_data_durability(
+                    meta,
+                    &unavailable,
+                    &mut state.durability_cache,
+                )
+            };
+            if let Err(precommit_err) = validation {
                 self.fence_on_quorum_loss(&precommit_err);
                 if let Some(previous) = previous_metadata {
                     *meta = previous.clone();
@@ -2586,23 +2629,40 @@ impl ArgosFs {
                     .filter(|previous| previous.integrity.meta_hash == previous_meta_hash)
             };
             let details = json!({"txid": meta.txid, "previous_meta_hash": previous_meta_hash, "details": details});
-            let commit = |backend: &dyn StorageBackend| match replay_previous {
-                Some(previous) => raw_store::append_transaction_with_trusted_integrity_quorum(
-                    backend,
-                    &superblocks,
-                    meta,
-                    Some(previous),
-                    action,
-                    details.clone(),
-                ),
-                None => raw_store::append_transaction_quorum(
-                    backend,
-                    &superblocks,
-                    meta,
-                    None,
-                    action,
-                    details.clone(),
-                ),
+            let mut commit = |backend: &dyn StorageBackend| {
+                let _timer = self.commit_metrics.timer(CommitPhase::Journal);
+                if let Some(base) = v2_base.as_deref() {
+                    return raw_store::append_transaction_with_trusted_integrity_quorum_measured(
+                        backend,
+                        &superblocks,
+                        meta,
+                        raw_store::PreparedJournalBase {
+                            previous: base,
+                            delta: prepared_delta.take(),
+                        },
+                        &self.commit_metrics,
+                        action,
+                        details.clone(),
+                    );
+                }
+                match replay_previous {
+                    Some(previous) => raw_store::append_transaction_with_trusted_integrity_quorum(
+                        backend,
+                        &superblocks,
+                        meta,
+                        Some(previous),
+                        action,
+                        details.clone(),
+                    ),
+                    None => raw_store::append_transaction_quorum(
+                        backend,
+                        &superblocks,
+                        meta,
+                        None,
+                        action,
+                        details.clone(),
+                    ),
+                }
             };
             let result = if self.open_backend_covers_superblocks(&superblocks) {
                 commit(&*self.backend)
@@ -2633,8 +2693,10 @@ impl ArgosFs {
                     if Self::transaction_error_is_committed(&commit_err) {
                         meta.inodes.mark_committed();
                         let mut state = self.deferred_commit.lock();
+                        state.durable_metadata = Some(Arc::new(meta.clone()));
                         state.raw_uncommitted_metadata_dirty = false;
                         state.raw_advisory_metadata_dirty = false;
+                        state.durability_cache = None;
                         drop(state);
                         self.rebuild_quota_runtime_locked(meta)?;
                     }
@@ -2655,6 +2717,10 @@ impl ArgosFs {
             }
             meta.inodes.mark_committed();
             let mut state = self.deferred_commit.lock();
+            state.durable_metadata = Some(Arc::new(meta.clone()));
+            if let Some(cache) = &mut state.durability_cache {
+                cache.inodes = meta.inodes.clone();
+            }
             state.raw_uncommitted_metadata_dirty = false;
             state.raw_advisory_metadata_dirty = false;
             return Ok(());
