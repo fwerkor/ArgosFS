@@ -11,6 +11,8 @@ pub struct FreeExtents {
     extents: Vector<RawFreeExtent>,
     #[serde(skip)]
     normalized: OnceLock<bool>,
+    #[serde(skip)]
+    length_upper_bound: OnceLock<u64>,
 }
 
 impl FreeExtents {
@@ -21,6 +23,16 @@ impl FreeExtents {
                 .zip(self.extents.iter().skip(1))
                 .all(|(left, right)| left.offset.saturating_add(left.length) < right.offset)
         })
+    }
+
+    pub(crate) fn known_length_upper_bound(&self) -> Option<u64> {
+        self.length_upper_bound.get().copied()
+    }
+
+    /// A conservative upper bound is enough to rule out a first-fit search.
+    /// Only a full unsuccessful scan or allocator-owned mutations may set it.
+    pub(crate) fn mark_length_upper_bound(&mut self, bound: u64) {
+        self.length_upper_bound = OnceLock::from(bound);
     }
 
     pub(crate) fn known_normalized(&self) -> bool {
@@ -46,6 +58,7 @@ impl DerefMut for FreeExtents {
         // All external mutation paths (including IndexMut, get_mut, and
         // whole-vector replacement) invalidate the ordering proof first.
         self.normalized.take();
+        self.length_upper_bound.take();
         &mut self.extents
     }
 }
@@ -68,6 +81,7 @@ impl FromIterator<RawFreeExtent> for FreeExtents {
         Self {
             extents: items.into_iter().collect(),
             normalized: OnceLock::new(),
+            length_upper_bound: OnceLock::new(),
         }
     }
 }

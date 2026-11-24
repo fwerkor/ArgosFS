@@ -407,3 +407,59 @@ fn benchmark_cached_free_list_ordering() {
         old.as_secs_f64() / new.as_secs_f64()
     );
 }
+
+#[test]
+fn allocator_large_request_bound_never_skips_a_new_or_modified_fit() {
+    let mut state = init_allocator(4096, 4096 * 200_000, 4096);
+    state.free_extents = (0..47_000)
+        .map(|i| RawFreeExtent {
+            offset: (i * 3 + 1) * 4096,
+            length: 4096,
+        })
+        .collect();
+    state.next_offset = 150_000 * 4096;
+    let first = allocate(&mut state, "disk", 8192, 1).unwrap();
+    assert_eq!(first.offset, 150_000 * 4096);
+    assert_eq!(state.free_extents.known_length_upper_bound(), Some(4096));
+    let second = allocate(&mut state, "disk", 8192, 1).unwrap();
+    assert_eq!(second.offset, first.offset + 8192);
+    assert_eq!(state.free_extents.known_length_upper_bound(), Some(4096));
+    free(&mut state, &first).unwrap();
+    assert_eq!(state.free_extents.known_length_upper_bound(), Some(8192));
+    assert_eq!(
+        allocate(&mut state, "disk", 8192, 2).unwrap().offset,
+        first.offset
+    );
+    state.free_extents[0].length = 16384;
+    assert_eq!(state.free_extents.known_length_upper_bound(), None);
+    assert_eq!(allocate(&mut state, "disk", 8192, 3).unwrap().offset, 4096);
+}
+
+#[test]
+#[ignore = "synthetic fragmented allocation benchmark"]
+fn benchmark_fragmented_allocation_bound() {
+    let mut base = init_allocator(4096, 4096 * 200_000, 4096);
+    base.free_extents = (0..47_000)
+        .map(|i| RawFreeExtent {
+            offset: (i * 3 + 1) * 4096,
+            length: 4096,
+        })
+        .collect();
+    base.next_offset = 150_000 * 4096;
+    let mut cold = base.clone();
+    let start = std::time::Instant::now();
+    for _ in 0..1000 {
+        std::hint::black_box(cold.free_extents.get_mut(0).unwrap());
+        allocate(&mut cold, "disk", 8192, 1).unwrap();
+    }
+    let old = start.elapsed();
+    let mut warm = base;
+    let start = std::time::Instant::now();
+    for _ in 0..1000 {
+        allocate(&mut warm, "disk", 8192, 1).unwrap();
+    }
+    let new = start.elapsed();
+    assert_eq!(cold.next_offset, warm.next_offset);
+    assert_eq!(cold.free_extents, warm.free_extents);
+    println!("47000 small extents, 1000 large allocations: scan={old:?}, bounded={new:?}, speedup={:.1}x", old.as_secs_f64()/new.as_secs_f64());
+}
