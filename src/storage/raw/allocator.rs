@@ -8,7 +8,7 @@ pub fn init_allocator(data_start: u64, data_length: u64, block_size: u64) -> Raw
         data_start,
         data_end: data_start.saturating_add(data_length),
         next_offset: data_start,
-        free_extents: imbl::Vector::new(),
+        free_extents: Default::default(),
     }
 }
 
@@ -28,11 +28,15 @@ pub fn allocate(
         .map(|(index, free)| (index, free.clone()))
     {
         let offset = free.offset;
+        let preserve_proof = state.free_extents.known_normalized();
         if free.length == length {
             state.free_extents.remove(index);
         } else if let Some(slot) = state.free_extents.get_mut(index) {
             slot.offset = slot.offset.saturating_add(length);
             slot.length = slot.length.saturating_sub(length);
+        }
+        if preserve_proof {
+            state.free_extents.mark_normalized();
         }
         return Ok(PhysicalExtent {
             disk_id: disk_id.to_string(),
@@ -85,11 +89,7 @@ pub fn free(state: &mut RawAllocatorState, extent: &PhysicalExtent) -> Result<()
     // Existing pools can contain unsorted or uncoalesced lists. Keep the
     // old normalization semantics for these exceptional inputs; generated
     // free lists are sorted and strictly separated after every mutation.
-    if !free
-        .iter()
-        .zip(free.iter().skip(1))
-        .all(|(left, right)| left.offset.saturating_add(left.length) < right.offset)
-    {
+    if !free.is_normalized() {
         free.push_back(RawFreeExtent {
             offset: start,
             length: extent.length,
@@ -135,6 +135,7 @@ pub fn free(state: &mut RawAllocatorState, extent: &PhysicalExtent) -> Result<()
         free.push_back(replacement);
         free.append(right);
     }
+    free.mark_normalized();
     Ok(())
 }
 
@@ -225,6 +226,7 @@ fn coalesce(state: &mut RawAllocatorState) {
         merged.push(extent);
     }
     state.free_extents = merged.into_iter().collect();
+    state.free_extents.mark_normalized();
 }
 
 #[cfg(test)]

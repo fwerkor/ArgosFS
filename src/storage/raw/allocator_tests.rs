@@ -335,3 +335,75 @@ fn persistent_free_extents_keep_legacy_array_serialization() {
         serde_json::from_slice(&serde_json::to_vec(&list).unwrap()).unwrap();
     assert_eq!(restored, vector);
 }
+
+#[test]
+fn allocator_ordering_proof_survives_trusted_mutations_and_invalidates_external_edits() {
+    let mut state = init_allocator(4096, 4096 * 150_000, 4096);
+    state.free_extents = (0..47_000)
+        .map(|i| RawFreeExtent {
+            offset: (i * 3 + 1) * 4096,
+            length: 4096,
+        })
+        .collect();
+    assert!(!state.free_extents.known_normalized());
+    assert!(state.free_extents.is_normalized());
+    let snapshot = state.clone();
+    let allocated = allocate(&mut state, "disk", 4096, 1).unwrap();
+    assert!(state.free_extents.known_normalized());
+    free(&mut state, &allocated).unwrap();
+    assert!(state.free_extents.known_normalized());
+    assert_eq!(state.free_extents, snapshot.free_extents);
+    state.free_extents[0].offset = 99 * 4096;
+    assert!(!state.free_extents.known_normalized());
+    assert!(!state.free_extents.is_normalized());
+    free(&mut state, &allocated).unwrap();
+    assert!(state.free_extents.known_normalized());
+    assert!(state
+        .free_extents
+        .iter()
+        .zip(state.free_extents.iter().skip(1))
+        .all(|(a, b)| a.offset + a.length < b.offset));
+    let restored: RawAllocatorState =
+        serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+    assert!(!restored.free_extents.known_normalized());
+    assert_eq!(restored.free_extents, state.free_extents);
+}
+
+#[test]
+#[ignore = "synthetic fragmented allocator coalescing benchmark"]
+fn benchmark_cached_free_list_ordering() {
+    let mut base = init_allocator(4096, 4096 * 150_000, 4096);
+    base.free_extents = (0..47_000)
+        .map(|i| RawFreeExtent {
+            offset: (i * 3 + 1) * 4096,
+            length: 4096,
+        })
+        .collect();
+    assert!(base.free_extents.is_normalized());
+    let extent = PhysicalExtent {
+        disk_id: "disk".into(),
+        offset: 4096,
+        length: 4096,
+        generation: 1,
+        flags: 0,
+    };
+    let mut cold = base.clone();
+    let start = std::time::Instant::now();
+    for _ in 0..1000 {
+        // Simulate the prior implementation's full normalization check.
+        std::hint::black_box(cold.free_extents.get_mut(0).unwrap());
+        free(&mut cold, &extent).unwrap();
+    }
+    let old = start.elapsed();
+    let mut warm = base;
+    let start = std::time::Instant::now();
+    for _ in 0..1000 {
+        free(&mut warm, &extent).unwrap();
+    }
+    let new = start.elapsed();
+    assert_eq!(cold.free_extents, warm.free_extents);
+    println!(
+        "47000 extents, 1000 releases: recheck={old:?}, cached={new:?}, speedup={:.1}x",
+        old.as_secs_f64() / new.as_secs_f64()
+    );
+}
