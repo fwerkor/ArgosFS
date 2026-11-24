@@ -2,7 +2,9 @@ use crate::error::Result;
 use crate::util::{atomic_write, ensure_dir, sha256_hex};
 use parking_lot::Mutex;
 use serde_json::json;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeMap;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -55,8 +57,13 @@ struct CacheInner {
     inflight_l2: BTreeMap<String, InflightL2>,
     l2_loaded: bool,
     l2_bytes: u64,
+    l2_hot_bytes: u64,
     l2_index: BTreeMap<PathBuf, L2Entry>,
     l2_clock: u64,
+    l2_evict_seed: u64,
+    l2_window_requests: u64,
+    l2_window_hits: u64,
+    l2_freeze_stream: bool,
     hits: u64,
     misses: u64,
     l2_hits: u64,
@@ -102,6 +109,25 @@ impl CacheInner {
         if let Some(item) = self.items.remove(key) {
             self.bytes = self.bytes.saturating_sub(item.data.len());
             self.order.remove(&item.last_used);
+        }
+    }
+
+    /// Detect a workload with real cache reuse. A one-shot sequential scan
+    /// has a very low L2 hit ratio; a re-read pass hits a substantial sample.
+    /// Freeze cold admissions only once reuse is demonstrated, then let the
+    /// ratio fall again if a different workload arrives.
+    fn record_l2_lookup(&mut self, hit: bool) {
+        const WINDOW: u64 = 64;
+        const FREEZE_RATIO: f64 = 0.03;
+        self.l2_window_requests = self.l2_window_requests.saturating_add(1);
+        if hit {
+            self.l2_window_hits = self.l2_window_hits.saturating_add(1);
+        }
+        if self.l2_window_requests >= WINDOW {
+            let ratio = self.l2_window_hits as f64 / self.l2_window_requests as f64;
+            self.l2_freeze_stream = ratio >= FREEZE_RATIO;
+            self.l2_window_requests = 0;
+            self.l2_window_hits = 0;
         }
     }
 
@@ -161,6 +187,16 @@ struct InflightL2 {
 struct L2Entry {
     size: u64,
     touched: u64,
+    /// Set when the entry was served from L2 at least once. Reused entries are
+    /// protected from the random cold-entry eviction used for streaming scans.
+    reused: bool,
+}
+
+fn eviction_score(path: &Path, seed: u64) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+    seed.hash(&mut hasher);
+    hasher.finish()
 }
 
 pub struct BlockCache {
@@ -283,6 +319,7 @@ impl BlockCache {
             // This exact key was removed, replaced or prefix-invalidated
             // while its L2 file was read. Other keys do not affect this read.
             inner.misses = inner.misses.saturating_add(1);
+            inner.record_l2_lookup(false);
             return None;
         }
         if let Some((item, valid)) = candidate {
@@ -299,9 +336,19 @@ impl BlockCache {
                 inner.l2_hits = inner.l2_hits.saturating_add(1);
                 inner.l2_clock = inner.l2_clock.saturating_add(1);
                 let touched = inner.l2_clock;
-                if let Some(entry) = inner.l2_index.get_mut(&path) {
+                let promoted = inner.l2_index.get_mut(&path).map(|entry| {
                     entry.touched = touched;
+                    if entry.reused {
+                        None
+                    } else {
+                        entry.reused = true;
+                        Some(entry.size)
+                    }
+                });
+                if let Some(Some(size)) = promoted {
+                    inner.l2_hot_bytes = inner.l2_hot_bytes.saturating_add(size);
                 }
+                inner.record_l2_lookup(true);
                 let data = Arc::clone(&item.data);
                 inner.insert_memory(key, item, self.memory_limit);
                 return Some(data);
@@ -312,9 +359,13 @@ impl BlockCache {
             let _ = std::fs::remove_file(&path);
             if let Some(entry) = inner.l2_index.remove(&path) {
                 inner.l2_bytes = inner.l2_bytes.saturating_sub(entry.size);
+                if entry.reused {
+                    inner.l2_hot_bytes = inner.l2_hot_bytes.saturating_sub(entry.size);
+                }
             }
         }
         inner.misses = inner.misses.saturating_add(1);
+        inner.record_l2_lookup(false);
         None
     }
 
@@ -361,6 +412,9 @@ impl BlockCache {
             let mut inner = self.inner.lock();
             if let Some(entry) = inner.l2_index.remove(&path) {
                 inner.l2_bytes = inner.l2_bytes.saturating_sub(entry.size);
+                if entry.reused {
+                    inner.l2_hot_bytes = inner.l2_hot_bytes.saturating_sub(entry.size);
+                }
             }
         }
     }
@@ -378,6 +432,15 @@ impl BlockCache {
             ("l2_errors".to_string(), json!(inner.l2_errors)),
             ("l2_bytes".to_string(), json!(inner.l2_bytes)),
             ("l2_items".to_string(), json!(inner.l2_index.len())),
+            ("l2_hot_bytes".to_string(), json!(inner.l2_hot_bytes)),
+            (
+                "l2_hot_items".to_string(),
+                json!(inner.l2_index.values().filter(|entry| entry.reused).count()),
+            ),
+            (
+                "l2_stream_frozen".to_string(),
+                json!(u8::from(inner.l2_freeze_stream)),
+            ),
             (
                 "direct_copy_bytes".to_string(),
                 json!(self.direct_copy_bytes.load(Ordering::Relaxed)),
@@ -405,21 +468,43 @@ impl BlockCache {
     fn put_l2(&self, key: &str, data: &[u8]) -> Result<()> {
         self.load_l2_index()?;
         let path = self.l2_path(key);
+        {
+            let inner = self.inner.lock();
+            // Once the recent hit ratio shows real reuse, a new streaming
+            // admission would start evicting the reusable sample before the
+            // rest of the second pass can read it. Freeze cold admissions at
+            // that point; existing keys can always be refreshed. A different
+            // workload with a low hit ratio eventually unfreezes the cache.
+            if inner.l2_bytes >= self.l2_limit
+                && inner.l2_freeze_stream
+                && !inner.l2_index.contains_key(&path)
+            {
+                return Ok(());
+            }
+        }
         atomic_write(&path, data)?;
         let mut inner = self.inner.lock();
         inner.l2_clock = inner.l2_clock.saturating_add(1);
         let touched = inner.l2_clock;
+        let reused = inner.l2_index.get(&path).is_some_and(|entry| entry.reused);
         let old = inner.l2_index.insert(
             path,
             L2Entry {
                 size: data.len() as u64,
                 touched,
+                reused,
             },
         );
         if let Some(old) = old {
             inner.l2_bytes = inner.l2_bytes.saturating_sub(old.size);
+            if old.reused {
+                inner.l2_hot_bytes = inner.l2_hot_bytes.saturating_sub(old.size);
+            }
         }
         inner.l2_bytes = inner.l2_bytes.saturating_add(data.len() as u64);
+        if reused {
+            inner.l2_hot_bytes = inner.l2_hot_bytes.saturating_add(data.len() as u64);
+        }
         inner.l2_writes += 1;
         drop(inner);
         self.prune_l2()
@@ -465,6 +550,7 @@ impl BlockCache {
                 L2Entry {
                     size,
                     touched: clock,
+                    reused: false,
                 },
             );
         }
@@ -472,6 +558,7 @@ impl BlockCache {
         inner.l2_loaded = true;
         inner.l2_index = index;
         inner.l2_bytes = total;
+        inner.l2_hot_bytes = 0;
         inner.l2_clock = clock.max(inner.l2_clock);
         Ok(())
     }
@@ -482,24 +569,46 @@ impl BlockCache {
         if inner.l2_bytes <= self.l2_limit {
             return Ok(());
         }
-        let mut files = inner
-            .l2_index
-            .iter()
-            .map(|(path, entry)| (entry.touched, path.clone(), entry.size))
-            .collect::<Vec<_>>();
-        files.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
-        for (_, path, len) in files {
-            if inner.l2_bytes <= self.l2_limit {
+        // Prune with hysteresis so a scan does not sort and evict on every
+        // admission. Cold entries are evicted in a deterministic hash order
+        // (effectively a uniform random sample of the scanned stream), while
+        // entries that have already been reused are kept until no cold entry
+        // remains. This lets a second sequential pass hit a useful sample of
+        // the first pass instead of finding only an already-evicted LRU tail.
+        let target = self.l2_limit.saturating_sub(self.l2_limit / 16).max(1);
+        inner.l2_evict_seed = inner.l2_evict_seed.wrapping_add(1);
+        let seed = inner.l2_evict_seed;
+        let mut cold = Vec::new();
+        let mut hot = Vec::new();
+        for (path, entry) in &inner.l2_index {
+            if entry.reused {
+                hot.push((entry.touched, path.clone()));
+            } else {
+                cold.push((eviction_score(path, seed), path.clone()));
+            }
+        }
+        cold.sort_unstable();
+        hot.sort_unstable();
+        for (_, path) in cold.into_iter().chain(hot) {
+            if inner.l2_bytes <= target {
                 break;
             }
             match std::fs::remove_file(&path) {
                 Ok(()) => {
-                    inner.l2_bytes = inner.l2_bytes.saturating_sub(len);
-                    inner.l2_index.remove(&path);
+                    if let Some(entry) = inner.l2_index.remove(&path) {
+                        inner.l2_bytes = inner.l2_bytes.saturating_sub(entry.size);
+                        if entry.reused {
+                            inner.l2_hot_bytes = inner.l2_hot_bytes.saturating_sub(entry.size);
+                        }
+                    }
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    inner.l2_bytes = inner.l2_bytes.saturating_sub(len);
-                    inner.l2_index.remove(&path);
+                    if let Some(entry) = inner.l2_index.remove(&path) {
+                        inner.l2_bytes = inner.l2_bytes.saturating_sub(entry.size);
+                        if entry.reused {
+                            inner.l2_hot_bytes = inner.l2_hot_bytes.saturating_sub(entry.size);
+                        }
+                    }
                 }
                 Err(err) => return Err(err.into()),
             }
