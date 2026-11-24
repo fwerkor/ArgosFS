@@ -63,6 +63,9 @@ pub(super) fn diff(
                 continue;
             }
         }
+        if array_splice_allowed() && diff_sorted_extents(&path, left, right, ops)? {
+            continue;
+        }
         diff_json(
             &path,
             &serde_json::to_value(left)?,
@@ -71,6 +74,73 @@ pub(super) fn diff(
         );
     }
     Ok(())
+}
+
+/// Offset order supplies exact anchors without materializing JSON trees or
+/// searching a bounded lookahead window. Only changed runs become Values.
+fn diff_sorted_extents(
+    path: &str,
+    left: &imbl::Vector<RawFreeExtent>,
+    right: &imbl::Vector<RawFreeExtent>,
+    ops: &mut Vec<MetadataDeltaOp>,
+) -> Result<bool> {
+    const MAX_RUNS: usize = 8192;
+    let ordered = |items: &imbl::Vector<RawFreeExtent>| {
+        items
+            .iter()
+            .zip(items.iter().skip(1))
+            .all(|(a, b)| a.offset < b.offset)
+    };
+    if !ordered(left) || !ordered(right) {
+        return Ok(false);
+    }
+    let mut edits = Vec::new();
+    let mut a = left.iter().peekable();
+    let mut b = right.iter().peekable();
+    let mut cursor = 0u64;
+    while a.peek().is_some() || b.peek().is_some() {
+        if matches!((a.peek(), b.peek()), (Some(x), Some(y)) if x == y) {
+            a.next();
+            b.next();
+            cursor += 1;
+            continue;
+        }
+        let mut delete = 0u64;
+        let mut insert = Vec::new();
+        loop {
+            match (a.peek(), b.peek()) {
+                (Some(x), Some(y)) if x == y => break,
+                (Some(x), Some(y)) if x.offset < y.offset => {
+                    a.next();
+                    delete += 1;
+                }
+                (Some(x), Some(y)) if x.offset == y.offset => {
+                    a.next();
+                    delete += 1;
+                    insert.push(serde_json::to_value(b.next().unwrap())?);
+                }
+                (_, Some(_)) => insert.push(serde_json::to_value(b.next().unwrap())?),
+                (Some(_), None) => {
+                    a.next();
+                    delete += 1;
+                }
+                (None, None) => break,
+            }
+        }
+        let count = insert.len() as u64;
+        edits.push(MetadataDeltaOp::Splice {
+            path: path.to_owned(),
+            start: cursor,
+            delete,
+            insert,
+        });
+        cursor += count;
+        if edits.len() > MAX_RUNS {
+            return Ok(false);
+        }
+    }
+    ops.extend(edits);
+    Ok(true)
 }
 
 pub(super) fn is_allocator_path(tokens: &[String]) -> bool {
@@ -134,7 +204,32 @@ fn replay_one(allocator: &mut RawAllocatorState, tail: &[String], op: &MetadataD
     ) -> Option<()> {
         match tail {
             [field] if field == "free_extents" => {
-                allocator.free_extents = serde_json::from_value(replacement(op)?.clone()).ok()?;
+                if let MetadataDeltaOp::Splice {
+                    start,
+                    delete,
+                    insert,
+                    ..
+                } = op
+                {
+                    let start = usize::try_from(*start).ok()?;
+                    let end = start.checked_add(usize::try_from(*delete).ok()?)?;
+                    let list = &mut allocator.free_extents;
+                    if end > list.len() {
+                        return None;
+                    }
+                    let inserted = insert
+                        .iter()
+                        .map(|value| serde_json::from_value::<RawFreeExtent>(value.clone()))
+                        .collect::<std::result::Result<imbl::Vector<_>, _>>()
+                        .ok()?;
+                    let suffix = list.split_off(end);
+                    list.truncate(start);
+                    list.append(inserted);
+                    list.append(suffix);
+                } else {
+                    allocator.free_extents =
+                        serde_json::from_value(replacement(op)?.clone()).ok()?;
+                }
             }
             [field] => {
                 let value = replacement(op)?.as_u64()?;
@@ -334,5 +429,129 @@ mod tests {
         }
         let new = start.elapsed();
         println!("188000 extents, 10 iterations: old_header={old:?}, typed_delta={new:?}, speedup={:.1}x", old.as_secs_f64()/new.as_secs_f64());
+    }
+}
+
+#[cfg(test)]
+mod splice_tests {
+    use super::*;
+
+    #[test]
+    fn sorted_allocator_splices_share_chunks_and_match_generic_replay() {
+        let left: imbl::Vector<_> = (0..47_000u64)
+            .map(|i| RawFreeExtent {
+                offset: (i * 4 + 1) * 4096,
+                length: 4096,
+            })
+            .collect();
+        let mut right = left.clone();
+        // Widely separated insertions and removals, beyond generic lookahead.
+        right.insert(
+            400,
+            RawFreeExtent {
+                offset: left[399].offset + 8192,
+                length: 4096,
+            },
+        );
+        right[900].length = 8192;
+        let tail = right.split_off(20_000);
+        right.truncate(12_000);
+        right.append(tail);
+        right.insert(
+            30_000,
+            RawFreeExtent {
+                offset: right[29_999].offset + 8192,
+                length: 4096,
+            },
+        );
+        let path = "/free_extents";
+        let mut ops = Vec::new();
+        assert!(diff_sorted_extents(path, &left, &right, &mut ops).unwrap());
+        assert!(ops.len() <= 4);
+        assert!(serde_json::to_vec(&ops).unwrap().len() < 1024);
+        let mut state = RawAllocatorState {
+            free_extents: left.clone(),
+            ..Default::default()
+        };
+        let mut reference = serde_json::to_value(&state).unwrap();
+        for op in &ops {
+            assert!(replay_one(&mut state, &["free_extents".into()], op));
+            apply_delta_op(&mut reference, op).unwrap();
+        }
+        assert_eq!(state.free_extents, right);
+        assert_eq!(serde_json::to_value(&state).unwrap(), reference);
+        // Persistent vector splits may rebalance individual boundary chunks;
+        // assert sharing across the whole surviving sequence instead.
+        let original = left
+            .iter()
+            .map(|e| (e.offset, e as *const RawFreeExtent))
+            .collect::<BTreeMap<_, _>>();
+        let shared = state
+            .free_extents
+            .iter()
+            .filter(|e| {
+                original
+                    .get(&e.offset)
+                    .is_some_and(|ptr| std::ptr::eq(*ptr, *e))
+            })
+            .count();
+        assert!(
+            shared > state.free_extents.len() / 2,
+            "only {shared} surviving entries shared"
+        );
+        let bad = MetadataDeltaOp::Splice {
+            path: path.into(),
+            start: u64::MAX,
+            delete: 2,
+            insert: vec![],
+        };
+        assert!(!replay_one(&mut state, &["free_extents".into()], &bad));
+        assert!(apply_delta_op(&mut reference, &bad).is_err());
+    }
+
+    #[test]
+    fn allocator_splice_gate_preserves_legacy_encoding() {
+        let left: imbl::Vector<_> = (0..1000u64)
+            .map(|i| RawFreeExtent {
+                offset: i * 4096 * 4,
+                length: 4096,
+            })
+            .collect();
+        let mut right = left.clone();
+        right.insert(
+            100,
+            RawFreeExtent {
+                offset: left[99].offset + 8192,
+                length: 4096,
+            },
+        );
+        let previous = BTreeMap::from([(
+            "a".into(),
+            RawAllocatorState {
+                free_extents: left,
+                ..Default::default()
+            },
+        )]);
+        let next = BTreeMap::from([(
+            "a".into(),
+            RawAllocatorState {
+                free_extents: right,
+                ..Default::default()
+            },
+        )]);
+        for allowed in [false, true] {
+            let _guard = allow_array_splice(allowed);
+            let mut ops = Vec::new();
+            diff(&previous, &next, &mut ops).unwrap();
+            assert_eq!(
+                ops.iter()
+                    .any(|op| matches!(op, MetadataDeltaOp::Splice { .. })),
+                allowed
+            );
+            assert_eq!(
+                serde_json::to_value(replay(&previous, &ops).unwrap()).unwrap(),
+                serde_json::to_value(&next).unwrap()
+            );
+        }
     }
 }
