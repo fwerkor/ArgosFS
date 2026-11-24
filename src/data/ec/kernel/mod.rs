@@ -5,8 +5,8 @@
 //! entirety of its inner loop. Essentially all of the runtime is here.
 //!
 //! Multiplication, XOR accumulation and multi-row encoding share a scalar
-//! reference. ARM uses fused rows; x86 uses cache-sized tiles and vector
-//! shuffles or GFNI affine transformations. Every backend is tested against
+//! reference. ARM uses fused rows; x86 uses cache-sized tiles, with four-row
+//! register fusion on AVX-512 and GFNI, and vector shuffles or affine transforms. Every backend is tested against
 //! the same GF(256)/0x11D arithmetic and persisted parity format.
 
 use crate::data::ec::shards::ShardSource;
@@ -39,7 +39,7 @@ fn encode_tile_size(k: usize, m: usize) -> usize {
 /// Which implementation of the inner kernel to use.
 ///
 /// A `Kernel` can only be obtained from [`Kernel::SCALAR`], [`Kernel::detect`]
-/// or [`Kernel::supported`], every one of which returns something the current
+/// or `Kernel::supported`, every one of which returns something the current
 /// CPU can actually execute. That is a soundness requirement, not a
 /// convenience: the SIMD kernels are `unsafe` and rely on the ISA being
 /// present, so the variants are deliberately not public to construct.
@@ -552,7 +552,7 @@ mod tests {
     /// The kernels the environment insists this machine can run, as a
     /// comma-separated list of [`Kernel::name`] values.
     ///
-    /// Every test above sweeps [`Kernel::supported`], so a machine that does
+    /// Every test above sweeps `Kernel::supported`, so a machine that does
     /// not have an ISA simply does not test it, quietly. That is right for a
     /// developer's laptop and wrong for CI: a runner that loses AVX2, or a
     /// detection bug that stops reporting it, would drop a kernel from the

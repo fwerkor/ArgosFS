@@ -17,7 +17,11 @@ of missing data shards. Data-only reads do not allocate missing parity.
 Encoding uses owned shard buffers and reuses the matrix across a write.
 On x86, cache-sized tiles (4–64 KiB) keep source and output data local;
 GFNI applies a precomputed affine transform over the legacy 0x11D field
-rather than GFNI's AES-field multiplication instruction.
+rather than GFNI's AES-field multiplication instruction. For four or more
+parity rows and at least four sources, AVX-512BW and both GFNI backends
+compute four outputs together using two vector accumulators per row.
+This shares source loads and writes each complete output vector once.
+Remainder rows and partial vectors use the existing tiled slice operations.
 
 The optimized arithmetic and SIMD kernels were adapted from
 reed-solomon-engine 0.2.0. See the retained provenance and license notices in
@@ -80,5 +84,6 @@ single-threaded encode and one-erasure data recovery measurements against
 the original vendored implementation. It builds the original source from
 the pinned Git revision in a temporary directory; the baseline is not a
 dependency of ArgosFS. Throughput is data bytes for encode and recovered
-bytes for decode, in GiB/s. Results depend on CPU, stripe geometry and cache
+bytes for decode, in GiB/s. The benchmark includes every runtime-supported
+backend, including scalar and SSSE3. Results depend on CPU, stripe geometry and cache
 residency; they are not end-to-end disk throughput.

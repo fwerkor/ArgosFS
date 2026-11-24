@@ -68,9 +68,7 @@ mod data {
                 );
                 let mut mask = ShardMask::all_present(k + m);
                 mask.remove(0);
-                for kernel in
-                    Kernel::supported().filter(|k| k.name() != "scalar" && k.name() != "ssse3")
-                {
+                for kernel in Kernel::supported() {
                     let native = Codec::with_kernel(kernel, k, m).unwrap();
                     let mut shards = original.clone();
                     native.encode_all(&mut shards).unwrap();

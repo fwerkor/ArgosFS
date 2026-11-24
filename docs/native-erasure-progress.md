@@ -52,3 +52,38 @@ dispatch is conservative feature-based selection, not per-layout tuning.
   benchmarking and provenance documentation.
 
 No disk format changes or unmeasured end-to-end throughput claims.
+
+## SIMD fusion iteration (2026-11-24)
+
+- Four-output, two-vector register fusion for AVX-512BW, GFNI-256 and
+  GFNI-512 when at least four sources and four output rows are available.
+  Retain the tiled driver for remaining rows and scalar/vector tails.
+- Correctness: 14 kernel tests passed on Xeon 6138 and Ryzen AI Max+ 395;
+  13 kernel tests passed on Kunpeng 920, cross-built for static AArch64
+  Linux musl, with NEON explicitly required. ARM hardware lacks SVE/SVE2.
+- Independent vendor parity/recovery comparison completed on all three
+  machines. Format, Clippy, rustdoc with warnings denied and 12 legacy
+  codec tests passed during this iteration.
+- Benchmark now includes SSSE3 and scalar as well as all wider backends.
+  Rustdoc reference to a test-only method fixed.
+
+| CPU | Layout | Shard | Vendor (same run) | Previous native | Fused | Backend |
+| --- | --- | --- | ---: | ---: | ---: | --- |
+| Xeon 6138 | 8+4 | 1 MiB | 2.855 | 4.935 | 9.451 | AVX-512BW |
+| Xeon 6138 | 16+8 | 1 MiB | 1.310 | 3.187 | 5.048 | AVX-512BW |
+| Ryzen AI Max+ 395 | 8+4 | 1 MiB | 14.369 | 23.662 | 49.515 | GFNI-512 |
+| Ryzen AI Max+ 395 | 16+8 | 1 MiB | 7.317 | 11.608 | 22.477 | GFNI-512 |
+
+GiB/s, single thread, warm buffers; the previous native column is from
+the prior run, not a simultaneous A/B. Vendor and fused figures are
+paired within the same benchmark session. Hardware load/frequency varies.
+
+Kunpeng 920 NEON passed the independent vendor oracle, but narrow layouts
+(2+1, 4+2) are approximately 10–18% slower than the vendor build in the
+initial measured session. The wide 8+4/16+8 layouts are near parity.
+A narrow-row tiling/identity-XOR experiment did not resolve the regression
+and was not retained. Investigate compiler codegen, pointer/bounds-check
+overhead, cache behavior and architecture-specific row grouping before
+claiming parity or enabling new NEON optimizations. SSSE3/AVX2 fusion,
+scalar multiplication optimization, adaptive dispatch, SVE2 hardware
+validation and the full CI/integration acceptance remain open.

@@ -50,7 +50,7 @@ pub(super) fn gfni512_supported() -> bool {
 // the scalar reference handles the final partial vector.
 macro_rules! kernel {
     ($name:ident, $features:literal, $width:expr, $vector:ty,
-     $load:ident, $store:ident, $xor:ident, $prepare:ident, $product:ident) => {
+     $load:ident, $store:ident, $xor:ident, $zero:ident, $prepare:ident, $product:ident) => {
         pub(super) mod $name {
             use super::*;
 
@@ -133,6 +133,58 @@ macro_rules! kernel {
                 unsafe { apply::<true>(c, src, dst) }
             }
 
+            // Compute G rows in registers, writing each output once. All
+            // source/output windows are bounds checked before vector access.
+            #[target_feature(enable = $features)]
+            unsafe fn fused<const G: usize, S: ShardSource + ?Sized>(
+                matrix: &[u8],
+                k: usize,
+                srcs: &S,
+                mut outs: [&mut [u8]; G],
+                start: usize,
+                end: usize,
+            ) {
+                let rows: [&[u8]; G] = core::array::from_fn(|r| &matrix[r * k..(r + 1) * k]);
+                let mut i = start;
+                let zero = $zero();
+                while i + 2 * $width <= end {
+                    let mut a = [zero; G];
+                    let mut b = [zero; G];
+                    for j in 0..k {
+                        let src = &srcs.shard(j)[i..i + 2 * $width];
+                        // SAFETY: two vectors fit inside the checked window.
+                        unsafe {
+                            let x = $load(src.as_ptr().cast());
+                            let y = $load(src.as_ptr().add($width).cast());
+                            for r in 0..G {
+                                let t = $prepare(rows[r][j]);
+                                a[r] = $xor(a[r], $product(x, t));
+                                b[r] = $xor(b[r], $product(y, t));
+                            }
+                        }
+                    }
+                    for r in 0..G {
+                        let out = &mut outs[r][i..i + 2 * $width];
+                        // SAFETY: two vectors fit inside the checked window.
+                        unsafe {
+                            $store(out.as_mut_ptr().cast(), a[r]);
+                            $store(out.as_mut_ptr().add($width).cast(), b[r]);
+                        }
+                    }
+                    i += 2 * $width;
+                }
+                for (r, out) in outs.iter_mut().enumerate() {
+                    let out = &mut out[i..end];
+                    // SAFETY: the same ISA is enabled here.
+                    unsafe {
+                        apply::<false>(rows[r][0], &srcs.shard(0)[i..end], out);
+                        for (j, &c) in rows[r].iter().enumerate().skip(1) {
+                            apply::<true>(c, &srcs.shard(j)[i..end], out);
+                        }
+                    }
+                }
+            }
+
             #[target_feature(enable = $features)]
             pub(in crate::data::ec::kernel) unsafe fn mul_rows<
                 S: ShardSource + ?Sized,
@@ -147,7 +199,20 @@ macro_rules! kernel {
                 let tile = super::super::encode_tile_size(k, outs.len());
                 for start in (0..len).step_by(tile) {
                     let end = (start + tile).min(len);
-                    for (row, out) in outs.iter_mut().enumerate() {
+                    let mut groups = outs.chunks_exact_mut(4);
+                    let mut row = 0;
+                    if k >= 4 {
+                        for group in groups.by_ref() {
+                            let mut iter = group.iter_mut();
+                            let group = core::array::from_fn(|_| iter.next().unwrap().as_mut());
+                            // SAFETY: the same ISA is enabled here.
+                            unsafe {
+                                fused::<4, S>(&matrix[row * k..], k, srcs, group, start, end)
+                            };
+                            row += 4;
+                        }
+                    }
+                    for (row, out) in outs.iter_mut().enumerate().skip(row) {
                         let coeffs = &matrix[row * k..(row + 1) * k];
                         let out = &mut out.as_mut()[start..end];
                         // SAFETY: this function is enabled for the same ISA as apply.
@@ -215,6 +280,7 @@ kernel!(
     _mm512_loadu_si512,
     _mm512_storeu_si512,
     _mm512_xor_si512,
+    _mm512_setzero_si512,
     prepare_shuffle,
     product_shuffle
 );
@@ -226,6 +292,7 @@ kernel!(
     _mm256_loadu_si256,
     _mm256_storeu_si256,
     _mm256_xor_si256,
+    _mm256_setzero_si256,
     prepare_gfni256,
     product_gfni256
 );
@@ -237,6 +304,7 @@ kernel!(
     _mm512_loadu_si512,
     _mm512_storeu_si512,
     _mm512_xor_si512,
+    _mm512_setzero_si512,
     prepare_gfni512,
     product_gfni512
 );
