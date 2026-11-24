@@ -1,5 +1,8 @@
 use super::*;
-use crate::types::VolumeConfig;
+use crate::types::{DiskStatus, VolumeConfig};
+use crate::volume::capacity::{
+    fallback_statfs_capacity, max_stripe_units, statfs_bytes, statvfs_capacity,
+};
 
 #[test]
 fn kernel_killpriv_only_clears_setid_bits() {
@@ -227,6 +230,79 @@ fn raw_statfs_uses_allocator_regions_and_free_extents() {
     let quarantined = BTreeSet::from(["disk-0000".to_string()]);
     let unavailable = statfs_bytes(&volume.metadata_snapshot(), volume.root(), &quarantined);
     assert_eq!(unavailable, (0, 0));
+}
+
+#[test]
+fn statfs_advances_after_deferred_reclamation_commit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|index| tmp.path().join(format!("disk-{index}.img")))
+        .collect::<Vec<_>>();
+    let volume = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            defer_metadata_commit: true,
+            deferred_commit_interval_ms: 3_600_000,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "statfs-publish",
+        false,
+    )
+    .unwrap();
+    volume
+        .write_file("/payload", &vec![7u8; 64 * 1024], 0o644)
+        .unwrap();
+    volume.sync().unwrap();
+    let before_delete = volume
+        .published_capacity_snapshot()
+        .expect("raw pools publish capacity");
+
+    volume.unlink_path("/payload").unwrap();
+    let before_commit = volume
+        .published_capacity_snapshot()
+        .expect("raw pools publish capacity");
+    assert_eq!(
+        before_commit.free_bytes, before_delete.free_bytes,
+        "deferred reclamation must not publish space before its commit"
+    );
+
+    volume.sync().unwrap();
+    let after_commit = volume
+        .published_capacity_snapshot()
+        .expect("raw pools publish capacity");
+    assert!(
+        after_commit.free_bytes > before_commit.free_bytes,
+        "deleted extents must be republished after a durable commit: {} -> {}",
+        before_commit.free_bytes,
+        after_commit.free_bytes
+    );
+
+    // The FUSE statfs path must observe the republished value even while a
+    // checkpoint holds the metadata writer lock.
+    let fuse = ArgosFuse::new(volume.clone());
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let writer = std::thread::spawn(move || {
+        volume.test_with_metadata_write_lock(|| {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+    });
+    started_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    let started = std::time::Instant::now();
+    let snapshot = fuse.statfs_snapshot();
+    let elapsed = started.elapsed();
+    release_tx.send(()).unwrap();
+    writer.join().unwrap();
+    assert_eq!(snapshot.free_bytes, after_commit.free_bytes);
+    assert!(
+        elapsed < Duration::from_millis(200),
+        "statfs blocked during metadata write lock: {elapsed:?}"
+    );
 }
 
 #[test]
