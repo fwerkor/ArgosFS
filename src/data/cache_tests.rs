@@ -128,6 +128,38 @@ fn l2_scan_keeps_a_reusable_sample_and_protects_reused_entries() {
 }
 
 #[test]
+fn l2_frozen_cache_preserves_sample_and_adapts_to_a_new_working_set() {
+    let dir = tempdir().unwrap();
+    let cache = BlockCache::new(dir.path(), 0, 10);
+    cache.put("hot-a", b"aaaa").unwrap();
+    cache.put("hot-b", b"bbbb").unwrap();
+    for _ in 0..32 {
+        assert!(cache.get("hot-a", None).is_some());
+        assert!(cache.get("hot-b", None).is_some());
+    }
+    assert_eq!(cache.stats()["l2_stream_frozen"], 1);
+    assert_eq!(cache.stats()["l2_hot_bytes"], 8);
+    // There is spare space, but not enough to admit this block without
+    // pruning the protected sample.
+    cache.put("cold", b"cccc").unwrap();
+    assert_eq!(cache.stats()["l2_bytes"], 8);
+    assert_eq!(cache.stats()["l2_writes"], 2);
+    for n in 0..(8 * 64) {
+        assert!(cache.get(&format!("miss:{n}"), None).is_none());
+    }
+    assert_eq!(cache.stats()["l2_stream_frozen"], 0);
+    assert_eq!(cache.stats()["l2_hot_bytes"], 0);
+    // One oversized block must not evict the entire existing cache.
+    cache.put("oversized", &[0; 11]).unwrap();
+    assert_eq!(cache.stats()["l2_bytes"], 8);
+    for n in 0..32 {
+        cache.put(&format!("next:{n}"), b"next").unwrap();
+    }
+    assert!(cache.stats()["l2_bytes"].as_u64().unwrap() <= 10);
+    assert!((0..32).any(|n| cache.get(&format!("next:{n}"), None).is_some()));
+}
+
+#[test]
 fn l2_limit_resolution_honors_disable_override_and_invalid_values() {
     assert_eq!(resolve_l2_limit(123, None, None), 123);
     assert_eq!(resolve_l2_limit(123, None, Some("456".into())), 456);
