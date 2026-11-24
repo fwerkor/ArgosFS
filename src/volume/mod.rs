@@ -130,6 +130,10 @@ mod read_fast_tests;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+#[path = "data_fanout_tests.rs"]
+mod stripe_fanout_tests;
+
 pub use autopilot::{AutopilotConfig, ReshapeReport};
 use helpers::*;
 use namespace::*;
