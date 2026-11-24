@@ -46,7 +46,7 @@ fn checksum_mismatch_removes_memory_and_l2_entries() {
 }
 
 #[test]
-fn l2_index_loads_existing_files_and_prunes_oldest_entries() {
+fn l2_index_loads_existing_files_and_prunes_to_limit() {
     let dir = tempdir().unwrap();
     let cache = BlockCache::new(dir.path(), 0, 5);
     let first = cache.l2_path("first");
