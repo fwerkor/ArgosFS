@@ -1516,6 +1516,52 @@ fn journal_append_position(
     Ok((header, write_offset, end.unwrap_or_default(), rollover))
 }
 
+// Scan the complete journal prefix as before, but fetch bounded contiguous
+// ranges rather than two tiny device requests for every record. This preserves
+// physical checksum/record hash validation on every append (including stale
+// prefixes) and avoids trusting an unverified cached tip.
+const JOURNAL_TIP_BATCH_BYTES: usize = 256 * 1024;
+
+struct JournalTipReader<'a> {
+    backend: &'a dyn StorageBackend,
+    sb: &'a RawSuperblock,
+    offset: u64,
+    end: u64,
+    buffer: Vec<u8>,
+    consumed: usize,
+}
+
+impl JournalTipReader<'_> {
+    fn read_exact(&mut self, mut output: &mut [u8]) -> Result<()> {
+        while !output.is_empty() {
+            if self.consumed == self.buffer.len() {
+                let count = self
+                    .end
+                    .saturating_sub(self.offset)
+                    .min(JOURNAL_TIP_BATCH_BYTES as u64) as usize;
+                if count == 0 {
+                    return Err(ArgosError::CorruptedMetadata(
+                        "truncated raw journal tip".into(),
+                    ));
+                }
+                self.buffer.resize(count, 0);
+                self.backend.read_at(
+                    &self.sb.disk_id,
+                    self.sb.journal.offset + self.offset,
+                    &mut self.buffer,
+                )?;
+                self.offset += count as u64;
+                self.consumed = 0;
+            }
+            let count = output.len().min(self.buffer.len() - self.consumed);
+            output[..count].copy_from_slice(&self.buffer[self.consumed..self.consumed + count]);
+            self.consumed += count;
+            output = &mut output[count..];
+        }
+        Ok(())
+    }
+}
+
 fn journal_tip_identity(
     backend: &dyn StorageBackend,
     sb: &RawSuperblock,
@@ -1527,10 +1573,18 @@ fn journal_tip_identity(
     }
     let end = get_u64(&header, 24)?.min(sb.journal.length);
     let mut cursor = RAW_HEADER_SIZE as u64;
+    let mut reader = JournalTipReader {
+        backend,
+        sb,
+        offset: cursor,
+        end,
+        buffer: Vec::new(),
+        consumed: 0,
+    };
     let mut tip = None;
     while cursor + 36 <= end {
         let mut entry_header = [0u8; 36];
-        backend.read_at(&sb.disk_id, sb.journal.offset + cursor, &mut entry_header)?;
+        reader.read_exact(&mut entry_header)?;
         let len = u32::from_le_bytes(entry_header[..4].try_into().unwrap()) as usize;
         if len == 0 || cursor + 36 + len as u64 > end {
             return Err(ArgosError::CorruptedMetadata(format!(
@@ -1539,7 +1593,7 @@ fn journal_tip_identity(
             )));
         }
         let mut bytes = vec![0u8; len];
-        backend.read_at(&sb.disk_id, sb.journal.offset + cursor + 36, &mut bytes)?;
+        reader.read_exact(&mut bytes)?;
         if hex::encode(&entry_header[4..36]) != sha256_hex(&bytes) {
             return Err(ArgosError::Checksum(format!(
                 "raw journal payload checksum mismatch at {}:{}",
