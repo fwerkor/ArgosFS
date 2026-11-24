@@ -1608,20 +1608,16 @@ fn push_array_splice(
             if i < left.len() && j < right.len() && json_values_identical(&left[i], &right[j]) {
                 break;
             }
-            let insert = (1..=insert_window)
-                .find(|offset| {
-                    i < left.len()
-                        && j + offset < right.len()
-                        && json_values_identical(&left[i], &right[j + offset])
-                })
-                .map(|offset| offset);
-            let delete = (1..=delete_window)
-                .find(|offset| {
-                    j < right.len()
-                        && i + offset < left.len()
-                        && json_values_identical(&left[i + offset], &right[j])
-                })
-                .map(|offset| offset);
+            let insert = (1..=insert_window).find(|offset| {
+                i < left.len()
+                    && j + offset < right.len()
+                    && json_values_identical(&left[i], &right[j + offset])
+            });
+            let delete = (1..=delete_window).find(|offset| {
+                j < right.len()
+                    && i + offset < left.len()
+                    && json_values_identical(&left[i + offset], &right[j])
+            });
             match (insert, delete) {
                 (Some(insert), Some(delete)) if insert <= delete => j += insert,
                 (Some(_), Some(delete)) => i += delete,
@@ -1721,16 +1717,21 @@ fn diff_json_array(
         // overwrite every position before that tail. This is cheap when a
         // freed extent is inserted near the end of a large sorted list, which
         // previously fell back to rewriting the entire 1.9 MB list.
-        for index in left.len()..right.len() {
+        for (index, value) in right.iter().enumerate().skip(left.len()) {
             ops.push(MetadataDeltaOp::Add {
                 path: push_json_pointer(path, &index.to_string()),
-                value: right[index].clone(),
+                value: value.clone(),
             });
         }
-        for index in prefix..left.len() {
+        for (index, value) in right
+            .iter()
+            .enumerate()
+            .skip(prefix)
+            .take(left.len().saturating_sub(prefix))
+        {
             ops.push(MetadataDeltaOp::Replace {
                 path: push_json_pointer(path, &index.to_string()),
-                value: right[index].clone(),
+                value: value.clone(),
             });
         }
         return true;
