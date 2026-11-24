@@ -936,3 +936,105 @@ fn verified_shard_assembly_bulk_copies_only_the_logical_payload() {
     // more bytes than the member payload actually contains.
     assert_eq!(assemble(usize::MAX), vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
 }
+
+#[test]
+fn prepared_write_matches_regular_encoding_and_revalidates_geometry() {
+    static BUDGET: AtomicUsize = AtomicUsize::new(0);
+    let dir = tempfile::tempdir().unwrap();
+    let fs = ArgosFs::create(
+        dir.path(),
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            compression: Compression::Zstd,
+            ..Default::default()
+        },
+        3,
+        false,
+    )
+    .unwrap();
+    let mut data = vec![7; 8192];
+    data.extend((0..8192).map(|i| (i % 251) as u8));
+    data.extend_from_slice(b"tail");
+    let geometry = EncodingGeometry::from_meta(&fs.metadata_snapshot()).unwrap();
+    let prepared = PreparedWrite::build_with_budget(geometry.clone(), &data, &BUDGET).unwrap();
+    assert_eq!(prepared.stripes.len(), 3);
+    assert_eq!(BUDGET.load(Ordering::Acquire), 1);
+    let mut snapshot = fs.metadata_snapshot();
+    assert!(prepared.matches(&snapshot, &data));
+    assert!(!prepared.matches(&snapshot, &data.clone()));
+    snapshot.config.compression_level += 1;
+    assert!(!prepared.matches(&snapshot, &data));
+    snapshot.config.compression_level -= 1;
+    snapshot.encryption.enabled = true;
+    assert!(!prepared.matches(&snapshot, &data));
+    let codec = RsCodec::new(geometry.k, geometry.m).unwrap();
+    for (stripe, raw) in prepared.stripes.iter().zip(data.chunks(8192)) {
+        let (payload, compression) =
+            transform_stripe(raw, geometry.compression, geometry.level).unwrap();
+        let (size, shards) = encode_payload(&payload, geometry.k, Some(&codec)).unwrap();
+        assert_eq!(stripe.codec, compression);
+        assert_eq!(stripe.compressed_size, payload.len());
+        assert_eq!(stripe.shard_size, size);
+        assert_eq!(stripe.encoded, shards);
+        assert_eq!(stripe.raw_sha256, content_hash_hex(raw));
+    }
+    let permits = (0..3)
+        .map(|_| PreparationPermit::acquire(&BUDGET).unwrap())
+        .collect::<Vec<_>>();
+    assert!(PreparedWrite::build_with_budget(geometry.clone(), &data, &BUDGET).is_none());
+    drop(permits);
+    drop(prepared);
+    assert_eq!(BUDGET.load(Ordering::Acquire), 0);
+    let oversized = vec![0; PREPARED_PAYLOAD_LIMIT];
+    assert!(PreparedWrite::build_with_budget(geometry, &oversized, &BUDGET).is_none());
+    assert_eq!(BUDGET.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn concurrent_unencrypted_overwrites_and_aligned_appends_recover() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = (0..3)
+        .map(|i| dir.path().join(format!("prepare-{i}.img")))
+        .collect::<Vec<_>>();
+    let fs = ArgosFs::create_loop(
+        &paths,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            compression: Compression::Zstd,
+            ..Default::default()
+        },
+        64 * 1024 * 1024,
+        "prepared-writes",
+        false,
+    )
+    .unwrap();
+    let barrier = std::sync::Barrier::new(3);
+    std::thread::scope(|scope| {
+        for (name, byte) in [("/a", 17u8), ("/b", 39u8)] {
+            let fs = &fs;
+            let barrier = &barrier;
+            scope.spawn(move || {
+                barrier.wait();
+                let payload = vec![byte; 8192 * 8];
+                fs.write_file(name, &payload, 0o600).unwrap();
+                let ino = fs.resolve_path(name, true).unwrap();
+                fs.write_inode_range(ino, payload.len() as u64, &payload)
+                    .unwrap();
+                assert_eq!(
+                    fs.read_file(name, false).unwrap(),
+                    vec![byte; payload.len() * 2]
+                );
+            });
+        }
+        barrier.wait();
+    });
+    fs.sync().unwrap();
+    drop(fs);
+    let fs = ArgosFs::open_loop(&paths, false).unwrap();
+    assert_eq!(fs.read_file("/a", false).unwrap(), vec![17; 8192 * 16]);
+    assert_eq!(fs.read_file("/b", false).unwrap(), vec![39; 8192 * 16]);
+}
