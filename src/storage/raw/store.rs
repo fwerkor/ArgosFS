@@ -600,28 +600,90 @@ fn checkpoint_fits(bytes: usize, slot_len: u64) -> bool {
         .is_some_and(|end| end <= slot_len)
 }
 
+// Retain small checkpoints directly, but do not allocate a full expanded
+// JSON image just to decide whether it must be compressed. The probe streams
+// the exact legacy serialization into a digest and a bounded prefix buffer.
+const CHECKPOINT_PROBE_BYTES: usize = 1024 * 1024;
+
+struct CheckpointProbe {
+    len: u64,
+    hash: Sha256,
+    small: Option<Vec<u8>>,
+}
+
+impl std::io::Write for CheckpointProbe {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.len = self
+            .len
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| std::io::Error::other("checkpoint size overflow"))?;
+        self.hash.update(bytes);
+        if let Some(small) = &mut self.small {
+            if self.len <= CHECKPOINT_PROBE_BYTES as u64 {
+                small.extend_from_slice(bytes);
+            } else {
+                self.small = None;
+            }
+        }
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn prepare_checkpoint_payload(
     metadata: &Metadata,
     superblocks: &[RawSuperblock],
 ) -> Result<CheckpointPayload> {
-    let bytes = serde_json::to_vec(metadata)?;
+    use std::io::Write;
+    let mut probe = CheckpointProbe {
+        len: 0,
+        hash: Sha256::new(),
+        small: Some(Vec::new()),
+    };
+    {
+        let mut writer = std::io::BufWriter::with_capacity(64 * 1024, &mut probe);
+        serde_json::to_writer(&mut writer, metadata)?;
+        writer.flush()?;
+    }
+    let len = checked_usize(probe.len, "checkpoint expanded length")?;
     if superblocks
         .iter()
-        .all(|sb| checkpoint_fits(bytes.len(), sb.metadata.length / 2))
+        .all(|sb| checkpoint_fits(len, sb.metadata.length / 2))
     {
+        // Large uncompressed images need their exact legacy bytes anyway.
+        // Preserve that encoding and COW page reuse instead of forcing zstd.
         return Ok(CheckpointPayload {
-            bytes,
+            bytes: match probe.small {
+                Some(bytes) => bytes,
+                None => serde_json::to_vec(metadata)?,
+            },
             original: None,
         });
     }
-    if bytes.len() as u64 > METADATA_DECOMPRESSED_MAX {
+    if probe.len > METADATA_DECOMPRESSED_MAX {
         return Err(ArgosError::Invalid(format!(
             "metadata checkpoint exceeds {}-byte supported expansion limit",
             METADATA_DECOMPRESSED_MAX
         )));
     }
-    let original = (bytes.len() as u64, sha256_hex(&bytes));
-    let compressed = zstd::stream::encode_all(bytes.as_slice(), CHECKPOINT_ZSTD_LEVEL)?;
+    let original = (probe.len, hex::encode(probe.hash.finalize()));
+    let compressed = if let Some(bytes) = probe.small {
+        zstd::stream::encode_all(bytes.as_slice(), CHECKPOINT_ZSTD_LEVEL)?
+    } else {
+        // Stream the second serialization directly into the compressor. The
+        // immutable snapshot and deterministic inode ordering make both passes
+        // identical. No expanded JSON Vec is retained for the compressed path.
+        let encoder = zstd::stream::write::Encoder::new(Vec::new(), CHECKPOINT_ZSTD_LEVEL)?;
+        let mut writer = std::io::BufWriter::with_capacity(64 * 1024, encoder);
+        serde_json::to_writer(&mut writer, metadata)?;
+        writer.flush()?;
+        writer
+            .into_inner()
+            .map_err(|err| err.into_error())?
+            .finish()?
+    };
     Ok(CheckpointPayload {
         bytes: compressed,
         original: Some(original),
@@ -639,7 +701,7 @@ fn prepare_checkpoint_writes(
         "checkpoint",
         metadata.txid,
         metadata.integrity.generation,
-        &payload.bytes,
+        payload.bytes,
         &hash,
         u64::MAX,
         payload.original.as_ref(),
@@ -898,7 +960,7 @@ fn write_metadata_slot(
     checkpoint: &MetadataTreeCheckpoint,
     metrics: Option<&CommitMetrics>,
 ) -> Result<()> {
-    for (relative_offset, data) in &checkpoint.body_writes {
+    for (relative_offset, data) in checkpoint.body_writes() {
         backend.write_at(&sb.disk_id, offset + relative_offset, data)?;
         if let Some(metrics) = metrics {
             metrics.add_raw_write_bytes(RawWriteKind::Checkpoint, data.len());
@@ -931,7 +993,7 @@ fn write_metadata_slot_differential(
     metrics: Option<&CommitMetrics>,
 ) -> Result<()> {
     let mut old = vec![0u8; CHECKPOINT_BATCH_BYTES];
-    for (relative, data) in &checkpoint.body_writes {
+    for (relative, data) in checkpoint.body_writes() {
         for (chunk_index, chunk) in data.chunks(CHECKPOINT_BATCH_BYTES).enumerate() {
             let absolute = offset + relative + (chunk_index * CHECKPOINT_BATCH_BYTES) as u64;
             let readable = backend
@@ -2931,8 +2993,31 @@ fn metadata_hash_for_replay(metadata: &Metadata) -> Result<String> {
 
 struct MetadataTreeCheckpoint {
     header: [u8; RAW_HEADER_SIZE],
-    body_writes: Vec<(u64, Vec<u8>)>,
+    // Own the encoded payload once. Each member borrows the same bytes in
+    // bounded contiguous batches; the index is the only extra full-size
+    // allocation (48 bytes per 4 KiB page).
+    payload: Vec<u8>,
+    index: Vec<u8>,
+    data_start: u64,
     required_len: u64,
+}
+
+impl MetadataTreeCheckpoint {
+    fn body_writes(&self) -> impl Iterator<Item = (u64, &[u8])> {
+        self.payload
+            .chunks(CHECKPOINT_BATCH_BYTES)
+            .enumerate()
+            .map(|(batch, bytes)| {
+                (
+                    self.data_start + (batch * CHECKPOINT_BATCH_BYTES) as u64,
+                    bytes,
+                )
+            })
+            .chain(std::iter::once((
+                RAW_HEADER_SIZE as u64,
+                self.index.as_slice(),
+            )))
+    }
 }
 
 #[cfg(test)]
@@ -2944,14 +3029,22 @@ fn metadata_tree_checkpoint(
     hash: &str,
     slot_len: u64,
 ) -> Result<MetadataTreeCheckpoint> {
-    metadata_tree_checkpoint_encoded(disk_id, txid, generation, bytes, hash, slot_len, None)
+    metadata_tree_checkpoint_encoded(
+        disk_id,
+        txid,
+        generation,
+        bytes.to_vec(),
+        hash,
+        slot_len,
+        None,
+    )
 }
 
 fn metadata_tree_checkpoint_encoded(
     disk_id: &str,
     txid: u64,
     generation: u64,
-    bytes: &[u8],
+    bytes: Vec<u8>,
     hash: &str,
     slot_len: u64,
     original: Option<&(u64, String)>,
@@ -2995,9 +3088,6 @@ fn metadata_tree_checkpoint_encoded(
     }
 
     let mut index = vec![0u8; index_len];
-    let mut body_writes = Vec::with_capacity(bytes.len().div_ceil(CHECKPOINT_BATCH_BYTES) + 1);
-    let mut batch_offset = 0u64;
-    let mut batch = Vec::with_capacity(CHECKPOINT_BATCH_BYTES);
     for page_index in 0..page_count {
         let start = page_index * METADATA_PAGE_SIZE;
         let end = (start + METADATA_PAGE_SIZE).min(bytes.len());
@@ -3016,26 +3106,8 @@ fn metadata_tree_checkpoint_encoded(
             })?;
         put_u64(entry, 32, relative_offset);
         put_u32(entry, 40, page.len() as u32);
-        if batch.is_empty() {
-            batch_offset = relative_offset;
-        }
-        // Page boundaries remain unchanged in the on-disk index. The write
-        // batches are an I/O-only optimization; the reader still validates
-        // each individual 4 KiB page plus the full metadata checksum.
-        if !batch.is_empty()
-            && (batch_offset + batch.len() as u64 != relative_offset
-                || batch.len() + page.len() > CHECKPOINT_BATCH_BYTES)
-        {
-            body_writes.push((batch_offset, std::mem::take(&mut batch)));
-            batch_offset = relative_offset;
-        }
-        batch.extend_from_slice(page);
-    }
-    if !batch.is_empty() {
-        body_writes.push((batch_offset, batch));
     }
     let index_hash = sha256_hex(&index);
-    body_writes.push((RAW_HEADER_SIZE as u64, index));
 
     let mut out = [0u8; RAW_HEADER_SIZE];
     out[..16].copy_from_slice(METADATA_MAGIC);
@@ -3063,7 +3135,9 @@ fn metadata_tree_checkpoint_encoded(
     put_fixed_str(&mut out, 168, HASH_HEX_LEN, &index_hash);
     Ok(MetadataTreeCheckpoint {
         header: out,
-        body_writes,
+        payload: bytes,
+        index,
+        data_start,
         required_len: data_end,
     })
 }
