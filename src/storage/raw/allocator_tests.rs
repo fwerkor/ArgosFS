@@ -463,3 +463,139 @@ fn benchmark_fragmented_allocation_bound() {
     assert_eq!(cold.free_extents, warm.free_extents);
     println!("47000 small extents, 1000 large allocations: scan={old:?}, bounded={new:?}, speedup={:.1}x", old.as_secs_f64()/new.as_secs_f64());
 }
+
+#[test]
+fn indexed_first_fit_matches_linear_placement_through_mutations() {
+    let mut state = init_allocator(4096, 4096 * 300_000, 4096);
+    state.free_extents = (0..5000)
+        .map(|i| RawFreeExtent {
+            offset: (i * 16 + 1) * 4096,
+            length: ((i % 7) + 1) * 4096,
+        })
+        .collect();
+    state.next_offset = 100_000 * 4096;
+    let mut seed = 17u64;
+    for i in 0..400 {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let size = ((seed >> 32) % 9 + 1) * 4096;
+        let expected = state
+            .free_extents
+            .iter()
+            .find(|e| e.length >= size && e.offset % 4096 == 0)
+            .map(|e| e.offset)
+            .unwrap_or(state.next_offset);
+        let snapshot = state.clone();
+        let extent = allocate(&mut state, "disk", size, i).unwrap();
+        assert_eq!(extent.offset, expected);
+        if i % 3 == 0 {
+            free(&mut state, &extent).unwrap();
+        }
+        if i % 17 == 0 {
+            assert_eq!(
+                snapshot
+                    .free_extents
+                    .iter()
+                    .find(|e| e.length >= size)
+                    .map(|e| e.offset)
+                    .unwrap_or(snapshot.next_offset),
+                expected
+            );
+        }
+    }
+    // External mutation invalidates all derived indexes; a new fit must win.
+    state.free_extents[0].length = 8192;
+    let expected = state.free_extents[0].offset;
+    assert_eq!(
+        allocate(&mut state, "disk", 8192, 999).unwrap().offset,
+        expected
+    );
+}
+
+#[test]
+fn indexed_fit_preserves_alignment_and_legacy_unsorted_order() {
+    let mut state = init_allocator(4096, 4096 * 300_000, 4096);
+    state.free_extents = (0..5000)
+        .map(|i| RawFreeExtent {
+            offset: (i * 16 + 1) * 4096 + if i == 0 { 1 } else { 0 },
+            length: 8192,
+        })
+        .collect();
+    assert_eq!(
+        allocate(&mut state, "disk", 8192, 1).unwrap().offset,
+        17 * 4096
+    );
+    state.free_extents = state.free_extents.iter().rev().cloned().collect();
+    let expected = state.free_extents[0].offset;
+    assert_eq!(
+        allocate(&mut state, "disk", 8192, 2).unwrap().offset,
+        expected
+    );
+}
+
+#[test]
+#[ignore = "synthetic first-fit index benchmark"]
+fn benchmark_indexed_late_first_fit() {
+    let mut base = init_allocator(4096, 4096 * 300_000, 4096);
+    base.free_extents = (0..47_000)
+        .map(|i| RawFreeExtent {
+            offset: (i * 4 + 1) * 4096,
+            length: if i < 46_000 { 4096 } else { 8192 },
+        })
+        .collect();
+    base.next_offset = 200_000 * 4096;
+    let mut old = base.clone();
+    let began = std::time::Instant::now();
+    for _ in 0..1000 {
+        let pos = old
+            .free_extents
+            .iter()
+            .position(|e| e.length >= 8192)
+            .unwrap();
+        std::hint::black_box(old.free_extents.remove(pos));
+    }
+    let linear = began.elapsed();
+    let began = std::time::Instant::now();
+    for i in 0..1000 {
+        std::hint::black_box(allocate(&mut base, "disk", 8192, i).unwrap());
+    }
+    let indexed = began.elapsed();
+    assert_eq!(old.free_extents, base.free_extents);
+    println!("47000 extents, 1000 late first-fits: linear={linear:?}, indexed={indexed:?}, speedup={:.1}x",linear.as_secs_f64()/indexed.as_secs_f64());
+}
+
+#[test]
+fn indexed_capacity_matches_scan_after_mutations_and_legacy_edits() {
+    let mut state = init_allocator(4096, 4096 * 300_000, 4096);
+    state.free_extents = (0..5000)
+        .map(|i| RawFreeExtent {
+            offset: (i * 16 + 1) * 4096,
+            length: (i % 7 + 1) * 4096,
+        })
+        .collect();
+    state.next_offset = 100_000 * 4096;
+    fn check(state: &RawAllocatorState) {
+        for block in [4096, 8192] {
+            let expected = state
+                .free_extents
+                .iter()
+                .map(|e| e.length / block * block)
+                .sum::<u64>();
+            assert_eq!(state.free_extents.aligned_free_bytes(block), expected);
+        }
+    }
+    check(&state);
+    let snapshot = state.clone();
+    for n in 0..100 {
+        let extent = allocate(&mut state, "disk", (n % 8 + 1) * 4096, n).unwrap();
+        check(&state);
+        if n % 2 == 0 {
+            free(&mut state, &extent).unwrap();
+            check(&state);
+        }
+    }
+    check(&snapshot);
+    state.free_extents[0].length += 4096;
+    check(&state);
+    state.free_extents = state.free_extents.iter().rev().cloned().collect();
+    check(&state);
+}

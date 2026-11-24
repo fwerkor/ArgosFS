@@ -26,6 +26,13 @@ pub fn allocate(
         .is_some_and(|bound| bound < length)
     {
         None
+    } else if let Some(found) = state.free_extents.indexed_fit(length, block_size) {
+        if found.is_none() {
+            if let Some(index) = state.free_extents.take_fit_index() {
+                state.free_extents.restore_fit_index(index);
+            }
+        }
+        found
     } else {
         let mut max_seen = 0;
         let found = state
@@ -47,6 +54,16 @@ pub fn allocate(
         let offset = free.offset;
         let preserve_proof = state.free_extents.known_normalized();
         let old_bound = state.free_extents.known_length_upper_bound();
+        let mut fit_index = state.free_extents.take_fit_index();
+        if let Some(index) = &mut fit_index {
+            index.remove(&free);
+            if free.length > length {
+                index.insert(&RawFreeExtent {
+                    offset: free.offset.saturating_add(length),
+                    length: free.length - length,
+                });
+            }
+        }
         if free.length == length {
             state.free_extents.remove(index);
         } else if let Some(slot) = state.free_extents.get_mut(index) {
@@ -59,6 +76,9 @@ pub fn allocate(
         // Allocation cannot enlarge an existing free extent.
         if let Some(bound) = old_bound {
             state.free_extents.mark_length_upper_bound(bound);
+        }
+        if let Some(index) = fit_index {
+            state.free_extents.restore_fit_index(index);
         }
         return Ok(PhysicalExtent {
             disk_id: disk_id.to_string(),
@@ -149,6 +169,13 @@ pub fn free(state: &mut RawAllocatorState, extent: &PhysicalExtent) -> Result<()
         length: end.saturating_sub(start),
     };
     let merged_length = replacement.length;
+    let mut fit_index = free.take_fit_index();
+    if let Some(index) = &mut fit_index {
+        for i in first..last {
+            index.remove(&free[i]);
+        }
+        index.insert(&replacement);
+    }
     if last == first + 1 {
         free[first] = replacement;
     } else if first == last {
@@ -162,6 +189,9 @@ pub fn free(state: &mut RawAllocatorState, extent: &PhysicalExtent) -> Result<()
     free.mark_normalized();
     if let Some(bound) = old_bound {
         free.mark_length_upper_bound(bound.max(merged_length));
+    }
+    if let Some(index) = fit_index {
+        free.restore_fit_index(index);
     }
     Ok(())
 }
