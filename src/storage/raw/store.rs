@@ -639,7 +639,7 @@ fn prepare_checkpoint_writes(
         "checkpoint",
         metadata.txid,
         metadata.integrity.generation,
-        &payload.bytes,
+        payload.bytes,
         &hash,
         u64::MAX,
         payload.original.as_ref(),
@@ -898,7 +898,7 @@ fn write_metadata_slot(
     checkpoint: &MetadataTreeCheckpoint,
     metrics: Option<&CommitMetrics>,
 ) -> Result<()> {
-    for (relative_offset, data) in &checkpoint.body_writes {
+    for (relative_offset, data) in checkpoint.body_writes() {
         backend.write_at(&sb.disk_id, offset + relative_offset, data)?;
         if let Some(metrics) = metrics {
             metrics.add_raw_write_bytes(RawWriteKind::Checkpoint, data.len());
@@ -931,7 +931,7 @@ fn write_metadata_slot_differential(
     metrics: Option<&CommitMetrics>,
 ) -> Result<()> {
     let mut old = vec![0u8; CHECKPOINT_BATCH_BYTES];
-    for (relative, data) in &checkpoint.body_writes {
+    for (relative, data) in checkpoint.body_writes() {
         for (chunk_index, chunk) in data.chunks(CHECKPOINT_BATCH_BYTES).enumerate() {
             let absolute = offset + relative + (chunk_index * CHECKPOINT_BATCH_BYTES) as u64;
             let readable = backend
@@ -2994,8 +2994,31 @@ fn metadata_hash_for_replay(metadata: &Metadata) -> Result<String> {
 
 struct MetadataTreeCheckpoint {
     header: [u8; RAW_HEADER_SIZE],
-    body_writes: Vec<(u64, Vec<u8>)>,
+    // Own the encoded payload once. Each member borrows the same bytes in
+    // bounded contiguous batches; the index is the only extra full-size
+    // allocation (48 bytes per 4 KiB page).
+    payload: Vec<u8>,
+    index: Vec<u8>,
+    data_start: u64,
     required_len: u64,
+}
+
+impl MetadataTreeCheckpoint {
+    fn body_writes(&self) -> impl Iterator<Item = (u64, &[u8])> {
+        self.payload
+            .chunks(CHECKPOINT_BATCH_BYTES)
+            .enumerate()
+            .map(|(batch, bytes)| {
+                (
+                    self.data_start + (batch * CHECKPOINT_BATCH_BYTES) as u64,
+                    bytes,
+                )
+            })
+            .chain(std::iter::once((
+                RAW_HEADER_SIZE as u64,
+                self.index.as_slice(),
+            )))
+    }
 }
 
 #[cfg(test)]
@@ -3007,14 +3030,22 @@ fn metadata_tree_checkpoint(
     hash: &str,
     slot_len: u64,
 ) -> Result<MetadataTreeCheckpoint> {
-    metadata_tree_checkpoint_encoded(disk_id, txid, generation, bytes, hash, slot_len, None)
+    metadata_tree_checkpoint_encoded(
+        disk_id,
+        txid,
+        generation,
+        bytes.to_vec(),
+        hash,
+        slot_len,
+        None,
+    )
 }
 
 fn metadata_tree_checkpoint_encoded(
     disk_id: &str,
     txid: u64,
     generation: u64,
-    bytes: &[u8],
+    bytes: Vec<u8>,
     hash: &str,
     slot_len: u64,
     original: Option<&(u64, String)>,
@@ -3058,9 +3089,6 @@ fn metadata_tree_checkpoint_encoded(
     }
 
     let mut index = vec![0u8; index_len];
-    let mut body_writes = Vec::with_capacity(bytes.len().div_ceil(CHECKPOINT_BATCH_BYTES) + 1);
-    let mut batch_offset = 0u64;
-    let mut batch = Vec::with_capacity(CHECKPOINT_BATCH_BYTES);
     for page_index in 0..page_count {
         let start = page_index * METADATA_PAGE_SIZE;
         let end = (start + METADATA_PAGE_SIZE).min(bytes.len());
@@ -3079,26 +3107,8 @@ fn metadata_tree_checkpoint_encoded(
             })?;
         put_u64(entry, 32, relative_offset);
         put_u32(entry, 40, page.len() as u32);
-        if batch.is_empty() {
-            batch_offset = relative_offset;
-        }
-        // Page boundaries remain unchanged in the on-disk index. The write
-        // batches are an I/O-only optimization; the reader still validates
-        // each individual 4 KiB page plus the full metadata checksum.
-        if !batch.is_empty()
-            && (batch_offset + batch.len() as u64 != relative_offset
-                || batch.len() + page.len() > CHECKPOINT_BATCH_BYTES)
-        {
-            body_writes.push((batch_offset, std::mem::take(&mut batch)));
-            batch_offset = relative_offset;
-        }
-        batch.extend_from_slice(page);
-    }
-    if !batch.is_empty() {
-        body_writes.push((batch_offset, batch));
     }
     let index_hash = sha256_hex(&index);
-    body_writes.push((RAW_HEADER_SIZE as u64, index));
 
     let mut out = [0u8; RAW_HEADER_SIZE];
     out[..16].copy_from_slice(METADATA_MAGIC);
@@ -3126,7 +3136,9 @@ fn metadata_tree_checkpoint_encoded(
     put_fixed_str(&mut out, 168, HASH_HEX_LEN, &index_hash);
     Ok(MetadataTreeCheckpoint {
         header: out,
-        body_writes,
+        payload: bytes,
+        index,
+        data_start,
         required_len: data_end,
     })
 }
