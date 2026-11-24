@@ -91,9 +91,24 @@ pub(super) fn prepare_loop_images(paths: &[PathBuf], image_size: u64, force: boo
     Ok(())
 }
 
-pub(super) fn block_cache_root(volume_uuid: &str, paths: &[PathBuf]) -> PathBuf {
+/// Raw devices may be passed by `/dev/disk/by-*` symlinks. The device
+/// directory is usually devtmpfs, not a suitable persistent L2 store.
+/// Loop images retain their colocated cache for test and portable pools.
+pub(super) fn block_cache_root(
+    volume_uuid: &str,
+    backend: BackendKind,
+    paths: &[PathBuf],
+) -> PathBuf {
     if let Some(root) = std::env::var_os("ARGOSFS_BLOCK_CACHE_DIR") {
         return PathBuf::from(root).join(volume_uuid);
+    }
+    if backend == BackendKind::RawBlock {
+        return raw_block_cache_base(
+            current_uid(),
+            std::env::var_os("XDG_CACHE_HOME").as_deref().map(Path::new),
+            std::env::var_os("HOME").as_deref().map(Path::new),
+        )
+        .join(volume_uuid);
     }
     let mut root = paths
         .first()
@@ -103,6 +118,20 @@ pub(super) fn block_cache_root(volume_uuid: &str, paths: &[PathBuf]) -> PathBuf 
     root.push(".argosfs-block-cache");
     root.push(volume_uuid);
     root
+}
+
+pub(super) fn raw_block_cache_base(uid: u32, xdg: Option<&Path>, home: Option<&Path>) -> PathBuf {
+    if uid != 0 {
+        if let Some(xdg) = xdg.filter(|path| path.is_absolute()) {
+            return xdg.join("argosfs/blocks");
+        }
+        if let Some(home) = home.filter(|path| path.is_absolute()) {
+            return home.join(".cache/argosfs/blocks");
+        }
+    }
+    // No fallback to a device directory or a shared temporary directory.
+    // An unwritable cache is optional; callers may override or disable L2.
+    PathBuf::from("/var/cache/argosfs/blocks")
 }
 
 pub(super) fn root_inode(created_at: f64) -> Inode {

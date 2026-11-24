@@ -119,19 +119,57 @@ fn block_cache_root_honors_override_and_path_fallbacks() {
     std::env::remove_var("ARGOSFS_BLOCK_CACHE_DIR");
     let path = PathBuf::from("/tmp/argosfs-device.img");
     assert_eq!(
-        block_cache_root("uuid", &[path]),
+        block_cache_root("uuid", BackendKind::LoopBlock, &[path]),
         PathBuf::from("/tmp/.argosfs-block-cache/uuid")
     );
     assert_eq!(
-        block_cache_root("uuid", &[]),
+        block_cache_root("uuid", BackendKind::LoopBlock, &[]),
         std::env::temp_dir().join(".argosfs-block-cache/uuid")
     );
     std::env::set_var("ARGOSFS_BLOCK_CACHE_DIR", "/tmp/custom-cache");
     assert_eq!(
-        block_cache_root("uuid", &[]),
+        block_cache_root("uuid", BackendKind::LoopBlock, &[]),
+        PathBuf::from("/tmp/custom-cache/uuid")
+    );
+    assert_eq!(
+        block_cache_root("uuid", BackendKind::RawBlock, &[PathBuf::from("/dev/sda")]),
         PathBuf::from("/tmp/custom-cache/uuid")
     );
     std::env::remove_var("ARGOSFS_BLOCK_CACHE_DIR");
+    let raw = block_cache_root("uuid", BackendKind::RawBlock, &[PathBuf::from("/dev/sda")]);
+    assert_eq!(
+        raw,
+        block_cache_root(
+            "uuid",
+            BackendKind::RawBlock,
+            &[PathBuf::from("/dev/disk/by-partlabel/pool")]
+        )
+    );
+    assert!(!raw.starts_with("/dev"));
+}
+
+#[test]
+fn raw_cache_base_is_host_storage_and_ignores_relative_xdg_paths() {
+    assert_eq!(
+        raw_block_cache_base(0, Some(Path::new("/custom")), Some(Path::new("/root"))),
+        PathBuf::from("/var/cache/argosfs/blocks")
+    );
+    assert_eq!(
+        raw_block_cache_base(1000, Some(Path::new("/home/user/custom")), None),
+        PathBuf::from("/home/user/custom/argosfs/blocks")
+    );
+    assert_eq!(
+        raw_block_cache_base(
+            1000,
+            Some(Path::new("relative")),
+            Some(Path::new("/home/user"))
+        ),
+        PathBuf::from("/home/user/.cache/argosfs/blocks")
+    );
+    assert_eq!(
+        raw_block_cache_base(1000, None, None),
+        PathBuf::from("/var/cache/argosfs/blocks")
+    );
 }
 
 #[test]

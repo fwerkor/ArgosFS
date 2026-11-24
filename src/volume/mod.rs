@@ -714,7 +714,7 @@ impl ArgosFs {
             )));
         }
         let _ = RsCodec::new(meta.config.k, meta.config.m)?;
-        let cache_root = block_cache_root(&meta.uuid, paths);
+        let cache_root = block_cache_root(&meta.uuid, meta.backend, paths);
         let cache = BlockCache::new(cache_root, 64 * 1024 * 1024, meta.config.l2_cache_bytes);
         let root = paths
             .first()
