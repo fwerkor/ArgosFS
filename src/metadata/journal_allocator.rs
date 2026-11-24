@@ -438,12 +438,16 @@ mod splice_tests {
 
     #[test]
     fn sorted_allocator_splices_share_chunks_and_match_generic_replay() {
-        let left: imbl::Vector<_> = (0..47_000u64)
-            .map(|i| RawFreeExtent {
-                offset: (i * 4 + 1) * 4096,
-                length: 4096,
-            })
-            .collect();
+        let left = RawAllocatorState {
+            free_extents: (0..47_000u64)
+                .map(|i| RawFreeExtent {
+                    offset: (i * 4 + 1) * 4096,
+                    length: 4096,
+                })
+                .collect(),
+            ..Default::default()
+        }
+        .free_extents;
         let mut right = left.clone();
         // Widely separated insertions and removals, beyond generic lookahead.
         right.insert(
@@ -511,12 +515,16 @@ mod splice_tests {
 
     #[test]
     fn allocator_splice_gate_preserves_legacy_encoding() {
-        let left: imbl::Vector<_> = (0..1000u64)
-            .map(|i| RawFreeExtent {
-                offset: i * 4096 * 4,
-                length: 4096,
-            })
-            .collect();
+        let left = RawAllocatorState {
+            free_extents: (0..1000u64)
+                .map(|i| RawFreeExtent {
+                    offset: i * 4096 * 4,
+                    length: 4096,
+                })
+                .collect(),
+            ..Default::default()
+        }
+        .free_extents;
         let mut right = left.clone();
         right.insert(
             100,
