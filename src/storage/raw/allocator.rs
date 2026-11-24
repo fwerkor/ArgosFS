@@ -79,11 +79,43 @@ pub fn free(state: &mut RawAllocatorState, extent: &PhysicalExtent) -> Result<()
     if extent.length == 0 {
         return Ok(());
     }
-    state.free_extents.push(RawFreeExtent {
-        offset: extent.offset,
-        length: extent.length,
-    });
-    coalesce(state);
+    let mut start = extent.offset;
+    let mut end = extent.offset.saturating_add(extent.length);
+    let free = &mut state.free_extents;
+    // Existing pools can contain unsorted or uncoalesced lists. Keep the
+    // old normalization semantics for these exceptional inputs; generated
+    // free lists are sorted and strictly separated after every mutation.
+    if !free
+        .windows(2)
+        .all(|pair| pair[0].offset.saturating_add(pair[0].length) < pair[1].offset)
+    {
+        free.push(RawFreeExtent {
+            offset: start,
+            length: extent.length,
+        });
+        coalesce(state);
+        return Ok(());
+    }
+    // Only neighbors intersecting or touching the new range need merging.
+    // Reuse the existing allocation instead of sorting and rebuilding a
+    // potentially hundreds-of-thousands-entry free list on each reclamation.
+    let first = free.partition_point(|entry| entry.offset.saturating_add(entry.length) < start);
+    let mut last = first;
+    while let Some(entry) = free.get(last) {
+        if entry.offset > end {
+            break;
+        }
+        start = start.min(entry.offset);
+        end = end.max(entry.offset.saturating_add(entry.length));
+        last += 1;
+    }
+    free.splice(
+        first..last,
+        std::iter::once(RawFreeExtent {
+            offset: start,
+            length: end.saturating_sub(start),
+        }),
+    );
     Ok(())
 }
 
