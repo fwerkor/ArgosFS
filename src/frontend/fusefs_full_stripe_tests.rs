@@ -344,3 +344,128 @@ fn large_stripe_append_buffers_until_a_complete_stripe_is_available() {
     volume.sync().unwrap();
     assert_eq!(volume.read_file("/stream", false).unwrap(), expected);
 }
+
+#[test]
+fn disjoint_same_stripe_writes_commit_once_and_preserve_clean_gaps() {
+    const CHUNK: usize = 4096;
+    let (_dir, volume, ino) = fixture(2, 1, CHUNK);
+    let mut expected = (0..2 * CHUNK).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+    volume.write_inode_range(ino, 0, &expected).unwrap();
+    let fuse = ArgosFuse::new(volume.clone());
+    let before = volume.metadata_snapshot().next_stripe;
+    for (start, data) in [
+        (4096usize, b"right".as_slice()),
+        (100, b"left"),
+        (102, b"override"),
+        (2048, b"middle"),
+    ] {
+        assert!(fuse
+            .queue_writeback_staged(ino, start as u64, data)
+            .unwrap());
+        expected[start..start + data.len()].copy_from_slice(data);
+    }
+    assert_eq!(volume.metadata_snapshot().next_stripe, before);
+    assert!(!fuse.writeback.lock().dirty[&ino].gaps.is_empty());
+    assert_eq!(
+        fuse.read_visible_inode(ino, 0, expected.len()).unwrap(),
+        expected
+    );
+    // A clean gap can change after buffering; commit must read current bytes
+    // instead of publishing the placeholder or an old snapshot.
+    volume
+        .write_inode_range(ino, 3000, b"new gap data")
+        .unwrap();
+    expected[3000..3012].copy_from_slice(b"new gap data");
+    assert_eq!(
+        fuse.read_visible_inode(ino, 0, expected.len()).unwrap(),
+        expected
+    );
+    let before_flush = volume.metadata_snapshot().next_stripe;
+    fuse.flush_inode_writeback(ino).unwrap();
+    volume.sync().unwrap();
+    assert_eq!(volume.metadata_snapshot().next_stripe - before_flush, 1);
+    assert_eq!(volume.read_file("/stream", false).unwrap(), expected);
+    assert_eq!(fuse.writeback.lock().pending_bytes, 0);
+}
+
+#[test]
+fn disjoint_sparse_writes_preserve_zero_gaps_and_retry_after_quota_failure() {
+    const CHUNK: usize = 4096;
+    let (_dir, volume, _) = fixture(2, 1, CHUNK);
+    volume.mkdir("/quota", 0o755).unwrap();
+    let ino = volume.create_file_path("/quota/file", 0o600).unwrap();
+    volume.set_directory_quota("/quota", 1024).unwrap();
+    let fuse = ArgosFuse::new(volume.clone());
+    assert!(fuse.queue_writeback_staged(ino, 100, b"left").unwrap());
+    assert!(fuse.queue_writeback_staged(ino, 4096, b"right").unwrap());
+    let mut expected = vec![0; 4101];
+    expected[100..104].copy_from_slice(b"left");
+    expected[4096..].copy_from_slice(b"right");
+    assert_eq!(
+        fuse.read_visible_inode(ino, 0, expected.len()).unwrap(),
+        expected
+    );
+    assert!(matches!(
+        fuse.flush_inode_writeback(ino),
+        Err(ArgosError::QuotaExceeded { .. })
+    ));
+    assert_eq!(volume.attr_inode(ino).unwrap().size, 0);
+    assert_eq!(
+        fuse.read_visible_inode(ino, 0, expected.len()).unwrap(),
+        expected
+    );
+    volume.clear_directory_quota("/quota").unwrap();
+    fuse.flush_inode_writeback(ino).unwrap();
+    volume.sync().unwrap();
+    assert_eq!(volume.read_file("/quota/file", false).unwrap(), expected);
+}
+
+#[test]
+fn raw_disjoint_writeback_survives_sync_reopen_and_journal_verification() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|i| dir.path().join(format!("disjoint-{i}.img")))
+        .collect::<Vec<_>>();
+    let volume = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            compression: Compression::None,
+            defer_metadata_commit: true,
+            defer_journal_flush: true,
+            defer_data_flush: true,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "disjoint-raw",
+        false,
+    )
+    .unwrap();
+    let ino = volume.create_file_path("/stream", 0o600).unwrap();
+    let mut expected = vec![0x81; 8192];
+    volume.write_inode_range(ino, 0, &expected).unwrap();
+    volume.sync().unwrap();
+    let fuse = ArgosFuse::new(volume.clone());
+    for (offset, data) in [
+        (5000usize, b"last".as_slice()),
+        (10, b"first"),
+        (2500, b"mid"),
+    ] {
+        assert!(fuse
+            .queue_writeback_staged(ino, offset as u64, data)
+            .unwrap());
+        expected[offset..offset + data.len()].copy_from_slice(data);
+    }
+    let start = volume.metadata_snapshot().next_stripe;
+    fuse.flush_inode_writeback(ino).unwrap();
+    volume.sync().unwrap();
+    assert_eq!(volume.metadata_snapshot().next_stripe - start, 1);
+    drop(fuse);
+    drop(volume);
+    let reopened = ArgosFs::open_loop(&images, false).unwrap();
+    assert_eq!(reopened.read_file("/stream", false).unwrap(), expected);
+    assert_eq!(reopened.transaction_report().unwrap().invalid_entries, 0);
+    assert_eq!(reopened.fsck(false, false).unwrap().missing_shards, 0);
+}

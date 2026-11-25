@@ -109,6 +109,7 @@ fn missing_inode_keeps_enoent_for_xattr_operations() {
 #[test]
 fn dirty_extent_merges_adjacent_and_overlapping_writes() {
     let mut dirty = DirtyExtent {
+        gaps: Vec::new(),
         offset: 10,
         data: b"abcd".to_vec(),
         written_at: 1.0,
@@ -129,6 +130,7 @@ fn dirty_extent_reuses_reserved_capacity_across_sequential_writes() {
     let mut data = Vec::with_capacity(128 * 1024);
     data.extend_from_slice(b"abcd");
     let mut dirty = DirtyExtent {
+        gaps: Vec::new(),
         offset: 64,
         data,
         written_at: 1.0,
@@ -155,6 +157,7 @@ fn dirty_extent_reuses_reserved_capacity_across_sequential_writes() {
 #[test]
 fn dirty_extent_prepend_and_overlapping_extension_preserve_last_write() {
     let mut dirty = DirtyExtent {
+        gaps: Vec::new(),
         offset: 10,
         data: b"34567".to_vec(),
         written_at: 1.0,
@@ -170,6 +173,7 @@ fn dirty_extent_prepend_and_overlapping_extension_preserve_last_write() {
 #[test]
 fn dirty_extent_rejects_gaps_and_oversized_merges() {
     let mut dirty = DirtyExtent {
+        gaps: Vec::new(),
         offset: 10,
         data: b"abcd".to_vec(),
         written_at: 1.0,
@@ -607,6 +611,7 @@ fn handle_allocator_skips_collisions_and_tolerates_missing_ref_counts() {
 #[test]
 fn dirty_extent_checked_arithmetic_and_queue_limits_are_enforced() {
     let mut overflowing_existing = DirtyExtent {
+        gaps: Vec::new(),
         offset: u64::MAX,
         data: vec![1],
         written_at: 1.0,
@@ -616,6 +621,7 @@ fn dirty_extent_checked_arithmetic_and_queue_limits_are_enforced() {
     assert!(!overflowing_existing.try_merge(0, b"x", usize::MAX));
 
     let mut normal = DirtyExtent {
+        gaps: Vec::new(),
         offset: 0,
         data: vec![1],
         written_at: 1.0,
