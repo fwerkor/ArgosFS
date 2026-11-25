@@ -715,3 +715,21 @@ fn partial_stripe_replacement_preserves_both_boundary_fragments() {
     expected[offset..offset + payload.len()].copy_from_slice(&payload);
     assert_eq!(fs.read_file("/long", false).unwrap(), expected);
 }
+
+#[test]
+fn linked_inode_release_does_not_wait_for_other_metadata_readers() {
+    let (_dir, fs) = volume();
+    let ino = fs.create_file_path("/linked", 0o600).unwrap();
+    let guard = fs.meta.read();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let clone = fs.clone();
+    let worker = std::thread::spawn(move || {
+        tx.send(clone.reap_unlinked_inode(ino)).unwrap();
+    });
+    let result = rx.recv_timeout(std::time::Duration::from_secs(2));
+    drop(guard);
+    worker.join().unwrap();
+    result
+        .expect("linked close must not require the exclusive metadata lock")
+        .unwrap();
+}
