@@ -397,6 +397,8 @@ fn encrypted_reads_do_not_persist_plaintext_in_l2_cache() {
     fs.write_file("/secret", payload, 0o600).unwrap();
     assert_eq!(fs.read_file("/secret", true).unwrap(), payload);
     std::env::remove_var("ARGOSFS_KEY");
+    // Check the disk after all accepted asynchronous cache admissions finish.
+    drop(fs);
 
     assert!(!tree_contains_bytes(
         &tmp.path().join(".argosfs/cache/l2"),
@@ -415,16 +417,20 @@ fn reencrypt_removes_old_plaintext_l2_cache_entries() {
 
     fs.write_file("/plain", payload, 0o600).unwrap();
     assert_eq!(fs.read_file("/plain", true).unwrap(), payload);
+    // Orderly shutdown drains accepted L2 admissions before checking the fixture.
+    drop(fs);
     assert!(tree_contains_bytes(
         &tmp.path().join(".argosfs/cache/l2"),
         payload
     ));
 
+    let fs = ArgosFs::open(tmp.path()).unwrap();
     let key = "reencrypt cache cleanup key";
     fs.enable_encryption(key).unwrap();
     std::env::set_var("ARGOSFS_KEY", key);
     fs.rebalance().unwrap();
     std::env::remove_var("ARGOSFS_KEY");
+    drop(fs);
 
     assert!(!tree_contains_bytes(
         &tmp.path().join(".argosfs/cache/l2"),
