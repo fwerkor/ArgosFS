@@ -64,7 +64,7 @@ impl ArgosFs {
                         let mut bytes = 0u64;
                         for (offset, payload) in writes {
                             self.backend_write_at_locked(snapshot, disk, *offset, payload)?;
-                            self.commit_metrics.add_data_plane_bytes(
+                            self.runtime.commit_metrics.add_data_plane_bytes(
                                 DataPlaneByteKind::ShardPayloadWritten,
                                 payload.len(),
                             );

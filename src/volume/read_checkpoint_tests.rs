@@ -110,7 +110,7 @@ fn a_real_write_after_many_reads_commits_delta_and_recovers_without_hash_diverge
         assert_eq!(fs.read_inode(ino, 0, 9, false).unwrap(), b"read-only");
     }
     assert!(!fs.sync_deferred_if_dirty().unwrap());
-    assert!(fs.read_advisory.pending_entries().0 > 0);
+    assert!(fs.runtime.read_advisory.pending_entries().0 > 0);
     fs.write_file("/other", b"new actual durable data", 0o600)
         .unwrap();
     assert!(fs.sync_deferred_if_dirty().unwrap());
@@ -168,7 +168,7 @@ fn clean_unmount_after_advisory_only_reads_never_persists_a_stale_integrity_hash
     for _ in 0..25 {
         assert_eq!(fs.read_inode(ino, 0, 4, false).unwrap(), b"read");
     }
-    assert!(fs.read_advisory.pending_entries().0 > 0);
+    assert!(fs.runtime.read_advisory.pending_entries().0 > 0);
     let durable = fs.deferred_commit.lock().durable_metadata.clone().unwrap();
     let before = phase(&fs, CommitPhase::Checkpoint);
     let before_journal = phase(&fs, CommitPhase::Journal);
@@ -230,7 +230,7 @@ fn immediate_metadata_commit_after_advisory_reads_reanchors_trusted_hash() {
     for _ in 0..25 {
         assert_eq!(fs.read_file("/old", false).unwrap(), b"the old file");
     }
-    assert!(fs.read_advisory.pending_entries().0 > 0);
+    assert!(fs.runtime.read_advisory.pending_entries().0 > 0);
     assert!(!fs.deferred_commit.lock().raw_uncommitted_metadata_dirty);
     fs.write_file("/new", b"the new file", 0o600).unwrap();
     assert!(!fs.deferred_commit.lock().raw_advisory_metadata_dirty);

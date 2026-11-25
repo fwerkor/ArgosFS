@@ -659,7 +659,8 @@ impl ArgosFs {
         // successful range-write windows that actually reached the encoder;
         // truncate and fsck-repair are not foreground range writes.
         if action == "write-range" && !written_blocks.is_empty() {
-            self.commit_metrics
+            self.runtime
+                .commit_metrics
                 .add_data_plane_bytes(DataPlaneByteKind::RangeRewriteInput, window.len());
         }
         self.adjust_quota_usage_for_resize(ino, old_size, new_size as u64);
@@ -816,7 +817,7 @@ impl ArgosFs {
             self.cache.remove(&cache_key);
         } else if cache_policy == BlockCachePolicy::Normal {
             let mut flight_damage = Vec::new();
-            let decoded = self.decode_flights.run(&cache_key, || {
+            let decoded = self.runtime.decode_flights.run(&cache_key, || {
                 if let Some(raw) = self.cache.get(&cache_key, Some(&block.raw_sha256)) {
                     if raw.len() == block.raw_size {
                         return Ok((raw, Vec::new()));
@@ -1038,7 +1039,8 @@ impl ArgosFs {
             Ok(data) => data,
             Err(err) => {
                 if let Some(disk) = meta.disks.get(&shard.disk_id) {
-                    self.read_advisory
+                    self.runtime
+                        .read_advisory
                         .disk(disk, 0, start_time.elapsed().as_secs_f64());
                 }
                 damaged.push(format!("{}:missing-range:{}", shard.disk_id, shard.slot));
@@ -1046,8 +1048,11 @@ impl ArgosFs {
             }
         };
         if let Some(disk) = meta.disks.get(&shard.disk_id) {
-            self.read_advisory
-                .disk(disk, data.len() as u64, start_time.elapsed().as_secs_f64());
+            self.runtime.read_advisory.disk(
+                disk,
+                data.len() as u64,
+                start_time.elapsed().as_secs_f64(),
+            );
         }
 
         let first_checksum = verify_start / checksum_block_size;
@@ -1460,7 +1465,7 @@ impl ArgosFs {
                             self.backend_flush_locked(snapshot, &extent.disk_id)?;
                         }
                         let elapsed = start.elapsed().as_secs_f64();
-                        self.commit_metrics.add_data_plane_bytes(
+                        self.runtime.commit_metrics.add_data_plane_bytes(
                             DataPlaneByteKind::ShardPayloadWritten,
                             data.len(),
                         );
@@ -1580,7 +1585,8 @@ impl ArgosFs {
                 size: data.len(),
             };
             self.record_raw_shard_locked(meta, stripe_id, &shard, start.elapsed().as_secs_f64());
-            self.commit_metrics
+            self.runtime
+                .commit_metrics
                 .add_data_plane_bytes(DataPlaneByteKind::ShardPayloadWritten, data.len());
             return Ok(shard);
         }
@@ -1612,7 +1618,8 @@ impl ArgosFs {
             data.len() as u64,
             start.elapsed().as_secs_f64(),
         );
-        self.commit_metrics
+        self.runtime
+            .commit_metrics
             .add_data_plane_bytes(DataPlaneByteKind::ShardPayloadWritten, data.len());
         Ok(Shard {
             slot,
@@ -1966,13 +1973,13 @@ impl ArgosFs {
         shard: &Shard,
     ) -> Result<Option<Vec<u8>>> {
         let (result, attempts) = retry_verified(
-            1 + self.read_retries,
+            1 + self.runtime.read_retries,
             |_| {
                 let start = std::time::Instant::now();
                 match self.read_shard_locked(meta, shard) {
                     Ok(data) => {
                         if let Some(disk) = meta.disks.get(&shard.disk_id) {
-                            self.read_advisory.disk(
+                            self.runtime.read_advisory.disk(
                                 disk,
                                 data.len() as u64,
                                 start.elapsed().as_secs_f64(),
@@ -1982,7 +1989,8 @@ impl ArgosFs {
                     }
                     Err(err) => {
                         if let Some(disk) = meta.disks.get(&shard.disk_id) {
-                            self.read_advisory
+                            self.runtime
+                                .read_advisory
                                 .disk(disk, 0, start.elapsed().as_secs_f64());
                         }
                         Err(err)
@@ -1992,10 +2000,12 @@ impl ArgosFs {
             |data| data.len() == shard.size && content_hash_matches(data, &shard.sha256),
         )?;
         if attempts > 1 {
-            self.read_retries_seen
+            self.runtime
+                .read_retries_seen
                 .fetch_add((attempts - 1) as u64, std::sync::atomic::Ordering::Relaxed);
             if result.is_some() {
-                self.read_recovered
+                self.runtime
+                    .read_recovered
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }

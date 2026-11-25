@@ -816,14 +816,16 @@ impl ArgosFs {
         cursor: Option<InodeId>,
     ) -> (FsckReport, Option<InodeId>) {
         let mut report = FsckReport::default();
-        let repair_before = self.repair_counters.snapshot();
+        let repair_before = self.runtime.repair_counters.snapshot();
         if max_files == 0 {
             return (report, cursor);
         }
         let retries_before = self
+            .runtime
             .read_retries_seen
             .load(std::sync::atomic::Ordering::Relaxed);
         let recovered_before = self
+            .runtime
             .read_recovered
             .load(std::sync::atomic::Ordering::Relaxed);
         let mut next_cursor = cursor;
@@ -874,14 +876,17 @@ impl ArgosFs {
             next_cursor = Some(ino);
         }
         report.shard_read_retries = self
+            .runtime
             .read_retries_seen
             .load(std::sync::atomic::Ordering::Relaxed)
             .saturating_sub(retries_before);
         report.shard_read_recovered = self
+            .runtime
             .read_recovered
             .load(std::sync::atomic::Ordering::Relaxed)
             .saturating_sub(recovered_before);
-        self.repair_counters
+        self.runtime
+            .repair_counters
             .add_to_report(&mut report, repair_before);
         (report, next_cursor)
     }
@@ -889,7 +894,7 @@ impl ArgosFs {
     pub fn health_report(&self) -> HealthReport {
         let meta = self.meta.read();
         let mut live_disks = meta.disks.clone();
-        self.read_advisory.project_disks(&mut live_disks);
+        self.runtime.read_advisory.project_disks(&mut live_disks);
         let disks = live_disks
             .values()
             .map(|disk| risk_report(disk, &relative_or_absolute(&self.root, &disk.path)))
@@ -954,17 +959,20 @@ impl ArgosFs {
         // Argon2id derivation is intentionally amortized over encrypted files,
         // while every stripe still validates its own authenticated contents.
         let mut decrypt_key_cache = FsckKeyCache::default();
-        let repair_before = self.repair_counters.snapshot();
+        let repair_before = self.runtime.repair_counters.snapshot();
         let retries_before = self
+            .runtime
             .read_retries_seen
             .load(std::sync::atomic::Ordering::Relaxed);
         let recovered_before = self
+            .runtime
             .read_recovered
             .load(std::sync::atomic::Ordering::Relaxed);
         let total = inodes.len();
         for (position, ino) in inodes.into_iter().enumerate() {
             if position > 0 && position.is_multiple_of(1024) {
-                self.repair_counters
+                self.runtime
+                    .repair_counters
                     .add_to_report(&mut report, repair_before);
                 if let Some(callback) = progress.as_mut() {
                     callback(position, total, &report);
@@ -1191,7 +1199,8 @@ impl ArgosFs {
                 Some(NodeKind::Symlink | NodeKind::Special) | None => {}
             }
         }
-        self.repair_counters
+        self.runtime
+            .repair_counters
             .add_to_report(&mut report, repair_before);
         if let Some(callback) = progress.as_mut() {
             callback(total, total, &report);
@@ -1280,14 +1289,17 @@ impl ArgosFs {
             }
         }
         report.shard_read_retries = self
+            .runtime
             .read_retries_seen
             .load(std::sync::atomic::Ordering::Relaxed)
             .saturating_sub(retries_before);
         report.shard_read_recovered = self
+            .runtime
             .read_recovered
             .load(std::sync::atomic::Ordering::Relaxed)
             .saturating_sub(recovered_before);
-        self.repair_counters
+        self.runtime
+            .repair_counters
             .add_to_report(&mut report, repair_before);
         Ok(report)
     }
@@ -1338,9 +1350,9 @@ impl ArgosFs {
             targets
         };
 
-        let repair_before = self.repair_counters.snapshot();
-        let retries_before = self.read_retries_seen.load(Ordering::Relaxed);
-        let recovered_before = self.read_recovered.load(Ordering::Relaxed);
+        let repair_before = self.runtime.repair_counters.snapshot();
+        let retries_before = self.runtime.read_retries_seen.load(Ordering::Relaxed);
+        let recovered_before = self.runtime.read_recovered.load(Ordering::Relaxed);
         let mut report = FsckReport::default();
         // Like full fsck, a targeted recovery shares one authenticated
         // volume key among all affected encrypted files in this pass.
@@ -1426,20 +1438,24 @@ impl ArgosFs {
             }
             drop(meta);
             if (index + 1).is_multiple_of(128) || index + 1 == total {
-                self.repair_counters
+                self.runtime
+                    .repair_counters
                     .add_to_report(&mut report, repair_before);
                 progress(index + 1, total, &report);
             }
         }
         report.shard_read_retries = self
+            .runtime
             .read_retries_seen
             .load(Ordering::Relaxed)
             .saturating_sub(retries_before);
         report.shard_read_recovered = self
+            .runtime
             .read_recovered
             .load(Ordering::Relaxed)
             .saturating_sub(recovered_before);
-        self.repair_counters
+        self.runtime
+            .repair_counters
             .add_to_report(&mut report, repair_before);
         Ok(report)
     }
