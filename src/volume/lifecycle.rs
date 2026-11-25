@@ -169,6 +169,9 @@ impl ArgosFs {
         pool_name: &str,
         force: bool,
     ) -> Result<Self> {
+        if force {
+            remove_stale_pool_cache(BackendKind::LoopBlock, images);
+        }
         prepare_loop_images(images, image_size, force)?;
         Self::create_block_backend(BackendKind::LoopBlock, images, config, pool_name, force)
     }
@@ -179,6 +182,9 @@ impl ArgosFs {
         pool_name: &str,
         force: bool,
     ) -> Result<Self> {
+        if force {
+            remove_stale_pool_cache(BackendKind::RawBlock, devices);
+        }
         Self::create_block_backend(BackendKind::RawBlock, devices, config, pool_name, force)
     }
 
@@ -430,4 +436,22 @@ impl ArgosFs {
             runtime: Arc::new(MountRuntime::new()),
         })
     }
+}
+
+/// `mkfs --force` replaces the pool UUID, so the previous pool's L2 cache
+/// directory would otherwise be orphaned forever. Scan the members for the old
+/// UUID before they are reformatted and remove only that disposable cache.
+fn remove_stale_pool_cache(kind: BackendKind, paths: &[PathBuf]) {
+    let Some(pool_uuid) = raw_store::scan_paths(kind, paths)
+        .into_iter()
+        .find_map(|device| device.pool_uuid)
+    else {
+        return;
+    };
+    let base = match kind {
+        BackendKind::LoopBlock => super::helpers::loop_cache_base(paths),
+        BackendKind::RawBlock => super::helpers::default_raw_cache_base(),
+        BackendKind::Host => return,
+    };
+    let _ = crate::cache::clear_cache_dir(&base, &pool_uuid);
 }

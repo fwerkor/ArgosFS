@@ -425,6 +425,29 @@ impl ArgosFs {
         &self.root
     }
 
+    /// Base directory for raw-device L2 caches. Root uses
+    /// `/var/cache/argosfs/blocks`; unprivileged pools use the user's cache
+    /// directory.
+    pub fn default_cache_base() -> PathBuf {
+        helpers::default_raw_cache_base()
+    }
+
+    /// Base directory for loop-image L2 caches, colocated with the images.
+    pub fn loop_cache_base(paths: &[PathBuf]) -> PathBuf {
+        helpers::loop_cache_base(paths)
+    }
+
+    /// The pool's L2 cache directory.
+    pub fn cache_dir(&self) -> &Path {
+        self.cache.root()
+    }
+
+    /// On-disk L2 footprint. This walks the cache directory and is meant for
+    /// on-demand inspection, not the metrics hot path.
+    pub fn cache_disk_footprint(&self) -> Result<(u64, u64)> {
+        self.cache.disk_footprint()
+    }
+
     /// Lock-free with respect to metadata commits. Safe to expose alongside
     /// /commit-metrics while profiling warm/cold FUSE reads.
     pub(crate) fn read_cache_stats(&self) -> BTreeMap<String, serde_json::Value> {

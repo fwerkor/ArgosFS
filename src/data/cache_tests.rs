@@ -694,6 +694,76 @@ fn initial_cold_scan_keeps_stable_sample_across_lookup_windows_and_reopen() {
 }
 
 #[test]
+fn cache_admin_lists_clears_and_gcs_pool_directories() {
+    let dir = tempdir().unwrap();
+    let base = dir.path();
+    let first = uuid::Uuid::new_v4().to_string();
+    let second = uuid::Uuid::new_v4().to_string();
+    for (pool, bytes) in [(&first, 3usize), (&second, 5usize)] {
+        let pool_dir = base.join(pool).join("ab");
+        std::fs::create_dir_all(&pool_dir).unwrap();
+        std::fs::write(pool_dir.join("block.blk"), vec![0u8; bytes]).unwrap();
+    }
+    // A non-UUID directory must be ignored, not summarized or removed.
+    std::fs::create_dir_all(base.join("not-a-pool")).unwrap();
+    std::fs::write(base.join("not-a-pool").join("keep.blk"), b"x").unwrap();
+
+    let listed = list_cache_dirs(base).unwrap();
+    assert_eq!(listed.len(), 2);
+    assert!(list_cache_dirs(&base.join("missing")).unwrap().is_empty());
+    let mut ids: Vec<_> = listed.iter().map(|info| info.pool_uuid.clone()).collect();
+    ids.sort();
+    let mut expected = vec![first.clone(), second.clone()];
+    expected.sort();
+    assert_eq!(ids, expected);
+    let first_info = listed.iter().find(|info| info.pool_uuid == first).unwrap();
+    assert_eq!(first_info.files, 1);
+    assert_eq!(first_info.bytes, 3);
+
+    let removed = clear_cache_dir(base, &first).unwrap().unwrap();
+    assert_eq!(removed.files, 1);
+    assert_eq!(removed.bytes, 3);
+    assert!(!base.join(&first).exists());
+    assert!(clear_cache_dir(base, &first).unwrap().is_none());
+    assert!(clear_cache_dir(base, "not-a-uuid").is_err());
+
+    assert!(gc_cache_dirs(base, &BTreeSet::new()).is_err());
+    assert!(gc_cache_dirs(base, &BTreeSet::from(["invalid".to_string()])).is_err());
+    assert!(base.join(&second).exists());
+    let kept_uppercase = BTreeSet::from([second.to_uppercase()]);
+    assert!(gc_cache_dirs(base, &kept_uppercase).unwrap().is_empty());
+    let mut keep = BTreeSet::new();
+    keep.insert(first);
+    let removed = gc_cache_dirs(base, &keep).unwrap();
+    assert_eq!(removed.len(), 1);
+    assert_eq!(removed[0].pool_uuid, second);
+    assert!(!base.join(&second).exists());
+    assert!(base.join("not-a-pool").exists());
+}
+
+#[test]
+fn clear_drops_memory_and_l2_entries_and_recreates_the_root() {
+    let dir = tempdir().unwrap();
+    let cache = BlockCache::new(dir.path(), 1024, 1024);
+    cache.put("a:1", b"aaaa").unwrap();
+    cache.put("a:2", b"bbbb").unwrap();
+    assert_eq!(cache.get("a:1", None).unwrap(), b"aaaa");
+    assert_eq!(cache.stats()["l2_items"], 2);
+    assert!(cache.disk_footprint().unwrap().0 >= 2);
+
+    cache.clear().unwrap();
+    let stats = cache.stats();
+    assert_eq!(stats["memory_items"], 0);
+    assert_eq!(stats["memory_bytes"], 0);
+    assert_eq!(stats["l2_items"], 0);
+    assert_eq!(stats["l2_bytes"], 0);
+    assert_eq!(stats["l2_loaded_items"], 0);
+    assert_eq!(cache.disk_footprint().unwrap(), (0, 0));
+    assert!(dir.path().is_dir());
+    assert!(cache.get("a:1", None).is_none());
+}
+
+#[test]
 fn volatile_l2_publication_replaces_complete_blocks_and_ignores_interrupted_writes() {
     let dir = tempfile::tempdir().unwrap();
     let cache = BlockCache::new(dir.path(), 0, 1024);
@@ -771,4 +841,22 @@ fn async_admission_byte_budget_and_invalidation_do_not_block_producer() {
         assert!(!cache.l2_path(&job.key).exists());
     }
     assert_eq!(jobs.count(), 2);
+}
+
+#[test]
+fn clear_invalidates_queued_l2_admissions() {
+    let dir = tempdir().unwrap();
+    let mut cache = BlockCache::new(dir.path(), 1024, 1024);
+    let (sender, receiver) = mpsc::sync_channel(L2_QUEUE_ITEMS);
+    cache.writer = Some(L2Writer {
+        sender: Some(sender),
+        thread: None,
+    });
+    cache.put("secret", b"plaintext").unwrap();
+    cache.clear().unwrap();
+    drop(cache.writer.take());
+    let job = receiver.recv().unwrap();
+    cache.put_l2(&job.key, &job.data, job.generation).unwrap();
+    assert_eq!(cache.disk_footprint().unwrap(), (0, 0));
+    assert!(cache.get("secret", None).is_none());
 }
