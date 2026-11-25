@@ -112,6 +112,7 @@ impl ArgosFs {
                 let mut transient = BTreeSet::<usize>::new();
                 let mut seen = BTreeSet::new();
 
+                let mut pending = Vec::with_capacity(block.shards.len());
                 for shard in &block.shards {
                     if shard.slot >= total || !seen.insert(shard.slot) {
                         return Err(ArgosError::Invalid(format!(
@@ -146,26 +147,27 @@ impl ArgosFs {
                         }
                         continue;
                     }
-                    match self.read_shard_verified_locked(meta, shard) {
-                        Ok(Some(data)) => {
-                            work.bytes_read = work.bytes_read.saturating_add(data.len() as u64);
-                            present[shard.slot] = Some(data);
-                        }
-                        Ok(None) => {
-                            failed.insert(shard.slot);
-                        }
-                        Err(_) => {
-                            failed.insert(shard.slot);
-                            if meta.backend != BackendKind::Host
-                                && self.is_device_quarantined(&shard.disk_id)
-                                && (!repair_offline
-                                    || !self.quarantined_member_due_for_repair(&shard.disk_id))
-                            {
-                                transient.insert(shard.slot);
-                            }
+                    pending.push(shard);
+                }
+                self.read_verified_shards_batched(meta, &pending, |shard, result| match result {
+                    Ok(Some(data)) => {
+                        work.bytes_read = work.bytes_read.saturating_add(data.len() as u64);
+                        present[shard.slot] = Some(data);
+                    }
+                    Ok(None) => {
+                        failed.insert(shard.slot);
+                    }
+                    Err(_) => {
+                        failed.insert(shard.slot);
+                        if meta.backend != BackendKind::Host
+                            && self.is_device_quarantined(&shard.disk_id)
+                            && (!repair_offline
+                                || !self.quarantined_member_due_for_repair(&shard.disk_id))
+                        {
+                            transient.insert(shard.slot);
                         }
                     }
-                }
+                });
                 for slot in 0..total {
                     if !seen.contains(&slot) {
                         failed.insert(slot);

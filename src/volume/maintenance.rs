@@ -1059,6 +1059,7 @@ impl ArgosFs {
                                 continue;
                             }
                         };
+                        let mut pending = Vec::with_capacity(block.shards.len());
                         for shard in &block.shards {
                             // Do not read a shard from a member that is
                             // merely absent from the scan.  Its data is
@@ -1094,7 +1095,10 @@ impl ArgosFs {
                                 report.missing_shards += 1;
                                 continue;
                             }
-                            match self.read_shard_verified_locked(&meta, shard) {
+                            pending.push(shard);
+                        }
+                        self.read_verified_shards_batched(&meta, &pending, |shard, result| {
+                            match result {
                                 Ok(Some(_)) => {
                                     if shard.slot < total_slots {
                                         available_slots.insert(shard.slot);
@@ -1117,7 +1121,7 @@ impl ArgosFs {
                                     }
                                 }
                             }
-                        }
+                        });
                         if available_slots.len() < layout.k {
                             unrecoverable_blocks.push(format!(
                                 "stripe {} has {}/{} verified shards available",
