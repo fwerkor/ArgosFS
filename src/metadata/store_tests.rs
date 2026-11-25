@@ -289,6 +289,7 @@ fn sample_metadata() -> Metadata {
         integrity: MetadataIntegrity::default(),
         disks,
         inodes: inodes.into_iter().collect(),
+        checkpoint_member_catalog: None,
     }
 }
 

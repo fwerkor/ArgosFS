@@ -1293,8 +1293,8 @@ impl ArgosFs {
     /// unrelated members and unreferenced/orphaned extents are not checked.
     ///
     /// Select candidate inodes from the mount's incrementally maintained
-    /// member catalog, including uncommitted edits. Inspect only their blocks
-    /// to construct the stripe worklist. Revalidate each inode under its lock:
+    /// member/stripe catalog, including uncommitted edits. The checkpoint
+    /// carries this derived index; legacy checkpoints rebuild it on open. Revalidate each inode under its lock:
     /// another writer may replace its blocks after worklist construction.
     pub fn repair_member_shards(
         &self,
@@ -1323,20 +1323,12 @@ impl ArgosFs {
             }
             let targets = meta
                 .inodes
-                .member_inode_ids(disk_id)
+                .member_stripes(disk_id)
                 .into_iter()
-                .filter_map(|ino| {
-                    let inode = meta.inodes.get(&ino)?;
-                    if inode.kind != NodeKind::File {
-                        return None;
-                    }
-                    let stripes = inode
-                        .blocks
-                        .iter()
-                        .filter(|block| block.shards.iter().any(|shard| shard.disk_id == disk_id))
-                        .map(|block| block.stripe_id.clone())
-                        .collect::<BTreeSet<_>>();
-                    (!stripes.is_empty()).then_some((ino, stripes))
+                .filter(|(ino, _)| {
+                    meta.inodes
+                        .get(ino)
+                        .is_some_and(|inode| inode.kind == NodeKind::File)
                 })
                 .collect::<Vec<_>>();
             targets

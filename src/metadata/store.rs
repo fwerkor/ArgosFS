@@ -559,6 +559,7 @@ impl PagedMetadata {
             integrity: header.integrity,
             disks,
             inodes: inodes.into_iter().collect(),
+            checkpoint_member_catalog: None,
         })
     }
 

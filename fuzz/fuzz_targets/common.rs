@@ -85,6 +85,7 @@ pub fn metadata_from(data: &[u8], salt: usize) -> Metadata {
         integrity: MetadataIntegrity::default(),
         disks: BTreeMap::new(),
         inodes: Default::default(),
+        checkpoint_member_catalog: None,
     }
 }
 

@@ -625,6 +625,11 @@ pub struct Metadata {
     pub integrity: MetadataIntegrity,
     pub disks: BTreeMap<String, Disk>,
     pub inodes: TrackedInodes,
+    /// Optional raw checkpoint extension, consumed only after physical and
+    /// semantic verification. Never enters canonical metadata/journal JSON.
+    #[doc(hidden)]
+    #[serde(default, skip_serializing)]
+    pub checkpoint_member_catalog: Option<super::inodes::CheckpointMemberCatalog>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
