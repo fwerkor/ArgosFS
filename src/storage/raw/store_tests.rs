@@ -1642,6 +1642,16 @@ fn compressed_checkpoint_quorum_round_trip_and_corruption_checks() {
         sb.metadata.length = 1024 * 1024;
     }
     let payload = prepare_checkpoint_payload(&next, &superblocks).unwrap();
+    let exact = serde_json::to_vec(&next).unwrap();
+    assert!(exact.len() > CHECKPOINT_PROBE_BYTES);
+    assert_eq!(
+        payload.original.as_ref().unwrap(),
+        &(exact.len() as u64, sha256_hex(&exact))
+    );
+    assert_eq!(
+        zstd::stream::decode_all(payload.bytes.as_slice()).unwrap(),
+        exact
+    );
     assert!(
         payload.original.is_some(),
         "full JSON should not fit the test slot"
@@ -2052,7 +2062,9 @@ fn interrupted_integrity_feature_upgrade_is_retryable_without_v2_records() {
             sb.required_feature_flags & REQUIRED_FEATURE_DELTA_INTEGRITY,
             0
         );
+        assert_ne!(sb.required_feature_flags & REQUIRED_FEATURE_ARRAY_SPLICE, 0);
     }
+    assert!(array_splice_feature_enabled(&upgraded));
     assert_eq!(
         recover_metadata(&backend, &upgraded).unwrap().txid,
         previous.txid
@@ -2160,3 +2172,6 @@ fn v2_crash_after_quorum_commit_recovers_authenticated_delta() {
 
 #[path = "store_tests/rollover_slot.rs"]
 mod rollover_slot;
+
+#[path = "store_tests/journal_parallel.rs"]
+mod journal_parallel;

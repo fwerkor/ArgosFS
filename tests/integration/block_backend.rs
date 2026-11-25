@@ -1445,7 +1445,7 @@ fn raw_allocator_inconsistency_is_reported_by_fsck() {
         .get_mut(&extent.disk_id)
         .unwrap()
         .free_extents
-        .push(RawFreeExtent {
+        .push_back(RawFreeExtent {
             offset: extent.offset,
             length: extent.length,
         });
