@@ -222,7 +222,57 @@ impl ArgosFuseShared {
         {
             return Ok(self.queue_writeback(ino, offset, data));
         }
-        Ok(false)
+        // A legal stripe may be larger than the ordinary 4 MiB coalescer.
+        // If no complete prefix exists yet, grow only a sequential EOF
+        // buffer up to one stripe plus one incoming request (still subject
+        // to a hard per-inode and mount-wide bound). Otherwise pressure
+        // repeatedly flushes partial stripes and re-encodes the same data.
+        Ok(self.extend_incomplete_append(ino, offset, data))
+    }
+
+    fn extend_incomplete_append(&self, ino: InodeId, offset: u64, data: &[u8]) -> bool {
+        const MAX_LARGE_STRIPE_BUFFER: usize = 16 * 1024 * 1024;
+        if data.len() > FUSE_WRITEBACK_MAX_BYTES {
+            return false;
+        }
+        let _guard = self.writeback_lock(ino).write();
+        let Ok((old_size, stripe_size)) = self.volume.writeback_stripe_geometry(ino) else {
+            return false;
+        };
+        if stripe_size == 0 || stripe_size > MAX_LARGE_STRIPE_BUFFER {
+            return false;
+        }
+        let seen_ctime = self.volume.attr_inode(ino).ok().map(|attr| attr.ctime);
+        let mut wb = self.writeback.lock();
+        let Some(dirty) = wb.dirty.get(&ino) else {
+            return false;
+        };
+        if dirty.offset != old_size as u64 || dirty.end() != Some(offset) {
+            return false;
+        }
+        let Some(end) = old_size.checked_add(dirty.data.len()) else {
+            return false;
+        };
+        if end / stripe_size * stripe_size > old_size {
+            return false; // a complete prefix should be staged instead
+        }
+        let limit = stripe_size
+            .saturating_add(FUSE_WRITEBACK_MAX_BYTES - 1)
+            .min(MAX_LARGE_STRIPE_BUFFER);
+        let old_len = dirty.data.len();
+        let Some((_, merged_len)) = dirty.merge_bounds(offset, data.len(), limit) else {
+            return false;
+        };
+        if wb.pending_bytes - old_len + merged_len > FUSE_WRITEBACK_MAX_MOUNT_BYTES {
+            return false;
+        }
+        let dirty = Arc::make_mut(wb.dirty.get_mut(&ino).expect("locked dirty inode"));
+        if !dirty.try_merge(offset, data, limit) {
+            return false;
+        }
+        dirty.seen_ctime = seen_ctime;
+        wb.pending_bytes = wb.pending_bytes - old_len + merged_len;
+        true
     }
 
     /// Attribute reads observe acknowledged writes without forcing a COW
@@ -232,7 +282,7 @@ impl ArgosFuseShared {
     /// The writeback lock serializes observation with persistence; the inode
     /// cannot publish a stale size or timestamps halfway through a flush.
     pub(super) fn visible_inode_attr(&self, ino: InodeId) -> Result<NodeAttr> {
-        let inode_guard = self.writeback_lock(ino).write();
+        let inode_guard = self.writeback_lock(ino).read();
         let dirty = self.writeback.lock().dirty.get(&ino).cloned();
         let mut attr = self.volume.attr_inode(ino)?;
         let Some(dirty) = dirty else {

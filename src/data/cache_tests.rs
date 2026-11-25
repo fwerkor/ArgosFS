@@ -1,4 +1,5 @@
 use super::*;
+use crate::util::atomic_write;
 use crate::util::content_hash_matches;
 use tempfile::tempdir;
 
@@ -755,4 +756,27 @@ fn clear_drops_memory_and_l2_entries_and_recreates_the_root() {
     assert_eq!(cache.disk_footprint().unwrap(), (0, 0));
     assert!(dir.path().is_dir());
     assert!(cache.get("a:1", None).is_none());
+}
+
+#[test]
+fn volatile_l2_publication_replaces_complete_blocks_and_ignores_interrupted_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = BlockCache::new(dir.path(), 0, 1024);
+    let path = cache.l2_path("entry");
+    write_cache_block(&path, b"old").unwrap();
+    write_cache_block(&path, b"new content").unwrap();
+    std::fs::write(path.with_extension("cache-tmp-interrupted"), b"partial").unwrap();
+    cache.load_l2_index().unwrap();
+    assert_eq!(cache.stats()["l2_items"], 1);
+    assert_eq!(
+        cache
+            .get("entry", Some(&sha256_hex(b"new content")))
+            .unwrap(),
+        b"new content"
+    );
+    std::fs::write(&path, b"truncated").unwrap();
+    assert!(cache
+        .get("entry", Some(&sha256_hex(b"new content")))
+        .is_none());
+    assert!(!path.exists());
 }

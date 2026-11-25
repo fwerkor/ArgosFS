@@ -1,10 +1,12 @@
 use crate::error::Result;
-use crate::util::{atomic_write, ensure_dir, sha256_hex};
+use crate::util::{ensure_dir, sha256_hex};
 use parking_lot::Mutex;
 use serde_json::json;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -570,7 +572,7 @@ impl BlockCache {
                 }
             }
         }
-        atomic_write(&path, data)?;
+        write_cache_block(&path, data)?;
         let mut inner = self.inner.lock();
         inner.l2_clock = inner.l2_clock.saturating_add(1);
         let touched = inner.l2_clock;
@@ -819,6 +821,31 @@ pub fn gc_cache_dirs(base: &Path, keep: &BTreeSet<String>) -> Result<Vec<CacheDi
         removed.push(info);
     }
     Ok(removed)
+}
+
+/// L2 is a disposable, content-verified acceleration tier. Atomic publication
+/// prevents readers seeing a partial write; unlike metadata, cache blocks need
+/// not survive power loss. Never fsync a cache block or its parent directory.
+fn write_cache_block(path: &Path, data: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent)?;
+    }
+    let temporary = path.with_extension(format!("cache-tmp-{}", uuid::Uuid::new_v4()));
+    let result = (|| -> Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(data)?;
+        drop(file);
+        std::fs::rename(&temporary, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn configured_l2_limit(default_limit: u64) -> u64 {
