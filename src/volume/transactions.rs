@@ -352,59 +352,9 @@ impl ArgosFs {
             }
         })();
 
-        match result {
-            Ok(report) => {
-                let durability = self.apply_quorum_write_report(meta, report);
-                meta.inodes.mark_committed();
-                if let Some(cache) = &mut state.durability_cache {
-                    // Reset the tracked baseline with the committed inode map.
-                    cache.inodes = meta.inodes.clone();
-                }
-                drop(before_commit);
-                // The former durable Arc is no longer required after a durable commit.
-                state.durable_metadata = None;
-                drop(previous);
-                state.durable_metadata = Some(Arc::new(meta.clone()));
-                state.raw_uncommitted_metadata_dirty = false;
-                state.raw_advisory_metadata_dirty = false;
-                state.raw_checkpoint_required = false;
-                state.raw_mount_reanchor_pending = false;
-                state.dirty_transactions = 0;
-                state.dirty_since = None;
-                state.pending_reclaims.clear();
-                self.publish_capacity_snapshot_locked(meta);
-                match durability {
-                    Ok(()) => {
-                        state.last_error = None;
-                        Ok(true)
-                    }
-                    Err(err) => {
-                        state.last_error = Some(err.to_string());
-                        Err(err)
-                    }
-                }
-            }
-            Err(err) if Self::transaction_error_is_committed(&err) => {
-                meta.inodes.mark_committed();
-                if let Some(cache) = &mut state.durability_cache {
-                    // Reset the tracked baseline with the committed inode map.
-                    cache.inodes = meta.inodes.clone();
-                }
-                drop(before_commit);
-                state.durable_metadata = None;
-                drop(previous);
-                state.durable_metadata = Some(Arc::new(meta.clone()));
-                state.raw_uncommitted_metadata_dirty = false;
-                state.raw_advisory_metadata_dirty = false;
-                state.raw_checkpoint_required = false;
-                state.raw_mount_reanchor_pending = false;
-                state.dirty_transactions = 0;
-                state.dirty_since = None;
-                state.pending_reclaims.clear();
-                self.publish_capacity_snapshot_locked(meta);
-                state.last_error = Some(err.to_string());
-                Err(err)
-            }
+        let durability = match result {
+            Ok(report) => self.apply_quorum_write_report(meta, report),
+            Err(err) if Self::transaction_error_is_committed(&err) => Err(err),
             Err(err) => {
                 if let Some(snapshot) = before_commit {
                     *meta = snapshot;
@@ -419,9 +369,31 @@ impl ArgosFs {
                 // Retain the previous published snapshot.
                 self.fence_on_quorum_loss(&err);
                 state.last_error = Some(err.to_string());
-                Err(err)
+                return Err(err);
             }
+        };
+
+        // Both a successful quorum and an already-committed error advance the
+        // durable baseline. Never roll back or reclaim their acknowledged data.
+        meta.inodes.mark_committed();
+        if let Some(cache) = &mut state.durability_cache {
+            cache.inodes = meta.inodes.clone();
         }
+        drop(before_commit);
+        // Release the old baseline before retaining the new inode snapshot.
+        state.durable_metadata = None;
+        drop(previous);
+        state.durable_metadata = Some(Arc::new(meta.clone()));
+        state.raw_uncommitted_metadata_dirty = false;
+        state.raw_advisory_metadata_dirty = false;
+        state.raw_checkpoint_required = false;
+        state.raw_mount_reanchor_pending = false;
+        state.dirty_transactions = 0;
+        state.dirty_since = None;
+        state.pending_reclaims.clear();
+        self.publish_capacity_snapshot_locked(meta);
+        state.last_error = durability.as_ref().err().map(ToString::to_string);
+        durability.map(|()| true)
     }
 
     pub(super) fn commit_locked(
