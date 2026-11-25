@@ -239,6 +239,26 @@ impl Kernel {
         }
     }
 
+    /// Use a fused two-input fast path when one is available.
+    #[allow(unsafe_code)]
+    pub(crate) fn try_mul_two(
+        self,
+        coefficients: [u8; 2],
+        sources: [&[u8]; 2],
+        dst: &mut [u8],
+    ) -> bool {
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        if self.0 == Isa::Avx2 {
+            assert_eq!(sources[0].len(), dst.len());
+            assert_eq!(sources[1].len(), dst.len());
+            // SAFETY: the runtime-selected kernel guarantees AVX2.
+            unsafe { x86::avx2::mul_two(coefficients, sources, dst) };
+            return true;
+        }
+        let _ = (coefficients, sources, dst);
+        false
+    }
+
     /// `outs[t] = sum over j of matrix[t * data_shards + j] * srcs.shard(j)`,
     /// for every `t`.
     ///
@@ -270,6 +290,16 @@ impl Kernel {
             "every output has the same length as the sources"
         );
 
+        if data_shards == 2
+            && outs.len() == 1
+            && self.try_mul_two(
+                [matrix[0], matrix[1]],
+                [srcs.shard(0), srcs.shard(1)],
+                outs[0].as_mut(),
+            )
+        {
+            return;
+        }
         match self.0 {
             Isa::Scalar => scalar::mul_rows(matrix, data_shards, srcs, outs),
             #[cfg(target_arch = "aarch64")]

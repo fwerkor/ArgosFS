@@ -72,6 +72,18 @@ fn combine<S: ShardSource + ?Sized>(
         out.fill(0);
         return;
     }
+    if coeffs.len() == 2
+        && kernel.try_mul_two(
+            [coeffs[0], coeffs[1]],
+            [
+                inputs.shard(indices[0] as usize),
+                inputs.shard(indices[1] as usize),
+            ],
+            out,
+        )
+    {
+        return;
+    }
     // Retain the output tile in cache while combining all surviving inputs.
     const TILE: usize = 64 * 1024;
     for start in (0..out.len()).step_by(TILE) {
@@ -395,6 +407,37 @@ pub(crate) fn reconstruct_impl<S: AsRef<[u8]> + AsMut<[u8]>>(
 mod tests {
     use super::*;
     use crate::data::ec::Codec;
+
+    #[test]
+    fn two_input_codec_matches_reference_at_vector_and_tile_boundaries() {
+        for len in [31, 32, 33, 4095, 4096, 65535, 65536, 65537, 1048576] {
+            let reference = Codec::with_kernel(Kernel::SCALAR, 2, 1).unwrap();
+            let mut original: Vec<Vec<u8>> = (0..3)
+                .map(|j| {
+                    (0..len)
+                        .map(|i| (i * 17 + j * 41 + i / 251) as u8)
+                        .collect()
+                })
+                .collect();
+            reference.encode_all(&mut original).unwrap();
+            for kernel in Kernel::supported() {
+                let codec = Codec::with_kernel(kernel, 2, 1).unwrap();
+                let mut shards = original.clone();
+                shards[2].fill(0x77);
+                codec.encode_all(&mut shards).unwrap();
+                assert_eq!(shards, original, "{kernel}: encode length {len}");
+                for missing in 0..2 {
+                    let mut present = ShardMask::all_present(3);
+                    present.remove(missing);
+                    shards[missing].fill(0x55);
+                    codec
+                        .reconstruct_data(&mut shards, &present, &mut DecodeWorkspace::new())
+                        .unwrap();
+                    assert_eq!(shards, original, "{kernel}: recover length {len}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn fused_recovery_matches_reference_for_all_supported_kernels() {
