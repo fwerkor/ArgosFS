@@ -360,6 +360,26 @@ fn io_policy_and_encryption_cover_empty_repeat_and_wrong_passphrases() {
 }
 
 #[test]
+fn enable_encryption_purges_cached_plaintext() {
+    let _guard = env_lock();
+    let (_dir, fs) = host_volume(1);
+    fs.write_file("/secret", &[7u8; 8192], 0o644).unwrap();
+    assert_eq!(fs.read_file("/secret", false).unwrap(), vec![7u8; 8192]);
+    assert!(
+        fs.cache_disk_footprint().unwrap().0 > 0,
+        "the read should have admitted decoded blocks to L2"
+    );
+
+    fs.enable_encryption("correct").unwrap();
+
+    assert_eq!(fs.cache_disk_footprint().unwrap(), (0, 0));
+    let stats = fs.read_cache_stats();
+    assert_eq!(stats["memory_items"], 0);
+    assert_eq!(stats["l2_items"], 0);
+    assert_eq!(stats["l2_bytes"], 0);
+}
+
+#[test]
 fn add_disk_clamps_weight_tracks_capacity_and_rejects_duplicate_paths() {
     let (dir, fs) = host_volume(1);
     let path = dir.path().join("extra");

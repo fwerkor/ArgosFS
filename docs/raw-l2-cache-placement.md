@@ -14,3 +14,18 @@ An old cache directory is not automatically migrated or deleted; remove only
 its disposable cache files after unmounting if no longer needed. L2 is optional
 if the selected filesystem is unwritable. On embedded/read-only-root systems,
 set an explicit writable cache directory or disable L2.
+
+## Inspecting and clearing the cache
+
+`argosfs cache info` lists the pool cache directories under the raw-device base
+(`/var/cache/argosfs/blocks` for root) with their file and byte footprint.
+Pass `--devices` or `--images` to mark which pools are currently attached.
+`argosfs cache clear --pool <uuid>` removes one pool's directory, and
+`argosfs cache gc --devices ...` removes directories for pools that are not
+attached (or `--keep <uuid>` to name the ones to retain). Unmount the pool
+first for a clean cold start; a missing cache file is only a miss.
+
+`mkfs --force` removes the previous pool's directory before it assigns the new
+UUID, so reformatting a pool does not leave an orphan behind. Enabling
+encryption drops both the RAM and disk cache tiers, so decoded plaintext from
+before encryption does not remain on the host.

@@ -15,7 +15,9 @@ use crate::volume::NodeAttr;
 use crate::{ArgosError, ArgosFs, AutopilotPolicy};
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
+use serde_json::json;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::ffi::CString;
 use std::fs;
 use std::io::{self, IsTerminal, Read};
@@ -30,7 +32,7 @@ const DEFAULT_LOOP_IMAGE_SIZE: u64 = 64 * 1024 * 1024;
 mod commands;
 mod tree;
 
-use commands::Command;
+use commands::{BackendArgs, CacheCommand, Command};
 use tree::{export_tree, import_tree};
 
 #[derive(Parser)]
@@ -40,7 +42,7 @@ use tree::{export_tree, import_tree};
   Setup and discovery: mkfs, scan, inspect-device, inspect-pool, list-devices
   Root filesystem: mount-root, preflight-root, replay-journal, mount-recovery
   Device lifecycle: add-device, drain-device, replace-device, remove-device, reshape
-  Maintenance: health, fsck, scrub, rebalance, autopilot, verify-journal
+  Maintenance: health, fsck, scrub, rebalance, autopilot, verify-journal, cache
   File and security tools: import-tree, export-tree, put/get/ls/stat, ACL and encryption commands
 
 Use `argosfs help <COMMAND>` for command-specific options. Block-backed commands can reuse a JSON selector with `--pool-config FILE`.")]
@@ -267,8 +269,32 @@ pub fn run() -> Result<()> {
                 false,
             )?;
             validate_requested_pool(&fs, storage.pool.as_deref())?;
-            print_health_report(&fs.health_report(), json, true)?;
+            let report = fs.health_report();
+            let (cache_files, cache_bytes) = fs.cache_disk_footprint()?;
+            if structured_json_requested(json) {
+                let mut value = serde_json::to_value(&report)?;
+                if let Some(object) = value.as_object_mut() {
+                    object.insert(
+                        "cache_disk".to_string(),
+                        json!({
+                            "path": fs.cache_dir(),
+                            "files": cache_files,
+                            "bytes": cache_bytes,
+                        }),
+                    );
+                }
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else {
+                print_health_report(&report, false, false)?;
+                println!(
+                    "  L2 cache on disk: {} files, {} bytes at {}",
+                    cache_files,
+                    cache_bytes,
+                    fs.cache_dir().display()
+                );
+            }
         }
+        Command::Cache { command } => run_cache_command(command, json)?,
         Command::ListDevices { storage } => {
             let storage = storage.resolve(BackendKind::LoopBlock)?;
             let fs = open_backend(
@@ -1010,6 +1036,178 @@ fn backend_paths(
             }
         }
     }
+}
+
+fn run_cache_command(command: CacheCommand, json: bool) -> Result<()> {
+    match command {
+        CacheCommand::Info { cache_dir, storage } => {
+            let (base, attached) = cache_context(cache_dir, &storage)?;
+            let dirs = crate::cache::list_cache_dirs(&base)?;
+            let total_files: u64 = dirs.iter().map(|dir| dir.files).sum();
+            let total_bytes: u64 = dirs.iter().map(|dir| dir.bytes).sum();
+            if structured_json_requested(json) {
+                let pools: Vec<_> = dirs
+                    .iter()
+                    .map(|dir| {
+                        json!({
+                            "pool_uuid": dir.pool_uuid,
+                            "path": dir.path,
+                            "files": dir.files,
+                            "bytes": dir.bytes,
+                            "attached": attached
+                                .as_ref()
+                                .map(|set| set.contains(&dir.pool_uuid)),
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "cache_dir": base,
+                        "total_files": total_files,
+                        "total_bytes": total_bytes,
+                        "pools": pools,
+                    }))?
+                );
+            } else {
+                println!("cache dir: {}", base.display());
+                println!("{:<38} {:>8} {:>14}  attached", "pool", "files", "bytes");
+                for dir in &dirs {
+                    let attached = match &attached {
+                        Some(set) => set.contains(&dir.pool_uuid).to_string(),
+                        None => "unknown".to_string(),
+                    };
+                    println!(
+                        "{:<38} {:>8} {:>14}  {}",
+                        dir.pool_uuid, dir.files, dir.bytes, attached
+                    );
+                }
+                println!("total: {} files, {} bytes", total_files, total_bytes);
+            }
+        }
+        CacheCommand::Clear { pool, cache_dir } => {
+            let base = cache_dir.unwrap_or_else(ArgosFs::default_cache_base);
+            let removed = crate::cache::clear_cache_dir(&base, &pool)?;
+            if structured_json_requested(json) {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "cache_dir": base,
+                        "pool_uuid": pool,
+                        "removed": removed.as_ref().map(|dir| json!({
+                            "path": dir.path,
+                            "files": dir.files,
+                            "bytes": dir.bytes,
+                        })),
+                    }))?
+                );
+            } else if let Some(dir) = removed {
+                println!(
+                    "removed {} ({} files, {} bytes)",
+                    dir.path.display(),
+                    dir.files,
+                    dir.bytes
+                );
+            } else {
+                println!(
+                    "no cache directory for pool {pool} under {}",
+                    base.display()
+                );
+            }
+        }
+        CacheCommand::Gc {
+            cache_dir,
+            keep,
+            storage,
+        } => {
+            let (base, attached) = cache_context(cache_dir, &storage)?;
+            let mut keep_set: BTreeSet<String> = keep.into_iter().collect();
+            if let Some(attached) = attached {
+                keep_set.extend(attached);
+            }
+            if keep_set.is_empty() {
+                bail!(
+                    "refusing to remove every cache directory; pass --keep, --devices, or --images"
+                );
+            }
+            let removed = crate::cache::gc_cache_dirs(&base, &keep_set)?;
+            if structured_json_requested(json) {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "cache_dir": base,
+                        "kept": keep_set,
+                        "removed": removed
+                            .iter()
+                            .map(|dir| json!({
+                                "pool_uuid": dir.pool_uuid,
+                                "path": dir.path,
+                                "files": dir.files,
+                                "bytes": dir.bytes,
+                            }))
+                            .collect::<Vec<_>>(),
+                    }))?
+                );
+            } else {
+                for dir in &removed {
+                    println!(
+                        "removed {} ({} files, {} bytes)",
+                        dir.path.display(),
+                        dir.files,
+                        dir.bytes
+                    );
+                }
+                println!(
+                    "removed {} cache director{}",
+                    removed.len(),
+                    if removed.len() == 1 { "y" } else { "ies" }
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cache_context(
+    cache_dir: Option<PathBuf>,
+    storage: &BackendArgs,
+) -> Result<(PathBuf, Option<BTreeSet<String>>)> {
+    let (backend, paths) = cache_storage(storage)?;
+    let base = match cache_dir {
+        Some(dir) => dir,
+        None => match backend {
+            BackendKind::LoopBlock => ArgosFs::loop_cache_base(&paths),
+            BackendKind::RawBlock | BackendKind::Host => ArgosFs::default_cache_base(),
+        },
+    };
+    let attached = if paths.is_empty() {
+        None
+    } else {
+        let scanned = match backend {
+            BackendKind::LoopBlock => scan::scan_images(&paths),
+            BackendKind::RawBlock => scan::scan_devices(&paths),
+            BackendKind::Host => Vec::new(),
+        };
+        Some(
+            scanned
+                .into_iter()
+                .filter_map(|device| device.pool_uuid)
+                .collect(),
+        )
+    };
+    Ok((base, attached))
+}
+
+fn cache_storage(storage: &BackendArgs) -> Result<(BackendKind, Vec<PathBuf>)> {
+    if storage.images.is_empty() && storage.devices.is_empty() && storage.pool_config.is_none() {
+        return Ok((BackendKind::RawBlock, Vec::new()));
+    }
+    let resolved = storage.clone().resolve(BackendKind::RawBlock)?;
+    let paths = match resolved.backend {
+        BackendKind::LoopBlock => resolved.images,
+        BackendKind::RawBlock | BackendKind::Host => resolved.devices,
+    };
+    Ok((resolved.backend, paths))
 }
 
 fn open_backend(

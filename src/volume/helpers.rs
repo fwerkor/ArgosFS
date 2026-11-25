@@ -103,20 +103,29 @@ pub(super) fn block_cache_root(
         return PathBuf::from(root).join(volume_uuid);
     }
     if backend == BackendKind::RawBlock {
-        return raw_block_cache_base(
-            current_uid(),
-            std::env::var_os("XDG_CACHE_HOME").as_deref().map(Path::new),
-            std::env::var_os("HOME").as_deref().map(Path::new),
-        )
-        .join(volume_uuid);
+        return default_raw_cache_base().join(volume_uuid);
     }
+    loop_cache_base(paths).join(volume_uuid)
+}
+
+/// Base directory for raw-device L2 caches. Root uses `/var/cache/argosfs/blocks`;
+/// unprivileged pools use the user's cache directory.
+pub(super) fn default_raw_cache_base() -> PathBuf {
+    raw_block_cache_base(
+        current_uid(),
+        std::env::var_os("XDG_CACHE_HOME").as_deref().map(Path::new),
+        std::env::var_os("HOME").as_deref().map(Path::new),
+    )
+}
+
+/// Base directory for loop-image L2 caches, colocated with the images.
+pub(super) fn loop_cache_base(paths: &[PathBuf]) -> PathBuf {
     let mut root = paths
         .first()
         .and_then(|path| path.parent())
         .map(Path::to_path_buf)
         .unwrap_or_else(std::env::temp_dir);
     root.push(".argosfs-block-cache");
-    root.push(volume_uuid);
     root
 }
 

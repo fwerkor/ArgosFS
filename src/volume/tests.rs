@@ -2089,3 +2089,42 @@ fn immediate_v2_prepares_splices_only_after_all_members_upgrade() {
     let reopened = ArgosFs::open_loop(&images, false).unwrap();
     assert_eq!(reopened.read_file("/f079", false).unwrap(), vec![79; 8192]);
 }
+
+#[test]
+fn force_mkfs_removes_the_previous_pool_cache_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = dir.path().join("reuse.img");
+    let config = VolumeConfig {
+        k: 1,
+        m: 0,
+        ..VolumeConfig::default()
+    };
+    let fs = ArgosFs::create_loop(
+        std::slice::from_ref(&image),
+        config.clone(),
+        32 * 1024 * 1024,
+        "reuse",
+        false,
+    )
+    .unwrap();
+    let old_uuid = fs.metadata_snapshot().uuid;
+    let old_cache = fs.cache_dir().to_path_buf();
+    fs.write_file("/data", &[3u8; 4096], 0o600).unwrap();
+    assert_eq!(fs.read_file("/data", false).unwrap(), vec![3u8; 4096]);
+    assert!(old_cache.exists());
+    drop(fs);
+
+    let fs = ArgosFs::create_loop(
+        std::slice::from_ref(&image),
+        config,
+        32 * 1024 * 1024,
+        "reuse",
+        true,
+    )
+    .unwrap();
+    assert_ne!(fs.metadata_snapshot().uuid, old_uuid);
+    assert!(
+        !old_cache.exists(),
+        "stale cache directory survived mkfs --force"
+    );
+}

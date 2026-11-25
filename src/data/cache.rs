@@ -3,7 +3,7 @@ use crate::util::{atomic_write, ensure_dir, sha256_hex};
 use parking_lot::Mutex;
 use serde_json::json;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -507,6 +507,46 @@ impl BlockCache {
         self.root.join(&digest[..2]).join(format!("{digest}.blk"))
     }
 
+    /// The pool's L2 cache directory.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Current on-disk L2 footprint. This walks the cache directory and is
+    /// meant for on-demand inspection, not the metrics hot path.
+    pub fn disk_footprint(&self) -> Result<(u64, u64)> {
+        Ok(cache_footprint(&self.root))
+    }
+
+    /// Drop every decoded block from L1 and L2.
+    ///
+    /// The caller must quiesce reads (for example by holding the metadata
+    /// write lock) so a concurrent miss cannot re-admit plaintext after the
+    /// clear. In-flight L2 reads keep their mutation tickets; they finish as
+    /// misses against the removed files.
+    pub fn clear(&self) -> Result<()> {
+        {
+            let mut inner = self.inner.lock();
+            inner.items.clear();
+            inner.order.clear();
+            inner.bytes = 0;
+            inner.l2_index.clear();
+            inner.l2_bytes = 0;
+            inner.l2_hot_bytes = 0;
+            // The directory is about to be removed; do not rescan it.
+            inner.l2_loaded = true;
+            inner.l2_loaded_items = 0;
+            inner.l2_loaded_bytes = 0;
+        }
+        match std::fs::remove_dir_all(&self.root) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+        ensure_dir(&self.root)?;
+        Ok(())
+    }
+
     fn put_l2(&self, key: &str, data: &[u8]) -> Result<()> {
         self.load_l2_index()?;
         let path = self.l2_path(key);
@@ -677,6 +717,108 @@ impl BlockCache {
         }
         Ok(())
     }
+}
+
+/// Summary of one pool's on-disk L2 cache directory.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CacheDirInfo {
+    pub pool_uuid: String,
+    pub path: PathBuf,
+    pub files: u64,
+    pub bytes: u64,
+}
+
+fn cache_footprint(path: &Path) -> (u64, u64) {
+    let mut files = 0u64;
+    let mut bytes = 0u64;
+    for entry in walkdir::WalkDir::new(path)
+        .min_depth(1)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let is_block = entry
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".blk"));
+        if !is_block {
+            continue;
+        }
+        files = files.saturating_add(1);
+        bytes = bytes.saturating_add(entry.metadata().map(|meta| meta.len()).unwrap_or(0));
+    }
+    (files, bytes)
+}
+
+/// List the pool cache directories under `base`.
+///
+/// Only direct children whose name is a pool UUID are considered, so a
+/// mistyped base cannot make the caller summarize unrelated directories.
+pub fn list_cache_dirs(base: &Path) -> Result<Vec<CacheDirInfo>> {
+    let mut out = Vec::new();
+    let entries = match std::fs::read_dir(base) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(err) => return Err(err.into()),
+    };
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        let path = entry.path();
+        if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if uuid::Uuid::parse_str(name).is_err() {
+            continue;
+        }
+        let (files, bytes) = cache_footprint(&path);
+        out.push(CacheDirInfo {
+            pool_uuid: name.to_string(),
+            path,
+            files,
+            bytes,
+        });
+    }
+    out.sort_by(|left, right| left.pool_uuid.cmp(&right.pool_uuid));
+    Ok(out)
+}
+
+/// Remove one pool's L2 cache directory. Returns its footprint if it existed.
+pub fn clear_cache_dir(base: &Path, pool_uuid: &str) -> Result<Option<CacheDirInfo>> {
+    if uuid::Uuid::parse_str(pool_uuid).is_err() {
+        return Err(crate::error::ArgosError::Invalid(format!(
+            "not a pool UUID: {pool_uuid}"
+        )));
+    }
+    let path = base.join(pool_uuid);
+    if !path.is_dir() {
+        return Ok(None);
+    }
+    let (files, bytes) = cache_footprint(&path);
+    std::fs::remove_dir_all(&path)?;
+    Ok(Some(CacheDirInfo {
+        pool_uuid: pool_uuid.to_string(),
+        path,
+        files,
+        bytes,
+    }))
+}
+
+/// Remove every pool cache directory under `base` whose UUID is not in `keep`.
+pub fn gc_cache_dirs(base: &Path, keep: &BTreeSet<String>) -> Result<Vec<CacheDirInfo>> {
+    let mut removed = Vec::new();
+    for info in list_cache_dirs(base)? {
+        if keep.contains(&info.pool_uuid) {
+            continue;
+        }
+        std::fs::remove_dir_all(&info.path)?;
+        removed.push(info);
+    }
+    Ok(removed)
 }
 
 fn configured_l2_limit(default_limit: u64) -> u64 {

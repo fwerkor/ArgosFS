@@ -48,6 +48,46 @@ pub(super) struct ResolvedBackendArgs {
     pub(super) pool: Option<String>,
 }
 
+#[derive(Subcommand, Clone, Debug)]
+pub(super) enum CacheCommand {
+    /// Show on-disk L2 cache directories and their footprint.
+    Info {
+        /// Cache base directory. Defaults to the raw-device cache base.
+        #[arg(long, value_name = "DIR")]
+        cache_dir: Option<PathBuf>,
+        /// Raw devices or loop images used to mark attached pools.
+        #[command(flatten)]
+        storage: BackendArgs,
+    },
+    /// Remove one pool's L2 cache directory.
+    ///
+    /// Unmount the pool first for a clean cold start; the cache is disposable
+    /// and the daemon treats missing files as misses.
+    Clear {
+        /// Pool UUID whose cache directory to remove.
+        #[arg(long, value_name = "UUID")]
+        pool: String,
+        /// Cache base directory. Defaults to the raw-device cache base.
+        #[arg(long, value_name = "DIR")]
+        cache_dir: Option<PathBuf>,
+    },
+    /// Remove cache directories for pools that are not attached.
+    ///
+    /// Pass --devices or --images to discover attached pools, or --keep to
+    /// name the UUIDs to retain. Unmount the pools first.
+    Gc {
+        /// Cache base directory. Defaults to the raw-device cache base.
+        #[arg(long, value_name = "DIR")]
+        cache_dir: Option<PathBuf>,
+        /// Pool UUIDs to keep (repeatable).
+        #[arg(long = "keep", value_name = "UUID")]
+        keep: Vec<String>,
+        /// Raw devices or loop images used to discover attached pools.
+        #[command(flatten)]
+        storage: BackendArgs,
+    },
+}
+
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PoolConfigFile {
@@ -272,6 +312,11 @@ pub(super) enum Command {
     InspectPool {
         #[command(flatten)]
         storage: PoolArgs,
+    },
+    #[command(about = "Inspect and clear the persistent decoded-block L2 cache")]
+    Cache {
+        #[command(subcommand)]
+        command: CacheCommand,
     },
     #[command(about = "List members of a block-backed pool")]
     ListDevices {

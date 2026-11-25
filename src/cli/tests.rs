@@ -544,3 +544,67 @@ fn targeted_scrub_member_flag_is_explicit() {
         _ => panic!("unexpected command"),
     }
 }
+
+#[test]
+fn clap_parses_cache_info_clear_and_gc() {
+    let cli = Cli::try_parse_from([
+        "argosfs",
+        "cache",
+        "info",
+        "--cache-dir",
+        "/tmp/cache",
+        "--devices",
+        "/dev/test",
+    ])
+    .unwrap();
+    match cli.command {
+        Command::Cache {
+            command: CacheCommand::Info { cache_dir, storage },
+        } => {
+            assert_eq!(cache_dir.as_deref(), Some(Path::new("/tmp/cache")));
+            assert_eq!(storage.devices, [PathBuf::from("/dev/test")]);
+        }
+        _ => panic!("cache info parsed as the wrong command"),
+    }
+
+    let cli = Cli::try_parse_from([
+        "argosfs",
+        "cache",
+        "clear",
+        "--pool",
+        "c23cc52b-0191-493f-898d-5140044c84fb",
+    ])
+    .unwrap();
+    match cli.command {
+        Command::Cache {
+            command: CacheCommand::Clear { pool, cache_dir },
+        } => {
+            assert_eq!(pool, "c23cc52b-0191-493f-898d-5140044c84fb");
+            assert!(cache_dir.is_none());
+        }
+        _ => panic!("cache clear parsed as the wrong command"),
+    }
+
+    let cli = Cli::try_parse_from([
+        "argosfs",
+        "cache",
+        "gc",
+        "--keep",
+        "c23cc52b-0191-493f-898d-5140044c84fb",
+        "--images",
+        "a.img,b.img",
+    ])
+    .unwrap();
+    match cli.command {
+        Command::Cache {
+            command: CacheCommand::Gc { keep, storage, .. },
+        } => {
+            assert_eq!(keep, ["c23cc52b-0191-493f-898d-5140044c84fb"]);
+            assert_eq!(
+                storage.images,
+                [PathBuf::from("a.img"), PathBuf::from("b.img")]
+            );
+        }
+        _ => panic!("cache gc parsed as the wrong command"),
+    }
+}
