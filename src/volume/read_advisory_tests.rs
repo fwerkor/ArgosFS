@@ -126,7 +126,7 @@ fn advisory_runtime_memory_is_bounded_by_distinct_inodes_and_members() {
     for _ in 0..1500 {
         fs.read_inode(ino, 0, 1024, true).unwrap();
     }
-    let (inode_entries, disk_entries) = fs.read_advisory.pending_entries();
+    let (inode_entries, disk_entries) = fs.runtime.read_advisory.pending_entries();
     assert_eq!(inode_entries, 1);
     assert!(disk_entries <= 3);
     let latest = fs.metadata_snapshot();
@@ -138,7 +138,7 @@ fn pending_disk_latency_is_visible_to_health_and_autopilot_without_mutation() {
     let (_dir, _images, fs, _ino) = fixture();
     let disk = fs.meta.read().disks.values().next().unwrap().clone();
     let initial = fs.meta.read().disks[&disk.id].read_latency_ewma_ms;
-    fs.read_advisory.disk(&disk, 4096, 1.0);
+    fs.runtime.read_advisory.disk(&disk, 4096, 1.0);
     let health = fs.health_report();
     let reported = health.disks.iter().find(|d| d.id == disk.id).unwrap();
     let projected = fs.metadata_snapshot();
@@ -148,7 +148,7 @@ fn pending_disk_latency_is_visible_to_health_and_autopilot_without_mutation() {
     );
     assert!(reported.read_latency_ewma_ms > initial);
     assert_eq!(fs.meta.read().disks[&disk.id].read_latency_ewma_ms, initial);
-    assert!(fs.read_advisory.pending_entries().1 > 0);
+    assert!(fs.runtime.read_advisory.pending_entries().1 > 0);
 }
 
 #[test]
@@ -175,7 +175,7 @@ fn immediate_commit_rollback_baseline_keeps_preceding_read_telemetry() {
     fs.write_file("/file", b"valid", 0o600).unwrap();
     let ino = fs.resolve_path("/file", true).unwrap();
     let before = fs.metadata_snapshot().inodes[&ino].read_bytes;
-    fs.read_advisory.inode(ino, 64, true);
+    fs.runtime.read_advisory.inode(ino, 64, true);
     let mut meta = fs.meta.write();
     let rollback = fs.commit_previous_with_advisory_locked(&mut meta).unwrap();
     assert_eq!(rollback.inodes[&ino].read_bytes, before + 64);
@@ -183,6 +183,6 @@ fn immediate_commit_rollback_baseline_keeps_preceding_read_telemetry() {
     *meta = rollback;
     assert_eq!(meta.inodes[&ino].read_bytes, before + 64);
     drop(meta);
-    assert_eq!(fs.read_advisory.pending_entries().0, 0);
+    assert_eq!(fs.runtime.read_advisory.pending_entries().0, 0);
     assert_eq!(fs.metadata_snapshot().inodes[&ino].read_bytes, before + 64);
 }

@@ -277,6 +277,37 @@ impl QuotaRuntime {
     }
 }
 
+/// Mount-local state shared by every handle, independent of backend configuration.
+struct MountRuntime {
+    read_advisory: read_advisory::ReadAdvisory,
+    commit_metrics: CommitMetrics,
+    dirty_host_shards: Mutex<BTreeSet<PathBuf>>,
+    inode_locks: Mutex<BTreeMap<InodeId, Arc<Mutex<()>>>>,
+    decode_flights: decode_flights::DecodeFlights,
+    read_retries_seen: AtomicU64,
+    read_recovered: AtomicU64,
+    repair_counters: RepairCounters,
+    mount_owners: AtomicUsize,
+    read_retries: usize,
+}
+
+impl MountRuntime {
+    fn new() -> Self {
+        Self {
+            read_advisory: read_advisory::ReadAdvisory::default(),
+            commit_metrics: CommitMetrics::default(),
+            dirty_host_shards: Mutex::new(BTreeSet::new()),
+            inode_locks: Mutex::new(BTreeMap::new()),
+            decode_flights: decode_flights::DecodeFlights::default(),
+            read_retries_seen: AtomicU64::new(0),
+            read_recovered: AtomicU64::new(0),
+            repair_counters: RepairCounters::default(),
+            mount_owners: AtomicUsize::new(1),
+            read_retries: configured_read_retries(),
+        }
+    }
+}
+
 pub struct ArgosFs {
     root: Arc<PathBuf>,
     backend: Arc<dyn StorageBackend>,
@@ -289,26 +320,18 @@ pub struct ArgosFs {
     capacity_snapshot: Arc<RwLock<Option<CapacitySnapshot>>>,
     quota_runtime: Arc<RwLock<QuotaRuntime>>,
     deferred_commit: Arc<Mutex<DeferredCommitState>>,
-    read_advisory: Arc<read_advisory::ReadAdvisory>,
-    commit_metrics: Arc<CommitMetrics>,
     quarantined_devices: Arc<Mutex<BTreeSet<String>>>,
     quarantine_since: Arc<Mutex<BTreeMap<String, f64>>>,
     write_fence: Arc<Mutex<Option<String>>>,
-    dirty_host_shards: Arc<Mutex<BTreeSet<PathBuf>>>,
-    inode_locks: Arc<Mutex<BTreeMap<InodeId, Arc<Mutex<()>>>>>,
     cache: Arc<BlockCache>,
-    decode_flights: Arc<decode_flights::DecodeFlights>,
     verify_written: Option<Arc<VerifyAfterWrite>>,
-    read_retries: usize,
-    read_retries_seen: Arc<AtomicU64>,
-    read_recovered: Arc<AtomicU64>,
-    repair_counters: Arc<RepairCounters>,
-    mount_owners: Arc<AtomicUsize>,
+
+    runtime: Arc<MountRuntime>,
 }
 
 impl Clone for ArgosFs {
     fn clone(&self) -> Self {
-        self.mount_owners.fetch_add(1, Ordering::Relaxed);
+        self.runtime.mount_owners.fetch_add(1, Ordering::Relaxed);
         Self {
             root: self.root.clone(),
             backend: self.backend.clone(),
@@ -318,21 +341,12 @@ impl Clone for ArgosFs {
             capacity_snapshot: self.capacity_snapshot.clone(),
             quota_runtime: self.quota_runtime.clone(),
             deferred_commit: self.deferred_commit.clone(),
-            read_advisory: self.read_advisory.clone(),
-            commit_metrics: self.commit_metrics.clone(),
             quarantined_devices: self.quarantined_devices.clone(),
             quarantine_since: self.quarantine_since.clone(),
             write_fence: self.write_fence.clone(),
-            dirty_host_shards: self.dirty_host_shards.clone(),
-            inode_locks: self.inode_locks.clone(),
             cache: self.cache.clone(),
-            decode_flights: self.decode_flights.clone(),
             verify_written: self.verify_written.clone(),
-            read_retries: self.read_retries,
-            read_retries_seen: self.read_retries_seen.clone(),
-            read_recovered: self.read_recovered.clone(),
-            repair_counters: self.repair_counters.clone(),
-            mount_owners: self.mount_owners.clone(),
+            runtime: self.runtime.clone(),
         }
     }
 }
@@ -341,7 +355,7 @@ impl Drop for ArgosFs {
     fn drop(&mut self) {
         // A clone can outlive another mount handle (for example a metrics
         // request). Only the final handle may stop the shared verifier.
-        if self.mount_owners.fetch_sub(1, Ordering::AcqRel) != 1 {
+        if self.runtime.mount_owners.fetch_sub(1, Ordering::AcqRel) != 1 {
             return;
         }
         // The worker owns a metadata Arc, so stop it before clean-unmount.
@@ -418,13 +432,13 @@ impl ArgosFs {
     }
 
     pub(crate) fn commit_metrics(&self) -> &CommitMetrics {
-        &self.commit_metrics
+        &self.runtime.commit_metrics
     }
 
     pub fn metadata_snapshot(&self) -> Metadata {
         let guard = self.meta.read();
         let mut snapshot = guard.clone();
-        self.read_advisory.project(&mut snapshot);
+        self.runtime.read_advisory.project(&mut snapshot);
         snapshot
     }
 
@@ -433,7 +447,7 @@ impl ArgosFs {
     pub(crate) fn try_metadata_snapshot(&self) -> Option<Metadata> {
         self.meta.try_read().map(|meta| {
             let mut snapshot = meta.clone();
-            self.read_advisory.project(&mut snapshot);
+            self.runtime.read_advisory.project(&mut snapshot);
             snapshot
         })
     }
@@ -467,7 +481,7 @@ impl ArgosFs {
     /// member. Call only after unmounting all other processes using this pool;
     /// this API cannot fence an unrelated legacy daemon already mounted.
     pub fn upgrade_delta_integrity(&mut self) -> Result<()> {
-        if self.mount_owners.load(Ordering::Acquire) != 1 {
+        if self.runtime.mount_owners.load(Ordering::Acquire) != 1 {
             return Err(ArgosError::Conflict(
                 "raw integrity upgrade requires a unique volume handle".to_string(),
             ));
@@ -630,7 +644,8 @@ impl ArgosFs {
     }
 
     fn inode_lock(&self, ino: InodeId) -> Arc<Mutex<()>> {
-        self.inode_locks
+        self.runtime
+            .inode_locks
             .lock()
             .entry(ino)
             .or_insert_with(|| Arc::new(Mutex::new(())))

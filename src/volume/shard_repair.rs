@@ -369,16 +369,19 @@ impl ArgosFs {
             return Err(err);
         }
         self.finish_block_reclamation_locked(meta, &replaced);
-        self.repair_counters
+        self.runtime
+            .repair_counters
             .shards
             .fetch_add(work.shards, Ordering::Relaxed);
-        self.repair_counters
+        self.runtime
+            .repair_counters
             .bytes_read
             .fetch_add(work.bytes_read, Ordering::Relaxed);
-        self.repair_counters
+        self.runtime
+            .repair_counters
             .bytes_written
             .fetch_add(work.bytes_written, Ordering::Relaxed);
-        self.repair_counters.elapsed_ns.fetch_add(
+        self.runtime.repair_counters.elapsed_ns.fetch_add(
             start_time.elapsed().as_nanos().min(u64::MAX as u128) as u64,
             Ordering::Relaxed,
         );

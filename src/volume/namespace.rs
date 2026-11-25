@@ -266,7 +266,9 @@ impl ArgosFs {
         // lock is needed for the common FUSE append-overlay read.
         let meta = self.meta.read();
         if meta.inodes.contains_key(&ino) {
-            self.read_advisory.inode(ino, tail_bytes, !prefix_read);
+            self.runtime
+                .read_advisory
+                .inode(ino, tail_bytes, !prefix_read);
         }
     }
 
@@ -515,7 +517,7 @@ impl ArgosFs {
                     )
                 });
             if !must_repair {
-                self.read_advisory.inode(ino, data.len(), true);
+                self.runtime.read_advisory.inode(ino, data.len(), true);
                 return decoded.map(|(data, damaged)| (data, damaged, false));
             }
         }
@@ -744,9 +746,11 @@ impl ArgosFs {
             prepared.as_ref(),
         ) {
             result?;
-            self.commit_metrics
+            self.runtime
+                .commit_metrics
                 .add_data_plane_bytes(DataPlaneByteKind::RangeAccepted, data.len());
-            self.commit_metrics
+            self.runtime
+                .commit_metrics
                 .add_data_plane_bytes(DataPlaneByteKind::RangeAlignedAppend, data.len());
             return Ok(data.len());
         }
@@ -777,9 +781,11 @@ impl ArgosFs {
                 write_time,
                 prepared,
             )?;
-            self.commit_metrics
+            self.runtime
+                .commit_metrics
                 .add_data_plane_bytes(DataPlaneByteKind::RangeAccepted, data.len());
-            self.commit_metrics
+            self.runtime
+                .commit_metrics
                 .add_data_plane_bytes(DataPlaneByteKind::RangeAlignedAppend, data.len());
             return Ok(data.len());
         }
@@ -833,7 +839,8 @@ impl ArgosFs {
             json!({"inode": ino, "offset": offset, "bytes": data.len(), "rewrite": "stripe-window-local"}),
             write_time,
         )?;
-        self.commit_metrics
+        self.runtime
+            .commit_metrics
             .add_data_plane_bytes(DataPlaneByteKind::RangeAccepted, data.len());
         Ok(data.len())
     }

@@ -213,7 +213,7 @@ impl ArgosFs {
         if !state.has_pending_sync() {
             return Ok(false);
         }
-        let _group_commit_timer = self.commit_metrics.timer(CommitPhase::GroupCommit);
+        let _group_commit_timer = self.runtime.commit_metrics.timer(CommitPhase::GroupCommit);
         // A pool can grow after mount. Never decide the integrity scheme from
         // the superblocks cached at open: dynamically added voting members
         // must also carry the mandatory downgrade-prevention feature.
@@ -263,7 +263,7 @@ impl ArgosFs {
             }
             let mut prepared_delta = None;
             {
-                let _integrity_timer = self.commit_metrics.timer(CommitPhase::Integrity);
+                let _integrity_timer = self.runtime.commit_metrics.timer(CommitPhase::Integrity);
                 if incremental_integrity_enabled && !checkpoint {
                     prepared_delta = Some(journal::prepare_delta_integrity_with_delta(
                         meta, &previous,
@@ -278,8 +278,10 @@ impl ArgosFs {
             let superblocks = self.metadata_superblocks_locked(meta)?;
             let unavailable = self.quarantined_devices.lock().clone();
             {
-                let _validation_timer =
-                    self.commit_metrics.timer(CommitPhase::DurabilityValidation);
+                let _validation_timer = self
+                    .runtime
+                    .commit_metrics
+                    .timer(CommitPhase::DurabilityValidation);
                 Self::validate_deferred_data_durability(
                     meta,
                     &unavailable,
@@ -291,7 +293,8 @@ impl ArgosFs {
                     if dirty_transactions > 0
                         && (meta.config.defer_data_flush || bulk_import_enabled())
                     {
-                        let _flush_timer = self.commit_metrics.timer(CommitPhase::DataFlush);
+                        let _flush_timer =
+                            self.runtime.commit_metrics.timer(CommitPhase::DataFlush);
                         self.flush_deferred_data_locked(
                             meta,
                             backend,
@@ -310,16 +313,18 @@ impl ArgosFs {
                         } else {
                             CheckpointReason::LegacyFallback
                         };
-                        self.commit_metrics.record_checkpoint_reason(reason);
-                        let _checkpoint_timer = self.commit_metrics.timer(CommitPhase::Checkpoint);
+                        self.runtime.commit_metrics.record_checkpoint_reason(reason);
+                        let _checkpoint_timer =
+                            self.runtime.commit_metrics.timer(CommitPhase::Checkpoint);
                         raw_store::write_metadata_copies_quorum_measured(
                             backend,
                             &superblocks,
                             meta,
-                            &self.commit_metrics,
+                            &self.runtime.commit_metrics,
                         )
                     } else {
-                        let _journal_timer = self.commit_metrics.timer(CommitPhase::Journal);
+                        let _journal_timer =
+                            self.runtime.commit_metrics.timer(CommitPhase::Journal);
                         raw_store::append_transaction_with_trusted_integrity_quorum_measured(
                             backend,
                             &superblocks,
@@ -328,7 +333,7 @@ impl ArgosFs {
                                 previous: &previous,
                                 delta: prepared_delta.take(),
                             },
-                            &self.commit_metrics,
+                            &self.runtime.commit_metrics,
                             "group-commit",
                             json!({
                                 "transactions": dirty_transactions,
@@ -497,7 +502,7 @@ impl ArgosFs {
                 v2_base.is_some() && raw_store::array_splice_feature_enabled(&superblocks),
             );
             let mut prepared_delta = {
-                let _integrity_timer = self.commit_metrics.timer(CommitPhase::Integrity);
+                let _integrity_timer = self.runtime.commit_metrics.timer(CommitPhase::Integrity);
                 if let Some(base) = v2_base.as_deref() {
                     Some(journal::prepare_delta_integrity_with_delta(meta, base)?)
                 } else {
@@ -510,7 +515,10 @@ impl ArgosFs {
             };
             let unavailable = self.quarantined_devices.lock().clone();
             let validation = {
-                let _timer = self.commit_metrics.timer(CommitPhase::DurabilityValidation);
+                let _timer = self
+                    .runtime
+                    .commit_metrics
+                    .timer(CommitPhase::DurabilityValidation);
                 let mut state = self.deferred_commit.lock();
                 Self::validate_deferred_data_durability(
                     meta,
@@ -540,7 +548,7 @@ impl ArgosFs {
             };
             let details = json!({"txid": meta.txid, "previous_meta_hash": previous_meta_hash, "details": details});
             let mut commit = |backend: &dyn StorageBackend| {
-                let _timer = self.commit_metrics.timer(CommitPhase::Journal);
+                let _timer = self.runtime.commit_metrics.timer(CommitPhase::Journal);
                 if let Some(base) = v2_base.as_deref() {
                     return raw_store::append_transaction_with_trusted_integrity_quorum_measured(
                         backend,
@@ -550,7 +558,7 @@ impl ArgosFs {
                             previous: base,
                             delta: prepared_delta.take(),
                         },
-                        &self.commit_metrics,
+                        &self.runtime.commit_metrics,
                         action,
                         details.clone(),
                     );
@@ -789,7 +797,7 @@ impl ArgosFs {
     }
 
     pub(super) fn drain_read_advisory_locked(&self, meta: &mut Metadata) {
-        if self.read_advisory.drain(meta) && meta.backend != BackendKind::Host {
+        if self.runtime.read_advisory.drain(meta) && meta.backend != BackendKind::Host {
             self.deferred_commit.lock().raw_advisory_metadata_dirty = true;
         }
     }
@@ -812,9 +820,10 @@ impl ArgosFs {
         let waiting = Instant::now();
         let mut meta = self.meta.write();
         self.drain_read_advisory_locked(&mut meta);
-        self.commit_metrics
+        self.runtime
+            .commit_metrics
             .observe(CommitPhase::SyncLockWait, waiting.elapsed());
-        let _lock_hold = self.commit_metrics.timer(CommitPhase::SyncLockHold);
+        let _lock_hold = self.runtime.commit_metrics.timer(CommitPhase::SyncLockHold);
         if meta.backend != BackendKind::Host {
             self.ensure_block_backend_writable_locked(&meta)?;
             if bulk_import_enabled() || meta.config.defer_metadata_commit {
@@ -834,15 +843,16 @@ impl ArgosFs {
             let previous_meta_hash = meta.integrity.meta_hash.clone();
             journal::prepare_metadata_integrity_with_previous(&mut meta, previous_meta_hash)?;
             let superblocks = self.metadata_superblocks_locked(&meta)?;
-            self.commit_metrics
+            self.runtime
+                .commit_metrics
                 .record_checkpoint_reason(CheckpointReason::RecoveryOrFormat);
-            let _checkpoint_timer = self.commit_metrics.timer(CommitPhase::Checkpoint);
+            let _checkpoint_timer = self.runtime.commit_metrics.timer(CommitPhase::Checkpoint);
             let result = if self.open_backend_covers_superblocks(&superblocks) {
                 raw_store::write_metadata_copies_quorum_measured(
                     &*self.backend,
                     &superblocks,
                     &meta,
-                    &self.commit_metrics,
+                    &self.runtime.commit_metrics,
                 )
             } else {
                 let backend = self.metadata_block_backend_locked(&meta, &superblocks, true)?;
@@ -850,7 +860,7 @@ impl ArgosFs {
                     &*backend,
                     &superblocks,
                     &meta,
-                    &self.commit_metrics,
+                    &self.runtime.commit_metrics,
                 )
             };
             let durability = match result {
@@ -915,7 +925,7 @@ impl ArgosFs {
                 &superblocks,
                 &meta,
                 true,
-                &self.commit_metrics,
+                &self.runtime.commit_metrics,
             )?;
             self.apply_quorum_write_report(&meta, report)
         };
@@ -929,7 +939,7 @@ impl ArgosFs {
 
     pub(super) fn sync_dirty_host_shards(&self) -> Result<()> {
         let shard_paths = {
-            let mut dirty = self.dirty_host_shards.lock();
+            let mut dirty = self.runtime.dirty_host_shards.lock();
             std::mem::take(&mut *dirty)
         };
         let mut failed = BTreeSet::new();
@@ -947,7 +957,7 @@ impl ArgosFs {
             }
         }
         if !failed.is_empty() {
-            self.dirty_host_shards.lock().extend(failed);
+            self.runtime.dirty_host_shards.lock().extend(failed);
         }
         if let Some(err) = first_error {
             return Err(ArgosError::Io(err));
@@ -956,6 +966,6 @@ impl ArgosFs {
     }
 
     pub(super) fn mark_host_shard_dirty(&self, path: PathBuf) {
-        self.dirty_host_shards.lock().insert(path);
+        self.runtime.dirty_host_shards.lock().insert(path);
     }
 }

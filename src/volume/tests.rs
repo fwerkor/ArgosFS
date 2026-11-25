@@ -18,11 +18,11 @@ fn host_sync_drains_only_dirty_shard_set() {
 
     fs.write_file("/dirty", b"dirty shard tracking", 0o644)
         .unwrap();
-    assert!(!fs.dirty_host_shards.lock().is_empty());
+    assert!(!fs.runtime.dirty_host_shards.lock().is_empty());
 
     fs.sync().unwrap();
 
-    assert!(fs.dirty_host_shards.lock().is_empty());
+    assert!(fs.runtime.dirty_host_shards.lock().is_empty());
 }
 
 #[test]
@@ -46,7 +46,7 @@ fn data_operations_register_per_inode_locks() {
     fs.write_inode_range(ino, 3, b"def").unwrap();
     fs.truncate_inode(ino, 4).unwrap();
 
-    assert!(fs.inode_locks.lock().contains_key(&ino));
+    assert!(fs.runtime.inode_locks.lock().contains_key(&ino));
 }
 
 fn host_volume() -> (tempfile::TempDir, ArgosFs) {
@@ -413,7 +413,7 @@ fn raw_journal_events_refresh_stale_read_telemetry_integrity() {
         journal::canonical_metadata_hash(&dirty).unwrap(),
         dirty.integrity.meta_hash
     );
-    assert!(fs.read_advisory.pending_entries().0 > 0);
+    assert!(fs.runtime.read_advisory.pending_entries().0 > 0);
     assert!(!fs.deferred_commit.lock().raw_uncommitted_metadata_dirty);
 
     {
@@ -427,7 +427,7 @@ fn raw_journal_events_refresh_stale_read_telemetry_integrity() {
     assert_eq!(report.raw_journal_quorum, Some(true));
     // Event journal snapshots do not include unflushed, crash-optional read
     // telemetry. The next real transaction must fold it into its valid hash.
-    assert!(fs.read_advisory.pending_entries().0 > 0);
+    assert!(fs.runtime.read_advisory.pending_entries().0 > 0);
     assert!(!fs.deferred_commit.lock().raw_uncommitted_metadata_dirty);
     fs.write_file("/subsequent", b"durable", 0o600).unwrap();
     fs.sync().unwrap();
@@ -742,12 +742,12 @@ fn dirty_host_sync_ignores_deleted_paths_and_keeps_failed_paths() {
     let missing = fs.root.join("missing-shard");
     fs.mark_host_shard_dirty(missing);
     fs.sync_dirty_host_shards().unwrap();
-    assert!(fs.dirty_host_shards.lock().is_empty());
+    assert!(fs.runtime.dirty_host_shards.lock().is_empty());
 
     let unsyncable = PathBuf::from("/dev/null");
     fs.mark_host_shard_dirty(unsyncable.clone());
     assert!(fs.sync_dirty_host_shards().is_err());
-    assert!(fs.dirty_host_shards.lock().contains(&unsyncable));
+    assert!(fs.runtime.dirty_host_shards.lock().contains(&unsyncable));
 }
 
 #[test]
@@ -1796,7 +1796,7 @@ fn upgraded_legacy_event_rollover_with_read_telemetry_reanchors_before_first_v2_
     fs.upgrade_delta_integrity().unwrap();
     assert_eq!(fs.metadata_snapshot().integrity.hash_scheme, None);
     assert_eq!(fs.read_file("/old", false).unwrap(), b"old payload");
-    assert!(fs.read_advisory.pending_entries().0 > 0);
+    assert!(fs.runtime.read_advisory.pending_entries().0 > 0);
     assert!(!fs.deferred_commit.lock().raw_uncommitted_metadata_dirty);
     {
         let meta = fs.meta.read();
