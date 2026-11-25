@@ -286,3 +286,18 @@ checkpoint and unrelated host writes; do not attribute the entire physical
 ratio to dirty-tail coalescing. Synthetic 4+4 tests demonstrate unchanged
 contents and fewer stripe encodes, but only the original physical fixture can
 establish field amplification, CPU, RSS and tail-latency improvements.
+
+
+### Read-path concurrency and profiling
+
+Disjoint cold stripe misses within one read may be decoded concurrently in
+batches of up to four stripes and 16 MiB of raw stripe payload. A shared
+process-wide worker budget also limits per-stripe shard fanout. Larger
+stripes and physical verification retain the serial range path. Warm
+verified cache hits still copy directly to the caller without workers.
+
+Both metrics endpoints report `argosfs_read_phase_duration_seconds_count`,
+`_sum` and `_max` with the `phase` labels `fuse_queue`, `fuse_service`
+and `stripe_decode`. Compare counter deltas during the same isolated
+workload. Decode timings overlap when independent reads execute concurrently,
+so their sum is aggregate worker wall time, not elapsed benchmark time.

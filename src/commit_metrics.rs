@@ -269,9 +269,41 @@ impl FlushDurationCounters {
     }
 }
 
+/// Foreground read-path timings, separate from metadata commit phases.
+#[derive(Clone, Copy)]
+pub(crate) enum ReadPhase {
+    FuseQueue,
+    FuseService,
+    StripeDecode,
+}
+
+impl ReadPhase {
+    const ALL: [Self; 3] = [Self::FuseQueue, Self::FuseService, Self::StripeDecode];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::FuseQueue => "fuse_queue",
+            Self::FuseService => "fuse_service",
+            Self::StripeDecode => "stripe_decode",
+        }
+    }
+}
+
+pub(crate) struct ReadPhaseTimer<'a> {
+    counter: &'a PhaseCounters,
+    started: Instant,
+}
+
+impl Drop for ReadPhaseTimer<'_> {
+    fn drop(&mut self) {
+        self.counter.observe(self.started.elapsed());
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct CommitMetrics {
     phases: [PhaseCounters; CommitPhase::ALL.len()],
+    read_phases: [PhaseCounters; ReadPhase::ALL.len()],
     data_plane_bytes: [AtomicU64; DataPlaneByteKind::ALL.len()],
     writeback_flushes: [AtomicU64; WritebackFlushReason::ALL.len()],
     writeback_flush_errors: [AtomicU64; WritebackFlushReason::ALL.len()],
@@ -435,6 +467,25 @@ impl CommitMetrics {
                     self.rollover_member_strategies[index].load(Ordering::Relaxed),
                 )
             })
+    }
+
+    pub(crate) fn observe_read(&self, phase: ReadPhase, duration: Duration) {
+        self.read_phases[phase as usize].observe(duration);
+    }
+
+    pub(crate) fn read_timer(&self, phase: ReadPhase) -> ReadPhaseTimer<'_> {
+        ReadPhaseTimer {
+            counter: &self.read_phases[phase as usize],
+            started: Instant::now(),
+        }
+    }
+
+    pub(crate) fn read_snapshots(
+        &self,
+    ) -> impl Iterator<Item = (&'static str, PhaseSnapshot)> + '_ {
+        ReadPhase::ALL
+            .into_iter()
+            .map(|phase| (phase.name(), self.read_phases[phase as usize].snapshot()))
     }
 
     pub(crate) fn timer(&self, phase: CommitPhase) -> PhaseTimer<'_> {

@@ -9,7 +9,7 @@ use super::fuse_directory_cache::{DirectoryListingCache, DirectoryRevision};
 use super::fuse_queue::FuseRequestExecutor;
 use super::metrics;
 use crate::acl;
-use crate::commit_metrics::WritebackFlushReason;
+use crate::commit_metrics::{ReadPhase, WritebackFlushReason};
 use crate::error::{ArgosError, Result};
 use crate::types::{InodeId, NodeKind};
 use crate::util::now_f64;
@@ -942,7 +942,16 @@ impl Filesystem for ArgosFuse {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
+        let submitted_at = Instant::now();
         self.submit_io_kind(ino.0, true, move |shared| {
+            shared
+                .volume
+                .commit_metrics()
+                .observe_read(ReadPhase::FuseQueue, submitted_at.elapsed());
+            let _service = shared
+                .volume
+                .commit_metrics()
+                .read_timer(ReadPhase::FuseService);
             let file = shared.handles.lock().get(fh).cloned();
             let result = file
                 .ok_or_else(|| ArgosError::Invalid("invalid FUSE file handle".to_string()))

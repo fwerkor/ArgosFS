@@ -337,6 +337,29 @@ fn emit_commit_metrics(volume: &ArgosFs, emitter: &mut MetricEmitter<'_>) {
     {
         emitter.writeback_flush_histogram(reason, &buckets, total_ns);
     }
+    for (phase, snapshot) in volume.commit_metrics().read_snapshots() {
+        let labels = [("phase", phase)];
+        emitter.typed_metric(
+            "argosfs_read_phase_duration_seconds_count",
+            "Completed read path phase timings",
+            snapshot.count as f64,
+            &labels,
+            "counter",
+        );
+        emitter.typed_metric(
+            "argosfs_read_phase_duration_seconds_sum",
+            "Total read path phase wall time",
+            snapshot.total_ns as f64 / 1e9,
+            &labels,
+            "counter",
+        );
+        emitter.metric(
+            "argosfs_read_phase_duration_seconds_max",
+            "Maximum observed read path phase wall time",
+            snapshot.max_ns as f64 / 1e9,
+            &labels,
+        );
+    }
     for (phase, snapshot) in volume.commit_metrics().snapshots() {
         let labels = [("phase", phase)];
         emit_commit_phase(emitter, snapshot, &labels);
