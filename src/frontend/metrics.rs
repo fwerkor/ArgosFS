@@ -231,6 +231,10 @@ fn emit_read_cache_metrics(volume: &ArgosFs, emitter: &mut MetricEmitter<'_>) {
             "argosfs_read_cache_l2_admission_oversize_total",
             "l2_admission_oversize",
         ),
+        (
+            "argosfs_read_cache_l2_queue_dropped_total",
+            "l2_queue_dropped",
+        ),
         ("argosfs_read_cache_l2_evictions_total", "l2_evictions"),
         ("argosfs_read_cache_l2_writes_total", "l2_writes"),
         ("argosfs_read_cache_l2_errors_total", "l2_errors"),
@@ -251,6 +255,7 @@ fn emit_read_cache_metrics(volume: &ArgosFs, emitter: &mut MetricEmitter<'_>) {
         ("argosfs_read_cache_memory_bytes", "memory_bytes"),
         ("argosfs_read_cache_memory_items", "memory_items"),
         ("argosfs_read_cache_l2_bytes", "l2_bytes"),
+        ("argosfs_read_cache_l2_pending_bytes", "l2_pending_bytes"),
         ("argosfs_read_cache_l2_items", "l2_items"),
         ("argosfs_read_cache_l2_hot_bytes", "l2_hot_bytes"),
         ("argosfs_read_cache_l2_hot_items", "l2_hot_items"),
