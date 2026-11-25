@@ -2027,3 +2027,65 @@ fn upgraded_immediate_transactions_use_delta_and_incremental_durability() {
         .entries
         .contains_key("directory"));
 }
+
+#[test]
+fn immediate_v2_prepares_splices_only_after_all_members_upgrade() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|i| dir.path().join(format!("immediate-splice-{i}.img")))
+        .collect::<Vec<_>>();
+    let mut fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            compression: Compression::None,
+            ..Default::default()
+        },
+        64 * 1024 * 1024,
+        "immediate-splice",
+        false,
+    )
+    .unwrap();
+    fs.upgrade_delta_integrity().unwrap();
+    // Create a long ordered list of real reclaimed extents by writing then
+    // deleting alternate stripes. Inserting another extent in the middle
+    // should emit a splice rather than a replacement of the whole array.
+    for i in 0..80 {
+        fs.write_file(&format!("/f{i:03}"), &vec![i as u8; 8192], 0o600)
+            .unwrap();
+    }
+    for i in (0..80).step_by(2) {
+        fs.unlink_path(&format!("/f{i:03}")).unwrap();
+    }
+    fs.sync().unwrap();
+    let sb = &fs.raw_superblocks[0];
+    let mut header = [0u8; 4096];
+    fs.backend
+        .read_at(&sb.disk_id, sb.journal.offset, &mut header)
+        .unwrap();
+    let end = u64::from_le_bytes(header[24..32].try_into().unwrap());
+    let mut body = vec![0u8; (end - 4096) as usize];
+    fs.backend
+        .read_at(&sb.disk_id, sb.journal.offset + 4096, &mut body)
+        .unwrap();
+    let mut cursor = 0;
+    let mut splices = 0;
+    while cursor + 36 <= body.len() {
+        let n = u32::from_le_bytes(body[cursor..cursor + 4].try_into().unwrap()) as usize;
+        let record: serde_json::Value =
+            serde_json::from_slice(&body[cursor + 36..cursor + 36 + n]).unwrap();
+        if let Some(delta) = record["metadata_delta"].as_array() {
+            splices += delta.iter().filter(|op| op["op"] == "splice").count();
+        }
+        cursor += 36 + n;
+    }
+    assert!(
+        splices > 0,
+        "upgraded immediate commits did not emit array splices"
+    );
+    drop(fs);
+    let reopened = ArgosFs::open_loop(&images, false).unwrap();
+    assert_eq!(reopened.read_file("/f079", false).unwrap(), vec![79; 8192]);
+}

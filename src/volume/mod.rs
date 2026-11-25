@@ -2660,6 +2660,12 @@ impl ArgosFs {
                         && previous_meta_hash.len() == 64
                 })
             };
+            // Immediate v2 transactions prepare the authenticated delta before
+            // the raw-store append path installs its feature guard. Use the
+            // same all-active-member policy here, including the disabled case.
+            let _splice_guard = journal::allow_array_splice(
+                v2_base.is_some() && raw_store::array_splice_feature_enabled(&superblocks),
+            );
             let mut prepared_delta = {
                 let _integrity_timer = self.commit_metrics.timer(CommitPhase::Integrity);
                 if let Some(base) = v2_base.as_deref() {
