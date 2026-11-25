@@ -30,6 +30,41 @@ const PREPARED_PAYLOAD_LIMIT: usize = 8 * 1024 * 1024;
 const MAX_PREPARED_WRITES: usize = 4;
 static ACTIVE_PREPARATIONS: AtomicUsize = AtomicUsize::new(0);
 
+// Bound extra workers across concurrent FUSE requests, not just per stripe.
+// A request always makes progress on its calling thread even if the budget
+// is exhausted or the OS refuses to create another worker.
+const MAX_SHARD_READ_WORKERS: usize = 32;
+static ACTIVE_SHARD_READ_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+struct ShardReadPermit;
+
+impl ShardReadPermit {
+    fn try_acquire() -> Option<Self> {
+        // Keep the MSRV-compatible compare-exchange loop: `fetch_update` was
+        // deprecated in newer Rust and `try_update` is not available on the
+        // older toolchains this crate supports.
+        let mut current = ACTIVE_SHARD_READ_WORKERS.load(Ordering::Acquire);
+        while current < MAX_SHARD_READ_WORKERS {
+            match ACTIVE_SHARD_READ_WORKERS.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self),
+                Err(observed) => current = observed,
+            }
+        }
+        None
+    }
+}
+
+impl Drop for ShardReadPermit {
+    fn drop(&mut self) {
+        ACTIVE_SHARD_READ_WORKERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 struct PreparationPermit(&'static AtomicUsize);
 impl PreparationPermit {
     fn acquire(counter: &'static AtomicUsize) -> Option<Self> {
@@ -706,6 +741,68 @@ impl ArgosFs {
         )
     }
 
+    /// Read the shards of one stripe concurrently.  Independent members have
+    /// independent backend queues and storage devices, so serial reads make a
+    /// 4+4 stripe pay four full device latencies.  Results are returned in the
+    /// caller's slot order so damage reporting stays deterministic.
+    fn read_block_shards_parallel(
+        &self,
+        meta: &Metadata,
+        pending: Vec<(usize, &Shard)>,
+        shards: &mut [Option<Vec<u8>>],
+        damaged: &mut Vec<String>,
+    ) {
+        // Keep one read on the caller and only spawn for the remaining
+        // independent members. Preserve the slot order when consuming results.
+        let results = std::thread::scope(|scope| {
+            let mut reads = Vec::with_capacity(pending.len());
+            let mut pending = pending.into_iter().peekable();
+            while let Some((slot, shard)) = pending.next() {
+                let worker = if pending.peek().is_some() {
+                    ShardReadPermit::try_acquire().and_then(|permit| {
+                        std::thread::Builder::new()
+                            .spawn_scoped(scope, move || {
+                                let _permit = permit;
+                                self.read_shard_verified_locked(meta, shard)
+                            })
+                            .ok()
+                    })
+                } else {
+                    None
+                };
+                let inline = if worker.is_none() {
+                    Some(self.read_shard_verified_locked(meta, shard))
+                } else {
+                    None
+                };
+                reads.push((slot, shard, worker, inline));
+            }
+            reads
+                .into_iter()
+                .map(|(slot, shard, worker, inline)| {
+                    let result = match worker {
+                        Some(worker) => worker.join().expect("parallel shard reader panicked"),
+                        None => inline.expect("inline shard read completed"),
+                    };
+                    (slot, shard, result)
+                })
+                .collect::<Vec<_>>()
+        });
+        for (slot, shard, result) in results {
+            match result {
+                Ok(Some(data)) => {
+                    shards[slot] = Some(data);
+                }
+                Ok(None) => {
+                    damaged.push(format!("{}:checksum:{}", shard.disk_id, slot));
+                }
+                Err(_) => {
+                    damaged.push(format!("{}:missing:{}", shard.disk_id, slot));
+                }
+            }
+        }
+    }
+
     fn decode_block_with_cache_policy_locked(
         &self,
         meta: &Metadata,
@@ -790,6 +887,7 @@ impl ArgosFs {
             {
                 break;
             }
+            let mut pending = Vec::new();
             for shard in &block.shards {
                 if (shard.slot >= layout.k) != parity_pass {
                     continue;
@@ -809,18 +907,9 @@ impl ArgosFs {
                     damaged.push(format!("{}:unavailable", shard.disk_id));
                     continue;
                 }
-                match self.read_shard_verified_locked(meta, shard) {
-                    Ok(Some(data)) => {
-                        shards[shard.slot] = Some(data);
-                    }
-                    Ok(None) => {
-                        damaged.push(format!("{}:checksum:{}", shard.disk_id, shard.slot));
-                    }
-                    Err(_) => {
-                        damaged.push(format!("{}:missing:{}", shard.disk_id, shard.slot));
-                    }
-                }
+                pending.push((shard.slot, shard));
             }
+            self.read_block_shards_parallel(meta, pending, &mut shards, damaged);
         }
         let compressed: Vec<u8> = if shards[..layout.k].iter().all(Option::is_some) {
             // Each data shard has already passed its individual hash. The
