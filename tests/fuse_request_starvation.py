@@ -16,6 +16,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.request
 
 
 def exercise(mount: Path, args):
@@ -82,6 +83,48 @@ def exercise(mount: Path, args):
         raise AssertionError("statvfs exceeded the configured latency limit")
 
 
+
+def check_xattr_observation(mount: Path, url: str):
+    """Reading xattrs between writes must not force data-plane commits."""
+    def counters():
+        for _ in range(100):
+            try:
+                with urllib.request.urlopen(url, timeout=2) as response:
+                    lines = response.read().decode().splitlines()
+                return {
+                    key.split('"')[1]: int(float(value))
+                    for line in lines if line.startswith("argosfs_writeback_flushes_total{")
+                    for key, value in [line.split(" ", 1)]
+                }
+            except OSError:
+                time.sleep(0.1)
+        raise RuntimeError("metrics endpoint did not become available")
+
+    path = mount / "xattr-writeback-regression"
+    with open(path, "wb") as file:
+        file.write(b"a" * 8192)
+        file.flush()
+        os.fsync(file.fileno())
+    name = "user.argosfs.writeback-test"
+    os.setxattr(path, name, b"value")
+    fd = os.open(path, os.O_RDWR)
+    try:
+        before = counters()
+        assert os.pwrite(fd, b"first", 0) == 5
+        assert os.getxattr(path, name) == b"value"
+        assert name in os.listxattr(path)
+        assert os.pwrite(fd, b"second", 5) == 6
+        during = counters()
+        assert during["metadata"] == before["metadata"], (before, during)
+        assert os.pread(fd, 11, 0) == b"firstsecond"
+        os.fsync(fd)
+        after = counters()
+        assert after["sync"] - before["sync"] == 1, (before, after)
+    finally:
+        os.close(fd)
+    assert path.read_bytes() == b"firstsecond" + b"a" * (8192 - 11)
+    print("xattr observation preserves dirty writeback and fsync commits it once")
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", type=Path, default=Path("target/release/argosfs"))
@@ -93,6 +136,9 @@ def main():
     existing_mount = os.environ.get("ARGOSFS_COMPAT_MOUNTPOINT")
     if existing_mount:
         exercise(Path(existing_mount), args)
+        metrics_url = os.environ.get("ARGOSFS_COMPAT_METRICS_URL")
+        if metrics_url:
+            check_xattr_observation(Path(existing_mount), metrics_url)
         return
 
     with tempfile.TemporaryDirectory(prefix="argosfs-228-") as directory:
