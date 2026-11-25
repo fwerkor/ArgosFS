@@ -493,6 +493,43 @@ pub(super) mod avx2 {
         scalar::mul_add_slice(c, &src[i..], &mut dst[i..]);
     }
 
+    /// Combine two data shards directly into one parity/recovery shard.
+    /// The output is stored once; no intermediate destination load or write.
+    #[target_feature(enable = "avx2")]
+    pub(in crate::data::ec::kernel) unsafe fn mul_two(
+        coefficients: [u8; 2],
+        sources: [&[u8]; 2],
+        dst: &mut [u8],
+    ) {
+        let [a, b] = coefficients;
+        let [x, y] = sources;
+        debug_assert_eq!(x.len(), dst.len());
+        debug_assert_eq!(y.len(), dst.len());
+        if a == 0 {
+            return unsafe { mul_slice(b, y, dst) };
+        }
+        if b == 0 {
+            return unsafe { mul_slice(a, x, dst) };
+        }
+        let len = dst.len();
+        // Tables and ISA checks are outside the vector loop.
+        unsafe {
+            let ta = shuffles(a);
+            let tb = shuffles(b);
+            let mut i = 0;
+            while i + LANES <= len {
+                let u = _mm256_loadu_si256(x.as_ptr().add(i).cast());
+                let v = _mm256_loadu_si256(y.as_ptr().add(i).cast());
+                let u = if a == 1 { u } else { multiply(u, ta) };
+                let v = if b == 1 { v } else { multiply(v, tb) };
+                _mm256_storeu_si256(dst.as_mut_ptr().add(i).cast(), _mm256_xor_si256(u, v));
+                i += LANES;
+            }
+            scalar::mul_slice(a, &x[i..], &mut dst[i..]);
+            scalar::mul_add_slice(b, &y[i..], &mut dst[i..]);
+        }
+    }
+
     // Two independent output rows share each loaded source and its nibble
     // indices. Four accumulators fit in the narrow x86 register file.
     #[target_feature(enable = "avx2")]
