@@ -4,6 +4,9 @@ use super::*;
 pub(super) struct DirtyExtent {
     pub(super) offset: u64,
     pub(super) data: Vec<u8>,
+    // Absolute ranges of clean bytes inside the buffered envelope. They are
+    // never overlaid on reads or treated as acknowledged writes at commit.
+    pub(super) gaps: Vec<(u64, u64)>,
     // Time of the last acknowledged buffered write, not the later disk flush.
     pub(super) written_at: f64,
     // Actual persisted ctime when the latest buffered write was acknowledged.
@@ -17,6 +20,15 @@ impl DirtyExtent {
         self.offset.checked_add(self.data.len() as u64)
     }
 
+    fn span_bounds(&self, offset: u64, len: usize, max_bytes: usize) -> Option<(u64, usize)> {
+        let existing_end = self.end()?;
+        let new_end = offset.checked_add(u64::try_from(len).ok()?)?;
+        let merged_start = self.offset.min(offset);
+        let merged_end = existing_end.max(new_end);
+        let merged_len = usize::try_from(merged_end.checked_sub(merged_start)?).ok()?;
+        (merged_len <= max_bytes).then_some((merged_start, merged_len))
+    }
+
     pub(super) fn merge_bounds(
         &self,
         offset: u64,
@@ -28,17 +40,39 @@ impl DirtyExtent {
         if offset > existing_end || self.offset > new_end {
             return None;
         }
-        let merged_start = self.offset.min(offset);
-        let merged_end = existing_end.max(new_end);
-        let merged_len = usize::try_from(merged_end.checked_sub(merged_start)?).ok()?;
-        (merged_len <= max_bytes).then_some((merged_start, merged_len))
+        self.span_bounds(offset, len, max_bytes)
     }
 
     pub(super) fn try_merge(&mut self, offset: u64, data: &[u8], max_bytes: usize) -> bool {
-        let Some((merged_start, merged_len)) = self.merge_bounds(offset, data.len(), max_bytes)
+        self.merge_bounds(offset, data.len(), max_bytes).is_some()
+            && self.try_merge_span(offset, data, max_bytes)
+    }
+
+    fn try_merge_span(&mut self, offset: u64, data: &[u8], max_bytes: usize) -> bool {
+        let Some((merged_start, merged_len)) = self.span_bounds(offset, data.len(), max_bytes)
         else {
             return false;
         };
+        let existing_end = self.end().expect("checked extent");
+        let new_end = offset + data.len() as u64;
+        let mut gaps = Vec::new();
+        for &(start, end) in &self.gaps {
+            if start < offset {
+                gaps.push((start, end.min(offset)));
+            }
+            if new_end < end {
+                gaps.push((start.max(new_end), end));
+            }
+        }
+        if existing_end < offset {
+            gaps.push((existing_end, offset));
+        } else if new_end < self.offset {
+            gaps.push((new_end, self.offset));
+        }
+        if gaps.len() > 128 {
+            return false;
+        }
+        gaps.sort_unstable();
         if merged_start == self.offset {
             // Appends and in-place overwrites are the common path. Reuse Vec's
             // amortized capacity instead of copying the whole dirty stripe on
@@ -47,8 +81,8 @@ impl DirtyExtent {
             let start = (offset - self.offset) as usize;
             self.data[start..start + data.len()].copy_from_slice(data);
         } else {
-            // A prepend still needs to move the existing bytes. The merge
-            // bounds guarantee that there is no uninitialised gap.
+            // A prepend still needs to move the existing bytes. Clean gaps
+            // have zero placeholders that are never exposed or persisted.
             let mut merged = vec![0; merged_len];
             let old_start = (self.offset - merged_start) as usize;
             merged[old_start..old_start + self.data.len()].copy_from_slice(&self.data);
@@ -57,8 +91,31 @@ impl DirtyExtent {
             self.offset = merged_start;
             self.data = merged;
         }
+        self.gaps = gaps;
         self.written_at = now_f64();
         true
+    }
+
+    fn covered_ranges(&self) -> impl Iterator<Item = (u64, u64)> + '_ {
+        let end = self.end().expect("valid dirty extent");
+        std::iter::once(self.offset)
+            .chain(self.gaps.iter().map(|gap| gap.1))
+            .zip(
+                self.gaps
+                    .iter()
+                    .map(|gap| gap.0)
+                    .chain(std::iter::once(end)),
+            )
+            .filter(|(start, end)| start < end)
+    }
+
+    fn covered_len(&self) -> usize {
+        self.data.len()
+            - self
+                .gaps
+                .iter()
+                .map(|(start, end)| (end - start) as usize)
+                .sum::<usize>()
     }
 }
 
@@ -128,6 +185,7 @@ impl ArgosFuseShared {
             DirtyExtent {
                 offset,
                 data: data.to_vec(),
+                gaps: Vec::new(),
                 written_at: now_f64(),
                 seen_ctime,
             },
@@ -152,7 +210,7 @@ impl ArgosFuseShared {
         };
         // This optimization is only for strictly sequential EOF appends.
         // A gap/overwrite must use the existing ordered flush fallback.
-        if dirty.end() != Some(next_offset) {
+        if !dirty.gaps.is_empty() || dirty.end() != Some(next_offset) {
             return Ok(false);
         }
         let Ok((old_size, stripe_size)) = self.volume.writeback_stripe_geometry(ino) else {
@@ -217,6 +275,9 @@ impl ArgosFuseShared {
         if self.queue_writeback(ino, offset, data) {
             return Ok(true);
         }
+        if self.queue_same_stripe_gap(ino, offset, data) {
+            return Ok(true);
+        }
         if data.len() <= FUSE_WRITEBACK_MAX_BYTES
             && self.flush_complete_stripes_for_append(ino, offset)?
         {
@@ -228,6 +289,57 @@ impl ArgosFuseShared {
         // to a hard per-inode and mount-wide bound). Otherwise pressure
         // repeatedly flushes partial stripes and re-encodes the same data.
         Ok(self.extend_incomplete_append(ino, offset, data))
+    }
+
+    /// Kernel writeback can deliver pages out of order. Keep disjoint writes
+    /// to one logical stripe in a single bounded envelope; commit only the
+    /// covered ranges and reconstruct clean gaps from the current metadata.
+    fn queue_same_stripe_gap(&self, ino: InodeId, offset: u64, data: &[u8]) -> bool {
+        if data.is_empty() || data.len() > FUSE_WRITEBACK_MAX_BYTES {
+            return false;
+        }
+        let _guard = self.writeback_lock(ino).write();
+        let Ok((_, stripe_size)) = self.volume.writeback_stripe_geometry(ino) else {
+            return false;
+        };
+        let stripe_size = stripe_size as u64;
+        if stripe_size == 0 {
+            return false;
+        }
+        let seen_ctime = self.volume.attr_inode(ino).ok().map(|attr| attr.ctime);
+        let mut wb = self.writeback.lock();
+        let Some(dirty) = wb.dirty.get(&ino) else {
+            return false;
+        };
+        let (Some(old_end), Some(new_end)) = (dirty.end(), offset.checked_add(data.len() as u64))
+        else {
+            return false;
+        };
+        let same_stripe = if old_end < offset {
+            old_end.saturating_sub(1) / stripe_size == offset / stripe_size
+        } else if new_end < dirty.offset {
+            new_end.saturating_sub(1) / stripe_size == dirty.offset / stripe_size
+        } else {
+            false
+        };
+        if !same_stripe {
+            return false;
+        }
+        let old_len = dirty.data.len();
+        let Some((_, merged_len)) = dirty.span_bounds(offset, data.len(), FUSE_WRITEBACK_MAX_BYTES)
+        else {
+            return false;
+        };
+        if wb.pending_bytes - old_len + merged_len > FUSE_WRITEBACK_MAX_MOUNT_BYTES {
+            return false;
+        }
+        let dirty = Arc::make_mut(wb.dirty.get_mut(&ino).expect("locked dirty inode"));
+        if !dirty.try_merge_span(offset, data, FUSE_WRITEBACK_MAX_BYTES) {
+            return false;
+        }
+        dirty.seen_ctime = seen_ctime;
+        wb.pending_bytes = wb.pending_bytes - old_len + merged_len;
+        true
     }
 
     fn extend_incomplete_append(&self, ino: InodeId, offset: u64, data: &[u8]) -> bool {
@@ -247,7 +359,8 @@ impl ArgosFuseShared {
         let Some(dirty) = wb.dirty.get(&ino) else {
             return false;
         };
-        if dirty.offset != old_size as u64 || dirty.end() != Some(offset) {
+        if !dirty.gaps.is_empty() || dirty.offset != old_size as u64 || dirty.end() != Some(offset)
+        {
             return false;
         }
         let Some(end) = old_size.checked_add(dirty.data.len()) else {
@@ -373,14 +486,16 @@ impl ArgosFuseShared {
             .try_reserve_exact(visible_len.saturating_sub(output.len()))
             .map_err(|_| ArgosError::Io(std::io::Error::from_raw_os_error(libc::ENOMEM)))?;
         output.resize(visible_len, 0);
-        let overlay_start = offset.max(dirty.offset);
-        let overlay_end = read_end.min(dirty_end);
-        if overlay_end > overlay_start {
-            let src_start = (overlay_start - dirty.offset) as usize;
-            let dst_start = (overlay_start - offset) as usize;
-            let len = (overlay_end - overlay_start) as usize;
-            output[dst_start..dst_start + len]
-                .copy_from_slice(&dirty.data[src_start..src_start + len]);
+        for (start, end) in dirty.covered_ranges() {
+            let overlay_start = offset.max(start);
+            let overlay_end = read_end.min(end);
+            if overlay_end > overlay_start {
+                let src_start = (overlay_start - dirty.offset) as usize;
+                let dst_start = (overlay_start - offset) as usize;
+                let len = (overlay_end - overlay_start) as usize;
+                output[dst_start..dst_start + len]
+                    .copy_from_slice(&dirty.data[src_start..src_start + len]);
+            }
         }
 
         // The persisted prefix was already counted by read_inode. Count the
@@ -418,20 +533,39 @@ impl ArgosFuseShared {
             }
             return Ok(());
         };
-        let result = self.volume.write_inode_range_from_open_handle_at(
-            ino,
-            dirty.offset,
-            dirty.data.as_slice(),
-            dirty.written_at,
-            dirty.seen_ctime,
-        );
+        let expected = dirty.covered_len();
+        let result = if dirty.gaps.is_empty() {
+            self.volume.write_inode_range_from_open_handle_at(
+                ino,
+                dirty.offset,
+                dirty.data.as_slice(),
+                dirty.written_at,
+                dirty.seen_ctime,
+            )
+        } else {
+            let ranges = dirty
+                .covered_ranges()
+                .map(|(start, end)| {
+                    (
+                        start,
+                        &dirty.data[(start - dirty.offset) as usize..(end - dirty.offset) as usize],
+                    )
+                })
+                .collect::<Vec<_>>();
+            self.volume.write_inode_ranges_from_open_handle_at(
+                ino,
+                &ranges,
+                dirty.written_at,
+                dirty.seen_ctime,
+            )
+        };
         self.volume.commit_metrics().record_writeback_flush(
             reason,
-            matches!(&result, Ok(written) if *written == dirty.data.len()),
+            matches!(&result, Ok(written) if *written == expected),
             started.elapsed(),
         );
         let reap_after_flush = match result {
-            Ok(written) if written == dirty.data.len() => {
+            Ok(written) if written == expected => {
                 drop(dirty);
                 let mut writeback = self.writeback.lock();
                 writeback.remove_dirty(ino);

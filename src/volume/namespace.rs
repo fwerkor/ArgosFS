@@ -706,6 +706,84 @@ impl ArgosFs {
         )
     }
 
+    /// Commit disjoint acknowledged writes as one stripe-window transaction.
+    /// Clean gaps are decoded from the current inode under the same exclusive
+    /// lock as publication, never from stale writeback placeholders.
+    pub(crate) fn write_inode_ranges_from_open_handle_at(
+        &self,
+        ino: InodeId,
+        ranges: &[(u64, &[u8])],
+        written_at: f64,
+        seen_ctime: Option<f64>,
+    ) -> Result<usize> {
+        if !written_at.is_finite() || ranges.is_empty() {
+            return Err(ArgosError::Invalid("invalid buffered write ranges".into()));
+        }
+        if let [(offset, data)] = ranges {
+            return self
+                .write_inode_range_from_open_handle_at(ino, *offset, data, written_at, seen_ctime);
+        }
+        let mut accepted = 0usize;
+        let mut end = 0usize;
+        let mut spans = Vec::with_capacity(ranges.len());
+        for &(offset, data) in ranges {
+            let start = usize::try_from(offset)
+                .map_err(|_| ArgosError::Invalid("write offset is too large".into()))?;
+            if data.is_empty() || start < end {
+                return Err(ArgosError::Invalid(
+                    "overlapping or empty buffered ranges".into(),
+                ));
+            }
+            end = start
+                .checked_add(data.len())
+                .ok_or_else(|| ArgosError::Invalid("write range overflow".into()))?;
+            accepted = accepted
+                .checked_add(data.len())
+                .ok_or_else(|| ArgosError::Invalid("write byte count overflow".into()))?;
+            spans.push((start, end, data));
+        }
+        let start = spans[0].0;
+        let inode_lock = self.inode_lock(ino);
+        let _inode_guard = inode_lock.lock();
+        let mut meta = self.meta.write();
+        let (old_size, stripe_size) = self.range_update_geometry_locked(&meta, ino)?;
+        let new_size = old_size.max(end);
+        let affected_start = start / stripe_size * stripe_size;
+        let affected_end = end
+            .div_ceil(stripe_size)
+            .saturating_mul(stripe_size)
+            .min(new_size);
+        let mut window = zeroed_io_buffer(
+            affected_end - affected_start,
+            "disjoint stripe rewrite window",
+        )?;
+        let mut cursor = affected_start;
+        for (start, end, data) in spans {
+            let gap_end = start.min(old_size);
+            if cursor < gap_end {
+                let clean = self.decode_inode_window_locked(&mut meta, ino, cursor, gap_end)?;
+                window[cursor - affected_start..gap_end - affected_start].copy_from_slice(&clean);
+            }
+            window[start - affected_start..end - affected_start].copy_from_slice(data);
+            cursor = end;
+        }
+        let suffix_end = affected_end.min(old_size);
+        if cursor < suffix_end {
+            let clean = self.decode_inode_window_locked(&mut meta, ino, cursor, suffix_end)?;
+            window[cursor - affected_start..suffix_end - affected_start].copy_from_slice(&clean);
+        }
+        self.rewrite_inode_window_locked(
+            &mut meta, ino, affected_start, affected_end, new_size, &window, accepted as u64,
+            true, false, "write-range",
+            json!({"inode": ino, "offset": start, "bytes": accepted, "rewrite": "coalesced-stripe-window"}),
+            Some(BufferedWriteTime { at: written_at, seen_ctime }),
+        )?;
+        self.runtime
+            .commit_metrics
+            .add_data_plane_bytes(DataPlaneByteKind::RangeAccepted, accepted);
+        Ok(accepted)
+    }
+
     /// Use exactly the write layout that the range writer uses when deciding
     /// which buffered EOF prefix consists of complete logical stripes.
     pub(crate) fn writeback_stripe_geometry(&self, ino: InodeId) -> Result<(usize, usize)> {
