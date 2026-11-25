@@ -70,6 +70,11 @@ struct CacheInner {
     l2_hits: u64,
     l2_writes: u64,
     l2_errors: u64,
+    l2_admission_frozen: u64,
+    l2_admission_oversize: u64,
+    l2_evictions: u64,
+    l2_loaded_items: u64,
+    l2_loaded_bytes: u64,
 }
 
 impl CacheInner {
@@ -138,11 +143,16 @@ impl CacheInner {
             if self.l2_low_reuse_windows >= 8 {
                 // Keep cold priorities stable across pruning batches, rotating
                 // only after sustained low reuse so a new workload can adapt.
-                self.l2_evict_seed = self.l2_evict_seed.wrapping_add(1);
-                for entry in self.l2_index.values_mut() {
-                    entry.reused = false;
+                // During the initial cold scan there is no hot population
+                // to demote. Rotating its priority destroys the stable
+                // sample and biases residency towards the tail of the scan.
+                if self.l2_hot_bytes > 0 {
+                    self.l2_evict_seed = self.l2_evict_seed.wrapping_add(1);
+                    for entry in self.l2_index.values_mut() {
+                        entry.reused = false;
+                    }
+                    self.l2_hot_bytes = 0;
                 }
-                self.l2_hot_bytes = 0;
                 self.l2_low_reuse_windows = 0;
             }
             self.l2_window_requests = 0;
@@ -451,6 +461,17 @@ impl BlockCache {
             ("l2_hits".to_string(), json!(inner.l2_hits)),
             ("l2_writes".to_string(), json!(inner.l2_writes)),
             ("l2_errors".to_string(), json!(inner.l2_errors)),
+            (
+                "l2_admission_frozen".to_string(),
+                json!(inner.l2_admission_frozen),
+            ),
+            (
+                "l2_admission_oversize".to_string(),
+                json!(inner.l2_admission_oversize),
+            ),
+            ("l2_evictions".to_string(), json!(inner.l2_evictions)),
+            ("l2_loaded_items".to_string(), json!(inner.l2_loaded_items)),
+            ("l2_loaded_bytes".to_string(), json!(inner.l2_loaded_bytes)),
             ("l2_bytes".to_string(), json!(inner.l2_bytes)),
             ("l2_items".to_string(), json!(inner.l2_index.len())),
             ("l2_hot_bytes".to_string(), json!(inner.l2_hot_bytes)),
@@ -490,18 +511,23 @@ impl BlockCache {
         self.load_l2_index()?;
         let path = self.l2_path(key);
         {
-            let inner = self.inner.lock();
+            let mut inner = self.inner.lock();
             // Once the recent hit ratio shows real reuse, a new streaming
             // admission would start evicting the reusable sample before the
             // rest of the second pass can read it. Freeze cold admissions at
             // that point; existing keys can always be refreshed. A different
             // workload with a low hit ratio eventually unfreezes the cache.
-            if !inner.l2_index.contains_key(&path)
-                && (data.len() as u64 > self.l2_limit
-                    || (inner.l2_freeze_stream
-                        && inner.l2_bytes.saturating_add(data.len() as u64) > self.l2_limit))
-            {
-                return Ok(());
+            if !inner.l2_index.contains_key(&path) {
+                if data.len() as u64 > self.l2_limit {
+                    inner.l2_admission_oversize += 1;
+                    return Ok(());
+                }
+                if inner.l2_freeze_stream
+                    && inner.l2_bytes.saturating_add(data.len() as u64) > self.l2_limit
+                {
+                    inner.l2_admission_frozen += 1;
+                    return Ok(());
+                }
             }
         }
         atomic_write(&path, data)?;
@@ -544,7 +570,18 @@ impl BlockCache {
             .into_iter()
             .filter_map(|entry| entry.ok())
         {
-            if !entry.file_type().is_file() {
+            if !entry.file_type().is_file()
+                || !entry
+                    .path()
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| {
+                        name.strip_suffix(".blk").is_some_and(|digest| {
+                            digest.len() == 64
+                                && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                        })
+                    })
+            {
                 continue;
             }
             let Ok(metadata) = entry.metadata() else {
@@ -578,6 +615,8 @@ impl BlockCache {
         }
 
         inner.l2_loaded = true;
+        inner.l2_loaded_items = index.len() as u64;
+        inner.l2_loaded_bytes = total;
         inner.l2_index = index;
         inner.l2_bytes = total;
         inner.l2_hot_bytes = 0;
@@ -617,6 +656,7 @@ impl BlockCache {
             match std::fs::remove_file(&path) {
                 Ok(()) => {
                     if let Some(entry) = inner.l2_index.remove(&path) {
+                        inner.l2_evictions += 1;
                         inner.l2_bytes = inner.l2_bytes.saturating_sub(entry.size);
                         if entry.reused {
                             inner.l2_hot_bytes = inner.l2_hot_bytes.saturating_sub(entry.size);
@@ -625,6 +665,7 @@ impl BlockCache {
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                     if let Some(entry) = inner.l2_index.remove(&path) {
+                        inner.l2_evictions += 1;
                         inner.l2_bytes = inner.l2_bytes.saturating_sub(entry.size);
                         if entry.reused {
                             inner.l2_hot_bytes = inner.l2_hot_bytes.saturating_sub(entry.size);
