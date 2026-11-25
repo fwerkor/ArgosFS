@@ -379,6 +379,13 @@ fn enable_encryption_purges_cached_plaintext() {
     assert_eq!(stats["memory_items"], 0);
     assert_eq!(stats["l2_items"], 0);
     assert_eq!(stats["l2_bytes"], 0);
+
+    // Legacy unencrypted blocks remain readable, but must not refill either tier.
+    assert_eq!(fs.read_file("/secret", false).unwrap(), vec![7u8; 8192]);
+    assert_eq!(fs.read_cache_stats()["memory_items"], 0);
+    drop(fs);
+    let fs = ArgosFs::open(dir.path()).unwrap();
+    assert_eq!(fs.cache_disk_footprint().unwrap(), (0, 0));
 }
 
 #[test]

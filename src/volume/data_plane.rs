@@ -505,6 +505,7 @@ impl ArgosFs {
                 // A prior full-block cache fill must not bypass that existing
                 // corruption-detection behavior for single-member layouts.
                 if cache_policy == BlockCachePolicy::Normal
+                    && !meta.encryption.enabled
                     && !block.encrypted
                     && (block.shards.len() > 1 || block.codec != Compression::None)
                 {
@@ -813,7 +814,7 @@ impl ArgosFs {
         cache_policy: BlockCachePolicy,
     ) -> Result<Vec<u8>> {
         let cache_key = format!("{}:{}:{}", meta.uuid, block.stripe_id, block.raw_sha256);
-        if block.encrypted {
+        if block.encrypted || meta.encryption.enabled {
             self.cache.remove(&cache_key);
         } else if cache_policy == BlockCachePolicy::Normal {
             let mut flight_damage = Vec::new();
@@ -965,7 +966,8 @@ impl ArgosFs {
                 reason: "raw checksum mismatch".to_string(),
             });
         }
-        if !block.encrypted && cache_policy == BlockCachePolicy::Normal {
+        if !meta.encryption.enabled && !block.encrypted && cache_policy == BlockCachePolicy::Normal
+        {
             self.cache.put(cache_key, &raw)?;
         }
         Ok(raw)
@@ -1156,7 +1158,7 @@ impl ArgosFs {
                 reason: "single-device raw checksum mismatch".to_string(),
             });
         }
-        if cache_policy == BlockCachePolicy::Normal {
+        if !meta.encryption.enabled && cache_policy == BlockCachePolicy::Normal {
             self.cache.put(cache_key, &data)?;
         }
         Ok(data)

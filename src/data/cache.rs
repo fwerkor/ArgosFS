@@ -958,9 +958,21 @@ pub fn clear_cache_dir(base: &Path, pool_uuid: &str) -> Result<Option<CacheDirIn
 
 /// Remove every pool cache directory under `base` whose UUID is not in `keep`.
 pub fn gc_cache_dirs(base: &Path, keep: &BTreeSet<String>) -> Result<Vec<CacheDirInfo>> {
+    let keep: BTreeSet<_> = keep
+        .iter()
+        .map(|id| {
+            uuid::Uuid::parse_str(id)
+                .map_err(|_| crate::error::ArgosError::Invalid(format!("not a pool UUID: {id}")))
+        })
+        .collect::<Result<_>>()?;
+    if keep.is_empty() {
+        return Err(crate::error::ArgosError::Invalid(
+            "refusing cache GC without a pool UUID to retain".into(),
+        ));
+    }
     let mut removed = Vec::new();
     for info in list_cache_dirs(base)? {
-        if keep.contains(&info.pool_uuid) {
+        if uuid::Uuid::parse_str(&info.pool_uuid).is_ok_and(|id| keep.contains(&id)) {
             continue;
         }
         std::fs::remove_dir_all(&info.path)?;

@@ -727,6 +727,11 @@ fn cache_admin_lists_clears_and_gcs_pool_directories() {
     assert!(clear_cache_dir(base, &first).unwrap().is_none());
     assert!(clear_cache_dir(base, "not-a-uuid").is_err());
 
+    assert!(gc_cache_dirs(base, &BTreeSet::new()).is_err());
+    assert!(gc_cache_dirs(base, &BTreeSet::from(["invalid".to_string()])).is_err());
+    assert!(base.join(&second).exists());
+    let kept_uppercase = BTreeSet::from([second.to_uppercase()]);
+    assert!(gc_cache_dirs(base, &kept_uppercase).unwrap().is_empty());
     let mut keep = BTreeSet::new();
     keep.insert(first);
     let removed = gc_cache_dirs(base, &keep).unwrap();

@@ -28,4 +28,6 @@ first for a clean cold start; a missing cache file is only a miss.
 `mkfs --force` removes the previous pool's directory before it assigns the new
 UUID, so reformatting a pool does not leave an orphan behind. Enabling
 encryption drops both the RAM and disk cache tiers, so decoded plaintext from
-before encryption does not remain on the host.
+before encryption is removed from the cache. Subsequent reads bypass both
+cache tiers, including reads of legacy blocks written before encryption. This
+is not a secure erase of underlying media or a replacement for re-encryption.
