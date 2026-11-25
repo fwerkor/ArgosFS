@@ -156,6 +156,10 @@ struct DeferredCommitState {
     // Recovery normalization requires a full one-time checkpoint before
     // establishing a trusted v2 delta baseline.
     raw_checkpoint_required: bool,
+    // A clean, complete v2 mount may keep its already durable journal tip
+    // until a real mutation requires a canonical checkpoint. This is not
+    // used for recovery after an error, degraded discovery or formatting.
+    raw_mount_reanchor_pending: bool,
     dirty_transactions: u64,
     dirty_since: Option<Instant>,
     pending_reclaims: Vec<FileBlock>,
@@ -181,6 +185,13 @@ impl DeferredCommitState {
         Self::new_with_raw_dirty(meta, false)
     }
 
+    fn has_pending_sync(&self) -> bool {
+        self.dirty_transactions > 0
+            || !self.pending_reclaims.is_empty()
+            || (!self.raw_mount_reanchor_pending
+                && (self.raw_uncommitted_metadata_dirty || self.raw_checkpoint_required))
+    }
+
     fn new_with_raw_dirty(meta: &Metadata, raw_uncommitted_metadata_dirty: bool) -> Self {
         Self {
             durable_metadata: (meta.backend != BackendKind::Host).then(|| Arc::new(meta.clone())),
@@ -188,6 +199,7 @@ impl DeferredCommitState {
             raw_uncommitted_metadata_dirty,
             raw_advisory_metadata_dirty: false,
             raw_checkpoint_required: raw_uncommitted_metadata_dirty,
+            raw_mount_reanchor_pending: false,
             dirty_transactions: 0,
             dirty_since: None,
             pending_reclaims: Vec::new(),
@@ -707,15 +719,35 @@ impl ArgosFs {
             Arc::new(GuardedBackend::new(Arc::new(backend_file)));
         raw_store::initialize_pool(backend.clone(), &superblocks, &mut meta, force)?;
         raw_store::write_superblock_clean_state(&*backend, &superblocks, false)?;
-        Self::from_block_parts(paths, backend, true, superblocks, meta)
+        Self::from_block_parts(paths, backend, true, superblocks, meta, false)
     }
 
     fn open_block_backend(kind: BackendKind, paths: &[PathBuf], write: bool) -> Result<Self> {
         let opened = raw_store::open_pool(kind, paths, write)?;
+        let clean_complete = opened.report.errors.is_empty()
+            && opened.superblocks.len()
+                == opened
+                    .metadata
+                    .disks
+                    .values()
+                    .filter(|disk| disk.status != DiskStatus::Removed)
+                    .count()
+            && opened
+                .metadata
+                .disks
+                .values()
+                .all(|disk| matches!(disk.status, DiskStatus::Online | DiskStatus::Removed));
         let mut meta = opened.metadata;
         normalize_metadata_layouts(&mut meta);
         recompute_disk_usage_from_metadata(&mut meta);
-        Self::from_block_parts(paths, opened.backend, write, opened.superblocks, meta)
+        Self::from_block_parts(
+            paths,
+            opened.backend,
+            write,
+            opened.superblocks,
+            meta,
+            clean_complete,
+        )
     }
 
     fn from_block_parts(
@@ -724,6 +756,7 @@ impl ArgosFs {
         backend_writable: bool,
         superblocks: Vec<RawSuperblock>,
         meta: Metadata,
+        clean_complete: bool,
     ) -> Result<Self> {
         if meta.format != FORMAT_VERSION {
             return Err(ArgosError::Invalid(format!(
@@ -750,10 +783,11 @@ impl ArgosFs {
             meta.inodes.initialize_member_catalog();
         }
         let meta = Arc::new(MetadataLock::new(meta));
-        let deferred_commit = Arc::new(Mutex::new(DeferredCommitState::new_with_raw_dirty(
-            &meta.read(),
-            raw_uncommitted_metadata_dirty,
-        )));
+        let mut state =
+            DeferredCommitState::new_with_raw_dirty(&meta.read(), raw_uncommitted_metadata_dirty);
+        state.raw_mount_reanchor_pending = clean_complete
+            && meta.read().integrity.hash_scheme == Some(journal::DELTA_INTEGRITY_SCHEME);
+        let deferred_commit = Arc::new(Mutex::new(state));
         let quota_runtime = Arc::new(RwLock::new(QuotaRuntime::from_metadata(&meta.read())?));
         let capacity_snapshot = Arc::new(RwLock::new(Some(CapacitySnapshot::from_metadata(
             &root,
@@ -1001,11 +1035,7 @@ impl ArgosFs {
             return Ok(false);
         }
         let state = self.deferred_commit.lock();
-        if state.dirty_transactions == 0
-            && state.pending_reclaims.is_empty()
-            && !state.raw_uncommitted_metadata_dirty
-            && !state.raw_checkpoint_required
-        {
+        if !state.has_pending_sync() {
             return Ok(false);
         }
         drop(state);
@@ -1111,7 +1141,7 @@ impl ArgosFs {
             }
             let checkpoint_required = {
                 let state = self.deferred_commit.lock();
-                state.raw_uncommitted_metadata_dirty || state.raw_checkpoint_required
+                state.has_pending_sync()
             };
             // Immediate raw mutations are already journal-durable. Read-side
             // telemetry changes only the live view, not the trusted durable
@@ -1156,6 +1186,7 @@ impl ArgosFs {
             state.raw_uncommitted_metadata_dirty = false;
             state.raw_advisory_metadata_dirty = false;
             state.raw_checkpoint_required = false;
+            state.raw_mount_reanchor_pending = false;
             drop(state);
             self.publish_capacity_snapshot_locked(&meta);
             durability?;
@@ -2382,11 +2413,7 @@ impl ArgosFs {
         self.ensure_block_backend_writable_locked(meta)?;
         self.drain_read_advisory_locked(meta);
         let mut state = self.deferred_commit.lock();
-        if state.dirty_transactions == 0
-            && state.pending_reclaims.is_empty()
-            && !state.raw_uncommitted_metadata_dirty
-            && !state.raw_checkpoint_required
-        {
+        if !state.has_pending_sync() {
             return Ok(false);
         }
         let _group_commit_timer = self.commit_metrics.timer(CommitPhase::GroupCommit);
@@ -2539,6 +2566,7 @@ impl ArgosFs {
                 state.raw_uncommitted_metadata_dirty = false;
                 state.raw_advisory_metadata_dirty = false;
                 state.raw_checkpoint_required = false;
+                state.raw_mount_reanchor_pending = false;
                 state.dirty_transactions = 0;
                 state.dirty_since = None;
                 state.pending_reclaims.clear();
@@ -2567,6 +2595,7 @@ impl ArgosFs {
                 state.raw_uncommitted_metadata_dirty = false;
                 state.raw_advisory_metadata_dirty = false;
                 state.raw_checkpoint_required = false;
+                state.raw_mount_reanchor_pending = false;
                 state.dirty_transactions = 0;
                 state.dirty_since = None;
                 state.pending_reclaims.clear();
@@ -2611,6 +2640,7 @@ impl ArgosFs {
     ) -> Result<()> {
         self.ensure_block_backend_writable_locked(meta)?;
         self.drain_read_advisory_locked(meta);
+        self.deferred_commit.lock().raw_mount_reanchor_pending = false;
         if meta.backend != BackendKind::Host
             && (bulk_import_enabled() || meta.config.defer_metadata_commit)
         {
@@ -2863,6 +2893,7 @@ impl ArgosFs {
         state.raw_uncommitted_metadata_dirty = true;
         state.raw_advisory_metadata_dirty = false;
         state.raw_checkpoint_required = true;
+        state.raw_mount_reanchor_pending = false;
         drop(state);
         self.publish_capacity_snapshot_locked(meta);
         Ok(())
@@ -2926,6 +2957,7 @@ impl ArgosFs {
                         let mut state = self.deferred_commit.lock();
                         state.raw_uncommitted_metadata_dirty = true;
                         state.raw_checkpoint_required = true;
+                        state.raw_mount_reanchor_pending = false;
                     }
                     Ok(())
                 }
