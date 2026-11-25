@@ -108,6 +108,7 @@ pub(crate) const MAX_IN_MEMORY_IO_BYTES: usize = 256 * 1024 * 1024;
 mod autopilot;
 pub(crate) mod capacity;
 mod data_plane;
+mod decode_flights;
 mod metadata_lock;
 mod raw_parallel_write;
 use metadata_lock::MetadataLock;
@@ -291,6 +292,7 @@ pub struct ArgosFs {
     dirty_host_shards: Arc<Mutex<BTreeSet<PathBuf>>>,
     inode_locks: Arc<Mutex<BTreeMap<InodeId, Arc<Mutex<()>>>>>,
     cache: Arc<BlockCache>,
+    decode_flights: Arc<decode_flights::DecodeFlights>,
     verify_written: Option<Arc<VerifyAfterWrite>>,
     read_retries: usize,
     read_retries_seen: Arc<AtomicU64>,
@@ -319,6 +321,7 @@ impl Clone for ArgosFs {
             dirty_host_shards: self.dirty_host_shards.clone(),
             inode_locks: self.inode_locks.clone(),
             cache: self.cache.clone(),
+            decode_flights: self.decode_flights.clone(),
             verify_written: self.verify_written.clone(),
             read_retries: self.read_retries,
             read_retries_seen: self.read_retries_seen.clone(),
@@ -558,6 +561,7 @@ impl ArgosFs {
             dirty_host_shards: Arc::new(Mutex::new(BTreeSet::new())),
             inode_locks: Arc::new(Mutex::new(BTreeMap::new())),
             cache: Arc::new(cache),
+            decode_flights: Arc::new(decode_flights::DecodeFlights::default()),
             verify_written: None,
             read_retries: configured_read_retries(),
             read_retries_seen: Arc::new(AtomicU64::new(0)),
@@ -825,6 +829,7 @@ impl ArgosFs {
             dirty_host_shards: Arc::new(Mutex::new(BTreeSet::new())),
             inode_locks: Arc::new(Mutex::new(BTreeMap::new())),
             cache: Arc::new(cache),
+            decode_flights: Arc::new(decode_flights::DecodeFlights::default()),
             verify_written,
             read_retries: configured_read_retries(),
             read_retries_seen: Arc::new(AtomicU64::new(0)),

@@ -14,7 +14,7 @@ use fuser::{
     ReplyEmpty, ReplyEntry, ReplyLseek, ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request,
     SessionACL, TimeOrNow, WriteFlags,
 };
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CString, OsStr};
 use std::io::Read;
@@ -63,7 +63,7 @@ pub struct ArgosFuse {
 pub struct ArgosFuseShared {
     volume: ArgosFs,
     writeback: Mutex<FuseWriteback>,
-    writeback_locks: [Mutex<()>; WRITEBACK_LOCK_STRIPES],
+    writeback_locks: [RwLock<()>; WRITEBACK_LOCK_STRIPES],
     handles: Mutex<FuseHandles>,
     directory_cache: Mutex<DirectoryListingCache>,
     statfs_cache: Mutex<CapacitySnapshot>,
@@ -341,7 +341,7 @@ impl ArgosFuse {
             shared: Arc::new(ArgosFuseShared {
                 volume,
                 writeback: Mutex::new(FuseWriteback::default()),
-                writeback_locks: std::array::from_fn(|_| Mutex::new(())),
+                writeback_locks: std::array::from_fn(|_| RwLock::new(())),
                 handles: Mutex::new(FuseHandles::default()),
                 directory_cache: Mutex::new(DirectoryListingCache::default()),
                 statfs_cache: Mutex::new(snapshot),
@@ -352,6 +352,15 @@ impl ArgosFuse {
     }
 
     fn submit_io(&self, ino: InodeId, job: impl FnOnce(Arc<ArgosFuseShared>) + Send + 'static) {
+        self.submit_io_kind(ino, false, job);
+    }
+
+    fn submit_io_kind(
+        &self,
+        ino: InodeId,
+        shared_read: bool,
+        job: impl FnOnce(Arc<ArgosFuseShared>) + Send + 'static,
+    ) {
         let shared = Arc::clone(&self.shared);
         let executor = self.io_tasks.get_or_init(|| {
             FuseRequestExecutor::start(fuse_thread_count("ARGOSFS_FUSE_IO_WORKERS", 2, 16))
@@ -359,7 +368,12 @@ impl ArgosFuse {
         });
         match executor {
             Ok(executor) => {
-                if !executor.submit(ino, move || job(shared)) {
+                let accepted = if shared_read {
+                    executor.submit_read(ino, move || job(shared))
+                } else {
+                    executor.submit(ino, move || job(shared))
+                };
+                if !accepted {
                     eprintln!("argosfs: rejecting FUSE request during shutdown");
                 }
             }
@@ -503,7 +517,7 @@ impl ArgosFuseShared {
     // The fixed lock stripes bound lock memory independently of inode count.
     // A stripe protects acknowledged bytes and their persisted generation;
     // the mount-wide writeback mutex protects only map/accounting changes.
-    fn writeback_lock(&self, ino: InodeId) -> &Mutex<()> {
+    fn writeback_lock(&self, ino: InodeId) -> &RwLock<()> {
         &self.writeback_locks[(ino as usize) % WRITEBACK_LOCK_STRIPES]
     }
 
@@ -511,7 +525,7 @@ impl ArgosFuseShared {
         if data.len() > FUSE_WRITEBACK_MAX_BYTES {
             return false;
         }
-        let _inode_guard = self.writeback_lock(ino).lock();
+        let _inode_guard = self.writeback_lock(ino).write();
         let seen_ctime = self.volume.attr_inode(ino).ok().map(|attr| attr.ctime);
         let mut writeback = self.writeback.lock();
         if let Some(dirty) = writeback.dirty.get(&ino) {
@@ -556,7 +570,7 @@ impl ArgosFuseShared {
     /// On error, no acknowledged dirty bytes are discarded.
     fn flush_complete_stripes_for_append(&self, ino: InodeId, next_offset: u64) -> Result<bool> {
         let started = Instant::now();
-        let _inode_guard = self.writeback_lock(ino).lock();
+        let _inode_guard = self.writeback_lock(ino).write();
         let Some(dirty) = self.writeback.lock().dirty.get(&ino).cloned() else {
             return Ok(false);
         };
@@ -637,7 +651,7 @@ impl ArgosFuseShared {
     /// The writeback lock serializes observation with persistence; the inode
     /// cannot publish a stale size or timestamps halfway through a flush.
     fn visible_inode_attr(&self, ino: InodeId) -> Result<NodeAttr> {
-        let inode_guard = self.writeback_lock(ino).lock();
+        let inode_guard = self.writeback_lock(ino).write();
         let dirty = self.writeback.lock().dirty.get(&ino).cloned();
         let mut attr = self.volume.attr_inode(ino)?;
         let Some(dirty) = dirty else {
@@ -670,7 +684,7 @@ impl ArgosFuseShared {
     /// Holding the per-inode writeback lock across metadata/read/overlay is necessary:
     /// a concurrent flush must not mix two inode generations in one reply.
     fn read_visible_inode(&self, ino: InodeId, offset: u64, size: usize) -> Result<Vec<u8>> {
-        let inode_guard = self.writeback_lock(ino).lock();
+        let inode_guard = self.writeback_lock(ino).read();
         let dirty = self.writeback.lock().dirty.get(&ino).cloned();
         let Some(dirty) = dirty else {
             return self.volume.read_inode(ino, offset, size, true);
@@ -754,7 +768,7 @@ impl ArgosFuseShared {
         reason: WritebackFlushReason,
     ) -> Result<()> {
         let started = Instant::now();
-        let _inode_guard = self.writeback_lock(ino).lock();
+        let _inode_guard = self.writeback_lock(ino).write();
         // Keep acknowledged bytes in the map and charged to the mount budget
         // until persistence succeeds; failures never need to reinsert them.
         let dirty = self.writeback.lock().dirty.get(&ino).cloned();
@@ -837,7 +851,7 @@ impl ArgosFuseShared {
     }
 
     fn discard_inode_writeback(&self, ino: InodeId) {
-        let _inode_guard = self.writeback_lock(ino).lock();
+        let _inode_guard = self.writeback_lock(ino).write();
         let mut writeback = self.writeback.lock();
         writeback.remove_dirty(ino);
         writeback.reap_after_flush.remove(&ino);
@@ -1463,7 +1477,7 @@ impl Filesystem for ArgosFuse {
         _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
-        self.submit_io(ino.0, move |shared| {
+        self.submit_io_kind(ino.0, true, move |shared| {
             let file = shared.handles.lock().get(fh).cloned();
             let result = file
                 .ok_or_else(|| ArgosError::Invalid("invalid FUSE file handle".to_string()))

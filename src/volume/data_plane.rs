@@ -718,20 +718,61 @@ impl ArgosFs {
         if block.encrypted {
             self.cache.remove(&cache_key);
         } else if cache_policy == BlockCachePolicy::Normal {
-            if let Some(raw) = self.cache.get(&cache_key, Some(&block.raw_sha256)) {
-                if raw.len() == block.raw_size {
-                    return Ok(raw);
+            let mut flight_damage = Vec::new();
+            let decoded = self.decode_flights.run(&cache_key, || {
+                if let Some(raw) = self.cache.get(&cache_key, Some(&block.raw_sha256)) {
+                    if raw.len() == block.raw_size {
+                        return Ok((raw, Vec::new()));
+                    }
+                    self.cache.remove(&cache_key);
                 }
-                self.cache.remove(&cache_key);
-            }
+                let raw = self.decode_uncached_block_locked(
+                    meta,
+                    block,
+                    decrypt_key,
+                    &mut flight_damage,
+                    cache_policy,
+                    &cache_key,
+                )?;
+                Ok((raw, std::mem::take(&mut flight_damage)))
+            });
+            return match decoded {
+                Ok((raw, flight_damage)) => {
+                    damaged.extend(flight_damage);
+                    Ok(raw)
+                }
+                Err(err) => {
+                    damaged.extend(flight_damage);
+                    Err(err)
+                }
+            };
         }
+        self.decode_uncached_block_locked(
+            meta,
+            block,
+            decrypt_key,
+            damaged,
+            cache_policy,
+            &cache_key,
+        )
+    }
+
+    fn decode_uncached_block_locked(
+        &self,
+        meta: &Metadata,
+        block: &FileBlock,
+        decrypt_key: Option<&[u8; 32]>,
+        damaged: &mut Vec<String>,
+        cache_policy: BlockCachePolicy,
+        cache_key: &str,
+    ) -> Result<Vec<u8>> {
         let layout = layout_by_id(meta, block_layout_id(block))?;
         if layout.k == 1 && layout.m == 0 && !block.encrypted && block.codec == Compression::None {
             return self.decode_single_shard_block_with_cache_policy_locked(
                 meta,
                 block,
                 damaged,
-                &cache_key,
+                cache_key,
                 cache_policy,
             );
         }
@@ -835,7 +876,7 @@ impl ArgosFs {
             });
         }
         if !block.encrypted && cache_policy == BlockCachePolicy::Normal {
-            self.cache.put(&cache_key, &raw)?;
+            self.cache.put(cache_key, &raw)?;
         }
         Ok(raw)
     }

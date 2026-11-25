@@ -1,6 +1,7 @@
 //! Blocking FUSE operations run here, never on the kernel request readers.
 //!
-//! Jobs for one inode execute in submission order. Independent inodes can
+//! Consecutive reads for one inode may overlap; exclusive requests preserve
+//! their submission order as barriers. Independent inodes can
 //! progress in parallel; a slow checkpoint does not consume request readers.
 use parking_lot::{Condvar, Mutex};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -11,12 +12,41 @@ use std::thread::{self, JoinHandle};
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
+struct QueuedJob {
+    shared_read: bool,
+    run: Job,
+}
+
+#[derive(Default)]
+struct Active {
+    readers: usize,
+    exclusive: bool,
+}
+
 #[derive(Default)]
 struct State {
-    jobs: BTreeMap<u64, VecDeque<Job>>,
+    jobs: BTreeMap<u64, VecDeque<QueuedJob>>,
     ready: VecDeque<u64>,
-    active: BTreeSet<u64>,
+    ready_set: BTreeSet<u64>,
+    active: BTreeMap<u64, Active>,
     stopping: bool,
+}
+
+impl State {
+    fn schedule(&mut self, inode: u64) -> bool {
+        let Some(next) = self.jobs.get(&inode).and_then(|jobs| jobs.front()) else {
+            return false;
+        };
+        let runnable = self
+            .active
+            .get(&inode)
+            .is_none_or(|active| !active.exclusive && (next.shared_read || active.readers == 0));
+        if runnable && self.ready_set.insert(inode) {
+            self.ready.push_back(inode);
+            return true;
+        }
+        false
+    }
 }
 
 #[derive(Default)]
@@ -51,15 +81,28 @@ impl FuseRequestExecutor {
     /// Submission cannot block a FUSE request reader, including when all
     /// execution threads are doing slow I/O or waiting for metadata locks.
     pub(super) fn submit(&self, inode: u64, job: impl FnOnce() + Send + 'static) -> bool {
+        self.submit_kind(inode, false, job)
+    }
+
+    pub(super) fn submit_read(&self, inode: u64, job: impl FnOnce() + Send + 'static) -> bool {
+        self.submit_kind(inode, true, job)
+    }
+
+    fn submit_kind(
+        &self,
+        inode: u64,
+        shared_read: bool,
+        job: impl FnOnce() + Send + 'static,
+    ) -> bool {
         let mut state = self.shared.state.lock();
         if state.stopping {
             return false;
         }
-        let pending = state.jobs.entry(inode).or_default();
-        let was_empty = pending.is_empty();
-        pending.push_back(Box::new(job));
-        if was_empty && !state.active.contains(&inode) {
-            state.ready.push_back(inode);
+        state.jobs.entry(inode).or_default().push_back(QueuedJob {
+            shared_read,
+            run: Box::new(job),
+        });
+        if state.schedule(inode) {
             self.shared.ready.notify_one();
         }
         true
@@ -92,9 +135,18 @@ fn worker(shared: Arc<Shared>) {
             let mut state = shared.state.lock();
             loop {
                 if let Some(inode) = state.ready.pop_front() {
+                    state.ready_set.remove(&inode);
                     let jobs = state.jobs.get_mut(&inode).expect("ready inode has jobs");
                     let job = jobs.pop_front().expect("ready inode has nonempty queue");
-                    state.active.insert(inode);
+                    let active = state.active.entry(inode).or_default();
+                    if job.shared_read {
+                        active.readers += 1;
+                    } else {
+                        active.exclusive = true;
+                    }
+                    if state.schedule(inode) {
+                        shared.ready.notify_one();
+                    }
                     break (inode, job);
                 }
                 if state.stopping {
@@ -106,16 +158,26 @@ fn worker(shared: Arc<Shared>) {
 
         // A panicking handler must not strand subsequent requests for its
         // inode. Dropping an unused fuser reply reports EIO to the caller.
-        if catch_unwind(AssertUnwindSafe(job)).is_err() {
+        let shared_read = job.shared_read;
+        if catch_unwind(AssertUnwindSafe(job.run)).is_err() {
             eprintln!("argosfs: FUSE I/O task panicked");
         }
 
         let mut state = shared.state.lock();
-        state.active.remove(&inode);
-        if state.jobs.get(&inode).is_some_and(|jobs| !jobs.is_empty()) {
-            state.ready.push_back(inode);
-            shared.ready.notify_one();
+        let active = state.active.get_mut(&inode).expect("running inode");
+        if shared_read {
+            active.readers -= 1;
         } else {
+            active.exclusive = false;
+        }
+        if active.readers == 0 && !active.exclusive {
+            state.active.remove(&inode);
+        }
+        if state.schedule(inode) {
+            shared.ready.notify_one();
+        } else if !state.active.contains_key(&inode)
+            && state.jobs.get(&inode).is_some_and(|jobs| jobs.is_empty())
+        {
             state.jobs.remove(&inode);
         }
     }
@@ -160,6 +222,51 @@ mod tests {
         executor.shutdown();
         assert_eq!(*trace.lock(), (0..100).collect::<Vec<_>>());
         assert!(!executor.submit(42, || panic!("must never execute after shutdown")));
+    }
+
+    #[test]
+    fn same_inode_reads_overlap_but_writes_are_fifo_barriers() {
+        let mut executor = FuseRequestExecutor::start(4).unwrap();
+        let (started, running) = mpsc::channel();
+        let (release_a, wait_a) = mpsc::channel();
+        let (release_b, wait_b) = mpsc::channel();
+        let a = started.clone();
+        assert!(executor.submit_read(1, move || {
+            a.send("a").unwrap();
+            wait_a.recv().unwrap();
+        }));
+        let b = started.clone();
+        assert!(executor.submit_read(1, move || {
+            b.send("b").unwrap();
+            wait_b.recv().unwrap();
+        }));
+        let (release_write, wait_write) = mpsc::channel();
+        let w = started.clone();
+        assert!(executor.submit(1, move || {
+            w.send("write").unwrap();
+            wait_write.recv().unwrap();
+        }));
+        assert!(executor.submit_read(1, move || started.send("after").unwrap()));
+        let mut first = [
+            running.recv_timeout(Duration::from_secs(2)).unwrap(),
+            running.recv_timeout(Duration::from_secs(2)).unwrap(),
+        ];
+        first.sort_unstable();
+        assert_eq!(first, ["a", "b"]);
+        release_a.send(()).unwrap();
+        assert!(running.recv_timeout(Duration::from_millis(50)).is_err());
+        release_b.send(()).unwrap();
+        assert_eq!(
+            running.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "write"
+        );
+        assert!(running.recv_timeout(Duration::from_millis(50)).is_err());
+        release_write.send(()).unwrap();
+        assert_eq!(
+            running.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "after"
+        );
+        executor.shutdown();
     }
 
     #[test]
