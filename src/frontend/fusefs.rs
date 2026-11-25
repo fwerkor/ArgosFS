@@ -1333,12 +1333,9 @@ impl Filesystem for ArgosFuse {
         self.submit_io(ino.0, move |shared| {
             let req = &req;
             let name = name.as_os_str();
-            if let Err(err) =
-                shared.flush_inode_writeback_reason(ino.0, WritebackFlushReason::Metadata)
-            {
-                reply.error(errno(&err));
-                return;
-            }
+            // Xattrs are independent of buffered file data. In particular,
+            // Linux probes security.capability before writes; forcing a
+            // data flush here defeats write coalescing on each request.
             let result = shared
                 .require_access(req, ino, libc::R_OK)
                 .and_then(|()| shared.volume.getxattr_inode(ino.0, xattr_name(name)?));
@@ -1355,12 +1352,9 @@ impl Filesystem for ArgosFuse {
         let req = RequestIdentity::from_request(req);
         self.submit_io(ino.0, move |shared| {
             let req = &req;
-            if let Err(err) =
-                shared.flush_inode_writeback_reason(ino.0, WritebackFlushReason::Metadata)
-            {
-                reply.error(errno(&err));
-                return;
-            }
+            // Xattrs are independent of buffered file data. In particular,
+            // Linux probes security.capability before writes; forcing a
+            // data flush here defeats write coalescing on each request.
             match shared
                 .require_access(req, ino, libc::R_OK)
                 .and_then(|()| shared.volume.listxattr_inode(ino.0))
