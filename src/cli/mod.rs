@@ -720,6 +720,7 @@ pub fn run() -> Result<()> {
             if repair || remove_orphans {
                 fs.sync()?;
                 report.journals_reset = fs.reset_stale_journals()?;
+                fs.finish_maintenance_verification(&mut report);
             }
             print_fsck_report(&report, json)?;
         }
@@ -737,7 +738,7 @@ pub fn run() -> Result<()> {
             validate_root_backend(root.as_deref(), storage.backend)?;
             let fs = open_backend(root, storage.backend, storage.images, storage.devices, true)?;
             validate_requested_pool(&fs, storage.pool.as_deref())?;
-            let report = if let Some(member_id) = member {
+            let mut report = if let Some(member_id) = member {
                 eprintln!(
                     "{}",
                     serde_json::json!({
@@ -782,6 +783,7 @@ pub fn run() -> Result<()> {
                 })?
             };
             fs.sync()?;
+            fs.finish_maintenance_verification(&mut report);
             print_fsck_report(&report, json)?;
         }
         Command::Rebalance { root } => {
@@ -1318,7 +1320,7 @@ fn print_fsck_report(report: &FsckReport, explicit_json: bool) -> Result<()> {
         return Ok(());
     }
     println!(
-        "checked files={} directories={} damaged={} repaired={} unrecoverable={} missing_shards={} checksum_errors={} shard_read_retries={} shard_read_recovered={} orphans={} journals_reset={}",
+        "checked files={} directories={} damaged={} repaired={} unrecoverable={} missing_shards={} checksum_errors={} shard_read_retries={} shard_read_recovered={} orphans={} journals_reset={} write_verify_checks={} write_verify_retries={} write_verify_failures={} write_verify_skipped={}",
         report.files_checked,
         report.directories_checked,
         report.damaged_files,
@@ -1329,7 +1331,11 @@ fn print_fsck_report(report: &FsckReport, explicit_json: bool) -> Result<()> {
         report.shard_read_retries,
         report.shard_read_recovered,
         report.orphan_shards,
-        report.journals_reset
+        report.journals_reset,
+        report.write_verify_checks,
+        report.write_verify_retries,
+        report.write_verify_failures,
+        report.write_verify_skipped
     );
     for error in &report.errors {
         eprintln!("error: {error}");

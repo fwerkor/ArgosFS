@@ -8,7 +8,7 @@ pub fn init_allocator(data_start: u64, data_length: u64, block_size: u64) -> Raw
         data_start,
         data_end: data_start.saturating_add(data_length),
         next_offset: data_start,
-        free_extents: imbl::Vector::new(),
+        free_extents: Default::default(),
     }
 }
 
@@ -20,19 +20,65 @@ pub fn allocate(
 ) -> Result<PhysicalExtent> {
     let block_size = state.block_size.max(4096);
     let length = align_up(length.max(1), block_size);
-    if let Some((index, free)) = state
+    let candidate = if state
         .free_extents
-        .iter()
-        .enumerate()
-        .find(|(_, free)| free.length >= length && free.offset % block_size == 0)
-        .map(|(index, free)| (index, free.clone()))
+        .known_length_upper_bound()
+        .is_some_and(|bound| bound < length)
     {
+        None
+    } else if let Some(found) = state.free_extents.indexed_fit(length, block_size) {
+        if found.is_none() {
+            if let Some(index) = state.free_extents.take_fit_index() {
+                state.free_extents.restore_fit_index(index);
+            }
+        }
+        found
+    } else {
+        let mut max_seen = 0;
+        let found = state
+            .free_extents
+            .iter()
+            .enumerate()
+            .find(|(_, free)| {
+                max_seen = max_seen.max(free.length);
+                free.length >= length && free.offset % block_size == 0
+            })
+            .map(|(index, free)| (index, free.clone()));
+        if found.is_none() {
+            // No match means the entire list was visited; max_seen is exact.
+            state.free_extents.mark_length_upper_bound(max_seen);
+        }
+        found
+    };
+    if let Some((index, free)) = candidate {
         let offset = free.offset;
+        let preserve_proof = state.free_extents.known_normalized();
+        let old_bound = state.free_extents.known_length_upper_bound();
+        let mut fit_index = state.free_extents.take_fit_index();
+        if let Some(index) = &mut fit_index {
+            index.remove(&free);
+            if free.length > length {
+                index.insert(&RawFreeExtent {
+                    offset: free.offset.saturating_add(length),
+                    length: free.length - length,
+                });
+            }
+        }
         if free.length == length {
             state.free_extents.remove(index);
         } else if let Some(slot) = state.free_extents.get_mut(index) {
             slot.offset = slot.offset.saturating_add(length);
             slot.length = slot.length.saturating_sub(length);
+        }
+        if preserve_proof {
+            state.free_extents.mark_normalized();
+        }
+        // Allocation cannot enlarge an existing free extent.
+        if let Some(bound) = old_bound {
+            state.free_extents.mark_length_upper_bound(bound);
+        }
+        if let Some(index) = fit_index {
+            state.free_extents.restore_fit_index(index);
         }
         return Ok(PhysicalExtent {
             disk_id: disk_id.to_string(),
@@ -82,14 +128,11 @@ pub fn free(state: &mut RawAllocatorState, extent: &PhysicalExtent) -> Result<()
     let mut start = extent.offset;
     let mut end = extent.offset.saturating_add(extent.length);
     let free = &mut state.free_extents;
+    let old_bound = free.known_length_upper_bound();
     // Existing pools can contain unsorted or uncoalesced lists. Keep the
     // old normalization semantics for these exceptional inputs; generated
     // free lists are sorted and strictly separated after every mutation.
-    if !free
-        .iter()
-        .zip(free.iter().skip(1))
-        .all(|(left, right)| left.offset.saturating_add(left.length) < right.offset)
-    {
+    if !free.is_normalized() {
         free.push_back(RawFreeExtent {
             offset: start,
             length: extent.length,
@@ -125,6 +168,14 @@ pub fn free(state: &mut RawAllocatorState, extent: &PhysicalExtent) -> Result<()
         offset: start,
         length: end.saturating_sub(start),
     };
+    let merged_length = replacement.length;
+    let mut fit_index = free.take_fit_index();
+    if let Some(index) = &mut fit_index {
+        for i in first..last {
+            index.remove(&free[i]);
+        }
+        index.insert(&replacement);
+    }
     if last == first + 1 {
         free[first] = replacement;
     } else if first == last {
@@ -134,6 +185,13 @@ pub fn free(state: &mut RawAllocatorState, extent: &PhysicalExtent) -> Result<()
         free.truncate(first);
         free.push_back(replacement);
         free.append(right);
+    }
+    free.mark_normalized();
+    if let Some(bound) = old_bound {
+        free.mark_length_upper_bound(bound.max(merged_length));
+    }
+    if let Some(index) = fit_index {
+        free.restore_fit_index(index);
     }
     Ok(())
 }
@@ -224,7 +282,10 @@ fn coalesce(state: &mut RawAllocatorState) {
         }
         merged.push(extent);
     }
+    let max_length = merged.iter().map(|extent| extent.length).max().unwrap_or(0);
     state.free_extents = merged.into_iter().collect();
+    state.free_extents.mark_normalized();
+    state.free_extents.mark_length_upper_bound(max_length);
 }
 
 #[cfg(test)]

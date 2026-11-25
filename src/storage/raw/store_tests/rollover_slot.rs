@@ -88,8 +88,7 @@ fn protected_rollover_preserves_prior_checkpoint_and_halves_physical_bytes() {
     let checkpoint = prepare_checkpoint_writes(&next, &superblocks).unwrap();
     let bytes_per_slot = RAW_HEADER_SIZE as u64
         + checkpoint
-            .body_writes
-            .iter()
+            .body_writes()
             .map(|(_, bytes)| bytes.len() as u64)
             .sum::<u64>();
     let metrics = CommitMetrics::default();
@@ -508,8 +507,7 @@ fn changed_page_checkpoint_rewrites_only_modified_and_corrupt_target_pages() {
         .1;
     let full = next.header.len() as u64
         + next
-            .body_writes
-            .iter()
+            .body_writes()
             .map(|(_, data)| data.len() as u64)
             .sum::<u64>();
     assert!(

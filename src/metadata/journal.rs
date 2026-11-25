@@ -646,20 +646,19 @@ pub(crate) fn prepare_delta_integrity_with_delta(
     Ok(delta)
 }
 
-pub fn inject_crash(point: &str) -> Result<()> {
+pub(crate) fn crash_point_requested(point: &str) -> bool {
     let thread_spec = THREAD_CRASH_POINT.with(|value| value.borrow().clone());
-    let spec = match thread_spec {
-        Some(spec) => spec,
-        None => match std::env::var("ARGOSFS_CRASH_POINT") {
-            Ok(spec) => spec,
-            Err(_) => return Ok(()),
-        },
-    };
-    if spec
-        .split(',')
-        .map(str::trim)
-        .any(|wanted| wanted == point || wanted == "all")
-    {
+    thread_spec
+        .or_else(|| std::env::var("ARGOSFS_CRASH_POINT").ok())
+        .is_some_and(|spec| {
+            spec.split(',')
+                .map(str::trim)
+                .any(|wanted| wanted == point || wanted == "all")
+        })
+}
+
+pub fn inject_crash(point: &str) -> Result<()> {
+    if crash_point_requested(point) {
         if std::env::var("ARGOSFS_CRASH_ABORT").ok().as_deref() == Some("1") {
             std::process::abort();
         }
@@ -677,6 +676,13 @@ pub fn set_thread_crash_point(point: Option<&str>) {
 pub fn thread_crash_point(point: &str) -> ThreadCrashPointGuard {
     let previous = THREAD_CRASH_POINT.with(|value| value.replace(Some(point.to_string())));
     ThreadCrashPointGuard { previous }
+}
+
+/// Multi-member data I/O must preserve the caller-thread fault injection
+/// semantics, including process abort at an exact partial-write boundary.
+pub(crate) fn crash_injection_configured() -> bool {
+    THREAD_CRASH_POINT.with(|value| value.borrow().is_some())
+        || std::env::var_os("ARGOSFS_CRASH_POINT").is_some()
 }
 
 pub fn thread_checkpoint_interval(interval: u64) -> ThreadCheckpointIntervalGuard {

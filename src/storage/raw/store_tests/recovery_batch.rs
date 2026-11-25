@@ -44,6 +44,95 @@ impl StorageBackend for CountingRecoveryReads {
 }
 
 #[test]
+fn recovery_materializes_older_quorum_winner_without_retaining_full_history() {
+    let (_dir, images, base, superblocks) = quorum_fixture();
+    let backend = block_backend_for(&images);
+    // Both voting members support a committed prefix; a lone newer tail
+    // must not displace it. No commit certificates are needed for this case.
+    let mut previous = base.clone();
+    for i in 0..12 {
+        let next = next_metadata(&previous, &format!("history-{i}"));
+        let (entry, _) = build_journal_entry(
+            &next,
+            Some(&previous),
+            "history",
+            serde_json::json!({}),
+            true,
+        )
+        .unwrap();
+        for sb in &superblocks[..2] {
+            let (header, offset, end, rollover) =
+                journal_append_position(&backend, sb, entry.len()).unwrap();
+            assert!(!rollover);
+            append_journal_member(
+                &backend,
+                sb,
+                header,
+                offset,
+                end,
+                &entry,
+                JournalMemberWriteOptions {
+                    flush: true,
+                    metrics: None,
+                },
+            )
+            .unwrap();
+        }
+        previous = next;
+    }
+    let winner = previous;
+    let tail = next_metadata(&winner, "uncommitted-tail");
+    let (entry, _) =
+        build_journal_entry(&tail, Some(&winner), "history", serde_json::json!({}), true).unwrap();
+    let sb = &superblocks[0];
+    let (header, offset, end, rollover) =
+        journal_append_position(&backend, sb, entry.len()).unwrap();
+    assert!(!rollover);
+    append_journal_member(
+        &backend,
+        sb,
+        header,
+        offset,
+        end,
+        &entry,
+        JournalMemberWriteOptions {
+            flush: true,
+            metrics: None,
+        },
+    )
+    .unwrap();
+    let mut report = TransactionReport::default();
+    let scan =
+        scan_journal_metadata(&backend, &superblocks, &mut report, Some(&base), &[], None).unwrap();
+    assert_eq!(
+        scan.winner,
+        Some((
+            winner.txid,
+            winner.integrity.generation,
+            winner.integrity.meta_hash.clone()
+        ))
+    );
+    assert!(
+        scan.retained.is_none(),
+        "older winner should be reconstructed, not held in the history map"
+    );
+    let expected_valid = report.valid_entries;
+    let mut report = TransactionReport::default();
+    let recovered =
+        read_latest_journal_metadata(&backend, &superblocks, &mut report, Some(&base), &[])
+            .unwrap()
+            .unwrap();
+    assert_eq!(recovered.txid, winner.txid);
+    assert_eq!(recovered.integrity.meta_hash, winner.integrity.meta_hash);
+    assert_eq!(
+        report.valid_entries, expected_valid,
+        "second pass must not double-count report entries"
+    );
+    let actual = recover_metadata(&backend, &superblocks).unwrap();
+    assert_eq!(actual.integrity.meta_hash, winner.integrity.meta_hash);
+}
+
+#[test]
 fn recovery_reads_checkpoint_in_large_batches_and_verifies_each_page() {
     let (_dir, images, _, superblocks) = quorum_fixture();
     let backend = block_backend_for(&images);
@@ -142,5 +231,68 @@ fn recovery_rejects_invalid_page_index_before_body_read() {
             &header,
         ),
         Err(ArgosError::CorruptedMetadata(_))
+    ));
+}
+
+#[test]
+fn journal_tip_scans_all_records_using_bounded_contiguous_reads() {
+    let (_dir, images, metadata, superblocks) = quorum_fixture();
+    let backend = block_backend_for(&images);
+    let sb = &superblocks[0];
+    let (record, _) = build_journal_entry(
+        &metadata,
+        None,
+        "tip-batch",
+        serde_json::json!({"payload": "x".repeat(4096)}),
+        true,
+    )
+    .unwrap();
+    let (large, _) = build_journal_entry(
+        &metadata,
+        None,
+        "large-tip-batch",
+        serde_json::json!({"payload": "y".repeat(JOURNAL_TIP_BATCH_BYTES + 17)}),
+        true,
+    )
+    .unwrap();
+    let count = JOURNAL_TIP_BATCH_BYTES * 2 / record.len() + 3;
+    let mut body = record.repeat(count);
+    body.extend_from_slice(&large);
+    assert!(body.len() as u64 + RAW_HEADER_SIZE as u64 <= sb.journal.length);
+    initialize_journal_region(&backend, &sb.disk_id, sb).unwrap();
+    let start = sb.journal.offset + RAW_HEADER_SIZE as u64;
+    backend.write_at(&sb.disk_id, start, &body).unwrap();
+    let mut header = [0; RAW_HEADER_SIZE];
+    backend
+        .read_at(&sb.disk_id, sb.journal.offset, &mut header)
+        .unwrap();
+    put_u64(&mut header, 24, RAW_HEADER_SIZE as u64 + body.len() as u64);
+    backend
+        .write_at(&sb.disk_id, sb.journal.offset, &header)
+        .unwrap();
+    let counted = CountingRecoveryReads {
+        inner: block_backend_for(&images),
+        device: sb.disk_id.clone(),
+        first_body_byte: start,
+        last_body_byte: start + body.len() as u64,
+        body_calls: AtomicUsize::new(0),
+    };
+    assert_eq!(
+        journal_tip_identity(&counted, sb).unwrap(),
+        Some((metadata.txid, metadata.integrity.meta_hash.clone()))
+    );
+    assert_eq!(
+        counted.body_calls.load(Ordering::Relaxed),
+        body.len().div_ceil(JOURNAL_TIP_BATCH_BYTES)
+    );
+    assert!(body.len().div_ceil(JOURNAL_TIP_BATCH_BYTES) * 20 < (count + 1) * 2);
+    // Corrupt a prefix record, not the final record. A fast tip read must
+    // still detect corruption before any new transaction can be appended.
+    backend
+        .write_at(&sb.disk_id, start + 36, &[body[36] ^ 1])
+        .unwrap();
+    assert!(matches!(
+        journal_tip_identity(&counted, sb),
+        Err(ArgosError::Checksum(_))
     ));
 }
