@@ -652,3 +652,42 @@ fn concurrent_read_cache_copy_is_bounded_and_byte_accounted() {
     assert_eq!(cache.stats()["direct_copy_bytes"], 8 * 128 * 128);
     assert_eq!(cache.stats()["memory_bytes"], block.len());
 }
+
+#[test]
+fn initial_cold_scan_keeps_stable_sample_across_lookup_windows_and_reopen() {
+    let dir = tempdir().unwrap();
+    let cache = BlockCache::new(dir.path(), 0, 64 * 1024);
+    for n in 0..1024 {
+        let key = format!("cold:{n}");
+        assert!(cache.get(&key, None).is_none());
+        cache.put(&key, &[0x71; 1024]).unwrap();
+    }
+    assert_eq!(cache.inner.lock().l2_evict_seed, 0);
+    let resident = cache.stats()["l2_items"].as_u64().unwrap();
+    assert!(resident >= 48);
+    assert!(cache.stats()["l2_evictions"].as_u64().unwrap() > 0);
+    drop(cache);
+    // An unrelated file from an interrupted write is not a cache block.
+    let foreign = dir.path().join("unrelated.tmp");
+    std::fs::write(&foreign, [0; 8192]).unwrap();
+    let cache = BlockCache::new(dir.path(), 0, 64 * 1024);
+    cache.load_l2_index().unwrap();
+    assert_eq!(cache.stats()["l2_loaded_items"], resident);
+    assert_eq!(cache.stats()["l2_loaded_bytes"], resident * 1024);
+    let mut hits = 0;
+    for n in 0..1024 {
+        let key = format!("cold:{n}");
+        if cache.get(&key, None).is_some() {
+            hits += 1;
+        } else {
+            cache.put(&key, &[0x71; 1024]).unwrap();
+        }
+    }
+    assert!(
+        hits >= 32,
+        "retained sample should survive remount, hits={hits}"
+    );
+    assert!(foreign.exists());
+    cache.put("oversize", &[0; 65537]).unwrap();
+    assert_eq!(cache.stats()["l2_admission_oversize"], 1);
+}

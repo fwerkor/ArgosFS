@@ -223,6 +223,31 @@ fn emit_read_cache_metrics(volume: &ArgosFs, emitter: &mut MetricEmitter<'_>) {
         }
     }
     for (name, key) in [
+        (
+            "argosfs_read_cache_l2_admission_frozen_total",
+            "l2_admission_frozen",
+        ),
+        (
+            "argosfs_read_cache_l2_admission_oversize_total",
+            "l2_admission_oversize",
+        ),
+        ("argosfs_read_cache_l2_evictions_total", "l2_evictions"),
+        ("argosfs_read_cache_l2_writes_total", "l2_writes"),
+        ("argosfs_read_cache_l2_errors_total", "l2_errors"),
+    ] {
+        if let Some(value) = cache.get(key).and_then(serde_json::Value::as_u64) {
+            emitter.typed_metric(
+                name,
+                "L2 cache admission and eviction events since volume open",
+                value as f64,
+                &[],
+                "counter",
+            );
+        }
+    }
+    for (name, key) in [
+        ("argosfs_read_cache_l2_loaded_items", "l2_loaded_items"),
+        ("argosfs_read_cache_l2_loaded_bytes", "l2_loaded_bytes"),
         ("argosfs_read_cache_memory_bytes", "memory_bytes"),
         ("argosfs_read_cache_memory_items", "memory_items"),
         ("argosfs_read_cache_l2_bytes", "l2_bytes"),
