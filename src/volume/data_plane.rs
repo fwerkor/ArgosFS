@@ -36,6 +36,35 @@ static ACTIVE_PREPARATIONS: AtomicUsize = AtomicUsize::new(0);
 const MAX_SHARD_READ_WORKERS: usize = 32;
 static ACTIVE_SHARD_READ_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
+// Range requests may span multiple stripes, including short or sparse
+// extents. Share the shard worker budget with stripe-level fanout.
+const MAX_RANGE_READ_BATCH: usize = 4;
+// A range may refer to stripes as large as MAX_IN_MEMORY_IO_BYTES. Do
+// not multiply the previous single-stripe transient memory bound.
+const MAX_PARALLEL_RANGE_RAW_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Clone, Copy)]
+struct ReadSlice<'a> {
+    block: &'a FileBlock,
+    source_start: usize,
+    destination_start: usize,
+    len: usize,
+}
+
+struct DecodedSlice {
+    bytes: Vec<u8>,
+    start: usize,
+    damaged: Vec<String>,
+}
+
+impl ReadSlice<'_> {
+    fn copy_decoded(self, decoded: DecodedSlice, out: &mut [u8], damaged: &mut Vec<String>) {
+        out[self.destination_start..self.destination_start + self.len]
+            .copy_from_slice(&decoded.bytes[decoded.start..decoded.start + self.len]);
+        damaged.extend(decoded.damaged);
+    }
+}
+
 struct ShardReadPermit;
 
 impl ShardReadPermit {
@@ -484,7 +513,7 @@ impl ArgosFs {
         } else {
             None
         };
-        let mut damaged = Vec::new();
+        let mut selected = Vec::new();
         for block in &inode.blocks {
             let block_start = usize::try_from(block.raw_offset).map_err(|_| {
                 ArgosError::Invalid(format!("block {} raw offset is too large", block.stripe_id))
@@ -492,57 +521,153 @@ impl ArgosFs {
             let block_end = block_start.checked_add(block.raw_size).ok_or_else(|| {
                 ArgosError::Invalid(format!("block {} raw range overflow", block.stripe_id))
             })?;
-            if block_end <= start || block_start >= end {
-                continue;
-            }
             let copy_start = block_start.max(start);
             let copy_end = block_end.min(end);
             if copy_end > copy_start {
-                let dst_start = copy_start - start;
-                let len = copy_end - copy_start;
-                // Preserve the 1+0 uncompressed direct-range path: it reads
-                // and validates the physical shard subblocks on *every* read.
-                // A prior full-block cache fill must not bypass that existing
-                // corruption-detection behavior for single-member layouts.
-                if cache_policy == BlockCachePolicy::Normal
-                    && !block.encrypted
-                    && (block.shards.len() > 1 || block.codec != Compression::None)
-                {
-                    let cache_key =
-                        format!("{}:{}:{}", meta.uuid, block.stripe_id, block.raw_sha256);
-                    if self.cache.copy_range(
-                        &cache_key,
-                        Some(&block.raw_sha256),
-                        block.raw_size,
-                        copy_start - block_start,
-                        &mut out[dst_start..dst_start + len],
-                    ) {
-                        continue;
-                    }
-                }
-                if let Some(raw) = self.decode_block_range_locked(
-                    meta,
+                selected.push(ReadSlice {
                     block,
-                    copy_start - block_start,
-                    copy_end - block_start,
-                    &mut damaged,
-                )? {
-                    out[dst_start..dst_start + len].copy_from_slice(&raw);
-                } else {
-                    let raw = self.decode_block_with_cache_policy_locked(
-                        meta,
-                        block,
-                        decrypt_key.as_ref(),
-                        &mut damaged,
-                        cache_policy,
-                    )?;
-                    let src_start = copy_start - block_start;
-                    out[dst_start..dst_start + len]
-                        .copy_from_slice(&raw[src_start..src_start + len]);
+                    source_start: copy_start - block_start,
+                    destination_start: copy_start - start,
+                    len: copy_end - copy_start,
+                });
+            }
+        }
+        let mut damaged = Vec::new();
+        // Preserve the old ordered overwrite semantics for noncanonical
+        // overlapping/out-of-order metadata, and keep physical maintenance
+        // verification on its existing serial path.
+        let ordered = selected
+            .windows(2)
+            .all(|pair| pair[0].destination_start + pair[0].len <= pair[1].destination_start);
+        if cache_policy != BlockCachePolicy::Normal || !ordered {
+            for slice in selected {
+                if !self.copy_cached_slice(meta, slice, cache_policy, &mut out) {
+                    let decoded =
+                        self.decode_read_slice(meta, slice, decrypt_key.as_ref(), cache_policy)?;
+                    slice.copy_decoded(decoded, &mut out, &mut damaged);
                 }
+            }
+            return Ok((out, damaged));
+        }
+
+        // Warm ranges retain the direct-copy path and do not spawn workers.
+        // Only independent cold stripe misses overlap, in bounded batches.
+        selected.retain(|slice| !self.copy_cached_slice(meta, *slice, cache_policy, &mut out));
+        for batch in selected.chunks(MAX_RANGE_READ_BATCH) {
+            if batch.len() == 1
+                || batch.iter().fold(0usize, |sum, slice| {
+                    sum.saturating_add(slice.block.raw_size)
+                }) > MAX_PARALLEL_RANGE_RAW_BYTES
+            {
+                for slice in batch {
+                    let decoded =
+                        self.decode_read_slice(meta, *slice, decrypt_key.as_ref(), cache_policy)?;
+                    slice.copy_decoded(decoded, &mut out, &mut damaged);
+                }
+                continue;
+            }
+            let decoded = std::thread::scope(|scope| {
+                let mut tasks = Vec::with_capacity(batch.len());
+                for (index, &slice) in batch.iter().enumerate() {
+                    let key = decrypt_key.as_ref();
+                    let task = if index + 1 < batch.len() {
+                        ShardReadPermit::try_acquire().and_then(|permit| {
+                            std::thread::Builder::new()
+                                .spawn_scoped(scope, move || {
+                                    let _permit = permit;
+                                    self.decode_read_slice(meta, slice, key, cache_policy)
+                                })
+                                .ok()
+                        })
+                    } else {
+                        None
+                    };
+                    let inline = if task.is_none() {
+                        Some(self.decode_read_slice(meta, slice, key, cache_policy))
+                    } else {
+                        None
+                    };
+                    tasks.push((slice, task, inline));
+                }
+                tasks
+                    .into_iter()
+                    .map(|(slice, task, inline)| {
+                        let result = match task {
+                            Some(task) => task.join().expect("parallel stripe reader panicked"),
+                            None => inline.expect("inline stripe read completed"),
+                        };
+                        (slice, result)
+                    })
+                    .collect::<Vec<_>>()
+            });
+            // All workers have completed before propagating any error.
+            // Apply damage and bytes in the original logical block order.
+            for (slice, result) in decoded {
+                slice.copy_decoded(result?, &mut out, &mut damaged);
             }
         }
         Ok((out, damaged))
+    }
+
+    fn copy_cached_slice(
+        &self,
+        meta: &Metadata,
+        slice: ReadSlice<'_>,
+        cache_policy: BlockCachePolicy,
+        out: &mut [u8],
+    ) -> bool {
+        let block = slice.block;
+        // The 1+0 uncompressed direct-range path must verify physical
+        // subblocks even after a full-block cache admission.
+        if cache_policy != BlockCachePolicy::Normal
+            || block.encrypted
+            || (block.shards.len() <= 1 && block.codec == Compression::None)
+        {
+            return false;
+        }
+        let key = format!("{}:{}:{}", meta.uuid, block.stripe_id, block.raw_sha256);
+        self.cache.copy_range(
+            &key,
+            Some(&block.raw_sha256),
+            block.raw_size,
+            slice.source_start,
+            &mut out[slice.destination_start..slice.destination_start + slice.len],
+        )
+    }
+
+    fn decode_read_slice(
+        &self,
+        meta: &Metadata,
+        slice: ReadSlice<'_>,
+        decrypt_key: Option<&[u8; 32]>,
+        cache_policy: BlockCachePolicy,
+    ) -> Result<DecodedSlice> {
+        let mut damaged = Vec::new();
+        if let Some(bytes) = self.decode_block_range_locked(
+            meta,
+            slice.block,
+            slice.source_start,
+            slice.source_start + slice.len,
+            &mut damaged,
+        )? {
+            return Ok(DecodedSlice {
+                bytes,
+                start: 0,
+                damaged,
+            });
+        }
+        let bytes = self.decode_block_with_cache_policy_locked(
+            meta,
+            slice.block,
+            decrypt_key,
+            &mut damaged,
+            cache_policy,
+        )?;
+        Ok(DecodedSlice {
+            bytes,
+            start: slice.source_start,
+            damaged,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -864,6 +989,10 @@ impl ArgosFs {
         cache_policy: BlockCachePolicy,
         cache_key: &str,
     ) -> Result<Vec<u8>> {
+        let _decode = self
+            .runtime
+            .commit_metrics
+            .read_timer(crate::commit_metrics::ReadPhase::StripeDecode);
         let layout = layout_by_id(meta, block_layout_id(block))?;
         if layout.k == 1 && layout.m == 0 && !block.encrypted && block.codec == Compression::None {
             return self.decode_single_shard_block_with_cache_policy_locked(

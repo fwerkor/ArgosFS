@@ -189,3 +189,61 @@ fn healthy_stripe_reads_data_shards_concurrently() {
         "data shards of one stripe must be read concurrently"
     );
 }
+
+#[test]
+fn cold_multistripe_range_overlaps_independent_stripe_reads() {
+    let dir = tempdir().unwrap();
+    let images = (0..3)
+        .map(|i| dir.path().join(format!("range-{i}.img")))
+        .collect::<Vec<_>>();
+    let mut fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            compression: Compression::None,
+            chunk_size: 4096,
+            l2_cache_bytes: 0,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "parallel-range",
+        false,
+    )
+    .unwrap();
+    let data = (0..32_768)
+        .map(|i| ((i * 31 + i / 7) % 251) as u8)
+        .collect::<Vec<_>>();
+    fs.write_file("/range", &data, 0o600).unwrap();
+    fs.sync().unwrap();
+    let ino = fs.resolve_path("/range", true).unwrap();
+    let meta = fs.metadata_snapshot();
+    assert_eq!(meta.inodes[&ino].blocks.len(), 4);
+    for block in &meta.inodes[&ino].blocks {
+        fs.cache.remove(&format!(
+            "{}:{}:{}",
+            meta.uuid, block.stripe_id, block.raw_sha256
+        ));
+    }
+    let backend = Arc::new(ReadConcurrencyProbe {
+        inner: fs.backend.clone(),
+        active: AtomicUsize::new(0),
+        max_active: AtomicUsize::new(0),
+    });
+    fs.backend = backend.clone();
+    assert_eq!(
+        fs.read_inode(ino, 127, data.len() - 512, true).unwrap(),
+        &data[127..data.len() - 385]
+    );
+    assert!(
+        backend.max_active.load(Ordering::SeqCst) > 2,
+        "reads spanning multiple stripes must overlap, not just the two shards of one stripe"
+    );
+    // The repeated subrange is now served by verified caches.
+    backend.max_active.store(0, Ordering::SeqCst);
+    assert_eq!(
+        fs.read_inode(ino, 127, data.len() - 512, true).unwrap(),
+        &data[127..data.len() - 385]
+    );
+    assert_eq!(backend.max_active.load(Ordering::SeqCst), 0);
+}
