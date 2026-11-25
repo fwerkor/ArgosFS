@@ -2,7 +2,7 @@
 name = "argosfs"
 version = "1.2.0"
 edition = "2021"
-rust-version = "1.87"
+rust-version = "1.89"
 license = "Apache-2.0"
 description = "ArgosFS self-driving erasure-coded root filesystem"
 authors = ["FWERKOR"]
@@ -33,7 +33,6 @@ lz4_flex = "0.14"
 memmap2 = "0.9.11"
 parking_lot = "0.12.5"
 rand = "0.10"
-reed-solomon-engine = { version = "=0.2.0", path = "vendor/reed-solomon-engine" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11"
@@ -53,5 +52,5 @@ codegen-units = 1
 strip = "symbols"
 
 [workspace]
-# The standalone libFuzzer package and third-party codec are not workspace members.
-exclude = ["fuzz", "vendor/reed-solomon-engine"]
+# The standalone libFuzzer package is not a workspace member.
+exclude = ["fuzz"]

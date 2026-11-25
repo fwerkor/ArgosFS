@@ -5,10 +5,7 @@
 //! [`super::tables`]. Two shuffles and an XOR replace 16 field
 //! multiplications.
 //!
-//! NEON is part of the mandatory aarch64 baseline, so there is no runtime
-//! detection here and none is needed: [`Kernel::is_supported`] gates on
-//! `cfg!(target_feature = "neon")`, which is enabled by default on every
-//! aarch64 target this crate builds for.
+//! The dispatcher checks NEON support at runtime before entering this module.
 //!
 //! [`mul_rows`] is the same shuffle, blocked over several output shards at
 //! once. Section "Why `mul_rows` is blocked" below explains why that is worth a
@@ -32,7 +29,7 @@ use core::arch::aarch64::{
 };
 
 use super::{scalar, tables};
-use crate::shards::ShardSource;
+use crate::data::ec::shards::ShardSource;
 
 /// Bytes per vector register.
 const LANES: usize = 16;
@@ -80,6 +77,7 @@ unsafe fn multiply(s: uint8x16_t, t: Shuffles) -> uint8x16_t {
 }
 
 /// `dst = c * src`, where `dst` and `src` have equal length.
+#[inline]
 #[target_feature(enable = "neon")]
 pub(super) unsafe fn mul_slice(c: u8, src: &[u8], dst: &mut [u8]) {
     debug_assert_eq!(src.len(), dst.len());
@@ -123,6 +121,7 @@ pub(super) unsafe fn mul_slice(c: u8, src: &[u8], dst: &mut [u8]) {
 }
 
 /// `dst ^= c * src`, where `dst` and `src` have equal length.
+#[inline]
 #[target_feature(enable = "neon")]
 pub(super) unsafe fn mul_add_slice(c: u8, src: &[u8], dst: &mut [u8]) {
     debug_assert_eq!(src.len(), dst.len());
@@ -186,27 +185,9 @@ pub(super) unsafe fn mul_add_slice(c: u8, src: &[u8], dst: &mut [u8]) {
 // accumulators, plus the source and table vectors) fit without spilling. On
 // x86, where there are 16, it does not; see the head of `x86.rs`.
 //
-// Measured end to end through `Codec::encode_all` on an Apple M1 Pro at
-// 1200-byte shards, against the same benchmark run on the previous row-major
-// driver: 1.31x at 8+4, 1.44x at 16+8, 1.44x at 32+16 and 1.46x at 64+16. The
-// `tbl` count is identical either way -- blocking removes the surrounding work,
-// not the shuffles -- so the win comes from the traffic and the nibble split,
-// and it grows with `data_shards * parity_shards`. At 4+2, where the whole
-// working set is a few kilobytes and the shuffles are the bottleneck, this is
-// *slower* than the row-major loop: 6% at 64 bytes, 8% at 256, 6% at 1200, 8%
-// at 4 KB, 5% at 16 KB and 1% at 64 KB. That is the one configuration
-// where it does not pay, and it is left alone rather than special-cased: a
-// narrow-group fallback to the row-major path helps 4+2 by about 7% but would
-// cost far more at, say, 64+2, where the traffic argument is at its strongest
-// and the group is still only two rows wide.
-//
-// Small-split figures here move by several percent with machine state, and the
-// narrow peels move most. Any re-measurement has to A/B against the previous
-// driver in the same session on an otherwise idle machine; comparing a fresh
-// run against a published table will overstate the gain.
-//
-// The same blocking is a *loss* on the scalar path at every configuration,
-// which is why `scalar::mul_rows` stays a plain driver over the reference pair.
+// Register blocking is used for wide layouts. The small fixed geometries
+// have dedicated loops; two-row blocking handles the remaining narrow
+// groups. Benchmark results and provenance are in docs/erasure-codec.md.
 
 /// Bytes per iteration of the blocked main loop: two vectors, so one nibble
 /// split feeds two shuffles per row.
@@ -235,18 +216,18 @@ fn take_group<'r, const W: usize, O: AsMut<[u8]>>(
     *rest = tail;
     let mut shards = head.iter_mut();
     Some(core::array::from_fn(|_| {
-        shards.next().expect("split_at_mut(W) yields exactly W shards").as_mut()
+        shards
+            .next()
+            .expect("split_at_mut(W) yields exactly W shards")
+            .as_mut()
     }))
 }
 
 /// Computes `G` consecutive output rows, starting at row `first`, in one pass
 /// over the sources.
 ///
-/// Every index below is bounds checked. That is not a concession: a 32-byte
-/// window costs one range check per source per block, amortized over `G` rows,
-/// and slicing the `G` coefficient rows once per group rather than indexing
-/// `matrix` per element keeps the checks out of the inner loop entirely. The
-/// only `unsafe` here is the intrinsics.
+/// Source lengths and coefficient rows are validated once before the vector
+/// loops; every output window is bounds checked before each store.
 #[target_feature(enable = "neon")]
 unsafe fn group<const G: usize, S: ShardSource + ?Sized>(
     matrix: &[u8],
@@ -274,6 +255,14 @@ unsafe fn group<const G: usize, S: ShardSource + ?Sized>(
     let coeffs: [&[u8]; G] =
         core::array::from_fn(|t| &matrix[(first + t) * data_shards..(first + t + 1) * data_shards]);
 
+    // Validate every source once, then keep its address in a fixed-size
+    // stack array. The codec limits geometry to MAX_SHARDS.
+    let mut sources = [core::ptr::null(); crate::data::ec::MAX_SHARDS];
+    for (j, ptr) in sources[..data_shards].iter_mut().enumerate() {
+        *ptr = srcs.shard(j)[..len].as_ptr();
+    }
+    let sources = &sources[..data_shards];
+
     // SAFETY: neither reads memory, and this function requires `neon`.
     let (mask, zero) = unsafe { (vdupq_n_u8(0x0F), vdupq_n_u8(0)) };
     let mut i = 0;
@@ -281,15 +270,18 @@ unsafe fn group<const G: usize, S: ShardSource + ?Sized>(
     while i + PAIR <= len {
         let mut low_half = [zero; G];
         let mut high_half = [zero; G];
-        for j in 0..data_shards {
-            let window = &srcs.shard(j)[i..i + PAIR];
-            // SAFETY: `window` is `PAIR` == 32 bytes long, so 16 bytes are
-            // readable at offset 0 and 16 more at offset `LANES`. `vld1q_u8`
-            // has no alignment requirement. The rest are register-to-register.
+        for (j, &source) in sources.iter().enumerate() {
+            // SAFETY: each source was checked to contain len bytes;
+            // i + PAIR <= len. The rest are register-to-register.
             let (l0, h0, l1, h1) = unsafe {
-                let s0 = vld1q_u8(window.as_ptr());
-                let s1 = vld1q_u8(window.as_ptr().add(LANES));
-                (vandq_u8(s0, mask), vshrq_n_u8(s0, 4), vandq_u8(s1, mask), vshrq_n_u8(s1, 4))
+                let s0 = vld1q_u8(source.add(i));
+                let s1 = vld1q_u8(source.add(i + LANES));
+                (
+                    vandq_u8(s0, mask),
+                    vshrq_n_u8(s0, 4),
+                    vandq_u8(s1, mask),
+                    vshrq_n_u8(s1, 4),
+                )
             };
             for (t, row) in coeffs.iter().enumerate() {
                 let table = tables::SPLIT.get(row[j]);
@@ -321,12 +313,10 @@ unsafe fn group<const G: usize, S: ShardSource + ?Sized>(
 
     while i + LANES <= len {
         let mut acc = [zero; G];
-        for j in 0..data_shards {
-            let window = &srcs.shard(j)[i..i + LANES];
-            // SAFETY: `window` is `LANES` == 16 bytes long. `vld1q_u8` has no
-            // alignment requirement; the rest are register-to-register.
+        for (j, &source) in sources.iter().enumerate() {
+            // SAFETY: source length was checked and i + LANES <= len.
             let (low, high) = unsafe {
-                let s = vld1q_u8(window.as_ptr());
+                let s = vld1q_u8(source.add(i));
                 (vandq_u8(s, mask), vshrq_n_u8(s, 4))
             };
             for (t, row) in coeffs.iter().enumerate() {
@@ -369,60 +359,119 @@ unsafe fn group<const G: usize, S: ShardSource + ?Sized>(
     }
 }
 
-/// `outs[t] = sum over j of matrix[t * data_shards + j] * srcs.shard(j)`, for
-/// every `t`.
-///
-/// Output rows are peeled in groups of 8, then 4; the one to three rows that
-/// can be left over are computed row-major, by the same two operations the
-/// codec used before this one existed. Eight is where the register file runs
-/// out. Four is where blocking starts to pay, and the reason the peel stops
-/// there is measured rather than assumed.
-///
-/// The arithmetic predicts a group of `G` rows issues `4 + 6G` SIMD ops per 32
-/// bytes per source against row-major's `10G`, so `G = 1` should be a wash and
-/// `G = 2` a 1.25x win. Neither holds. Against the row-major predecessor, on
-/// 1024-byte shards on an Apple M1 Pro:
-///
-/// | split | `G` used | ratio |
-/// |------:|---------:|------:|
-/// | 8+1   | 1        | 0.67x |
-/// | 4+2   | 2        | 0.92x |
-/// | 8+2   | 2        | 1.04x |
-/// | 4+3   | 2 then 1 | 0.80x |
-/// | 4+4   | 4        | 1.19x |
-/// | 8+4   | 4        | 1.32x |
-/// | 16+8  | 8        | 1.44x |
-/// | 64+16 | 8        | 1.47x |
-///
-/// A group's fixed cost - forming the row array, hoisting the output bounds,
-/// re-slicing the coefficient rows, and the tail - does not shrink with `G`,
-/// so at `G = 1` it is paid in full against no saving at all and costs half
-/// again the row-major time. `G = 2` is worse than a wash at four data shards
-/// and barely better at eight, because the saving scales with the source count
-/// it is amortized over while the fixed cost does not. Only from `G = 4` is the
-/// win large enough to clear the overhead at every source count in range.
-///
-/// Peeling narrower groups therefore made the operation *slower* at exactly the
-/// splits with the least headroom: any parity count with a low bit set pulled
-/// in a `G = 1` or `G = 2` group, so 8+1 lost 50% and 4+3 lost 25%. Stopping at
-/// four costs the 4% that 8+2 gave up and leaves no configuration slower than
-/// the row-major path it replaced.
-///
-/// The obvious objection is that a narrow group is only unprofitable when there
-/// are also few sources, and that at many sources and few parity rows the
-/// blocked form should win by a lot. It does not. The saving and the row-major
-/// cost both scale with the source count, so their ratio is fixed at `10G` to
-/// `4 + 6G` and only the per-group overhead varies. Measured at 1024 bytes,
-/// blocked against row-major: 64+1 0.68x, 128+1 0.68x, 32+2 1.04x, 64+2 1.06x,
-/// 128+2 1.01x, 250+2 0.99x, 128+3 0.89x. Many sources do not rescue a narrow
-/// group; `G = 1` stays a 47% loss at any width, and the most a `G = 2` group
-/// ever returns is 6%.
-///
-/// Recovering that 6% would take a threshold on `data_shards` as well as
-/// `parity_shards`, applying to `parity_shards == 2` only and not to 1 or 3.
-/// That is two interacting thresholds and a third code path for at most 6% at
-/// one split, and no consumer of this crate is known to run it. Peeling at 8
-/// and 4 is the whole rule.
+/// Two data shards and one parity are common on small pools. Keep both
+/// coefficient tables in registers and assign each output vector once.
+#[target_feature(enable = "neon")]
+unsafe fn two_sources(c0: u8, c1: u8, x: &[u8], y: &[u8], out: &mut [u8]) {
+    assert_eq!(x.len(), y.len());
+    assert_eq!(x.len(), out.len());
+    let len = x.len();
+    let t0 = unsafe { shuffles(c0) };
+    let t1 = unsafe { shuffles(c1) };
+    let mut i = 0;
+    while i + BLOCK <= len {
+        for lane in 0..4 {
+            let off = i + lane * LANES;
+            // SAFETY: both sources and destination have a full vector here.
+            unsafe {
+                let a = vld1q_u8(x.as_ptr().add(off));
+                let b = vld1q_u8(y.as_ptr().add(off));
+                vst1q_u8(
+                    out.as_mut_ptr().add(off),
+                    veorq_u8(multiply(a, t0), multiply(b, t1)),
+                );
+            }
+        }
+        i += BLOCK;
+    }
+    while i + LANES <= len {
+        // SAFETY: the full vector lies in all three equal-length slices.
+        unsafe {
+            let a = vld1q_u8(x.as_ptr().add(i));
+            let b = vld1q_u8(y.as_ptr().add(i));
+            vst1q_u8(
+                out.as_mut_ptr().add(i),
+                veorq_u8(multiply(a, t0), multiply(b, t1)),
+            );
+        }
+        i += LANES;
+    }
+    scalar::mul_slice(c0, &x[i..], &mut out[i..]);
+    scalar::mul_add_slice(c1, &y[i..], &mut out[i..]);
+}
+
+/// A fixed 4+2 geometry keeps all eight split tables in registers.
+#[target_feature(enable = "neon")]
+unsafe fn four_two<S: ShardSource + ?Sized, O: AsMut<[u8]>>(
+    matrix: &[u8],
+    srcs: &S,
+    outs: &mut [O],
+    len: usize,
+) {
+    let src: [&[u8]; 4] = core::array::from_fn(|j| &srcs.shard(j)[..len]);
+    let (left, right) = outs.split_at_mut(1);
+    let out0 = &mut left[0].as_mut()[..len];
+    let out1 = &mut right[0].as_mut()[..len];
+    // SAFETY: this function requires NEON.
+    let t0: [Shuffles; 4] = core::array::from_fn(|j| unsafe { shuffles(matrix[j]) });
+    let t1: [Shuffles; 4] = core::array::from_fn(|j| unsafe { shuffles(matrix[4 + j]) });
+    let mask = unsafe { vdupq_n_u8(15) };
+    let zero = unsafe { vdupq_n_u8(0) };
+    let mut i = 0;
+    while i + PAIR <= len {
+        let mut a0 = zero;
+        let mut a1 = zero;
+        let mut b0 = zero;
+        let mut b1 = zero;
+        // SAFETY: all source/output slices were checked to len; each
+        // vector is within the full pair. Tables have 16 entries each.
+        unsafe {
+            macro_rules! accumulate {
+                ($j:literal) => {{
+                    let x = vld1q_u8(src[$j].as_ptr().add(i));
+                    let y = vld1q_u8(src[$j].as_ptr().add(i + LANES));
+                    let lx = vandq_u8(x, mask);
+                    let hx = vshrq_n_u8(x, 4);
+                    let ly = vandq_u8(y, mask);
+                    let hy = vshrq_n_u8(y, 4);
+                    a0 = veorq_u8(
+                        a0,
+                        veorq_u8(vqtbl1q_u8(t0[$j].low, lx), vqtbl1q_u8(t0[$j].high, hx)),
+                    );
+                    a1 = veorq_u8(
+                        a1,
+                        veorq_u8(vqtbl1q_u8(t0[$j].low, ly), vqtbl1q_u8(t0[$j].high, hy)),
+                    );
+                    b0 = veorq_u8(
+                        b0,
+                        veorq_u8(vqtbl1q_u8(t1[$j].low, lx), vqtbl1q_u8(t1[$j].high, hx)),
+                    );
+                    b1 = veorq_u8(
+                        b1,
+                        veorq_u8(vqtbl1q_u8(t1[$j].low, ly), vqtbl1q_u8(t1[$j].high, hy)),
+                    );
+                }};
+            }
+            accumulate!(0);
+            accumulate!(1);
+            accumulate!(2);
+            accumulate!(3);
+            vst1q_u8(out0.as_mut_ptr().add(i), a0);
+            vst1q_u8(out0.as_mut_ptr().add(i + LANES), a1);
+            vst1q_u8(out1.as_mut_ptr().add(i), b0);
+            vst1q_u8(out1.as_mut_ptr().add(i + LANES), b1);
+        }
+        i += PAIR;
+    }
+    for (r, out) in [out0, out1].into_iter().enumerate() {
+        scalar::mul_slice(matrix[r * 4], &src[0][i..], &mut out[i..]);
+        for j in 1..4 {
+            scalar::mul_add_slice(matrix[r * 4 + j], &src[j][i..], &mut out[i..]);
+        }
+    }
+}
+
+/// Compute parity rows with fixed-geometry kernels or register groups.
 #[target_feature(enable = "neon")]
 pub(super) unsafe fn mul_rows<S: ShardSource + ?Sized, O: AsRef<[u8]> + AsMut<[u8]>>(
     matrix: &[u8],
@@ -430,9 +479,29 @@ pub(super) unsafe fn mul_rows<S: ShardSource + ?Sized, O: AsRef<[u8]> + AsMut<[u
     srcs: &S,
     outs: &mut [O],
 ) {
-    let Some(first_out) = outs.first() else { return };
+    let Some(first_out) = outs.first() else {
+        return;
+    };
     let len = first_out.as_ref().len();
+    if data_shards == 2 && outs.len() == 1 {
+        // SAFETY: same target feature; the helper checks slice lengths.
+        unsafe {
+            two_sources(
+                matrix[0],
+                matrix[1],
+                srcs.shard(0),
+                srcs.shard(1),
+                outs[0].as_mut(),
+            )
+        };
+        return;
+    }
 
+    if data_shards == 4 && outs.len() == 2 {
+        // SAFETY: same target feature; all accesses are checked.
+        unsafe { four_two(matrix, srcs, outs, len) };
+        return;
+    }
     let mut rest: &mut [O] = outs;
     let mut first = 0;
 
@@ -446,9 +515,11 @@ pub(super) unsafe fn mul_rows<S: ShardSource + ?Sized, O: AsRef<[u8]> + AsMut<[u
         )+};
     }
     peel!(8, 4);
+    if data_shards >= 4 {
+        peel!(2);
+    }
 
-    // One to three rows left. Row-major, which is what the driver ran for every
-    // row before `mul_rows` existed, so this path is the predecessor exactly.
+    // Remaining rows use the single-output slice operations.
     for (t, out) in rest.iter_mut().enumerate() {
         let row = &matrix[(first + t) * data_shards..][..data_shards];
         let out = out.as_mut();

@@ -52,21 +52,13 @@ pub enum Error {
         /// The length that was supplied.
         actual: usize,
     },
-    /// A caller-supplied workspace was smaller than
-    /// [`workspace_len`](crate::workspace_len) requires.
-    WorkspaceTooSmall {
-        /// The minimum length required.
-        required: usize,
-        /// The length that was supplied.
-        actual: usize,
-    },
     /// A matrix that the code's MDS property guarantees to be invertible was
     /// found to be singular.
     ///
     /// Reaching this variant means the generator matrix is not the one this
     /// crate constructs; it cannot be triggered by any input to a codec built
-    /// through [`Codec::new`](crate::Codec::new) or
-    /// [`Codec::new`](crate::Codec::new).
+    /// through [`Codec::new`](crate::data::ec::Codec::new) or
+    /// [`Codec::new`](crate::data::ec::Codec::new).
     SingularMatrix,
 }
 
@@ -76,7 +68,10 @@ impl fmt::Display for Error {
             Error::NoDataShards => f.write_str("data_shards must be at least 1"),
             Error::NoParityShards => f.write_str("parity_shards must be at least 1"),
             Error::TooManyShards { total } => {
-                write!(f, "{total} total shards exceeds the maximum of {MAX_SHARDS}")
+                write!(
+                    f,
+                    "{total} total shards exceeds the maximum of {MAX_SHARDS}"
+                )
             }
             Error::ShardCountMismatch { expected, actual } => {
                 write!(f, "expected {expected} shards, got {actual}")
@@ -88,9 +83,6 @@ impl fmt::Display for Error {
             }
             Error::MatrixSizeMismatch { expected, actual } => {
                 write!(f, "expected {expected} matrix coefficients, got {actual}")
-            }
-            Error::WorkspaceTooSmall { required, actual } => {
-                write!(f, "workspace of {actual} bytes is smaller than the required {required}")
             }
             Error::SingularMatrix => f.write_str("matrix is singular"),
         }

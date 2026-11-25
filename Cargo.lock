@@ -106,7 +106,6 @@ dependencies = [
  "memmap2",
  "parking_lot",
  "rand",
- "reed-solomon-engine",
  "serde",
  "serde_json",
  "sha2",
@@ -849,10 +848,6 @@ checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
 dependencies = [
  "bitflags",
 ]
-
-[[package]]
-name = "reed-solomon-engine"
-version = "0.2.0"
 
 [[package]]
 name = "ref-cast"

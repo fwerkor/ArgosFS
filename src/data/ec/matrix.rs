@@ -5,8 +5,8 @@
 //! compile time for `no_std` callers and at runtime for `alloc` callers. There
 //! is one implementation, not two that can drift apart.
 
-use crate::error::MAX_SHARDS;
-use crate::gf;
+use crate::data::ec::error::MAX_SHARDS;
+use crate::data::ec::gf;
 
 /// Reduces the leading `n` columns of the `n * cols` row-major matrix `m` to
 /// the identity, applying the same row operations to the trailing columns.
@@ -30,9 +30,7 @@ pub(crate) const fn gauss_jordan(m: &mut [u8], n: usize, cols: usize) -> bool {
         if pivot_row != col {
             let mut j = 0;
             while j < cols {
-                let tmp = m[col * cols + j];
-                m[col * cols + j] = m[pivot_row * cols + j];
-                m[pivot_row * cols + j] = tmp;
+                m.swap(col * cols + j, pivot_row * cols + j);
                 j += 1;
             }
         }
@@ -76,7 +74,7 @@ pub(crate) const fn gauss_jordan(m: &mut [u8], n: usize, cols: usize) -> bool {
 ///
 /// This is the standard systematic Vandermonde construction, and it is part of
 /// this crate's wire format. It is specified in prose in
-/// `docs/WIRE_FORMAT.md`; the summary is:
+/// `docs/erasure-wire-format.md`; the summary is:
 ///
 /// 1. Form the `total_shards * data_shards` Vandermonde matrix `V` over
 ///    GF(2^8) with `V[r][c] = r^c`, where `r` is the row index taken as a
@@ -103,28 +101,16 @@ pub(crate) const fn gauss_jordan(m: &mut [u8], n: usize, cols: usize) -> bool {
 /// Write `x_m = m` for the node in row `m` (the row index as a field element).
 /// `T[m][l] = x_m^l`, and the inverse of a Vandermonde matrix is
 ///
-/// ```text
-/// T^-1[l][c] = the coefficient of t^l in L_c(t)
-/// ```
 ///
 /// where `L_c` is the Lagrange basis polynomial for node `x_c`, because
 /// `(T * T^-1)[m][c] = sum over l of x_m^l * [t^l] L_c(t) = L_c(x_m)`, which is
 /// `1` when `m == c` and `0` otherwise. Row `data_shards + j` of `V` evaluates
 /// the same monomials at `y_j = data_shards + j`, so
 ///
-/// ```text
-/// P[j][c] = (V * T^-1)[data_shards + j][c] = L_c(y_j)
-///         = prod over m != c of (y_j + x_m) / prod over m != c of (x_c + x_m)
-/// ```
 ///
 /// Addition is XOR here, so `x_a + x_b` is just `a ^ b`. Multiplying the
 /// numerator by the missing factor gives the form the code below evaluates:
 ///
-/// ```text
-/// P[j][c] = master(y_j) / (y_j ^ c) / denominator(c)
-/// master(y)      = prod over m < data_shards of (y ^ m)
-/// denominator(c) = prod over m < data_shards, m != c of (c ^ m)
-/// ```
 ///
 /// That is `O(data_shards^2)` for the denominators plus `O(parity_shards *
 /// data_shards)` for the rest. The result is not an approximation of the
@@ -305,7 +291,12 @@ mod tests {
     fn reference_parity_matrix(data: usize, parity: usize) -> vec::Vec<u8> {
         let mut out = vec![0u8; parity * data];
         let mut scratch = vec![0u8; reference_scratch_len(data)];
-        assert!(build_parity_matrix_by_inversion(data, parity, &mut out, &mut scratch));
+        assert!(build_parity_matrix_by_inversion(
+            data,
+            parity,
+            &mut out,
+            &mut scratch
+        ));
         out
     }
 

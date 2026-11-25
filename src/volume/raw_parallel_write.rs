@@ -1,0 +1,297 @@
+//! Bounded raw write reservations: independent inode I/O can overlap, while
+//! publishing allocator and namespace changes remains an ordered transaction.
+use super::data_plane::PreparedWrite;
+use super::metadata_lock::ReservationSpec;
+use super::*;
+
+struct RawAppendPlan<'a> {
+    blocks: Vec<FileBlock>,
+    writes: BTreeMap<String, Vec<(u64, &'a [u8])>>,
+}
+
+impl ArgosFs {
+    /// Called under the caller's inode lock. None means the ordinary path
+    /// must be used; Some(Err) is an actual write/commit failure.
+    pub(super) fn try_parallel_raw_append(
+        &self,
+        ino: InodeId,
+        offset: usize,
+        data: &[u8],
+        clear_setid: bool,
+        write_time: Option<BufferedWriteTime>,
+        prepared: Option<&PreparedWrite<'_>>,
+    ) -> Option<Result<()>> {
+        let prepared = prepared?;
+        if journal::crash_injection_configured() || bulk_import_enabled() {
+            return None;
+        }
+        let lane = self.meta.parallel()?;
+        let mut plan = None;
+        let (reservation, snapshot) = {
+            let meta = lane.image();
+            if !self.parallel_append_eligible(&meta, ino, offset, data, prepared) {
+                return None;
+            }
+            if let Err(err) = self.ensure_block_backend_writable_locked(&meta) {
+                return Some(Err(err));
+            }
+            let target = offset.checked_add(data.len())? as u64;
+            if let Err(err) = self.ensure_resize_within_quotas_locked(&meta, ino, target) {
+                return Some(Err(err));
+            }
+            let result = lane.reserve(&meta, |private| {
+                let (spec, prepared_plan) =
+                    self.plan_raw_append(private, ino, offset, data, prepared)?;
+                plan = Some(prepared_plan);
+                Ok(spec)
+            });
+            match result {
+                Ok(result) => result,
+                Err(_) => return None,
+            }
+        };
+        let mut plan = plan.expect("reserved append has a plan");
+        // Each member gets one independent worker and a single flush after
+        // its payload writes. Nothing is visible in the live image yet.
+        let writes = std::thread::scope(|scope| {
+            let jobs = plan
+                .writes
+                .iter()
+                .map(|(disk, writes)| {
+                    let snapshot = &snapshot;
+                    scope.spawn(move || -> Result<(String, u64, f64)> {
+                        let start = Instant::now();
+                        let mut bytes = 0u64;
+                        for (offset, payload) in writes {
+                            self.backend_write_at_locked(snapshot, disk, *offset, payload)?;
+                            self.commit_metrics.add_data_plane_bytes(
+                                DataPlaneByteKind::ShardPayloadWritten,
+                                payload.len(),
+                            );
+                            bytes = bytes.saturating_add(payload.len() as u64);
+                        }
+                        self.backend_flush_locked(snapshot, disk)?;
+                        Ok((disk.clone(), bytes, start.elapsed().as_secs_f64()))
+                    })
+                })
+                .collect::<Vec<_>>();
+            // Join every worker before any failed reservation is released.
+            jobs.into_iter()
+                .map(|job| job.join().expect("raw append worker panicked"))
+                .collect::<Vec<_>>()
+        })
+        .into_iter()
+        .collect::<Result<Vec<_>>>();
+        let timings = match writes {
+            Ok(timings) => timings,
+            Err(err) => return Some(Err(err)),
+        };
+        reservation.wait_turn();
+        let mut meta = lane.image();
+        if !self.parallel_append_eligible(&meta, ino, offset, data, prepared) {
+            return None;
+        }
+        if let Err(err) = self.ensure_block_backend_writable_locked(&meta) {
+            return Some(Err(err));
+        }
+        let target = offset.checked_add(data.len())? as u64;
+        if let Err(err) = self.ensure_resize_within_quotas_locked(&meta, ino, target) {
+            return Some(Err(err));
+        }
+        // If an earlier writer failed, allocator/stripe choices might differ.
+        // Retry through the regular path only after this reservation is gone.
+        let mut staged = meta.clone();
+        if reservation.spec.apply(&mut staged).is_err() {
+            return None;
+        }
+        let rollback = self.commit_previous_with_advisory_locked(&mut meta);
+        meta.raw_pool.allocators = staged.raw_pool.allocators;
+        meta.next_stripe = staged.next_stripe;
+        let generation = meta.txid.saturating_add(1);
+        for block in &mut plan.blocks {
+            for shard in &mut block.shards {
+                let Some(ShardLocation::RawExtent(extent)) = &mut shard.location else {
+                    unreachable!()
+                };
+                extent.generation = generation;
+                if let Some(disk) = meta.disks.get_mut(&shard.disk_id) {
+                    disk.used_bytes = disk.used_bytes.saturating_add(extent.length);
+                }
+            }
+        }
+        for (disk, bytes, elapsed) in timings {
+            self.update_write_latency_locked(&mut meta, &disk, bytes, elapsed);
+        }
+        let now = write_time.map_or_else(now_f64, |time| time.at);
+        let inode = meta.inodes.get_mut(&ino).expect("validated append inode");
+        inode.blocks.extend(plan.blocks.iter().cloned());
+        inode.blocks.sort_by_key(|block| block.raw_offset);
+        set_inline_payload(inode, None);
+        inode.size = target;
+        inode.write_count = inode.write_count.saturating_add(1);
+        inode.write_bytes = inode.write_bytes.saturating_add(data.len() as u64);
+        inode.last_written_at = now;
+        inode.workload_score = inode.workload_score * 0.90 + 2.0;
+        inode.mtime = now;
+        inode.ctime = write_time.map_or(now, |time| time.persisted_ctime(inode.ctime));
+        if clear_setid {
+            inode.mode &= !(libc::S_ISUID | libc::S_ISGID);
+        }
+        if let Err(err) = self.commit_locked_with_previous(&mut meta, rollback.as_ref(), "write-range", json!({"inode":ino,"offset":offset,"bytes":data.len(),"rewrite":"parallel-aligned-eof-append"})) {
+            if !Self::transaction_error_is_committed(&err) && !matches!(err,ArgosError::Conflict(_)) {
+                if let Some(rollback) = rollback { *meta = rollback; }
+            }
+            return Some(Err(err));
+        }
+        self.adjust_quota_usage_for_resize(ino, offset as u64, target);
+        if let Some(verify) = &self.verify_written {
+            for block in &plan.blocks {
+                for shard in &block.shards {
+                    let Some(ShardLocation::RawExtent(extent)) = &shard.location else {
+                        unreachable!()
+                    };
+                    verify.enqueue(
+                        &shard.disk_id,
+                        extent.offset,
+                        extent.generation,
+                        shard.size,
+                        &shard.sha256,
+                        &block.stripe_id,
+                    );
+                }
+            }
+        }
+        // Drop while the image remains locked: another reserver must not
+        // replay this now-published allocation a second time.
+        drop(reservation);
+        Some(Ok(()))
+    }
+
+    fn parallel_append_eligible(
+        &self,
+        meta: &Metadata,
+        ino: InodeId,
+        offset: usize,
+        data: &[u8],
+        prepared: &PreparedWrite<'_>,
+    ) -> bool {
+        if meta.backend == BackendKind::Host
+            || meta.config.defer_metadata_commit
+            || meta.config.defer_data_flush
+            || !prepared.matches(meta, data)
+        {
+            return false;
+        }
+        let Ok((old_size, stripe_size)) = self.range_update_geometry_locked(meta, ino) else {
+            return false;
+        };
+        old_size == offset
+            && offset.is_multiple_of(stripe_size)
+            && meta
+                .inodes
+                .get(&ino)
+                .is_some_and(|inode| inode.inline_data.is_none())
+            && prepared
+                .stripes
+                .iter()
+                .all(|stripe| stripe.encoded.len() > 1)
+    }
+
+    fn plan_raw_append<'a>(
+        &self,
+        private: &mut Metadata,
+        ino: InodeId,
+        offset: usize,
+        data: &[u8],
+        prepared: &'a PreparedWrite<'_>,
+    ) -> Result<(ReservationSpec, RawAppendPlan<'a>)> {
+        let layout = current_write_layout(private)?;
+        let stripe_size = layout_stripe_raw_size(&layout)?;
+        let inode = private
+            .inodes
+            .get(&ino)
+            .ok_or_else(|| ArgosError::NotFound(format!("inode {ino}")))?;
+        let storage_class = inode.storage_class;
+        let boot_critical = inode.boot_critical;
+        let first_stripe = private.next_stripe;
+        let mut extents = Vec::new();
+        let mut blocks = Vec::new();
+        let mut writes = BTreeMap::<String, Vec<(u64, &[u8])>>::new();
+        for (index, (stripe, raw)) in prepared
+            .stripes
+            .iter()
+            .zip(data.chunks(stripe_size))
+            .enumerate()
+        {
+            let stripe_id = format!("s{:016x}", private.next_stripe);
+            private.next_stripe = private
+                .next_stripe
+                .checked_add(1)
+                .ok_or_else(|| ArgosError::Invalid("stripe id overflow".into()))?;
+            let placements = self.choose_disks_locked(
+                private,
+                PlacementRequest {
+                    key: &stripe_id,
+                    count: stripe.encoded.len(),
+                    storage_class,
+                    boot_critical,
+                    exclude_disks: &BTreeSet::new(),
+                    required_bytes: stripe.shard_size as u64,
+                },
+            )?;
+            let mut shards = Vec::new();
+            for (slot, (disk, payload)) in placements.iter().zip(&stripe.encoded).enumerate() {
+                self.ensure_disk_capacity_locked(private, disk, payload.len() as u64)?;
+                let state = private
+                    .raw_pool
+                    .allocators
+                    .get_mut(disk)
+                    .ok_or_else(|| ArgosError::MissingDevice(disk.clone()))?;
+                let extent =
+                    allocator::allocate(state, disk, payload.len() as u64, private.txid + 1)?;
+                private
+                    .disks
+                    .get_mut(disk)
+                    .expect("placement member")
+                    .used_bytes = private.disks[disk].used_bytes.saturating_add(extent.length);
+                writes
+                    .entry(disk.clone())
+                    .or_default()
+                    .push((extent.offset, payload));
+                shards.push(Shard {
+                    slot,
+                    disk_id: disk.clone(),
+                    location: Some(ShardLocation::RawExtent(extent.clone())),
+                    relpath: PathBuf::new(),
+                    sha256: stripe.shard_hashes[slot].clone(),
+                    checksum_block_size: 0,
+                    subblock_sha256: Vec::new(),
+                    size: payload.len(),
+                });
+                extents.push(extent);
+            }
+            blocks.push(FileBlock {
+                layout_id: layout.id.clone(),
+                stripe_id,
+                raw_offset: (offset + index * stripe_size) as u64,
+                raw_size: raw.len(),
+                raw_sha256: stripe.raw_sha256.clone(),
+                codec: stripe.codec,
+                encrypted: false,
+                nonce_hex: String::new(),
+                compressed_size: stripe.compressed_size,
+                shard_size: stripe.shard_size,
+                shards,
+                storage_class,
+            });
+        }
+        Ok((
+            ReservationSpec {
+                first_stripe,
+                next_stripe: private.next_stripe,
+                extents,
+            },
+            RawAppendPlan { blocks, writes },
+        ))
+    }
+}

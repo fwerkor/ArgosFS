@@ -17,7 +17,7 @@
 //! `const fn`-evaluated `.rodata`, which is why there is nothing to initialize
 //! at runtime and no lazy-init check on the hot path.
 
-use crate::gf;
+use crate::data::ec::gf;
 
 /// Low-nibble table for scalar `c`, spanning bytes `0..16` of its entry.
 pub(crate) const LOW: usize = 0;

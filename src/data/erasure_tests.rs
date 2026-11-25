@@ -100,7 +100,7 @@ fn for_each_missing_set(total: usize, count: usize, mut f: impl FnMut(&[usize]))
 }
 
 #[test]
-fn vendored_codec_matches_erase_for_every_layout_and_boundary_length() {
+fn native_codec_matches_erase_for_every_layout_and_boundary_length() {
     use erase::galois_8::ReedSolomon as LegacyCodec;
 
     let layouts = [(1, 1), (2, 1), (3, 2), (4, 4), (5, 5), (6, 6)];
@@ -157,8 +157,8 @@ fn vendored_codec_matches_erase_for_every_layout_and_boundary_length() {
 
 #[test]
 fn every_supported_simd_kernel_matches_scalar_and_legacy() {
+    use crate::data::ec::{Codec as EngineCodec, Kernel, ShardMask};
     use erase::galois_8::ReedSolomon as LegacyCodec;
-    use reed_solomon_engine::{Codec as EngineCodec, Kernel, ShardMask};
 
     for (k, m) in [(1, 1), (2, 1), (4, 4), (6, 6)] {
         let legacy = LegacyCodec::new(k, m).unwrap();
@@ -316,6 +316,38 @@ fn cached_data_decoder_keeps_full_reconstruction_errors() {
         RsCodec::reconstruct_data_cached(2, 1, vec![Some(vec![1]), None, None]),
         Err(ArgosError::Erasure(_))
     ));
+}
+
+// Exercise cache-tile boundaries and the final partial vector with a legacy
+// oracle, not only the short vector lengths used by the kernel unit tests.
+#[test]
+fn large_tiled_shards_match_legacy_and_recover() {
+    use crate::data::ec::{Codec, Kernel, ShardMask};
+    use erase::galois_8::ReedSolomon as Legacy;
+    for (k, m) in [(2, 1), (4, 2), (16, 8)] {
+        let tile = (256 * 1024 / (k + m)).clamp(4096, 65536) & !63;
+        let legacy = Legacy::new(k, m).unwrap();
+        for len in [tile - 1, tile, tile + 1, 2 * tile + 17, 65537] {
+            let mut expected = (0..k + m).map(|i| fill_shard(i, len)).collect::<Vec<_>>();
+            legacy.encode(&mut expected).unwrap();
+            for kernel in Kernel::supported() {
+                let native = Codec::with_kernel(kernel, k, m).unwrap();
+                let mut actual = expected.clone();
+                for shard in &mut actual[k..] {
+                    shard.fill(0xa5);
+                }
+                native.encode_all(&mut actual).unwrap();
+                assert_eq!(actual, expected, "{} {k}+{m} {len}", kernel.name());
+                let mut mask = ShardMask::all_present(k + m);
+                mask.remove(0);
+                actual[0].fill(0xa5);
+                native
+                    .reconstruct(&mut actual, &mask, &mut native.workspace())
+                    .unwrap();
+                assert_eq!(actual, expected, "{} {k}+{m} {len}", kernel.name());
+            }
+        }
+    }
 }
 
 #[test]

@@ -1,8 +1,8 @@
 //! Read-only access to a set of equal-length shards.
 //!
 //! This lives in its own module rather than beside the drivers in
-//! [`crate::driver`] because of the layering in `docs/DESIGN.md` section 2. The
-//! kernel is the bottom layer, and [`Kernel::mul_rows`](crate::Kernel) reads
+//! [`crate::data::ec::driver`] to avoid a dependency cycle. The
+//! kernel is the bottom layer, and [`Kernel::mul_rows`](crate::data::ec::Kernel) reads
 //! `data_shards` source shards at once, so it needs this trait. Defining it in
 //! `driver` would have the bottom layer importing from the top one, which is
 //! exactly backwards. A neutral module both layers can depend on keeps the

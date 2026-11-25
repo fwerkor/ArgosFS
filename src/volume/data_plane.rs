@@ -81,18 +81,19 @@ impl EncodingGeometry {
     }
 }
 
-struct PreparedStripe {
-    raw_sha256: String,
-    codec: Compression,
-    compressed_size: usize,
-    shard_size: usize,
-    encoded: Vec<Vec<u8>>,
+pub(super) struct PreparedStripe {
+    pub(super) raw_sha256: String,
+    pub(super) codec: Compression,
+    pub(super) compressed_size: usize,
+    pub(super) shard_size: usize,
+    pub(super) encoded: Vec<Vec<u8>>,
+    pub(super) shard_hashes: Vec<String>,
 }
 
 pub(super) struct PreparedWrite<'a> {
     geometry: EncodingGeometry,
     input: &'a [u8],
-    stripes: Vec<PreparedStripe>,
+    pub(super) stripes: Vec<PreparedStripe>,
     _permit: PreparationPermit,
 }
 
@@ -142,6 +143,10 @@ impl<'a> PreparedWrite<'a> {
                 codec,
                 compressed_size,
                 shard_size,
+                shard_hashes: encoded
+                    .iter()
+                    .map(|shard| content_hash_hex(shard))
+                    .collect(),
                 encoded,
             });
         }
@@ -153,7 +158,7 @@ impl<'a> PreparedWrite<'a> {
         })
     }
 
-    fn matches(&self, meta: &Metadata, data: &[u8]) -> bool {
+    pub(super) fn matches(&self, meta: &Metadata, data: &[u8]) -> bool {
         std::ptr::eq(self.input, data)
             && EncodingGeometry::from_meta(meta).as_ref() == Some(&self.geometry)
     }
@@ -184,13 +189,15 @@ fn encode_payload(
     let padded_len = shard_size
         .checked_mul(k)
         .ok_or_else(|| ArgosError::Invalid("encoded shard size overflow".into()))?;
-    let mut padded = payload.to_vec();
-    padded.resize(padded_len, 0);
-    let data_shards = padded
-        .chunks(shard_size)
-        .map(|chunk| chunk.to_vec())
-        .collect::<Vec<_>>();
-    Ok((shard_size, codec.encode(&data_shards)?))
+    let mut data_shards = Vec::with_capacity(k);
+    for chunk in payload.chunks(shard_size) {
+        let mut shard = chunk.to_vec();
+        shard.resize(shard_size, 0);
+        data_shards.push(shard);
+    }
+    debug_assert_eq!(padded_len / shard_size, k);
+    data_shards.resize_with(k, || vec![0; shard_size]);
+    Ok((shard_size, codec.encode_owned(data_shards)?))
 }
 
 impl ArgosFs {
@@ -1105,6 +1112,9 @@ impl ArgosFs {
         let mut prepared_stripes = prepared
             .as_mut()
             .map(|p| std::mem::take(&mut p.stripes).into_iter());
+        let rs = (layout.k != 1 || layout.m != 0)
+            .then(|| RsCodec::new(layout.k, layout.m))
+            .transpose()?;
         for (index, raw) in data.chunks(stripe_raw_size).enumerate() {
             let stripe_id = format!("s{:016x}", meta.next_stripe);
             meta.next_stripe = meta
@@ -1194,9 +1204,6 @@ impl ArgosFs {
                     } else {
                         (transformed, false, String::new())
                     };
-                    let rs = (layout.k != 1 || layout.m != 0)
-                        .then(|| RsCodec::new(layout.k, layout.m))
-                        .transpose()?;
                     let (shard_size, encoded) = encode_payload(&payload, layout.k, rs.as_ref())?;
                     (
                         codec,

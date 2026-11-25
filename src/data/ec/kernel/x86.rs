@@ -16,30 +16,8 @@
 //! gate, and [`super::Kernel::is_supported`] is the only thing that calls
 //! them.
 //!
-//! # Why there is no blocked `mul_rows` here
-//!
-//! `src/kernel/neon.rs` computes several output rows in one pass, holding their
-//! accumulators in registers so that each source byte's nibble split is paid
-//! once for all of them. On aarch64 that turns `10G` SIMD operations per 32
-//! bytes per source shard into `4 + 6G`, and it is worth 1.4x to 1.6x measured.
-//!
-//! Neither half of that accounting carries over to x86, so the `mul_rows`
-//! implementations below are thin loops over [`ssse3::mul_slice`] and
-//! [`ssse3::mul_add_slice`] (and their AVX2 counterparts), byte-identical by
-//! construction to the row-major loop the codec used to run itself.
-//!
-//! - **Registers.** SSE and AVX2 have 16 vector registers, not 32. Eight
-//!   accumulator pairs plus the source and table vectors do not fit, so the
-//!   group width that pays for itself is smaller and has to be found, not
-//!   assumed.
-//! - **No three-input XOR.** The aarch64 figure of six operations per row per
-//!   32 bytes counts `eor3`, which folds an accumulate into the XOR of the two
-//!   shuffle results. Below AVX-512 (`vpternlogd`) x86 has no equivalent, so
-//!   each row costs an extra XOR and the ratio moves.
-//!
-//! A blocked x86 path may well be worth writing. It is not worth writing
-//! *blind*: it needs its own measurement on x86 hardware, including the group
-//! width, before it replaces a loop that is already correct.
+//! The row driver tiles source and parity buffers to avoid repeatedly
+//! streaming whole shards from memory. AVX-512 and GFNI are in wide_x86.
 
 // The one place in the crate where `unsafe` is permitted, and only for
 // intrinsics. `forbid(unsafe_op_in_unsafe_fn)` is still in force from the
@@ -61,62 +39,14 @@ use core::arch::x86 as arch;
 #[cfg(target_arch = "x86_64")]
 use core::arch::x86_64 as arch;
 
-// The crate root is `no_std`, so `std` is not in scope anywhere by default and
-// has to be named where it is used. It is linked only under the `std` feature,
-// which is exactly the configuration that has runtime CPU detection.
-#[cfg(feature = "std")]
-extern crate std;
-
-/// Whether the current CPU can run the [`ssse3`] kernel.
-///
-/// See [`avx2_supported`] for the two-path detection this shares.
 #[inline]
 pub(super) fn ssse3_supported() -> bool {
-    #[cfg(feature = "std")]
-    {
-        std::arch::is_x86_feature_detected!("ssse3")
-    }
-    #[cfg(not(feature = "std"))]
-    {
-        cfg!(target_feature = "ssse3")
-    }
+    std::arch::is_x86_feature_detected!("ssse3")
 }
 
-/// Whether the current CPU can run the [`avx2`] kernel.
-///
-/// With `std`, this is a runtime query: `is_x86_feature_detected!` executes
-/// CPUID once and caches the answer, so a binary built for a generic x86
-/// target still uses the widest kernel the machine it lands on has.
-///
-/// Without `std` there is no runtime detection to be had, and this crate will
-/// not grow a dependency to get some. The check degrades to what the compiler
-/// was told: a `no_std` build gets the AVX2 kernel only when it was compiled
-/// with `-C target-feature=+avx2` (or a `target-cpu` that implies it), and the
-/// scalar reference otherwise.
-///
-/// # `std` is not a safety net for `-C target-feature`
-///
-/// `is_x86_feature_detected!` expands to
-/// `cfg!(target_feature = "avx2") || <runtime check>`. Under
-/// `-C target-feature=+avx2` the left operand is `true` and CPUID is never
-/// consulted, so the `std` path trusts the flag exactly as the `no_std` path
-/// does, and this returns `true` on a CPU that has no AVX2.
-///
-/// That is correct behaviour rather than a hole. The flag is a promise to the
-/// compiler about the machine, and LLVM has already acted on it across every
-/// crate in the build; a program compiled that way was lost long before it
-/// reached this function. It is documented because the wording it replaces
-/// suggested `std` protected you from it, and it does not.
 #[inline]
 pub(super) fn avx2_supported() -> bool {
-    #[cfg(feature = "std")]
-    {
-        std::arch::is_x86_feature_detected!("avx2")
-    }
-    #[cfg(not(feature = "std"))]
-    {
-        cfg!(target_feature = "avx2")
-    }
+    std::arch::is_x86_feature_detected!("avx2")
 }
 
 /// SSSE3, 16 bytes per shuffle.
@@ -126,11 +56,11 @@ pub(super) fn avx2_supported() -> bool {
 /// than assumed.
 pub(super) mod ssse3 {
     use super::arch::{
-        __m128i, _mm_and_si128, _mm_loadu_si128, _mm_set1_epi8, _mm_shuffle_epi8, _mm_srli_epi64,
-        _mm_storeu_si128, _mm_xor_si128,
+        __m128i, _mm_and_si128, _mm_loadu_si128, _mm_set1_epi8, _mm_setzero_si128,
+        _mm_shuffle_epi8, _mm_srli_epi64, _mm_storeu_si128, _mm_xor_si128,
     };
-    use crate::kernel::{scalar, tables};
-    use crate::shards::ShardSource;
+    use crate::data::ec::kernel::{scalar, tables};
+    use crate::data::ec::shards::ShardSource;
 
     /// Bytes per vector register.
     const LANES: usize = 16;
@@ -187,7 +117,7 @@ pub(super) mod ssse3 {
 
     /// `dst = c * src`, where `dst` and `src` have equal length.
     #[target_feature(enable = "ssse3")]
-    pub(in crate::kernel) unsafe fn mul_slice(c: u8, src: &[u8], dst: &mut [u8]) {
+    pub(in crate::data::ec::kernel) unsafe fn mul_slice(c: u8, src: &[u8], dst: &mut [u8]) {
         debug_assert_eq!(src.len(), dst.len());
         // `mul(0, x) == 0` and `mul(1, x) == x`. The table path handles both
         // correctly; these are shortcuts, and they exist only to mirror the
@@ -230,7 +160,7 @@ pub(super) mod ssse3 {
 
     /// `dst ^= c * src`, where `dst` and `src` have equal length.
     #[target_feature(enable = "ssse3")]
-    pub(in crate::kernel) unsafe fn mul_add_slice(c: u8, src: &[u8], dst: &mut [u8]) {
+    pub(in crate::data::ec::kernel) unsafe fn mul_add_slice(c: u8, src: &[u8], dst: &mut [u8]) {
         debug_assert_eq!(src.len(), dst.len());
         if c == 0 {
             return;
@@ -270,29 +200,119 @@ pub(super) mod ssse3 {
         scalar::mul_add_slice(c, &src[i..], &mut dst[i..]);
     }
 
+    // Two independent output rows share each loaded source and its nibble
+    // indices. Four accumulators fit in the narrow x86 register file.
+    #[target_feature(enable = "ssse3")]
+    unsafe fn fused_pair<S: ShardSource + ?Sized>(
+        rows: [&[u8]; 2],
+        srcs: &S,
+        mut outs: [&mut [u8]; 2],
+        start: usize,
+        end: usize,
+    ) {
+        let mut i = start;
+        let zero = _mm_setzero_si128();
+        while i + 2 * LANES <= end {
+            let mut a = [zero; 2];
+            let mut b = [zero; 2];
+            for (j, &c0) in rows[0].iter().enumerate() {
+                let src = &srcs.shard(j)[i..i + 2 * LANES];
+                // SAFETY: the checked source window contains two full vectors.
+                unsafe {
+                    let x = _mm_loadu_si128(src.as_ptr().cast());
+                    let y = _mm_loadu_si128(src.as_ptr().add(LANES).cast());
+                    let mask = _mm_set1_epi8(15);
+                    let lx = _mm_and_si128(x, mask);
+                    let hx = _mm_and_si128(_mm_srli_epi64(x, 4), mask);
+                    let ly = _mm_and_si128(y, mask);
+                    let hy = _mm_and_si128(_mm_srli_epi64(y, 4), mask);
+                    for r in 0..2 {
+                        let t = shuffles(if r == 0 { c0 } else { rows[1][j] });
+                        a[r] = _mm_xor_si128(
+                            a[r],
+                            _mm_xor_si128(
+                                _mm_shuffle_epi8(t.low, lx),
+                                _mm_shuffle_epi8(t.high, hx),
+                            ),
+                        );
+                        b[r] = _mm_xor_si128(
+                            b[r],
+                            _mm_xor_si128(
+                                _mm_shuffle_epi8(t.low, ly),
+                                _mm_shuffle_epi8(t.high, hy),
+                            ),
+                        );
+                    }
+                }
+            }
+            for r in 0..2 {
+                let out = &mut outs[r][i..i + 2 * LANES];
+                // SAFETY: the checked output window contains two full vectors.
+                unsafe {
+                    _mm_storeu_si128(out.as_mut_ptr().cast(), a[r]);
+                    _mm_storeu_si128(out.as_mut_ptr().add(LANES).cast(), b[r]);
+                }
+            }
+            i += 2 * LANES;
+        }
+        if i < end {
+            for (r, out) in outs.iter_mut().enumerate() {
+                let out = &mut out[i..end];
+                // SAFETY: the same ISA is enabled in this function.
+                unsafe {
+                    mul_slice(rows[r][0], &srcs.shard(0)[i..end], out);
+                    for (j, &c) in rows[r].iter().enumerate().skip(1) {
+                        mul_add_slice(c, &srcs.shard(j)[i..end], out);
+                    }
+                }
+            }
+        }
+    }
+
     /// `outs[t] = sum over j of matrix[t * data_shards + j] * srcs.shard(j)`,
     /// for every `t`.
     ///
-    /// A driver over the pair above, in the same row-major order `src/driver.rs`
-    /// used to run itself, which makes it byte-identical to the scalar
-    /// reference by construction. See the module docs for why this is not the
-    /// blocked form `src/kernel/neon.rs` uses.
+    /// Encode a cache-sized tile across all parity rows before advancing.
     #[target_feature(enable = "ssse3")]
-    pub(in crate::kernel) unsafe fn mul_rows<S: ShardSource + ?Sized, O: AsMut<[u8]>>(
+    pub(in crate::data::ec::kernel) unsafe fn mul_rows<S: ShardSource + ?Sized, O: AsMut<[u8]>>(
         matrix: &[u8],
         data_shards: usize,
         srcs: &S,
         outs: &mut [O],
     ) {
-        for (row, out) in outs.iter_mut().enumerate() {
-            let coeffs = &matrix[row * data_shards..(row + 1) * data_shards];
-            let out = out.as_mut();
-            // SAFETY: this function requires `ssse3`, which is what
-            // `mul_slice` and `mul_add_slice` require.
-            unsafe {
-                mul_slice(coeffs[0], srcs.shard(0), out);
-                for (j, &c) in coeffs.iter().enumerate().skip(1) {
-                    mul_add_slice(c, srcs.shard(j), out);
+        let len = srcs.shard(0).len();
+        let tile = crate::data::ec::kernel::encode_tile_size(data_shards, outs.len());
+        for start in (0..len).step_by(tile) {
+            let end = (start + tile).min(len);
+            let mut row = 0;
+            if data_shards >= 4 && end - start >= 2 * LANES {
+                for pair in outs.as_chunks_mut::<2>().0 {
+                    let (left, right) = pair.split_at_mut(1);
+                    let coeffs = &matrix[row * data_shards..(row + 2) * data_shards];
+                    let (r0, r1) = coeffs.split_at(data_shards);
+                    // SAFETY: same ISA as the fused helper.
+                    unsafe {
+                        fused_pair(
+                            [r0, r1],
+                            srcs,
+                            [left[0].as_mut(), right[0].as_mut()],
+                            start,
+                            end,
+                        )
+                    };
+                    row += 2;
+                }
+            }
+            for (row, out) in outs.iter_mut().enumerate().skip(row) {
+                let coeffs = &matrix[row * data_shards..(row + 1) * data_shards];
+                let out = &mut out.as_mut()[start..end];
+                // SAFETY: this function requires `ssse3`, which is what
+                // `mul_slice` and `mul_add_slice` require.
+                unsafe {
+                    mul_slice(coeffs[0], &srcs.shard(0)[start..end], out);
+                    for (j, &c) in coeffs.iter().enumerate().skip(1) {
+                        mul_add_slice(c, &srcs.shard(j)[start..end], out);
+                    }
                 }
             }
         }
@@ -307,12 +327,12 @@ pub(super) mod ssse3 {
 /// of the register.
 pub(super) mod avx2 {
     use super::arch::{
-        __m256i, _mm_loadu_si128, _mm256_and_si256, _mm256_broadcastsi128_si256,
-        _mm256_loadu_si256, _mm256_set1_epi8, _mm256_shuffle_epi8, _mm256_srli_epi64,
-        _mm256_storeu_si256, _mm256_xor_si256,
+        __m256i, _mm256_and_si256, _mm256_broadcastsi128_si256, _mm256_loadu_si256,
+        _mm256_set1_epi8, _mm256_setzero_si256, _mm256_shuffle_epi8, _mm256_srli_epi64,
+        _mm256_storeu_si256, _mm256_xor_si256, _mm_loadu_si128,
     };
-    use crate::kernel::{scalar, tables};
-    use crate::shards::ShardSource;
+    use crate::data::ec::kernel::{scalar, tables};
+    use crate::data::ec::shards::ShardSource;
 
     /// Bytes per vector register.
     const LANES: usize = 32;
@@ -390,7 +410,7 @@ pub(super) mod avx2 {
 
     /// `dst = c * src`, where `dst` and `src` have equal length.
     #[target_feature(enable = "avx2")]
-    pub(in crate::kernel) unsafe fn mul_slice(c: u8, src: &[u8], dst: &mut [u8]) {
+    pub(in crate::data::ec::kernel) unsafe fn mul_slice(c: u8, src: &[u8], dst: &mut [u8]) {
         debug_assert_eq!(src.len(), dst.len());
         // `mul(0, x) == 0` and `mul(1, x) == x`. The table path handles both
         // correctly; these are shortcuts, and they exist only to mirror the
@@ -433,7 +453,7 @@ pub(super) mod avx2 {
 
     /// `dst ^= c * src`, where `dst` and `src` have equal length.
     #[target_feature(enable = "avx2")]
-    pub(in crate::kernel) unsafe fn mul_add_slice(c: u8, src: &[u8], dst: &mut [u8]) {
+    pub(in crate::data::ec::kernel) unsafe fn mul_add_slice(c: u8, src: &[u8], dst: &mut [u8]) {
         debug_assert_eq!(src.len(), dst.len());
         if c == 0 {
             return;
@@ -473,28 +493,119 @@ pub(super) mod avx2 {
         scalar::mul_add_slice(c, &src[i..], &mut dst[i..]);
     }
 
+    // Two independent output rows share each loaded source and its nibble
+    // indices. Four accumulators fit in the narrow x86 register file.
+    #[target_feature(enable = "avx2")]
+    unsafe fn fused_pair<S: ShardSource + ?Sized>(
+        rows: [&[u8]; 2],
+        srcs: &S,
+        mut outs: [&mut [u8]; 2],
+        start: usize,
+        end: usize,
+    ) {
+        let mut i = start;
+        let zero = _mm256_setzero_si256();
+        while i + 2 * LANES <= end {
+            let mut a = [zero; 2];
+            let mut b = [zero; 2];
+            for (j, &c0) in rows[0].iter().enumerate() {
+                let src = &srcs.shard(j)[i..i + 2 * LANES];
+                // SAFETY: the checked source window contains two full vectors.
+                unsafe {
+                    let x = _mm256_loadu_si256(src.as_ptr().cast());
+                    let y = _mm256_loadu_si256(src.as_ptr().add(LANES).cast());
+                    let mask = _mm256_set1_epi8(15);
+                    let lx = _mm256_and_si256(x, mask);
+                    let hx = _mm256_and_si256(_mm256_srli_epi64(x, 4), mask);
+                    let ly = _mm256_and_si256(y, mask);
+                    let hy = _mm256_and_si256(_mm256_srli_epi64(y, 4), mask);
+                    for r in 0..2 {
+                        let t = shuffles(if r == 0 { c0 } else { rows[1][j] });
+                        a[r] = _mm256_xor_si256(
+                            a[r],
+                            _mm256_xor_si256(
+                                _mm256_shuffle_epi8(t.low, lx),
+                                _mm256_shuffle_epi8(t.high, hx),
+                            ),
+                        );
+                        b[r] = _mm256_xor_si256(
+                            b[r],
+                            _mm256_xor_si256(
+                                _mm256_shuffle_epi8(t.low, ly),
+                                _mm256_shuffle_epi8(t.high, hy),
+                            ),
+                        );
+                    }
+                }
+            }
+            for r in 0..2 {
+                let out = &mut outs[r][i..i + 2 * LANES];
+                // SAFETY: the checked output window contains two full vectors.
+                unsafe {
+                    _mm256_storeu_si256(out.as_mut_ptr().cast(), a[r]);
+                    _mm256_storeu_si256(out.as_mut_ptr().add(LANES).cast(), b[r]);
+                }
+            }
+            i += 2 * LANES;
+        }
+        if i < end {
+            for (r, out) in outs.iter_mut().enumerate() {
+                let out = &mut out[i..end];
+                // SAFETY: the same ISA is enabled in this function.
+                unsafe {
+                    mul_slice(rows[r][0], &srcs.shard(0)[i..end], out);
+                    for (j, &c) in rows[r].iter().enumerate().skip(1) {
+                        mul_add_slice(c, &srcs.shard(j)[i..end], out);
+                    }
+                }
+            }
+        }
+    }
+
     /// `outs[t] = sum over j of matrix[t * data_shards + j] * srcs.shard(j)`,
     /// for every `t`.
     ///
-    /// As in [`super::ssse3::mul_rows`]: a driver over the pair above, in the
-    /// row-major order the codec used to run itself. See the module docs for
-    /// why this is not the blocked form `src/kernel/neon.rs` uses.
+    /// Encode a cache-sized tile across all parity rows before advancing.
     #[target_feature(enable = "avx2")]
-    pub(in crate::kernel) unsafe fn mul_rows<S: ShardSource + ?Sized, O: AsMut<[u8]>>(
+    pub(in crate::data::ec::kernel) unsafe fn mul_rows<S: ShardSource + ?Sized, O: AsMut<[u8]>>(
         matrix: &[u8],
         data_shards: usize,
         srcs: &S,
         outs: &mut [O],
     ) {
-        for (row, out) in outs.iter_mut().enumerate() {
-            let coeffs = &matrix[row * data_shards..(row + 1) * data_shards];
-            let out = out.as_mut();
-            // SAFETY: this function requires `avx2`, which is what `mul_slice`
-            // and `mul_add_slice` require.
-            unsafe {
-                mul_slice(coeffs[0], srcs.shard(0), out);
-                for (j, &c) in coeffs.iter().enumerate().skip(1) {
-                    mul_add_slice(c, srcs.shard(j), out);
+        let len = srcs.shard(0).len();
+        let tile = crate::data::ec::kernel::encode_tile_size(data_shards, outs.len());
+        for start in (0..len).step_by(tile) {
+            let end = (start + tile).min(len);
+            let mut row = 0;
+            if data_shards >= 4 && end - start >= 2 * LANES {
+                for pair in outs.as_chunks_mut::<2>().0 {
+                    let (left, right) = pair.split_at_mut(1);
+                    let coeffs = &matrix[row * data_shards..(row + 2) * data_shards];
+                    let (r0, r1) = coeffs.split_at(data_shards);
+                    // SAFETY: same ISA as the fused helper.
+                    unsafe {
+                        fused_pair(
+                            [r0, r1],
+                            srcs,
+                            [left[0].as_mut(), right[0].as_mut()],
+                            start,
+                            end,
+                        )
+                    };
+                    row += 2;
+                }
+            }
+            for (row, out) in outs.iter_mut().enumerate().skip(row) {
+                let coeffs = &matrix[row * data_shards..(row + 1) * data_shards];
+                let out = &mut out.as_mut()[start..end];
+                // SAFETY: this function requires `avx2`, which is what `mul_slice`
+                // and `mul_add_slice` require.
+                unsafe {
+                    mul_slice(coeffs[0], &srcs.shard(0)[start..end], out);
+                    for (j, &c) in coeffs.iter().enumerate().skip(1) {
+                        mul_add_slice(c, &srcs.shard(j)[start..end], out);
+                    }
                 }
             }
         }

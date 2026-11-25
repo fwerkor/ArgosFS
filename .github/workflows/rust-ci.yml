@@ -141,24 +141,14 @@ jobs:
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
-      # Check only owned Rust sources; vendored src is pinned byte-for-byte
-      # to the published crate and may not match the runner's rustfmt version.
       - name: Check ArgosFS formatting
         run: cargo fmt --package argosfs -- --check
 
-      - name: Verify vendored erasure-codec source
-        run: python3 scripts/ci/verify-vendored-codec.py
-
-      # The published crate does not include the path-vendored code. Cargo
-      # replaces path+version with the pinned registry source; validate that
-      # this independently resolves and compiles before publishing ArgosFS.
-      - name: Verify crates.io packaging uses compatible pinned codec
+      - name: Verify packaged native codec compatibility
         run: |
           cargo package --locked --allow-dirty
-          # The release archive omits vendor/. Check the registry-installed
-          # copy against the same legacy parity and reconstruction oracle.
           package_version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
-          cargo test --manifest-path "target/package/argosfs-${package_version}/Cargo.toml" --lib data::erasure::tests -- --test-threads=1
+          cargo test --manifest-path "target/package/argosfs-${package_version}/Cargo.toml" --lib data:: -- --test-threads=1
 
       - name: Run Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
@@ -213,7 +203,16 @@ jobs:
           key: rust-unit-${{ matrix.arch }}
 
       - name: Run tests
+        env:
+          RS_REQUIRE_KERNELS: ${{ matrix.arch == 'arm64' && 'neon,scalar' || 'ssse3,avx2,scalar' }}
         run: cargo test --all-targets --all-features -- --test-threads=1
+
+      - name: Test SVE and SVE2 vector lengths
+        if: matrix.arch == 'x86_64'
+        run: |
+          sudo apt-get install -y qemu-user
+          rustup target add aarch64-unknown-linux-musl
+          scripts/ci/test-erasure-sve.sh
 
       - name: Build release binary
         run: cargo build --release --all-targets --all-features

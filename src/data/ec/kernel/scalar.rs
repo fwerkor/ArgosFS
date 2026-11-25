@@ -4,12 +4,27 @@
 //! GF(2^8) whose "elements" are whole shards, and the two functions below are
 //! the entirety of its inner loop. Essentially all of the runtime is here.
 //!
-//! This is the scalar reference implementation. It is written for obvious
-//! correctness and is never optimized: it is the specification that every
-//! future SIMD path must reproduce byte for byte.
+//! Portable fixed-coefficient table implementation. Table entries are
+//! generated from the field specification, independently of SIMD.
 
-use crate::gf;
-use crate::shards::ShardSource;
+use crate::data::ec::gf;
+use crate::data::ec::shards::ShardSource;
+
+const fn multiplication_table() -> [[u8; 256]; 256] {
+    let mut table = [[0; 256]; 256];
+    let mut c = 0;
+    while c < 256 {
+        let mut x = 0;
+        while x < 256 {
+            table[c][x] = gf::mul(c as u8, x as u8);
+            x += 1;
+        }
+        c += 1;
+    }
+    table
+}
+
+static MULTIPLICATION: [[u8; 256]; 256] = multiplication_table();
 
 /// `dst = c * src`
 ///
@@ -23,8 +38,9 @@ pub(crate) fn mul_slice(c: u8, src: &[u8], dst: &mut [u8]) {
         0 => dst.fill(0),
         1 => dst.copy_from_slice(src),
         _ => {
+            let table = &MULTIPLICATION[c as usize];
             for (d, &s) in dst.iter_mut().zip(src) {
-                *d = gf::mul(c, s);
+                *d = table[s as usize];
             }
         }
     }
@@ -44,8 +60,9 @@ pub(crate) fn mul_add_slice(c: u8, src: &[u8], dst: &mut [u8]) {
             }
         }
         _ => {
+            let table = &MULTIPLICATION[c as usize];
             for (d, &s) in dst.iter_mut().zip(src) {
-                *d ^= gf::mul(c, s);
+                *d ^= table[s as usize];
             }
         }
     }

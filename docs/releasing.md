@@ -12,8 +12,8 @@ Each run enforces the following order:
 1. Validate that the version is stable SemVer, is equal to Cargo.toml, and
    that the requested commit is the current main tip. A preexisting tag must
    point to the exact same commit.
-2. Test the library, validate the vendored codec, package the crate, and
-   repeat the erasure compatibility oracle from the packaged registry source.
+2. Test the library, package the crate, and
+   repeat the erasure compatibility oracle from the packaged native source.
 3. Build x86_64 and aarch64 Linux binaries on native GitHub-hosted runners.
 4. Generate one git-archive source tarball, SHA256SUMS, and a GitHub Release
    named vX.Y.Z. The tag is created only after all checks and builds pass.
@@ -21,7 +21,7 @@ Each run enforces the following order:
    token), and update the two AUR packages.
 
 The GitHub Release contains:
-- argosfs-X.Y.Z-source.tar.gz: tagged Git source including pinned codec source.
+- argosfs-X.Y.Z-source.tar.gz: tagged Git source including native codec source.
 - argosfs-X.Y.Z-x86_64-unknown-linux-gnu.tar.gz: Linux x86_64 binary.
 - argosfs-X.Y.Z-aarch64-unknown-linux-gnu.tar.gz: Linux ARM64 binary.
 - SHA256SUMS: the hashes of all three archives.
@@ -58,9 +58,8 @@ an older, differently positioned Git tag.
    All future releases use rust-lang/crates-io-auth-action@v1 to obtain a
    short-lived OIDC token. Do not keep a long-lived registry token configured.
 
-The crates.io archive uses the registry's reed-solomon-engine =0.2.0 (the
-repository's pinned vendor copy is excluded by Cargo packaging); the release
-verification runs the compatibility tests against the published dependency.
+The crates.io archive includes the native codec and its license notices.
+Release verification runs compatibility tests against the packaged source.
 
 ### AUR (once)
 

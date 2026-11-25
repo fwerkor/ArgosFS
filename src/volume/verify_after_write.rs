@@ -4,14 +4,14 @@
 //! extents are invalidated before they can be reused. The verifier forces
 //! the data to stable storage before evicting clean page-cache pages.
 
-use super::{ArgosFs, Metadata};
+use super::{ArgosFs, Metadata, MetadataLock};
 use crate::backend::{FileBlockBackend, StorageBackend};
 use crate::error::{ArgosError, Result};
 use crate::storage::guard::GuardedBackend;
 use crate::types::{DiskStatus, ShardLocation};
 use crate::util::content_hash_matches;
 use crate::util::usb_mode;
-use parking_lot::{Mutex as DeviceMutex, RwLock};
+use parking_lot::Mutex as DeviceMutex;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -52,7 +52,7 @@ pub struct VerifyAfterWrite {
     next_serial: AtomicU64,
     delay: Duration,
     max_retries: u32,
-    metadata: Arc<RwLock<Metadata>>,
+    metadata: Arc<MetadataLock>,
     quarantined: Arc<DeviceMutex<BTreeSet<String>>>,
     write_fence: Arc<DeviceMutex<Option<String>>>,
     extra_devices: DeviceMutex<BTreeMap<String, DeviceBackend>>,
@@ -87,7 +87,7 @@ impl VerifyAfterWrite {
         backend: Arc<dyn StorageBackend>,
         delay: Duration,
         max_retries: u32,
-        metadata: Arc<RwLock<Metadata>>,
+        metadata: Arc<MetadataLock>,
         quarantined: Arc<DeviceMutex<BTreeSet<String>>>,
         write_fence: Arc<DeviceMutex<Option<String>>>,
     ) -> Arc<Self> {
