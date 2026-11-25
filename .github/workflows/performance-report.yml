@@ -97,7 +97,7 @@ jobs:
           fi
 
       - name: Unit-test benchmark harness
-        run: python3 -m unittest discover -s scripts/experiments -p test_rootfs_perf.py -v
+        run: python3 -m unittest discover -s scripts/experiments -p 'test_*.py' -v
 
       - name: Build release binary
         run: cargo build --release
