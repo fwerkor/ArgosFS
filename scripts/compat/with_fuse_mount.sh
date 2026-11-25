@@ -104,6 +104,11 @@ mkdir -p "$mountpoint"
 
 mount_options="${ARGOSFS_COMPAT_MOUNT_OPTIONS:-}"
 mount_args=("$bin" mount "$root" "$mountpoint" --foreground)
+if [ "${ARGOSFS_COMPAT_ENABLE_METRICS:-0}" = "1" ]; then
+  metrics_port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')"
+  mount_args+=(--metrics-listen "127.0.0.1:$metrics_port")
+  export ARGOSFS_COMPAT_METRICS_URL="http://127.0.0.1:$metrics_port/commit-metrics"
+fi
 IFS=',' read -r -a requested_mount_options <<<"$mount_options"
 for option in "${requested_mount_options[@]}"; do
   option="$(printf '%s' "$option" | xargs)"
