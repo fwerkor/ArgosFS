@@ -1247,7 +1247,7 @@ fn blocked_inode_flush_does_not_hold_mount_writeback_map() {
             scope.spawn(move || shared.flush_inode_writeback(a).unwrap());
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
-                if shared.writeback_lock(a).try_lock().is_none() {
+                if shared.writeback_lock(a).try_write().is_none() {
                     break;
                 }
                 assert!(Instant::now() < deadline, "flush never acquired inode gate");
