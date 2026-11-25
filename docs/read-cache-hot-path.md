@@ -88,3 +88,19 @@ The cache metrics enable attributing a warm CPU regression to L1, L2 or
 verified decode activity; they do **not** themselves constitute a physical
 Borg performance comparison. Physical-device numbers require the reporter's
 test hardware and fixture.
+
+### Asynchronous L2 admission
+
+Normal volume mounts enqueue verified, unencrypted decoded stripes to a
+single background L2 writer. The queue is bounded to 32 jobs and 32 MiB
+of retained decoded payload (including the active job). Admission never
+waits for queue capacity: a saturated queue skips the optional disk-cache
+write while retaining normal L1 behavior. A shutdown drains accepted jobs.
+Generation checks before atomic rename prevent removed or replaced entries
+from being republished by a queued writer. All L2 reads remain hash- and
+length-verified; cache files and their directories do not receive durability
+barriers. Metadata, journals and authoritative shards are unchanged.
+
+Monitor `argosfs_read_cache_l2_pending_bytes` and
+`argosfs_read_cache_l2_queue_dropped_total` when comparing cold and warm
+performance. Drops affect future cache residency, not filesystem correctness.

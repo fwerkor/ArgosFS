@@ -362,9 +362,11 @@ fn io_policy_and_encryption_cover_empty_repeat_and_wrong_passphrases() {
 #[test]
 fn enable_encryption_purges_cached_plaintext() {
     let _guard = env_lock();
-    let (_dir, fs) = host_volume(1);
+    let (dir, fs) = host_volume(1);
     fs.write_file("/secret", &[7u8; 8192], 0o644).unwrap();
     assert_eq!(fs.read_file("/secret", false).unwrap(), vec![7u8; 8192]);
+    drop(fs);
+    let fs = ArgosFs::open(dir.path()).unwrap();
     assert!(
         fs.cache_disk_footprint().unwrap().0 > 0,
         "the read should have admitted decoded blocks to L2"

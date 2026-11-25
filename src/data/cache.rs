@@ -9,7 +9,9 @@ use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, SyncSender};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 
 /// Once admitted, cached block bytes are immutable. Compute their trusted
 /// digest *once* on admission rather than re-hashing every FUSE subrange read.
@@ -77,6 +79,8 @@ struct CacheInner {
     l2_evictions: u64,
     l2_loaded_items: u64,
     l2_loaded_bytes: u64,
+    l2_pending_bytes: usize,
+    l2_queue_dropped: u64,
 }
 
 impl CacheInner {
@@ -84,6 +88,12 @@ impl CacheInner {
         let in_flight = self.inflight_l2.entry(key.to_owned()).or_default();
         in_flight.readers += 1;
         in_flight.generation
+    }
+
+    fn l2_generation_current(&self, key: &str, generation: u64) -> bool {
+        self.inflight_l2
+            .get(key)
+            .is_some_and(|entry| entry.generation == generation)
     }
 
     fn finish_l2_read(&mut self, key: &str, generation: u64) -> bool {
@@ -232,15 +242,44 @@ fn eviction_score(path: &Path, seed: u64) -> u64 {
     hasher.finish()
 }
 
+// Bound both queued jobs and their total retained payload.
+const L2_QUEUE_ITEMS: usize = 32;
+const L2_QUEUE_BYTES: usize = 32 * 1024 * 1024;
+
+struct L2Admission {
+    key: String,
+    generation: u64,
+    data: Arc<[u8]>,
+}
+
+struct L2Writer {
+    sender: Option<SyncSender<L2Admission>>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Drop for L2Writer {
+    fn drop(&mut self) {
+        // Drain accepted admissions on orderly shutdown. The worker owns
+        // only a view of the cache state, never this sender.
+        self.sender.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 pub struct BlockCache {
     root: PathBuf,
     memory_limit: usize,
     l2_limit: u64,
-    inner: Mutex<CacheInner>,
+    inner: Arc<Mutex<CacheInner>>,
     // These byte counters must not take a second global cache lock on the
     // very hot direct-copy path. They reset on each volume open.
-    direct_copy_bytes: AtomicU64,
-    l2_read_bytes: AtomicU64,
+    direct_copy_bytes: Arc<AtomicU64>,
+    l2_read_bytes: Arc<AtomicU64>,
+    writer: Option<L2Writer>,
+    // Serialize staged writes with administrative purge, including temporary files.
+    l2_publication: Arc<Mutex<()>>,
 }
 
 impl BlockCache {
@@ -252,10 +291,54 @@ impl BlockCache {
             root,
             memory_limit,
             l2_limit,
-            inner: Mutex::new(CacheInner::default()),
-            direct_copy_bytes: AtomicU64::new(0),
-            l2_read_bytes: AtomicU64::new(0),
+            inner: Arc::new(Mutex::new(CacheInner::default())),
+            direct_copy_bytes: Arc::new(AtomicU64::new(0)),
+            l2_read_bytes: Arc::new(AtomicU64::new(0)),
+            writer: None,
+            l2_publication: Arc::new(Mutex::new(())),
         }
+    }
+
+    /// Production volumes use bounded, non-blocking L2 admission. If a
+    /// worker cannot be started, keep the verified synchronous fallback.
+    pub fn new_async(root: impl AsRef<Path>, memory_limit: usize, l2_limit: u64) -> Self {
+        let mut cache = Self::new(root, memory_limit, l2_limit);
+        if cache.l2_limit == 0 {
+            return cache;
+        }
+        let worker = Self {
+            root: cache.root.clone(),
+            memory_limit: cache.memory_limit,
+            l2_limit: cache.l2_limit,
+            inner: Arc::clone(&cache.inner),
+            direct_copy_bytes: Arc::clone(&cache.direct_copy_bytes),
+            l2_read_bytes: Arc::clone(&cache.l2_read_bytes),
+            writer: None,
+            l2_publication: Arc::clone(&cache.l2_publication),
+        };
+        let (sender, receiver) = mpsc::sync_channel::<L2Admission>(L2_QUEUE_ITEMS);
+        match std::thread::Builder::new()
+            .name("argosfs-l2-admission".into())
+            .spawn(move || {
+                for job in receiver {
+                    let result = worker.put_l2(&job.key, &job.data, job.generation);
+                    let mut inner = worker.inner.lock();
+                    inner.finish_l2_read(&job.key, job.generation);
+                    inner.l2_pending_bytes -= job.data.len();
+                    if result.is_err() {
+                        inner.l2_errors += 1;
+                    }
+                }
+            }) {
+            Ok(thread) => {
+                cache.writer = Some(L2Writer {
+                    sender: Some(sender),
+                    thread: Some(thread),
+                })
+            }
+            Err(_) => cache.inner.lock().l2_errors += 1,
+        }
+        cache
     }
 
     /// Legacy full-block caller. Most FUSE reads should call `get_range`,
@@ -403,18 +486,55 @@ impl BlockCache {
     }
 
     pub fn put(&self, key: &str, data: &[u8]) -> Result<()> {
-        // Hash once before taking the global cache mutex, even on a cold
-        // stripe admission while other FUSE threads are serving warm hits.
-        let admission = (self.memory_limit > 0).then(|| MemoryItem::new(Arc::from(data), 0));
-        {
-            let mut inner = self.inner.lock();
-            inner.note_key_mutation(key);
-            if let Some(item) = admission {
-                inner.insert_memory(key, item, self.memory_limit);
-            }
+        if self.memory_limit == 0 && self.l2_limit == 0 {
+            return Ok(());
         }
-        if self.l2_limit > 0 && self.put_l2(key, data).is_err() {
-            self.inner.lock().l2_errors += 1;
+        let data: Arc<[u8]> = Arc::from(data);
+        let admission = (self.memory_limit > 0).then(|| MemoryItem::new(Arc::clone(&data), 0));
+        let mut inner = self.inner.lock();
+        inner.note_key_mutation(key);
+        if let Some(item) = admission {
+            inner.insert_memory(key, item, self.memory_limit);
+        }
+        if self.l2_limit == 0 {
+            return Ok(());
+        }
+        if data.len() as u64 > self.l2_limit {
+            inner.l2_admission_oversize += 1;
+            return Ok(());
+        }
+        let generation = inner.begin_l2_read(key);
+        if let Some(writer) = &self.writer {
+            let len = data.len();
+            if inner.l2_pending_bytes.saturating_add(len) <= L2_QUEUE_BYTES {
+                let job = L2Admission {
+                    key: key.to_owned(),
+                    generation,
+                    data,
+                };
+                // Hold accounting lock through try_send: the worker cannot
+                // complete before its retained bytes are charged.
+                if writer
+                    .sender
+                    .as_ref()
+                    .expect("live writer")
+                    .try_send(job)
+                    .is_ok()
+                {
+                    inner.l2_pending_bytes += len;
+                    return Ok(());
+                }
+            }
+            inner.finish_l2_read(key, generation);
+            inner.l2_queue_dropped += 1;
+            return Ok(());
+        }
+        drop(inner);
+        let result = self.put_l2(key, &data, generation);
+        let mut inner = self.inner.lock();
+        inner.finish_l2_read(key, generation);
+        if result.is_err() {
+            inner.l2_errors += 1;
         }
         Ok(())
     }
@@ -434,15 +554,14 @@ impl BlockCache {
     }
 
     pub fn remove(&self, key: &str) {
-        {
-            let mut inner = self.inner.lock();
-            inner.note_key_mutation(key);
-            inner.remove_memory(key);
-        }
+        let mut inner = self.inner.lock();
+        inner.note_key_mutation(key);
+        inner.remove_memory(key);
         if self.l2_limit > 0 {
             let path = self.l2_path(key);
+            // Serialize deletion with publication and index update so a
+            // queued stale block cannot resurrect this entry.
             let _ = std::fs::remove_file(&path);
-            let mut inner = self.inner.lock();
             if let Some(entry) = inner.l2_index.remove(&path) {
                 inner.l2_bytes = inner.l2_bytes.saturating_sub(entry.size);
                 if entry.reused {
@@ -463,6 +582,14 @@ impl BlockCache {
             ("l2_hits".to_string(), json!(inner.l2_hits)),
             ("l2_writes".to_string(), json!(inner.l2_writes)),
             ("l2_errors".to_string(), json!(inner.l2_errors)),
+            (
+                "l2_pending_bytes".to_string(),
+                json!(inner.l2_pending_bytes),
+            ),
+            (
+                "l2_queue_dropped".to_string(),
+                json!(inner.l2_queue_dropped),
+            ),
             (
                 "l2_admission_frozen".to_string(),
                 json!(inner.l2_admission_frozen),
@@ -527,14 +654,19 @@ impl BlockCache {
     /// clear. In-flight L2 reads keep their mutation tickets; they finish as
     /// misses against the removed files.
     pub fn clear(&self) -> Result<()> {
+        let _publication = self.l2_publication.lock();
+        let mut inner = self.inner.lock();
+        inner.note_prefix_mutation("");
         {
-            let mut inner = self.inner.lock();
             inner.items.clear();
             inner.order.clear();
             inner.bytes = 0;
             inner.l2_index.clear();
             inner.l2_bytes = 0;
             inner.l2_hot_bytes = 0;
+            inner.l2_freeze_stream = false;
+            inner.l2_window_requests = 0;
+            inner.l2_window_hits = 0;
             // The directory is about to be removed; do not rescan it.
             inner.l2_loaded = true;
             inner.l2_loaded_items = 0;
@@ -549,11 +681,15 @@ impl BlockCache {
         Ok(())
     }
 
-    fn put_l2(&self, key: &str, data: &[u8]) -> Result<()> {
+    fn put_l2(&self, key: &str, data: &[u8], generation: u64) -> Result<()> {
+        let _publication = self.l2_publication.lock();
         self.load_l2_index()?;
         let path = self.l2_path(key);
         {
             let mut inner = self.inner.lock();
+            if !inner.l2_generation_current(key, generation) {
+                return Ok(());
+            }
             // Once the recent hit ratio shows real reuse, a new streaming
             // admission would start evicting the reusable sample before the
             // rest of the second pass can read it. Freeze cold admissions at
@@ -572,8 +708,18 @@ impl BlockCache {
                 }
             }
         }
-        write_cache_block(&path, data)?;
+        let temporary = stage_cache_block(&path, data)?;
         let mut inner = self.inner.lock();
+        if !inner.l2_generation_current(key, generation) {
+            let _ = std::fs::remove_file(temporary);
+            return Ok(());
+        }
+        if let Err(err) = std::fs::rename(&temporary, &path) {
+            let _ = std::fs::remove_file(temporary);
+            return Err(err.into());
+        }
+        // Readers that raced publication must recheck the current content.
+        inner.note_key_mutation(key);
         inner.l2_clock = inner.l2_clock.saturating_add(1);
         let touched = inner.l2_clock;
         let reused = inner.l2_index.get(&path).is_some_and(|entry| entry.reused);
@@ -826,7 +972,7 @@ pub fn gc_cache_dirs(base: &Path, keep: &BTreeSet<String>) -> Result<Vec<CacheDi
 /// L2 is a disposable, content-verified acceleration tier. Atomic publication
 /// prevents readers seeing a partial write; unlike metadata, cache blocks need
 /// not survive power loss. Never fsync a cache block or its parent directory.
-fn write_cache_block(path: &Path, data: &[u8]) -> Result<()> {
+fn stage_cache_block(path: &Path, data: &[u8]) -> Result<PathBuf> {
     if let Some(parent) = path.parent() {
         ensure_dir(parent)?;
     }
@@ -838,14 +984,22 @@ fn write_cache_block(path: &Path, data: &[u8]) -> Result<()> {
             .mode(0o600)
             .open(&temporary)?;
         file.write_all(data)?;
-        drop(file);
-        std::fs::rename(&temporary, path)?;
         Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
     }
-    result
+    result.map(|()| temporary)
+}
+
+#[cfg(test)]
+fn write_cache_block(path: &Path, data: &[u8]) -> Result<()> {
+    let temporary = stage_cache_block(path, data)?;
+    if let Err(err) = std::fs::rename(&temporary, path) {
+        let _ = std::fs::remove_file(temporary);
+        return Err(err.into());
+    }
+    Ok(())
 }
 
 fn configured_l2_limit(default_limit: u64) -> u64 {

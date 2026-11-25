@@ -46,13 +46,13 @@ impl ArgosFs {
             let _ =
                 crypto::derive_key_for_config(&meta.encryption, passphrase, meta.uuid.as_bytes())?;
         } else {
-            meta.encryption = crypto::new_encryption_config(passphrase, meta.uuid.as_bytes())?;
-            self.commit_locked(&mut meta, "enable-encryption", json!({}))?;
-            // Decoded blocks cached before encryption was enabled are
-            // plaintext. Drop both tiers now; new writes are encrypted and
-            // bypass the cache. The metadata write lock keeps reads out while
-            // the cache directory is removed.
+            let encryption = crypto::new_encryption_config(passphrase, meta.uuid.as_bytes())?;
+            // Purge before committing the configuration so a failed purge
+            // cannot leave encryption enabled with stale cached plaintext.
+            // The metadata write lock keeps reads out during the transition.
             self.cache.clear()?;
+            meta.encryption = encryption;
+            self.commit_locked(&mut meta, "enable-encryption", json!({}))?;
         }
         Ok(())
     }

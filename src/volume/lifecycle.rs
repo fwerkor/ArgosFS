@@ -139,7 +139,7 @@ impl ArgosFs {
         let _ = RsCodec::new(meta.config.k, meta.config.m)?;
         harden_host_storage_permissions(&root, &meta)?;
         meta.inodes.initialize_member_catalog();
-        let cache = BlockCache::new(
+        let cache = BlockCache::new_async(
             root.join(".argosfs/cache/l2"),
             64 * 1024 * 1024,
             meta.config.l2_cache_bytes,
@@ -371,7 +371,7 @@ impl ArgosFs {
         }
         let _ = RsCodec::new(meta.config.k, meta.config.m)?;
         let cache_root = block_cache_root(&meta.uuid, meta.backend, paths);
-        let cache = BlockCache::new(cache_root, 64 * 1024 * 1024, meta.config.l2_cache_bytes);
+        let cache = BlockCache::new_async(cache_root, 64 * 1024 * 1024, meta.config.l2_cache_bytes);
         let root = paths
             .first()
             .and_then(|path| path.parent())

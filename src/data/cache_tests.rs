@@ -780,3 +780,78 @@ fn volatile_l2_publication_replaces_complete_blocks_and_ignores_interrupted_writ
         .is_none());
     assert!(!path.exists());
 }
+
+#[test]
+fn async_l2_drains_on_shutdown_and_removed_keys_do_not_reappear() {
+    let dir = tempdir().unwrap();
+    let mut cache = BlockCache::new_async(dir.path(), 0, 1024 * 1024);
+    assert!(cache.writer.is_some());
+    cache.put("removed", b"stale").unwrap();
+    cache.remove("removed");
+    cache.put("retained", b"previous").unwrap();
+    cache.put("retained", b"current").unwrap();
+    // Join the real worker before asserting the persistent state.
+    drop(cache.writer.take());
+    assert_eq!(cache.stats()["l2_pending_bytes"], 0);
+    assert_eq!(cache.stats()["l2_errors"], 0);
+    assert!(cache.inner.lock().inflight_l2.is_empty());
+    assert!(!cache.l2_path("removed").exists());
+    drop(cache);
+    let reopened = BlockCache::new(dir.path(), 0, 1024 * 1024);
+    assert_eq!(
+        reopened
+            .get("retained", Some(&sha256_hex(b"current")))
+            .unwrap(),
+        b"current"
+    );
+}
+
+#[test]
+fn async_admission_byte_budget_and_invalidation_do_not_block_producer() {
+    let dir = tempdir().unwrap();
+    let mut cache = BlockCache::new(dir.path(), 0, 128 * 1024 * 1024);
+    // Stall consumption deterministically without blocking the cache lock.
+    let (sender, receiver) = mpsc::sync_channel(L2_QUEUE_ITEMS);
+    cache.writer = Some(L2Writer {
+        sender: Some(sender),
+        thread: None,
+    });
+    let data = vec![9; 8 * 1024 * 1024];
+    for i in 0..6 {
+        cache.put(&format!("key:{i}"), &data).unwrap();
+    }
+    assert_eq!(cache.stats()["l2_pending_bytes"], L2_QUEUE_BYTES);
+    assert_eq!(cache.stats()["l2_queue_dropped"], 2);
+    cache.invalidate_prefix("key:0");
+    cache.remove("key:1");
+    drop(cache.writer.take());
+    let mut jobs = receiver.into_iter();
+    for _ in 0..2 {
+        let job = jobs.next().unwrap();
+        assert!(!cache
+            .inner
+            .lock()
+            .l2_generation_current(&job.key, job.generation));
+        cache.put_l2(&job.key, &job.data, job.generation).unwrap();
+        assert!(!cache.l2_path(&job.key).exists());
+    }
+    assert_eq!(jobs.count(), 2);
+}
+
+#[test]
+fn clear_invalidates_queued_l2_admissions() {
+    let dir = tempdir().unwrap();
+    let mut cache = BlockCache::new(dir.path(), 1024, 1024);
+    let (sender, receiver) = mpsc::sync_channel(L2_QUEUE_ITEMS);
+    cache.writer = Some(L2Writer {
+        sender: Some(sender),
+        thread: None,
+    });
+    cache.put("secret", b"plaintext").unwrap();
+    cache.clear().unwrap();
+    drop(cache.writer.take());
+    let job = receiver.recv().unwrap();
+    cache.put_l2(&job.key, &job.data, job.generation).unwrap();
+    assert_eq!(cache.disk_footprint().unwrap(), (0, 0));
+    assert!(cache.get("secret", None).is_none());
+}
