@@ -119,6 +119,7 @@ mod maintenance_key;
 mod metadata_budget;
 mod namespace;
 mod read_advisory;
+mod shard_read_batch;
 mod shard_repair;
 #[cfg(test)]
 mod shard_repair_tests;
