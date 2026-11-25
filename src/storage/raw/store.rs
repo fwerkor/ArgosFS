@@ -69,6 +69,8 @@ const RAW_SCAN_RETRY_DELAY: std::time::Duration = std::time::Duration::from_mill
 
 #[derive(Clone)]
 pub struct RawOpen {
+    /// Recovery selected a verified state and all requested dirty flags were written.
+    pub recovery_verified: bool,
     pub backend: Arc<dyn StorageBackend>,
     pub metadata: Metadata,
     pub report: TransactionReport,
@@ -302,6 +304,7 @@ pub fn open_pool(kind: BackendKind, paths: &[PathBuf], write: bool) -> Result<Ra
     if !scan_errors.is_empty() {
         report.errors.extend(scan_errors);
     }
+    let mut recovery_verified = report.errors.is_empty() && report.invalid_entries == 0;
     if !clean_unmount_quorum(&superblocks, &metadata) {
         report
             .errors
@@ -310,6 +313,7 @@ pub fn open_pool(kind: BackendKind, paths: &[PathBuf], write: bool) -> Result<Ra
     if write {
         let dirty_report =
             write_superblock_clean_state_quorum(&*backend, &superblocks, &metadata, false)?;
+        recovery_verified &= dirty_report.failed_devices.is_empty();
         for (disk_id, error) in dirty_report.failed_devices {
             report.errors.push(format!(
                 "failed to mark raw member {disk_id} dirty on writable open: {error}"
@@ -317,6 +321,7 @@ pub fn open_pool(kind: BackendKind, paths: &[PathBuf], write: bool) -> Result<Ra
         }
     }
     Ok(RawOpen {
+        recovery_verified,
         backend,
         metadata,
         report,

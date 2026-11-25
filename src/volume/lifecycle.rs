@@ -329,7 +329,7 @@ impl ArgosFs {
         write: bool,
     ) -> Result<Self> {
         let opened = raw_store::open_pool(kind, paths, write)?;
-        let clean_complete = opened.report.errors.is_empty()
+        let reanchor_can_wait = opened.recovery_verified
             && opened.superblocks.len()
                 == opened
                     .metadata
@@ -351,7 +351,7 @@ impl ArgosFs {
             write,
             opened.superblocks,
             meta,
-            clean_complete,
+            reanchor_can_wait,
         )
     }
 
@@ -361,7 +361,7 @@ impl ArgosFs {
         backend_writable: bool,
         superblocks: Vec<RawSuperblock>,
         meta: Metadata,
-        clean_complete: bool,
+        reanchor_can_wait: bool,
     ) -> Result<Self> {
         if meta.format != FORMAT_VERSION {
             return Err(ArgosError::Invalid(format!(
@@ -390,8 +390,14 @@ impl ArgosFs {
         let meta = Arc::new(MetadataLock::new(meta));
         let mut state =
             DeferredCommitState::new_with_raw_dirty(&meta.read(), raw_uncommitted_metadata_dirty);
-        state.raw_mount_reanchor_pending = clean_complete
-            && meta.read().integrity.hash_scheme == Some(journal::DELTA_INTEGRITY_SCHEME);
+        // A fully verified, complete pool has a durable recovery base even
+        // after an unclean shutdown. Mount-time normalization can be anchored
+        // with the first real mutation; advisory reads and a clean unmount do
+        // not need to publish it. Missing members or recovery errors retain
+        // the conservative eager checkpoint.
+        state.raw_mount_reanchor_pending = reanchor_can_wait
+            && raw_uncommitted_metadata_dirty
+            && !meta.read().integrity.meta_hash.is_empty();
         let deferred_commit = Arc::new(Mutex::new(state));
         let quota_runtime = Arc::new(RwLock::new(QuotaRuntime::from_metadata(&meta.read())?));
         let capacity_snapshot = Arc::new(RwLock::new(Some(CapacitySnapshot::from_metadata(
