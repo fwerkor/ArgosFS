@@ -1,3 +1,4 @@
+use super::wire::{self, put_u32, put_u64};
 use crate::error::{ArgosError, Result};
 use crate::types::RAW_FORMAT_VERSION;
 use sha2::{Digest, Sha256};
@@ -530,26 +531,12 @@ fn get_region(bytes: &[u8], offset: usize) -> Result<RawRegion> {
     })
 }
 
-fn put_u32(out: &mut [u8], offset: usize, value: u32) {
-    out[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-}
-
-fn put_u64(out: &mut [u8], offset: usize, value: u64) {
-    out[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
-}
-
 fn get_u32(bytes: &[u8], offset: usize) -> Result<u32> {
-    let raw = bytes
-        .get(offset..offset + 4)
-        .ok_or_else(|| ArgosError::CorruptedMetadata("short u32 field".to_string()))?;
-    Ok(u32::from_le_bytes(raw.try_into().unwrap()))
+    wire::read_u32(bytes, offset, "short u32 field")
 }
 
 fn get_u64(bytes: &[u8], offset: usize) -> Result<u64> {
-    let raw = bytes
-        .get(offset..offset + 8)
-        .ok_or_else(|| ArgosError::CorruptedMetadata("short u64 field".to_string()))?;
-    Ok(u64::from_le_bytes(raw.try_into().unwrap()))
+    wire::read_u64(bytes, offset, "short u64 field")
 }
 
 fn uuid_from(bytes: &[u8], offset: usize) -> Result<Uuid> {
@@ -560,19 +547,11 @@ fn uuid_from(bytes: &[u8], offset: usize) -> Result<Uuid> {
 }
 
 fn put_fixed_str(out: &mut [u8], offset: usize, len: usize, value: &str) {
-    let raw = value.as_bytes();
-    let copy_len = raw.len().min(len.saturating_sub(1));
-    out[offset..offset + copy_len].copy_from_slice(&raw[..copy_len]);
+    wire::put_string(out, offset, len.saturating_sub(1), value)
 }
 
 fn get_fixed_str(bytes: &[u8], offset: usize, len: usize) -> Result<String> {
-    let raw = bytes
-        .get(offset..offset + len)
-        .ok_or_else(|| ArgosError::CorruptedMetadata("short string field".to_string()))?;
-    let end = raw.iter().position(|byte| *byte == 0).unwrap_or(raw.len());
-    std::str::from_utf8(&raw[..end])
-        .map(str::to_string)
-        .map_err(|err| ArgosError::CorruptedMetadata(err.to_string()))
+    wire::read_string(bytes, offset, len, "short string field")
 }
 
 #[cfg(test)]
