@@ -278,9 +278,21 @@ impl ArgosFs {
     }
 
     pub fn reap_unlinked_inode(&self, ino: InodeId) -> Result<()> {
+        // Closing a linked file is an observation, not a namespace
+        // mutation. Avoid the exclusive pool lock (and cloning the entire
+        // inode's block map) for the overwhelmingly common read-only close.
+        {
+            let meta = self.meta.read();
+            self.ensure_block_backend_writable_locked(&meta)?;
+            if meta.inodes.get(&ino).is_none_or(|inode| inode.nlink != 0) {
+                return Ok(());
+            }
+        }
+        // Recheck after upgrading the lock: an inode could have been reaped
+        // or linked again in the meantime.
         let mut meta = self.meta.write();
         self.ensure_block_backend_writable_locked(&meta)?;
-        let Some(inode) = meta.inodes.get(&ino).cloned() else {
+        let Some(inode) = meta.inodes.get(&ino) else {
             return Ok(());
         };
         if inode.nlink != 0 {

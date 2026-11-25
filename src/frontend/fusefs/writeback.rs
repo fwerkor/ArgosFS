@@ -232,7 +232,7 @@ impl ArgosFuseShared {
     /// The writeback lock serializes observation with persistence; the inode
     /// cannot publish a stale size or timestamps halfway through a flush.
     pub(super) fn visible_inode_attr(&self, ino: InodeId) -> Result<NodeAttr> {
-        let inode_guard = self.writeback_lock(ino).write();
+        let inode_guard = self.writeback_lock(ino).read();
         let dirty = self.writeback.lock().dirty.get(&ino).cloned();
         let mut attr = self.volume.attr_inode(ino)?;
         let Some(dirty) = dirty else {
