@@ -18,6 +18,8 @@
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="stylesheet" href="styles.css" />
     <script src="app.js" defer></script>
+    <link rel="stylesheet" href="lab.css" />
+    <script src="lab.mjs" type="module"></script>
   </head>
   <body data-page="home">
     <a class="skip-link" href="#main">Skip to content</a>
@@ -72,101 +74,92 @@
             Open-source Rust · Linux / FUSE · Apache-2.0
           </p>
         </div>
-        <figure class="storage-figure">
+        <figure class="storage-figure" id="storage-lab">
           <div class="figure-topline">
-            <span>THE STORAGE MODEL</span
-            ><span class="figure-tag">4 + 2 layout</span>
-          </div>
-          <div class="volume-name">
-            <span class="volume-icon" aria-hidden="true">/</span>
-            <div>
-              <strong>One filesystem</strong
-              ><span>Your files, distributed across disks</span>
+            <span>INTERACTIVE STORAGE LAB</span>
+            <div class="lab-actions">
+              <select id="lab-scenario" aria-label="Start a fresh example" hidden>
+                <option value="">New scenario</option>
+                <option value="failure">Disk failure</option>
+                <option value="corrupt">Silent corruption</option>
+                <option value="age">Aging disk</option>
+                <option value="slow">Slow disk</option>
+                <option value="expand">Expansion</option>
+                <option value="drain">Retirement</option>
+              </select>
+              <button type="button" id="lab-reset" hidden>Reset</button>
             </div>
           </div>
-          <div class="encoding-line">
-            <span>Reed–Solomon encoding</span><span aria-hidden="true">↓</span>
+          <div id="lab-fallback">
+            <h3>One pool. Multiple disks.</h3>
+            <p>Four data shards, two parity shards. Any four can reconstruct a stripe.</p>
+            <noscript>Enable JavaScript to explore the storage lab.</noscript>
           </div>
-          <div
-            class="disk-grid"
-            aria-label="Illustrative stripe with four data and two parity shards"
-          >
-            <button
-              class="disk"
-              type="button"
-              aria-pressed="false"
-              aria-label="Simulate failure of disk 1"
-              disabled
-            >
-              <span class="disk-id">DISK 01</span><span class="shard">D1</span
-              ><span class="disk-state">Online</span></button
-            ><button
-              class="disk"
-              type="button"
-              aria-pressed="false"
-              aria-label="Simulate failure of disk 2"
-              disabled
-            >
-              <span class="disk-id">DISK 02</span><span class="shard">D2</span
-              ><span class="disk-state">Online</span></button
-            ><button
-              class="disk"
-              type="button"
-              aria-pressed="false"
-              aria-label="Simulate failure of disk 3"
-              disabled
-            >
-              <span class="disk-id">DISK 03</span><span class="shard">D3</span
-              ><span class="disk-state">Online</span></button
-            ><button
-              class="disk"
-              type="button"
-              aria-pressed="false"
-              aria-label="Simulate failure of disk 4"
-              disabled
-            >
-              <span class="disk-id">DISK 04</span><span class="shard">D4</span
-              ><span class="disk-state">Online</span></button
-            ><button
-              class="disk parity"
-              type="button"
-              aria-pressed="false"
-              aria-label="Simulate failure of disk 5"
-              disabled
-            >
-              <span class="disk-id">DISK 05</span><span class="shard">P1</span
-              ><span class="disk-state">Online</span></button
-            ><button
-              class="disk parity"
-              type="button"
-              aria-pressed="false"
-              aria-label="Simulate failure of disk 6"
-              disabled
-            >
-              <span class="disk-id">DISK 06</span><span class="shard">P2</span
-              ><span class="disk-state">Online</span>
-            </button>
-          </div>
-          <div class="shard-legend">
-            <span><i></i> 4 data shards</span
-            ><span><i class="parity-key"></i> 2 parity shards</span>
-          </div>
-          <div class="recovery-state" data-state="healthy">
-            <span class="status-dot" aria-hidden="true"></span>
-            <div role="status" aria-live="polite" aria-atomic="true">
-              <strong id="recovery-title">All six shards available</strong
-              ><span id="recovery-detail"
-                >Any four are enough to recover this stripe.</span
-              >
+          <div id="lab-panel" hidden>
+            <div class="lab-summary">
+              <div><span>Pool</span><strong id="lab-health">Healthy</strong></div>
+              <div><span>Online</span><strong id="lab-online">7/7</strong></div>
+              <div><span>Slots used</span><strong id="lab-capacity">—</strong></div>
+              <label>New pool
+                <select id="lab-layout" aria-label="New pool layout (resets simulation)">
+                  <option value="2+1">2+1</option>
+                  <option value="3+2">3+2</option>
+                  <option value="4+2" selected>4+2</option>
+                  <option value="4+3">4+3</option>
+                </select>
+              </label>
             </div>
-            <button id="reset-disks" type="button" hidden>Reset</button>
+            <div class="lab-toolbar">
+              <label>Stripe <select id="lab-stripe" aria-label="Inspect stripe"></select></label>
+              <div class="lab-actions">
+                <button type="button" id="lab-write">Write +</button>
+                <button type="button" id="lab-read">Read</button>
+              </div>
+            </div>
+            <div class="lab-stripe" id="lab-stripe-view" aria-label="Selected stripe shards"></div>
+            <div class="lab-stripe-caption">
+              <span id="lab-stripe-status"></span>
+              <span class="lab-key"><i></i> Data <i></i> Parity</span>
+            </div>
+            <div class="lab-toolbar lab-disk-heading">
+              <span>DEVICES <span id="lab-device-count"></span></span>
+              <div class="lab-actions">
+                <select id="lab-media" aria-label="New disk medium">
+                  <option>HDD</option><option>SSD</option><option>NVMe</option>
+                </select>
+                <button id="lab-add" type="button">Add +</button>
+              </div>
+            </div>
+            <div class="lab-disks" id="lab-disks" aria-label="Select a disk"></div>
+            <div class="lab-device-controls">
+              <div id="lab-selection"></div>
+              <div class="lab-actions">
+                <button id="lab-fail" type="button">Fail</button>
+                <button id="lab-corrupt" type="button">Corrupt</button>
+                <button id="lab-age" type="button">Age</button>
+                <button id="lab-slow" type="button">Slow</button>
+                <button id="lab-drain" type="button">Drain</button>
+                <button id="lab-remove" type="button" hidden>Remove</button>
+              </div>
+            </div>
+            <div class="lab-maintenance">
+              <div class="lab-toolbar">
+                <span>AUTOPILOT</span>
+                <div class="lab-actions">
+                  <button id="lab-plan" type="button">Scan &amp; plan</button>
+                  <button id="lab-balance" type="button">Rebalance</button>
+                  <button id="lab-apply" type="button" disabled>Apply</button>
+                </div>
+              </div>
+              <ol class="lab-steps" aria-label="Maintenance stage">
+                <li>Observe</li><li>Plan</li><li>Apply</li><li>Verify</li>
+              </ol>
+              <div id="lab-plan-detail" class="lab-plan-detail"></div>
+            </div>
+            <ol id="lab-events" class="lab-events" aria-label="Recent events"></ol>
+            <div id="lab-announcement" class="lab-sr" role="status" aria-live="polite" aria-atomic="true"></div>
           </div>
-          <figcaption>
-            Illustrative stripe, not live telemetry.
-            <span id="diagram-hint"
-              >A 4+2 layout can recover up to two missing shards.</span
-            >
-          </figcaption>
+          <figcaption>Browser simulation · Slots and policies are illustrative.</figcaption>
         </figure>
       </section>
       <div class="spec-strip wrap" aria-label="Project fundamentals">
