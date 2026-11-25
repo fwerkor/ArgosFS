@@ -464,3 +464,75 @@ fn immediate_raw_reads_and_clean_unmount_do_not_checkpoint() {
     assert_eq!(reopened.read_file("/archive", false).unwrap(), b"stable");
     assert_eq!(reopened.transaction_report().unwrap().invalid_entries, 0);
 }
+
+#[test]
+fn clean_reopened_v2_pool_defers_reanchor_until_real_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|i| dir.path().join(format!("v2-reopen-{i}.img")))
+        .collect::<Vec<_>>();
+    let mut fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            defer_metadata_commit: true,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "clean-v2-reopen",
+        false,
+    )
+    .unwrap();
+    fs.upgrade_delta_integrity().unwrap();
+    fs.write_file("/before", b"durable before reopen", 0o600)
+        .unwrap();
+    fs.sync().unwrap();
+    let baseline = fs.metadata_snapshot();
+    assert_eq!(
+        baseline.integrity.hash_scheme,
+        Some(journal::DELTA_INTEGRITY_SCHEME)
+    );
+    fs.mark_clean_unmount().unwrap();
+    drop(fs);
+    let mut fs = ArgosFs::open_loop(&images, true).unwrap();
+    assert!(fs.deferred_commit.lock().raw_mount_reanchor_pending);
+    let audit = Arc::new(WriteAuditBackend::new(
+        fs.backend.clone(),
+        &fs.raw_superblocks,
+    ));
+    fs.backend = audit.clone();
+    for _ in 0..20 {
+        assert_eq!(
+            fs.read_file("/before", false).unwrap(),
+            b"durable before reopen"
+        );
+        assert!(!fs.sync_deferred_if_dirty().unwrap());
+        fs.sync().unwrap();
+    }
+    fs.mark_clean_unmount().unwrap();
+    assert_eq!(audit.totals(), [0, 0, 3 * 3 * 4096]);
+    drop(fs);
+    let fs = ArgosFs::open_loop(&images, true).unwrap();
+    assert_eq!(
+        fs.metadata_snapshot().integrity.meta_hash,
+        baseline.integrity.meta_hash
+    );
+    assert!(fs.deferred_commit.lock().raw_mount_reanchor_pending);
+    fs.write_file("/after", b"durable after reopen", 0o600)
+        .unwrap();
+    fs.sync().unwrap();
+    assert_eq!(phase(&fs, CommitPhase::Checkpoint), 1);
+    assert!(!fs.deferred_commit.lock().raw_mount_reanchor_pending);
+    drop(fs);
+    let fs = ArgosFs::open_loop(&images, false).unwrap();
+    assert_eq!(
+        fs.read_file("/before", false).unwrap(),
+        b"durable before reopen"
+    );
+    assert_eq!(
+        fs.read_file("/after", false).unwrap(),
+        b"durable after reopen"
+    );
+    assert_eq!(fs.transaction_report().unwrap().invalid_entries, 0);
+}
