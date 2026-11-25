@@ -30,7 +30,30 @@ const PREPARED_PAYLOAD_LIMIT: usize = 8 * 1024 * 1024;
 const MAX_PREPARED_WRITES: usize = 4;
 static ACTIVE_PREPARATIONS: AtomicUsize = AtomicUsize::new(0);
 
-type ShardReadResult<'a> = (usize, &'a Shard, Result<Option<Vec<u8>>>);
+// Bound extra workers across concurrent FUSE requests, not just per stripe.
+// A request always makes progress on its calling thread even if the budget
+// is exhausted or the OS refuses to create another worker.
+const MAX_SHARD_READ_WORKERS: usize = 32;
+static ACTIVE_SHARD_READ_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+struct ShardReadPermit;
+
+impl ShardReadPermit {
+    fn try_acquire() -> Option<Self> {
+        ACTIVE_SHARD_READ_WORKERS
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                (n < MAX_SHARD_READ_WORKERS).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| Self)
+    }
+}
+
+impl Drop for ShardReadPermit {
+    fn drop(&mut self) {
+        ACTIVE_SHARD_READ_WORKERS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 struct PreparationPermit(&'static AtomicUsize);
 impl PreparationPermit {
@@ -719,35 +742,42 @@ impl ArgosFs {
         shards: &mut [Option<Vec<u8>>],
         damaged: &mut Vec<String>,
     ) {
-        let results: Vec<ShardReadResult<'_>> = if pending.len() <= 1 {
-            pending
+        // Keep one read on the caller and only spawn for the remaining
+        // independent members. Preserve the slot order when consuming results.
+        let results = std::thread::scope(|scope| {
+            let mut reads = Vec::with_capacity(pending.len());
+            let mut pending = pending.into_iter().peekable();
+            while let Some((slot, shard)) = pending.next() {
+                let worker = if pending.peek().is_some() {
+                    ShardReadPermit::try_acquire().and_then(|permit| {
+                        std::thread::Builder::new()
+                            .spawn_scoped(scope, move || {
+                                let _permit = permit;
+                                self.read_shard_verified_locked(meta, shard)
+                            })
+                            .ok()
+                    })
+                } else {
+                    None
+                };
+                let inline = if worker.is_none() {
+                    Some(self.read_shard_verified_locked(meta, shard))
+                } else {
+                    None
+                };
+                reads.push((slot, shard, worker, inline));
+            }
+            reads
                 .into_iter()
-                .map(|(slot, shard)| (slot, shard, self.read_shard_verified_locked(meta, shard)))
-                .collect()
-        } else {
-            std::thread::scope(|scope| {
-                let handles = pending
-                    .into_iter()
-                    .map(|(slot, shard)| {
-                        (
-                            slot,
-                            shard,
-                            scope.spawn(move || self.read_shard_verified_locked(meta, shard)),
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                handles
-                    .into_iter()
-                    .map(|(slot, shard, handle)| {
-                        (
-                            slot,
-                            shard,
-                            handle.join().expect("parallel shard reader panicked"),
-                        )
-                    })
-                    .collect()
-            })
-        };
+                .map(|(slot, shard, worker, inline)| {
+                    let result = match worker {
+                        Some(worker) => worker.join().expect("parallel shard reader panicked"),
+                        None => inline.expect("inline shard read completed"),
+                    };
+                    (slot, shard, result)
+                })
+                .collect::<Vec<_>>()
+        });
         for (slot, shard, result) in results {
             match result {
                 Ok(Some(data)) => {
