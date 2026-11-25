@@ -10,6 +10,26 @@ The L1 cache owns immutable `Arc<[u8]>` values. Once inserted, callers cannot mu
 
 L2 cache reads still verify the full on-disk payload before admission. Encrypted blocks never enter the decoded-block fast path. Physical scrub and repair **bypass reconstructed data caches**, still read/validate member shards and may perform parity reconstruction and repair. On a miss, no weakened checksum/repair path is introduced.
 
+### Scan-resistant L2 reuse
+
+A plain LRU L2 cache is ineffective for a second pass over a stream larger than
+the cache: the first pass leaves only the tail resident, and the second pass
+evicts that tail before reaching it. The L2 now keeps a reusable sample:
+
+- cold entries are evicted in deterministic hash order rather than strict LRU,
+  so the resident set is a uniform sample of the scanned stream;
+- an entry that has been served from L2 is protected from cold-entry eviction;
+- a 64-lookup hit-ratio window freezes new cold admissions once the ratio
+  exceeds 3%. A different workload with a low hit ratio unfreezes it again;
+- pruning keeps a small hysteresis margin so it does not sort the index on
+  every admission.
+
+The first pass therefore leaves a sample spread through the stream, and the
+second pass can promote that sample while misses do not churn it away. This is
+still a cache of bounded size: a stream larger than L2 cannot be fully warm.
+The new `argosfs_read_cache_l2_hot_bytes`, `_l2_hot_items` and
+`_l2_stream_frozen` gauges expose the protected sample and admission state.
+
 ## Reproducing tests
 
 ```bash
@@ -42,6 +62,8 @@ Since this follow-up, both `/metrics` and the metadata-lock-independent
 | `argosfs_read_cache_l2_read_bytes_total` | Full encoded L2 cache-file bytes loaded before integrity validation |
 | `argosfs_read_cache_memory_bytes` / `_items` | Currently resident L1 payload and entries |
 | `argosfs_read_cache_l2_bytes` / `_items` | Currently indexed L2 disk payload and entries |
+| `argosfs_read_cache_l2_hot_bytes` / `_hot_items` | L2 entries protected after at least one verified reuse |
+| `argosfs_read_cache_l2_stream_frozen` | Cold admissions currently frozen by the hit-ratio window |
 
 All counters reset on volume open. The copy-byte counter covers only successful
 `copy_range` calls; it excludes misses, the physical shard reads, data assembled

@@ -125,9 +125,7 @@ pub(crate) fn statfs_bytes(
 fn raw_allocator_free_bytes(allocator: &RawAllocatorState) -> u64 {
     let block = allocator.block_size.max(4096);
     let tail = allocator.data_end.saturating_sub(allocator.next_offset) / block * block;
-    allocator.free_extents.iter().fold(tail, |total, extent| {
-        total.saturating_add(extent.length / block * block)
-    })
+    tail.saturating_add(allocator.free_extents.aligned_free_bytes(block))
 }
 
 pub(crate) fn max_stripe_units(per_disk: &[u64], width: usize) -> u64 {
@@ -135,7 +133,8 @@ pub(crate) fn max_stripe_units(per_disk: &[u64], width: usize) -> u64 {
         return 0;
     }
     let mut low = 0u64;
-    let mut high = per_disk.iter().copied().sum::<u64>() / width as u64;
+    let mut high = (per_disk.iter().map(|value| *value as u128).sum::<u128>() / width as u128)
+        .min(u64::MAX as u128) as u64;
     while low < high {
         let mid = low + (high - low).div_ceil(2);
         let support = per_disk
