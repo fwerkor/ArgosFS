@@ -281,183 +281,6 @@ h1 em {
   letter-spacing: 0.07em;
   color: #b2c5a7;
 }
-.figure-tag {
-  border: 1px solid #527046;
-  padding: 5px 8px;
-  border-radius: 3px;
-  color: var(--accent);
-  white-space: nowrap;
-}
-.volume-name {
-  display: flex;
-  gap: 16px;
-  align-items: center;
-  margin: 44px 0 0;
-  border: 1px solid #58754e;
-  border-radius: 4px;
-  background: #2b4535;
-  padding: 19px;
-}
-.volume-icon {
-  width: 39px;
-  height: 42px;
-  display: grid;
-  place-items: center;
-  border: 1px solid #a4c875;
-  border-radius: 3px;
-  color: var(--accent);
-  font: 24px var(--mono);
-}
-.volume-name strong {
-  display: block;
-  font-size: 20px;
-  font-weight: 500;
-  letter-spacing: -0.03em;
-}
-.volume-name div > span {
-  display: block;
-  font-size: 10px;
-  color: #b5c6ac;
-  margin-top: 6px;
-}
-.encoding-line {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 6px;
-  padding-block: 19px 13px;
-  color: #adc29f;
-  font: 9px/1.5 var(--mono);
-}
-.encoding-line > span:last-child {
-  color: var(--accent);
-  font-size: 22px;
-}
-.disk-grid {
-  display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
-  gap: 8px;
-}
-.disk {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  min-width: 0;
-  padding: 13px 3px 11px;
-  background: #a9d46f;
-  color: #233524;
-  border: 1px solid #b4de7d;
-  border-radius: 4px;
-  transition:
-    background 0.15s,
-    transform 0.15s;
-}
-.disk:disabled {
-  cursor: default;
-  opacity: 1;
-}
-.disk:not(:disabled):hover {
-  transform: translateY(-4px);
-  background: #c4ef89;
-}
-.disk:focus-visible {
-  outline-color: #e9ffca;
-  outline-offset: 3px;
-}
-.disk.parity {
-  background: #36573e;
-  border-color: #8aaa67;
-  color: #d1eab3;
-}
-.disk.parity:not(:disabled):hover {
-  background: #486e47;
-}
-.disk-id {
-  font: 8px/1.5 var(--mono);
-  white-space: nowrap;
-  letter-spacing: -0.03em;
-}
-.shard {
-  display: block;
-  font: 29px/1.4 var(--mono);
-  margin-block: 13px;
-}
-.disk-state {
-  font: 8px/1.5 var(--mono);
-}
-.disk[aria-pressed="true"] {
-  background: #4d4032;
-  color: #f2c799;
-  border: 1px dashed #cba075;
-}
-.disk[aria-pressed="true"] .shard {
-  text-decoration: line-through;
-  opacity: 0.7;
-}
-.shard-legend {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 20px;
-  font: 9px/1.5 var(--mono);
-  color: #bed0b3;
-  margin-top: 15px;
-}
-.shard-legend i {
-  display: inline-block;
-  width: 7px;
-  height: 7px;
-  background: #a9d46f;
-  margin-right: 4px;
-}
-.shard-legend .parity-key {
-  background: #36573e;
-  border: 1px solid #8aaa67;
-}
-.recovery-state {
-  display: flex;
-  gap: 10px;
-  align-items: center;
-  margin-top: 26px;
-  padding-block: 16px;
-  border-top: 1px solid #4d6643;
-  border-bottom: 1px solid #4d6643;
-  min-height: 75px;
-}
-.status-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--accent);
-  flex-shrink: 0;
-}
-.recovery-state strong {
-  display: block;
-  font-size: 12px;
-  font-weight: 500;
-}
-.recovery-state div > span {
-  display: block;
-  color: #bbcdb0;
-  font-size: 10px;
-  line-height: 1.6;
-  margin-top: 5px;
-}
-.recovery-state[data-state="lost"] .status-dot {
-  background: #f4ab78;
-}
-.recovery-state[data-state="lost"] strong {
-  color: #ffd1ad;
-}
-#reset-disks {
-  background: transparent;
-  color: #d0e5b8;
-  border: 1px solid #718565;
-  padding: 7px 8px;
-  border-radius: 3px;
-  margin-left: auto;
-  font-size: 10px;
-  flex-shrink: 0;
-}
 .storage-figure figcaption {
   font: 9px/1.7 var(--mono);
   color: #b2c5a7;
@@ -911,12 +734,6 @@ tbody td:last-child {
   .storage-figure {
     padding: 22px;
   }
-  .disk-grid {
-    gap: 5px;
-  }
-  .disk-id {
-    font-size: 7px;
-  }
   .control-grid,
   .split-section,
   .setup-step {
@@ -972,33 +789,6 @@ tbody td:last-child {
   }
   .hero-copy .eyebrow {
     max-width: 280px;
-  }
-  .disk-grid {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 7px;
-  }
-  .disk {
-    padding-block: 9px;
-  }
-  .shard {
-    font-size: 23px;
-    margin-block: 5px;
-  }
-  .disk-id {
-    font-size: 8px;
-  }
-  .volume-name {
-    margin-top: 24px;
-    padding: 12px;
-  }
-  .volume-name strong {
-    font-size: 17px;
-  }
-  .volume-name div > span {
-    line-height: 1.5;
-  }
-  .shard-legend {
-    gap: 12px;
   }
   .section {
     padding-block: 64px;
@@ -1085,20 +875,6 @@ tbody td:last-child {
   }
   .storage-figure {
     padding: 22px;
-  }
-  .disk-grid {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 5px;
-  }
-  .disk-id {
-    font-size: 9px;
-  }
-  .disk-state {
-    font-size: 9px;
-  }
-  .shard {
-    font-size: 28px;
-    margin-block: 10px;
   }
   .figure-topline {
     font-size: 8px;
@@ -1233,19 +1009,6 @@ tbody td:last-child {
 @media (max-width: 360px) {
   .wrap {
     width: calc(100% - 32px);
-  }
-  .disk-grid {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
-    gap: 7px;
-  }
-  .disk-id {
-    font-size: 8px;
-  }
-  .disk-state {
-    font-size: 8px;
-  }
-  .recovery-state {
-    flex-wrap: wrap;
   }
   .hero-copy .eyebrow {
     max-width: 260px;

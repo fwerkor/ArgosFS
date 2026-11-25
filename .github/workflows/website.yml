@@ -1,0 +1,20 @@
+name: Website CI
+
+on:
+  push:
+    branches: [main]
+    paths: [website/**, scripts/website/**, .github/workflows/website.yml]
+  pull_request:
+    branches: [main]
+    paths: [website/**, scripts/website/**, .github/workflows/website.yml]
+
+permissions:
+  contents: read
+
+jobs:
+  storage-lab:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Test the browser storage model
+        run: node --test scripts/website/lab-model.test.mjs
