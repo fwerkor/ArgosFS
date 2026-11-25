@@ -339,50 +339,39 @@ fn emit_commit_metrics(volume: &ArgosFs, emitter: &mut MetricEmitter<'_>) {
     }
     for (phase, snapshot) in volume.commit_metrics().snapshots() {
         let labels = [("phase", phase)];
-        emitter.typed_metric(
-            "argosfs_commit_phase_duration_seconds_count",
-            "Number of completed metadata commit phase timings (including failures)",
-            snapshot.count as f64,
-            &labels,
-            "counter",
-        );
-        emitter.typed_metric(
-            "argosfs_commit_phase_duration_seconds_sum",
-            "Total observed metadata commit phase wall time in seconds",
-            snapshot.total_ns as f64 / 1e9,
-            &labels,
-            "counter",
-        );
-        emitter.metric(
-            "argosfs_commit_phase_duration_seconds_max",
-            "Maximum observed metadata commit phase wall time in seconds since volume opened",
-            snapshot.max_ns as f64 / 1e9,
-            &labels,
-        );
+        emit_commit_phase(emitter, snapshot, &labels);
     }
     for (disk_id, phase, snapshot) in volume.commit_metrics().member_snapshots() {
         let labels = [("phase", phase), ("disk", disk_id.as_str())];
-        emitter.typed_metric(
-            "argosfs_commit_phase_duration_seconds_count",
-            "Number of completed metadata commit phase timings (including failures)",
-            snapshot.count as f64,
-            &labels,
-            "counter",
-        );
-        emitter.typed_metric(
-            "argosfs_commit_phase_duration_seconds_sum",
-            "Total observed metadata commit phase wall time in seconds",
-            snapshot.total_ns as f64 / 1e9,
-            &labels,
-            "counter",
-        );
-        emitter.metric(
-            "argosfs_commit_phase_duration_seconds_max",
-            "Maximum observed metadata commit phase wall time in seconds since volume opened",
-            snapshot.max_ns as f64 / 1e9,
-            &labels,
-        );
+        emit_commit_phase(emitter, snapshot, &labels);
     }
+}
+
+fn emit_commit_phase(
+    emitter: &mut MetricEmitter<'_>,
+    snapshot: crate::commit_metrics::PhaseSnapshot,
+    labels: &[(&str, &str)],
+) {
+    emitter.typed_metric(
+        "argosfs_commit_phase_duration_seconds_count",
+        "Number of completed metadata commit phase timings (including failures)",
+        snapshot.count as f64,
+        labels,
+        "counter",
+    );
+    emitter.typed_metric(
+        "argosfs_commit_phase_duration_seconds_sum",
+        "Total observed metadata commit phase wall time in seconds",
+        snapshot.total_ns as f64 / 1e9,
+        labels,
+        "counter",
+    );
+    emitter.metric(
+        "argosfs_commit_phase_duration_seconds_max",
+        "Maximum observed metadata commit phase wall time in seconds since volume opened",
+        snapshot.max_ns as f64 / 1e9,
+        labels,
+    );
 }
 
 fn handle_client(volume: &ArgosFs, stream: &mut TcpStream) -> Result<()> {
