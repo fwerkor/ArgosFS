@@ -40,12 +40,22 @@ struct ShardReadPermit;
 
 impl ShardReadPermit {
     fn try_acquire() -> Option<Self> {
-        ACTIVE_SHARD_READ_WORKERS
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                (n < MAX_SHARD_READ_WORKERS).then_some(n + 1)
-            })
-            .ok()
-            .map(|_| Self)
+        // Keep the MSRV-compatible compare-exchange loop: `fetch_update` was
+        // deprecated in newer Rust and `try_update` is not available on the
+        // older toolchains this crate supports.
+        let mut current = ACTIVE_SHARD_READ_WORKERS.load(Ordering::Acquire);
+        while current < MAX_SHARD_READ_WORKERS {
+            match ACTIVE_SHARD_READ_WORKERS.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self),
+                Err(observed) => current = observed,
+            }
+        }
+        None
     }
 }
 
