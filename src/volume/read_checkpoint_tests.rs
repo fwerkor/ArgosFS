@@ -536,3 +536,78 @@ fn clean_reopened_v2_pool_defers_reanchor_until_real_mutation() {
     );
     assert_eq!(fs.transaction_report().unwrap().invalid_entries, 0);
 }
+
+#[test]
+fn verified_unclean_reopen_defers_reanchor_through_read_only_syncs() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|i| dir.path().join(format!("unclean-{i}.img")))
+        .collect::<Vec<_>>();
+    let mut fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            defer_metadata_commit: true,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "verified-unclean",
+        false,
+    )
+    .unwrap();
+    fs.upgrade_delta_integrity().unwrap();
+    fs.write_file("/archive", b"durable", 0o600).unwrap();
+    fs.sync().unwrap();
+    drop(fs); // deliberately omit mark_clean_unmount
+    let mut fs = ArgosFs::open_loop(&images, true).unwrap();
+    assert!(fs.deferred_commit.lock().raw_mount_reanchor_pending);
+    let audit = Arc::new(WriteAuditBackend::new(
+        fs.backend.clone(),
+        &fs.raw_superblocks,
+    ));
+    fs.backend = audit.clone();
+    for _ in 0..20 {
+        assert_eq!(fs.read_file("/archive", false).unwrap(), b"durable");
+        assert!(!fs.sync_deferred_if_dirty().unwrap());
+        fs.sync().unwrap();
+    }
+    assert_eq!(audit.totals(), [0, 0, 0]);
+    fs.write_file("/new", b"new", 0o600).unwrap();
+    fs.sync().unwrap();
+    assert!(!fs.deferred_commit.lock().raw_mount_reanchor_pending);
+    assert!(audit.totals()[0] > 0);
+    fs.mark_clean_unmount().unwrap();
+    drop(fs);
+    let fs = ArgosFs::open_loop(&images, false).unwrap();
+    assert_eq!(fs.read_file("/archive", false).unwrap(), b"durable");
+    assert_eq!(fs.read_file("/new", false).unwrap(), b"new");
+    assert_eq!(fs.transaction_report().unwrap().invalid_entries, 0);
+}
+
+#[test]
+fn clean_legacy_reopen_with_relocated_members_does_not_checkpoint_reads() {
+    let (_dir, images, fs, _) = raw_fixture();
+    fs.mark_clean_unmount().unwrap();
+    drop(fs);
+    let moved = images
+        .iter()
+        .map(|path| {
+            let new = path.with_extension("moved");
+            std::fs::rename(path, &new).unwrap();
+            new
+        })
+        .collect::<Vec<_>>();
+    let mut fs = ArgosFs::open_loop(&moved, true).unwrap();
+    assert!(fs.deferred_commit.lock().raw_mount_reanchor_pending);
+    let audit = Arc::new(WriteAuditBackend::new(
+        fs.backend.clone(),
+        &fs.raw_superblocks,
+    ));
+    fs.backend = audit.clone();
+    assert!(fs.read_file("/value", false).is_ok());
+    assert!(!fs.sync_deferred_if_dirty().unwrap());
+    fs.sync().unwrap();
+    fs.mark_clean_unmount().unwrap();
+    assert_eq!(audit.totals(), [0, 0, 3 * 3 * 4096]);
+}
