@@ -649,7 +649,9 @@ pub struct RawAllocatorState {
     pub data_end: u64,
     pub next_offset: u64,
     #[serde(default)]
-    pub free_extents: Vec<RawFreeExtent>,
+    /// Persistent sequence: snapshots share unchanged extent chunks. Serde
+    /// continues to encode the same JSON array in the same order.
+    pub free_extents: super::free_extents::FreeExtents,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -794,6 +796,16 @@ pub struct FsckReport {
     /// selected metadata checkpoint.  Set by `fsck --repair`.
     #[serde(default)]
     pub journals_reset: u64,
+    /// Physical read-after-write attempts, including retries.
+    #[serde(default)]
+    pub write_verify_checks: u64,
+    #[serde(default)]
+    pub write_verify_retries: u64,
+    #[serde(default)]
+    pub write_verify_failures: u64,
+    /// Includes stale/reclaimed extents and queue overflow; not known damage.
+    #[serde(default)]
+    pub write_verify_skipped: u64,
     pub errors: Vec<String>,
 }
 

@@ -131,6 +131,10 @@ mod read_fast_tests;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+#[path = "data_fanout_tests.rs"]
+mod stripe_fanout_tests;
+
 pub use autopilot::{AutopilotConfig, ReshapeReport};
 pub(crate) use capacity::CapacitySnapshot;
 use helpers::*;
@@ -515,6 +519,7 @@ impl ArgosFs {
         }
         let _ = RsCodec::new(meta.config.k, meta.config.m)?;
         harden_host_storage_permissions(&root, &meta)?;
+        meta.inodes.initialize_member_catalog();
         let cache = BlockCache::new(
             root.join(".argosfs/cache/l2"),
             64 * 1024 * 1024,
@@ -722,7 +727,7 @@ impl ArgosFs {
             )));
         }
         let _ = RsCodec::new(meta.config.k, meta.config.m)?;
-        let cache_root = block_cache_root(&meta.uuid, paths);
+        let cache_root = block_cache_root(&meta.uuid, meta.backend, paths);
         let cache = BlockCache::new(cache_root, 64 * 1024 * 1024, meta.config.l2_cache_bytes);
         let root = paths
             .first()
@@ -736,6 +741,9 @@ impl ArgosFs {
                     && journal::canonical_metadata_hash(&meta)? != meta.integrity.meta_hash));
         let quarantined_devices = Arc::new(Mutex::new(BTreeSet::new()));
         let write_fence = Arc::new(Mutex::new(None));
+        if backend_writable {
+            meta.inodes.initialize_member_catalog();
+        }
         let meta = Arc::new(RwLock::new(meta));
         let deferred_commit = Arc::new(Mutex::new(DeferredCommitState::new_with_raw_dirty(
             &meta.read(),
@@ -799,6 +807,24 @@ impl ArgosFs {
             .as_ref()
             .map(|verify| verify.skipped())
             .unwrap_or(0)
+    }
+
+    /// Finish the delayed verifier before producing an offline maintenance
+    /// report. Call only after all repairs have completed and sync succeeded.
+    pub fn finish_maintenance_verification(&self, report: &mut FsckReport) {
+        if let Some(verify) = &self.verify_written {
+            verify.drain();
+            report.write_verify_checks = verify.checks();
+            report.write_verify_retries = verify.retries();
+            report.write_verify_failures = verify.failures();
+            report.write_verify_skipped = verify.skipped();
+            if report.write_verify_failures != 0 {
+                report.errors.push(format!(
+                    "read-after-write verification failed for {} shard(s)",
+                    report.write_verify_failures
+                ));
+            }
+        }
     }
 
     pub fn root(&self) -> &Path {
@@ -2406,12 +2432,6 @@ impl ArgosFs {
                 self.account_blocks_locked(meta, std::slice::from_ref(block), false);
                 self.delete_blocks_locked(meta, std::slice::from_ref(block));
             }
-            if !state.pending_reclaims.is_empty() {
-                // Deletion can free a lot of space before a slow journal or
-                // data flush finishes. Publish now so df advances during the
-                // commit instead of waiting for the writer lock to be released.
-                self.publish_capacity_snapshot_locked(meta);
-            }
             let mut prepared_delta = None;
             {
                 let _integrity_timer = self.commit_metrics.timer(CommitPhase::Integrity);
@@ -2559,7 +2579,8 @@ impl ArgosFs {
                     meta.integrity = before_integrity;
                 }
                 self.rebuild_quota_runtime_locked(meta)?;
-                self.publish_capacity_snapshot_locked(meta);
+                // The failed transaction did not make reclaimed space durable.
+                // Retain the previous published snapshot.
                 self.fence_on_quorum_loss(&err);
                 state.last_error = Some(err.to_string());
                 Err(err)

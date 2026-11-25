@@ -372,3 +372,63 @@ fn missing_targeted_rebuild_key_is_deferred_and_reports_final_progress() {
         unsafe { std::env::remove_var("ARGOSFS_KEY") };
     }
 }
+
+#[test]
+fn member_catalog_tracks_mutations_and_shared_snapshots_without_wire_changes() {
+    let (_dir, fs) = redundant_host_volume();
+    fs.write_file("/file", &vec![9; 8192], 0o600).unwrap();
+    let base = fs.metadata_snapshot();
+    let ino = base.inodes[&1].entries["file"];
+    let member = base.inodes[&ino].blocks[0].shards[0].disk_id.clone();
+    let before = serde_json::to_vec(&base.inodes).unwrap();
+    base.inodes.initialize_member_catalog();
+    assert_eq!(before, serde_json::to_vec(&base.inodes).unwrap());
+    assert_eq!(base.inodes.member_inode_ids(&member), vec![ino]);
+    let mut changed = base.inodes.clone();
+    changed.get_mut(&ino).unwrap().blocks[0]
+        .shards
+        .iter_mut()
+        .filter(|s| s.disk_id == member)
+        .for_each(|s| s.disk_id = "replacement".into());
+    assert!(changed.member_inode_ids(&member).is_empty());
+    assert_eq!(changed.member_inode_ids("replacement"), vec![ino]);
+    assert_eq!(base.inodes.member_inode_ids(&member), vec![ino]);
+    changed.mark_committed();
+    assert!(changed.member_inode_ids(&member).is_empty());
+    assert_eq!(changed.member_inode_ids("replacement"), vec![ino]);
+    let bytes = serde_json::to_vec(&changed).unwrap();
+    let mut recovered: crate::model::inodes::TrackedInodes =
+        serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(recovered.member_inode_ids("replacement"), vec![ino]);
+    let removed = recovered.remove(&ino).unwrap();
+    assert!(recovered.member_inode_ids("replacement").is_empty());
+    recovered.mark_committed();
+    assert!(recovered.member_inode_ids("replacement").is_empty());
+    recovered.insert(ino, removed);
+    assert_eq!(recovered.member_inode_ids("replacement"), vec![ino]);
+    recovered.mark_committed();
+    assert_eq!(recovered.member_inode_ids("replacement"), vec![ino]);
+}
+
+#[test]
+fn member_catalog_selects_sparse_work_from_100k_inode_namespace() {
+    let (_dir, fs) = redundant_host_volume();
+    fs.write_file("/file", &vec![9; 8192], 0o600).unwrap();
+    let mut snapshot = fs.metadata_snapshot();
+    let ino = snapshot.inodes[&1].entries["file"];
+    let member = snapshot.inodes[&ino].blocks[0].shards[0].disk_id.clone();
+    let empty = snapshot.inodes[&1].clone();
+    for n in 1000..101000 {
+        let mut inode = empty.clone();
+        inode.id = n;
+        inode.entries.clear();
+        snapshot.inodes.insert(n, inode);
+    }
+    snapshot.inodes.mark_committed();
+    assert_eq!(snapshot.inodes.len(), 100002);
+    assert_eq!(snapshot.inodes.member_inode_ids(&member), vec![ino]);
+    snapshot.inodes.get_mut(&1000).unwrap().mtime += 1.0;
+    assert_eq!(snapshot.inodes.member_inode_ids(&member), vec![ino]);
+    snapshot.inodes.mark_committed();
+    assert_eq!(snapshot.inodes.member_inode_ids(&member), vec![ino]);
+}

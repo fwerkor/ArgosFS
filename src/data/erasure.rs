@@ -3,9 +3,9 @@ use reed_solomon_engine::{Codec, ShardMask};
 use std::cell::RefCell;
 
 thread_local! {
-    // One layout per reader thread, bounded independently of stripe count.
+    // One layout per decoding thread, bounded independently of stripe count.
     // There is no shared mutable codec state between FUSE workers.
-    static READ_CODEC: RefCell<Option<(usize, usize, RsCodec)>> = const { RefCell::new(None) };
+    static DECODE_CODEC: RefCell<Option<(usize, usize, RsCodec)>> = const { RefCell::new(None) };
     // The RS engine explicitly permits reusing workspace contents.
     static DECODE_WORKSPACE: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
@@ -126,12 +126,35 @@ impl RsCodec {
         m: usize,
         shards: Vec<Option<Vec<u8>>>,
     ) -> Result<Vec<Vec<u8>>> {
-        READ_CODEC.with(|cached| {
+        Self::reconstruct_cached_inner(k, m, shards, true)
+    }
+
+    /// Repair needs all shards, including parity, but can reuse the same
+    /// bounded per-thread codec cache as the read-side data-only decoder.
+    pub(crate) fn reconstruct_cached(
+        k: usize,
+        m: usize,
+        shards: Vec<Option<Vec<u8>>>,
+    ) -> Result<Vec<Vec<u8>>> {
+        Self::reconstruct_cached_inner(k, m, shards, false)
+    }
+
+    fn reconstruct_cached_inner(
+        k: usize,
+        m: usize,
+        shards: Vec<Option<Vec<u8>>>,
+        data_only: bool,
+    ) -> Result<Vec<Vec<u8>>> {
+        DECODE_CODEC.with(|cached| {
             let mut cached = cached.borrow_mut();
             if !matches!(cached.as_ref(), Some((old_k, old_m, _)) if *old_k == k && *old_m == m) {
                 *cached = Some((k, m, Self::new(k, m)?));
             }
-            cached.as_ref().unwrap().2.reconstruct_inner(shards, true)
+            cached
+                .as_ref()
+                .unwrap()
+                .2
+                .reconstruct_inner(shards, data_only)
         })
     }
 

@@ -1217,3 +1217,59 @@ fn directory_listing_reuses_large_snapshot_and_invalidates_after_create() {
     let actual_attr = volume.attr_inode(file_ino).unwrap();
     assert!(actual_attr.size > cached_attr_size);
 }
+
+#[test]
+fn blocked_inode_flush_does_not_hold_mount_writeback_map() {
+    let tmp = tempfile::tempdir().unwrap();
+    let volume = ArgosFs::create(
+        tmp.path(),
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            ..Default::default()
+        },
+        1,
+        false,
+    )
+    .unwrap();
+    let a = volume.create_file_path("/a", 0o600).unwrap();
+    let b = volume.create_file_path("/b", 0o600).unwrap();
+    assert_ne!(
+        a as usize % WRITEBACK_LOCK_STRIPES,
+        b as usize % WRITEBACK_LOCK_STRIPES
+    );
+    let fuse = ArgosFuse::new(volume.clone());
+    assert!(fuse.queue_writeback(a, 0, b"pending-a"));
+    assert!(fuse.queue_writeback(b, 0, b"pending-b"));
+    std::thread::scope(|scope| {
+        volume.test_with_metadata_write_lock(|| {
+            let shared = &fuse.shared;
+            scope.spawn(move || shared.flush_inode_writeback(a).unwrap());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if shared.writeback_lock(a).try_lock().is_none() {
+                    break;
+                }
+                assert!(Instant::now() < deadline, "flush never acquired inode gate");
+                std::thread::yield_now();
+            }
+            // The flusher cannot make progress while we hold metadata, but
+            // unrelated dirty-state operations must remain available.
+            let (sent, received) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                let state = shared.writeback.lock();
+                assert_eq!(state.pending_bytes, 18);
+                assert_eq!(state.dirty[&a].data, b"pending-a");
+                drop(state);
+                shared.discard_inode_writeback(b);
+                sent.send(()).unwrap();
+            });
+            received
+                .recv_timeout(Duration::from_secs(5))
+                .expect("blocked flush held global writeback map");
+            assert_eq!(shared.writeback.lock().pending_bytes, 9);
+        });
+    });
+    assert_eq!(volume.read_file("/a", false).unwrap(), b"pending-a");
+    assert!(fuse.writeback.lock().dirty.is_empty());
+}
