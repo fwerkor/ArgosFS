@@ -319,3 +319,28 @@ fn failed_full_flush_restores_mount_budget_and_retry_after_quota_change() {
     assert_eq!(fuse.writeback.lock().pending_bytes, 0);
     assert_eq!(volume.read_file("/quota/data", true).unwrap(), payload);
 }
+
+#[test]
+fn large_stripe_append_buffers_until_a_complete_stripe_is_available() {
+    const CHUNK: usize = 2 * 1024 * 1024;
+    let (_dir, volume, ino) = fixture(4, 1, CHUNK);
+    let fuse = ArgosFuse::new(volume.clone());
+    let mut expected = Vec::new();
+    for i in 0..5 {
+        let data = vec![i as u8; CHUNK];
+        assert!(fuse
+            .queue_writeback_staged(ino, expected.len() as u64, &data)
+            .unwrap());
+        expected.extend_from_slice(&data);
+        assert!(fuse.writeback.lock().pending_bytes <= 16 * 1024 * 1024);
+    }
+    assert_eq!(volume.attr_inode(ino).unwrap().size, (4 * CHUNK) as u64);
+    assert_eq!(fuse.writeback.lock().pending_bytes, CHUNK);
+    assert_eq!(
+        fuse.read_visible_inode(ino, 0, expected.len()).unwrap(),
+        expected
+    );
+    fuse.flush_inode_writeback(ino).unwrap();
+    volume.sync().unwrap();
+    assert_eq!(volume.read_file("/stream", false).unwrap(), expected);
+}
