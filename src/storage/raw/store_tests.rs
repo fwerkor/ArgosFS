@@ -1367,10 +1367,26 @@ fn quorum_selection_uses_distinct_devices_and_highest_supported_generation() {
     second.integrity.meta_hash = journal::canonical_metadata_hash(&second).unwrap();
     let report = MetadataCandidateReport::default();
     let candidates = vec![
-        (member.clone(), Some(first.clone()), report.clone()),
-        ("orphan".to_string(), Some(first.clone()), report.clone()),
-        (member.clone(), Some(second.clone()), report.clone()),
-        ("orphan".to_string(), Some(second.clone()), report.clone()),
+        (
+            member.clone(),
+            Some(Arc::new(first.clone())),
+            report.clone(),
+        ),
+        (
+            "orphan".to_string(),
+            Some(Arc::new(first.clone())),
+            report.clone(),
+        ),
+        (
+            member.clone(),
+            Some(Arc::new(second.clone())),
+            report.clone(),
+        ),
+        (
+            "orphan".to_string(),
+            Some(Arc::new(second.clone())),
+            report.clone(),
+        ),
         ("missing".to_string(), None, report),
     ];
     let selected = select_quorum_metadata_candidate(&candidates)
@@ -1379,7 +1395,7 @@ fn quorum_selection_uses_distinct_devices_and_highest_supported_generation() {
     assert_eq!(selected.txid, second.txid);
     assert_eq!(metadata_quorum_requirement(&selected), 1);
 
-    let mut multi = selected.clone();
+    let mut multi = selected.as_ref().clone();
     let template: Disk = multi.disks.values().next().unwrap().clone();
     for index in 1..4 {
         let mut disk = template.clone();
@@ -1394,7 +1410,7 @@ fn quorum_selection_uses_distinct_devices_and_highest_supported_generation() {
     assert_eq!(metadata_quorum_requirement(&multi), 2);
     assert!(select_quorum_metadata_candidate(&[(
         member,
-        Some(multi),
+        Some(Arc::new(multi)),
         MetadataCandidateReport::default()
     )])
     .unwrap()
@@ -1414,8 +1430,16 @@ fn recovery_quorum_ignores_orphan_supporters_and_replay_targets() {
     let report = MetadataCandidateReport::default();
     assert!(
         select_quorum_metadata_candidate(&[
-            (real_a.clone(), Some(candidate.clone()), report.clone()),
-            (orphan.clone(), Some(candidate.clone()), report.clone()),
+            (
+                real_a.clone(),
+                Some(Arc::new(candidate.clone())),
+                report.clone()
+            ),
+            (
+                orphan.clone(),
+                Some(Arc::new(candidate.clone())),
+                report.clone()
+            ),
         ])
         .unwrap()
         .is_none(),
@@ -1429,8 +1453,8 @@ fn recovery_quorum_ignores_orphan_supporters_and_replay_targets() {
         .unwrap()
         .clone();
     assert!(select_quorum_metadata_candidate(&[
-        (real_a, Some(candidate.clone()), report.clone()),
-        (real_b, Some(candidate.clone()), report),
+        (real_a, Some(Arc::new(candidate.clone())), report.clone()),
+        (real_b, Some(Arc::new(candidate.clone())), report),
     ])
     .unwrap()
     .is_some());
@@ -1880,6 +1904,10 @@ fn recovery_validates_each_slot_but_decodes_identical_checkpoints_once() {
     for sb in &superblocks {
         let reports = read_metadata_candidates_cached(&backend, sb, &mut decoded).unwrap();
         assert_eq!(reports.len(), 2);
+        let shared = decoded.values().next().unwrap();
+        for (candidate, _) in &reports {
+            assert!(Arc::ptr_eq(candidate.as_ref().unwrap(), shared));
+        }
         assert!(
             reports.iter().all(|(_, report)| report.valid),
             "{reports:?}"
@@ -2143,7 +2171,9 @@ fn interrupted_integrity_feature_upgrade_is_retryable_without_v2_records() {
             sb.required_feature_flags & REQUIRED_FEATURE_DELTA_INTEGRITY,
             0
         );
+        assert_ne!(sb.required_feature_flags & REQUIRED_FEATURE_ARRAY_SPLICE, 0);
     }
+    assert!(array_splice_feature_enabled(&upgraded));
     assert_eq!(
         recover_metadata(&backend, &upgraded).unwrap().txid,
         previous.txid
@@ -2251,3 +2281,6 @@ fn v2_crash_after_quorum_commit_recovers_authenticated_delta() {
 
 #[path = "store_tests/rollover_slot.rs"]
 mod rollover_slot;
+
+#[path = "store_tests/journal_parallel.rs"]
+mod journal_parallel;

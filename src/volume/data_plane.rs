@@ -23,7 +23,201 @@ pub(super) fn assemble_data_shards<'a>(
     compressed
 }
 
+/// Bounded speculative preparation of unencrypted writes. Stripe IDs and
+/// placement are allocated only after reacquiring the metadata writer lock.
+/// Holding the inode lock keeps same-inode writers serialized.
+const PREPARED_PAYLOAD_LIMIT: usize = 8 * 1024 * 1024;
+const MAX_PREPARED_WRITES: usize = 4;
+static ACTIVE_PREPARATIONS: AtomicUsize = AtomicUsize::new(0);
+
+struct PreparationPermit(&'static AtomicUsize);
+impl PreparationPermit {
+    fn acquire(counter: &'static AtomicUsize) -> Option<Self> {
+        let mut current = counter.load(Ordering::Acquire);
+        while current < MAX_PREPARED_WRITES {
+            match counter.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Self(counter)),
+                Err(observed) => current = observed,
+            }
+        }
+        None
+    }
+}
+impl Drop for PreparationPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EncodingGeometry {
+    k: usize,
+    m: usize,
+    chunk_size: usize,
+    compression: Compression,
+    level: i32,
+}
+impl EncodingGeometry {
+    fn from_meta(meta: &Metadata) -> Option<Self> {
+        if meta.encryption.enabled {
+            return None;
+        }
+        let layout = current_write_layout(meta).ok()?;
+        if layout.k == 1 && layout.m == 0 && meta.config.compression == Compression::None {
+            return None;
+        }
+        Some(Self {
+            k: layout.k,
+            m: layout.m,
+            chunk_size: layout.chunk_size,
+            compression: meta.config.compression,
+            level: meta.config.compression_level,
+        })
+    }
+}
+
+struct PreparedStripe {
+    raw_sha256: String,
+    codec: Compression,
+    compressed_size: usize,
+    shard_size: usize,
+    encoded: Vec<Vec<u8>>,
+}
+
+pub(super) struct PreparedWrite<'a> {
+    geometry: EncodingGeometry,
+    input: &'a [u8],
+    stripes: Vec<PreparedStripe>,
+    _permit: PreparationPermit,
+}
+
+impl<'a> PreparedWrite<'a> {
+    fn build(geometry: EncodingGeometry, input: &'a [u8]) -> Option<Self> {
+        Self::build_with_budget(geometry, input, &ACTIVE_PREPARATIONS)
+    }
+
+    fn build_with_budget(
+        geometry: EncodingGeometry,
+        input: &'a [u8],
+        counter: &'static AtomicUsize,
+    ) -> Option<Self> {
+        if input.len() <= INLINE_DATA_MAX {
+            return None;
+        }
+        let stripe_size = geometry.chunk_size.checked_mul(geometry.k)?;
+        let total = geometry.k.checked_add(geometry.m)?;
+        if stripe_size == 0 || stripe_size > PREPARED_PAYLOAD_LIMIT {
+            return None;
+        }
+        // Include worst-case per-stripe padding and descriptor overhead;
+        // cap both encoded payload and number of queued stripes.
+        let count = input.len().div_ceil(stripe_size);
+        let last = input.len() - (count - 1) * stripe_size;
+        let bytes = (count - 1)
+            .checked_mul(geometry.chunk_size)?
+            .checked_add(last.div_ceil(geometry.k))?
+            .checked_mul(total)?;
+        let overhead = count.checked_mul(total.checked_mul(64)?.checked_add(256)?)?;
+        if bytes.checked_add(overhead)? > PREPARED_PAYLOAD_LIMIT {
+            return None;
+        }
+        let permit = PreparationPermit::acquire(counter)?;
+        let rs = (geometry.m != 0 || geometry.k != 1)
+            .then(|| RsCodec::new(geometry.k, geometry.m))
+            .transpose()
+            .ok()?;
+        let mut stripes = Vec::with_capacity(count);
+        for raw in input.chunks(stripe_size) {
+            let (payload, codec) =
+                transform_stripe(raw, geometry.compression, geometry.level).ok()?;
+            let compressed_size = payload.len();
+            let (shard_size, encoded) = encode_payload(&payload, geometry.k, rs.as_ref()).ok()?;
+            stripes.push(PreparedStripe {
+                raw_sha256: content_hash_hex(raw),
+                codec,
+                compressed_size,
+                shard_size,
+                encoded,
+            });
+        }
+        Some(Self {
+            geometry,
+            input,
+            stripes,
+            _permit: permit,
+        })
+    }
+
+    fn matches(&self, meta: &Metadata, data: &[u8]) -> bool {
+        std::ptr::eq(self.input, data)
+            && EncodingGeometry::from_meta(meta).as_ref() == Some(&self.geometry)
+    }
+}
+
+fn transform_stripe(
+    raw: &[u8],
+    compression: Compression,
+    level: i32,
+) -> Result<(Vec<u8>, Compression)> {
+    let compressed = compress(raw, compression, level)?;
+    if compression != Compression::None && compressed.len() >= raw.len() {
+        Ok((raw.to_vec(), Compression::None))
+    } else {
+        Ok((compressed, compression))
+    }
+}
+
+fn encode_payload(
+    payload: &[u8],
+    k: usize,
+    codec: Option<&RsCodec>,
+) -> Result<(usize, Vec<Vec<u8>>)> {
+    let Some(codec) = codec else {
+        return Ok((payload.len().max(1), vec![payload.to_vec()]));
+    };
+    let shard_size = payload.len().max(1).div_ceil(k);
+    let padded_len = shard_size
+        .checked_mul(k)
+        .ok_or_else(|| ArgosError::Invalid("encoded shard size overflow".into()))?;
+    let mut padded = payload.to_vec();
+    padded.resize(padded_len, 0);
+    let data_shards = padded
+        .chunks(shard_size)
+        .map(|chunk| chunk.to_vec())
+        .collect::<Vec<_>>();
+    Ok((shard_size, codec.encode(&data_shards)?))
+}
+
 impl ArgosFs {
+    pub(super) fn prepare_write<'a>(
+        &self,
+        ino: InodeId,
+        data: &'a [u8],
+        aligned_append: Option<usize>,
+    ) -> Option<PreparedWrite<'a>> {
+        let geometry = {
+            let meta = self.meta.read();
+            let inode = meta.inodes.get(&ino)?;
+            if inode.kind != NodeKind::File {
+                return None;
+            }
+            if let Some(offset) = aligned_append {
+                let (old_size, stripe_size) = self.range_update_geometry_locked(&meta, ino).ok()?;
+                if old_size != offset || offset % stripe_size != 0 || inode.inline_data.is_some() {
+                    return None;
+                }
+            }
+            EncodingGeometry::from_meta(&meta)?
+        };
+        // No metadata guard remains during hashing/compression/RS encoding.
+        PreparedWrite::build(geometry, data)
+    }
+
     pub(super) fn replace_inode_data(
         &self,
         ino: InodeId,
@@ -33,8 +227,9 @@ impl ArgosFs {
     ) -> Result<()> {
         let inode_lock = self.inode_lock(ino);
         let _inode_guard = inode_lock.lock();
+        let prepared = self.prepare_write(ino, data, None);
         let mut meta = self.meta.write();
-        self.replace_inode_data_locked(
+        self.replace_inode_data_prepared_locked(
             &mut meta,
             ino,
             data,
@@ -42,6 +237,7 @@ impl ArgosFs {
             details,
             false,
             &BTreeSet::new(),
+            prepared,
         )
     }
 
@@ -55,6 +251,30 @@ impl ArgosFs {
         details: serde_json::Value,
         preserve_mtime: bool,
         exclude_disks: &BTreeSet<String>,
+    ) -> Result<()> {
+        self.replace_inode_data_prepared_locked(
+            meta,
+            ino,
+            data,
+            action,
+            details,
+            preserve_mtime,
+            exclude_disks,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn replace_inode_data_prepared_locked(
+        &self,
+        meta: &mut Metadata,
+        ino: InodeId,
+        data: &[u8],
+        action: &str,
+        details: serde_json::Value,
+        preserve_mtime: bool,
+        exclude_disks: &BTreeSet<String>,
+        prepared: Option<PreparedWrite<'_>>,
     ) -> Result<()> {
         self.ensure_block_backend_writable_locked(meta)?;
         let rollback = self.commit_previous_with_advisory_locked(meta);
@@ -80,7 +300,15 @@ impl ArgosFs {
         let new_blocks = if inline_payload.is_some() {
             Vec::new()
         } else {
-            self.encode_data_locked(meta, data, 0, storage_class, boot_critical, exclude_disks)?
+            self.encode_data_prepared_locked(
+                meta,
+                data,
+                0,
+                storage_class,
+                boot_critical,
+                exclude_disks,
+                prepared,
+            )?
         };
         let new_blocks_for_cleanup = new_blocks.clone();
         let now = now_f64();
@@ -801,6 +1029,31 @@ impl ArgosFs {
         boot_critical: bool,
         exclude_disks: &BTreeSet<String>,
     ) -> Result<Vec<FileBlock>> {
+        self.encode_data_prepared_locked(
+            meta,
+            data,
+            base_offset,
+            storage_class,
+            boot_critical,
+            exclude_disks,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn encode_data_prepared_locked(
+        &self,
+        meta: &mut Metadata,
+        data: &[u8],
+        base_offset: u64,
+        storage_class: StorageTier,
+        boot_critical: bool,
+        exclude_disks: &BTreeSet<String>,
+        mut prepared: Option<PreparedWrite<'_>>,
+    ) -> Result<Vec<FileBlock>> {
+        if prepared.as_ref().is_some_and(|p| !p.matches(meta, data)) {
+            prepared = None;
+        }
         let rollback = meta.clone();
         let mut created_shards = Vec::new();
         match self.encode_data_locked_inner(
@@ -811,6 +1064,7 @@ impl ArgosFs {
             boot_critical,
             exclude_disks,
             &mut created_shards,
+            prepared,
         ) {
             Ok(blocks) => Ok(blocks),
             Err(err) => {
@@ -833,6 +1087,7 @@ impl ArgosFs {
         boot_critical: bool,
         exclude_disks: &BTreeSet<String>,
         created_shards: &mut Vec<Shard>,
+        prepared: Option<PreparedWrite<'_>>,
     ) -> Result<Vec<FileBlock>> {
         let mut blocks = Vec::new();
         let layout = current_write_layout(meta)?;
@@ -845,13 +1100,22 @@ impl ArgosFs {
         } else {
             None
         };
+        let mut prepared = prepared;
+        // Keep the permit live while draining the pre-encoded stripes.
+        let mut prepared_stripes = prepared
+            .as_mut()
+            .map(|p| std::mem::take(&mut p.stripes).into_iter());
         for (index, raw) in data.chunks(stripe_raw_size).enumerate() {
             let stripe_id = format!("s{:016x}", meta.next_stripe);
             meta.next_stripe = meta
                 .next_stripe
                 .checked_add(1)
                 .ok_or_else(|| ArgosError::Invalid("stripe id overflow".to_string()))?;
-            let raw_sha256 = content_hash_hex(raw);
+            let preencoded = prepared_stripes.as_mut().and_then(Iterator::next);
+            let raw_sha256 = preencoded
+                .as_ref()
+                .map(|p| p.raw_sha256.clone())
+                .unwrap_or_else(|| content_hash_hex(raw));
             if layout.k == 1
                 && layout.m == 0
                 && encrypt_key.is_none()
@@ -904,39 +1168,45 @@ impl ArgosFs {
                 });
                 continue;
             }
-            let compressed = compress(raw, meta.config.compression, meta.config.compression_level)?;
-            let (transformed, codec) =
-                if meta.config.compression != Compression::None && compressed.len() >= raw.len() {
-                    (raw.to_vec(), Compression::None)
+            let (codec, encrypted, nonce_hex, compressed_size, shard_size, encoded) =
+                if let Some(p) = preencoded {
+                    (
+                        p.codec,
+                        false,
+                        String::new(),
+                        p.compressed_size,
+                        p.shard_size,
+                        p.encoded,
+                    )
                 } else {
-                    (compressed, meta.config.compression)
+                    let (transformed, codec) = transform_stripe(
+                        raw,
+                        meta.config.compression,
+                        meta.config.compression_level,
+                    )?;
+                    let (payload, encrypted, nonce_hex) = if let Some(key) = encrypt_key.as_ref() {
+                        let (nonce, ciphertext) = crypto::encrypt_with_key(
+                            key,
+                            &transformed,
+                            &encryption_aad(&meta.uuid, &stripe_id),
+                        )?;
+                        (ciphertext, true, hex::encode(nonce))
+                    } else {
+                        (transformed, false, String::new())
+                    };
+                    let rs = (layout.k != 1 || layout.m != 0)
+                        .then(|| RsCodec::new(layout.k, layout.m))
+                        .transpose()?;
+                    let (shard_size, encoded) = encode_payload(&payload, layout.k, rs.as_ref())?;
+                    (
+                        codec,
+                        encrypted,
+                        nonce_hex,
+                        payload.len(),
+                        shard_size,
+                        encoded,
+                    )
                 };
-            let (payload, encrypted, nonce_hex) = if let Some(key) = encrypt_key.as_ref() {
-                let (nonce, ciphertext) = crypto::encrypt_with_key(
-                    key,
-                    &transformed,
-                    &encryption_aad(&meta.uuid, &stripe_id),
-                )?;
-                (ciphertext, true, hex::encode(nonce))
-            } else {
-                (transformed, false, String::new())
-            };
-            let (shard_size, encoded) = if layout.k == 1 && layout.m == 0 {
-                (payload.len().max(1), vec![payload.clone()])
-            } else {
-                let codec = RsCodec::new(layout.k, layout.m)?;
-                let shard_size = payload.len().max(1).div_ceil(layout.k);
-                let mut padded = payload.clone();
-                let padded_len = shard_size.checked_mul(layout.k).ok_or_else(|| {
-                    ArgosError::Invalid("encoded shard size overflow".to_string())
-                })?;
-                padded.resize(padded_len, 0);
-                let data_shards = padded
-                    .chunks(shard_size)
-                    .map(|chunk| chunk.to_vec())
-                    .collect::<Vec<_>>();
-                (shard_size, codec.encode(&data_shards)?)
-            };
             let single_raw_shard_integrity =
                 if layout.k == 1 && layout.m == 0 && !encrypted && codec == Compression::None {
                     Some(ShardIntegrity {
@@ -958,24 +1228,36 @@ impl ArgosFs {
                     required_bytes: shard_size as u64,
                 },
             )?;
-            let mut shards = Vec::new();
-            for (slot, shard_data) in encoded.iter().enumerate() {
-                let integrity = if slot == 0 {
-                    single_raw_shard_integrity.as_ref()
-                } else {
-                    None
-                };
-                let shard = self.write_shard_locked(
-                    meta,
-                    &placements[slot],
-                    &stripe_id,
-                    slot,
-                    shard_data,
-                    integrity,
-                )?;
-                created_shards.push(shard.clone());
-                shards.push(shard);
-            }
+            let shards = if meta.backend != BackendKind::Host
+                && encoded.len() > 1
+                && !journal::crash_injection_configured()
+                && placements.iter().collect::<BTreeSet<_>>().len() == placements.len()
+            {
+                let shards =
+                    self.write_raw_stripe_locked(meta, &placements, &stripe_id, &encoded)?;
+                created_shards.extend(shards.iter().cloned());
+                shards
+            } else {
+                let mut shards = Vec::new();
+                for (slot, shard_data) in encoded.iter().enumerate() {
+                    let integrity = if slot == 0 {
+                        single_raw_shard_integrity.as_ref()
+                    } else {
+                        None
+                    };
+                    let shard = self.write_shard_locked(
+                        meta,
+                        &placements[slot],
+                        &stripe_id,
+                        slot,
+                        shard_data,
+                        integrity,
+                    )?;
+                    created_shards.push(shard.clone());
+                    shards.push(shard);
+                }
+                shards
+            };
             let raw_offset = index
                 .checked_mul(stripe_raw_size)
                 .and_then(|offset| u64::try_from(offset).ok())
@@ -990,13 +1272,116 @@ impl ArgosFs {
                 codec,
                 encrypted,
                 nonce_hex,
-                compressed_size: payload.len(),
+                compressed_size,
                 shard_size,
                 shards,
                 storage_class,
             });
         }
         Ok(blocks)
+    }
+
+    /// Reserve COW extents under the metadata lock, write independent members
+    /// concurrently, and publish shard descriptors only after every worker
+    /// has completed. encode_data_locked owns the pre-allocation rollback
+    /// snapshot; on error no worker can still write a reclaimed extent.
+    fn write_raw_stripe_locked(
+        &self,
+        meta: &mut Metadata,
+        placements: &[String],
+        stripe_id: &str,
+        encoded: &[Vec<u8>],
+    ) -> Result<Vec<Shard>> {
+        self.ensure_block_backend_writable_locked(meta)?;
+        let mut reservations = Vec::with_capacity(encoded.len());
+        for (slot, (disk_id, data)) in placements.iter().zip(encoded).enumerate() {
+            self.ensure_disk_capacity_locked(meta, disk_id, data.len() as u64)?;
+            let allocator = meta
+                .raw_pool
+                .allocators
+                .get_mut(disk_id)
+                .ok_or_else(|| ArgosError::MissingDevice(disk_id.clone()))?;
+            let extent = allocator::allocate(allocator, disk_id, data.len() as u64, meta.txid + 1)?;
+            reservations.push((slot, extent, data));
+        }
+        let flush = !bulk_import_enabled() && !meta.config.defer_data_flush;
+        let snapshot = &*meta;
+        let writes = std::thread::scope(|scope| {
+            let jobs = reservations
+                .into_iter()
+                .map(|(slot, extent, data)| {
+                    scope.spawn(move || -> Result<(Shard, f64)> {
+                        let sha256 = content_hash_hex(data);
+                        let start = Instant::now();
+                        self.backend_write_at_locked(
+                            snapshot,
+                            &extent.disk_id,
+                            extent.offset,
+                            data,
+                        )?;
+                        if flush {
+                            self.backend_flush_locked(snapshot, &extent.disk_id)?;
+                        }
+                        let elapsed = start.elapsed().as_secs_f64();
+                        self.commit_metrics.add_data_plane_bytes(
+                            DataPlaneByteKind::ShardPayloadWritten,
+                            data.len(),
+                        );
+                        Ok((
+                            Shard {
+                                slot,
+                                disk_id: extent.disk_id.clone(),
+                                location: Some(ShardLocation::RawExtent(extent)),
+                                relpath: PathBuf::new(),
+                                sha256,
+                                checksum_block_size: 0,
+                                subblock_sha256: Vec::new(),
+                                size: data.len(),
+                            },
+                            elapsed,
+                        ))
+                    })
+                })
+                .collect::<Vec<_>>();
+            // Join all writers even if one failed, before rollback can reuse
+            // any reserved extent. Return the first error in slot order.
+            jobs.into_iter()
+                .map(|job| job.join().expect("raw shard writer panicked"))
+                .collect::<Vec<_>>()
+        });
+        let written = writes.into_iter().collect::<Result<Vec<_>>>()?;
+        let mut shards = Vec::with_capacity(written.len());
+        for (shard, elapsed) in written {
+            self.record_raw_shard_locked(meta, stripe_id, &shard, elapsed);
+            shards.push(shard);
+        }
+        Ok(shards)
+    }
+
+    fn record_raw_shard_locked(
+        &self,
+        meta: &mut Metadata,
+        stripe_id: &str,
+        shard: &Shard,
+        elapsed: f64,
+    ) {
+        let Some(ShardLocation::RawExtent(extent)) = &shard.location else {
+            unreachable!("raw shard required")
+        };
+        if let Some(disk) = meta.disks.get_mut(&shard.disk_id) {
+            disk.used_bytes = disk.used_bytes.saturating_add(extent.length);
+        }
+        self.update_write_latency_locked(meta, &shard.disk_id, shard.size as u64, elapsed);
+        if let Some(verify) = &self.verify_written {
+            verify.enqueue(
+                &shard.disk_id,
+                extent.offset,
+                extent.generation,
+                shard.size,
+                &shard.sha256,
+                stripe_id,
+            );
+        }
     }
 
     pub(super) fn write_shard_locked(
@@ -1047,28 +1432,7 @@ impl ArgosFs {
                 }
                 return Err(err);
             }
-            if let Some(disk) = meta.disks.get_mut(disk_id) {
-                disk.used_bytes = disk.used_bytes.saturating_add(extent.length);
-            }
-            self.update_write_latency_locked(
-                meta,
-                disk_id,
-                data.len() as u64,
-                start.elapsed().as_secs_f64(),
-            );
-            self.commit_metrics
-                .add_data_plane_bytes(DataPlaneByteKind::ShardPayloadWritten, data.len());
-            if let Some(verify) = &self.verify_written {
-                verify.enqueue(
-                    disk_id,
-                    extent.offset,
-                    extent.generation,
-                    data.len(),
-                    &sha256,
-                    stripe_id,
-                );
-            }
-            return Ok(Shard {
+            let shard = Shard {
                 slot,
                 disk_id: disk_id.to_string(),
                 location: Some(ShardLocation::RawExtent(extent)),
@@ -1077,7 +1441,11 @@ impl ArgosFs {
                 checksum_block_size,
                 subblock_sha256,
                 size: data.len(),
-            });
+            };
+            self.record_raw_shard_locked(meta, stripe_id, &shard, start.elapsed().as_secs_f64());
+            self.commit_metrics
+                .add_data_plane_bytes(DataPlaneByteKind::ShardPayloadWritten, data.len());
+            return Ok(shard);
         }
         let subdir = &stripe_id[stripe_id.len().saturating_sub(2)..];
         let relpath = PathBuf::from(format!("shards/{subdir}/{stripe_id}.{slot:03}.blk"));

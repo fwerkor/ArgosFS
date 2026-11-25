@@ -194,7 +194,8 @@ fn metadata_delta_round_trip_handles_add_remove_replace_and_escaped_keys() {
     assert!(delta.iter().any(|op| match op {
         MetadataDeltaOp::Add { path, .. }
         | MetadataDeltaOp::Remove { path }
-        | MetadataDeltaOp::Replace { path, .. } => path.contains("a~1b~0c"),
+        | MetadataDeltaOp::Replace { path, .. }
+        | MetadataDeltaOp::Splice { path, .. } => path.contains("a~1b~0c"),
     }));
     let applied = apply_metadata_delta(&previous, &delta).unwrap();
     assert_eq!(applied.txid, next.txid);
@@ -780,7 +781,8 @@ fn persistent_inode_diff_preserves_wire_identity_and_signed_zero_changes() {
         .filter(|op| match op {
             MetadataDeltaOp::Add { path, .. }
             | MetadataDeltaOp::Remove { path }
-            | MetadataDeltaOp::Replace { path, .. } => path.starts_with("/inodes/"),
+            | MetadataDeltaOp::Replace { path, .. }
+            | MetadataDeltaOp::Splice { path, .. } => path.starts_with("/inodes/"),
         })
         .collect::<Vec<_>>();
     assert_eq!(inode_ops.len(), 3);

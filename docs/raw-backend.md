@@ -177,8 +177,15 @@ remaining data durability is validated; writes are fenced when required shards
 would become unavailable. Scrub remains the recovery and repair path.
 
 The queue holds up to 8192 pending verifications and drops oldest entries
-under pressure. Unfinished entries are also discarded at unmount rather than
-blocking indefinitely for their configured delay. `verify_written_skipped()`
+under pressure. A normal mount teardown still discards unfinished entries rather
+than blocking indefinitely. Offline `scrub` (including `--member`) and repairing
+`fsck` now sync all repairs and drain the queue before printing their final report;
+remaining checks and retries run immediately without the configured delay. This
+can increase the command's finalization time. JSON and human-readable reports
+include `write_verify_checks`, `write_verify_retries`, `write_verify_failures`
+and `write_verify_skipped`. The latter also includes superseded extents, queue
+overflow and unsupported eviction; it is not a checksum-error count. A successful
+drain cannot recover previously dropped work. `verify_written_skipped()`
 reports such unverified work; `verify_written_failures()` counts confirmed
 final failures. Unsupported cache eviction counts as skipped, not a device
 failure. All counters are runtime-only; the process log reports confirmed

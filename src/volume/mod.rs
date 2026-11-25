@@ -106,6 +106,7 @@ const INLINE_DATA_MAX: usize = 512;
 pub(crate) const MAX_IN_MEMORY_IO_BYTES: usize = 256 * 1024 * 1024;
 
 mod autopilot;
+pub(crate) mod capacity;
 mod data_plane;
 #[cfg(test)]
 mod deferred_flush_tests;
@@ -130,7 +131,12 @@ mod read_fast_tests;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+#[path = "data_fanout_tests.rs"]
+mod stripe_fanout_tests;
+
 pub use autopilot::{AutopilotConfig, ReshapeReport};
+pub(crate) use capacity::CapacitySnapshot;
 use helpers::*;
 use namespace::*;
 
@@ -256,6 +262,10 @@ pub struct ArgosFs {
     backend_writable: bool,
     raw_superblocks: Arc<Vec<RawSuperblock>>,
     meta: Arc<RwLock<Metadata>>,
+    /// Advisory statfs view republished after durable metadata commits.  It is
+    /// intentionally independent of `meta` so statfs cannot block on a slow
+    /// checkpoint that holds the metadata writer lock.
+    capacity_snapshot: Arc<RwLock<Option<CapacitySnapshot>>>,
     quota_runtime: Arc<RwLock<QuotaRuntime>>,
     deferred_commit: Arc<Mutex<DeferredCommitState>>,
     read_advisory: Arc<read_advisory::ReadAdvisory>,
@@ -283,6 +293,7 @@ impl Clone for ArgosFs {
             backend_writable: self.backend_writable,
             raw_superblocks: self.raw_superblocks.clone(),
             meta: self.meta.clone(),
+            capacity_snapshot: self.capacity_snapshot.clone(),
             quota_runtime: self.quota_runtime.clone(),
             deferred_commit: self.deferred_commit.clone(),
             read_advisory: self.read_advisory.clone(),
@@ -528,6 +539,7 @@ impl ArgosFs {
             write_fence: Arc::new(Mutex::new(None)),
             quota_runtime: Arc::new(RwLock::new(QuotaRuntime::from_metadata(&meta)?)),
             meta: Arc::new(RwLock::new(meta)),
+            capacity_snapshot: Arc::new(RwLock::new(None)),
             dirty_host_shards: Arc::new(Mutex::new(BTreeSet::new())),
             inode_locks: Arc::new(Mutex::new(BTreeMap::new())),
             cache: Arc::new(cache),
@@ -717,7 +729,7 @@ impl ArgosFs {
             )));
         }
         let _ = RsCodec::new(meta.config.k, meta.config.m)?;
-        let cache_root = block_cache_root(&meta.uuid, paths);
+        let cache_root = block_cache_root(&meta.uuid, meta.backend, paths);
         let cache = BlockCache::new(cache_root, 64 * 1024 * 1024, meta.config.l2_cache_bytes);
         let root = paths
             .first()
@@ -740,6 +752,11 @@ impl ArgosFs {
             raw_uncommitted_metadata_dirty,
         )));
         let quota_runtime = Arc::new(RwLock::new(QuotaRuntime::from_metadata(&meta.read())?));
+        let capacity_snapshot = Arc::new(RwLock::new(Some(CapacitySnapshot::from_metadata(
+            &root,
+            &meta.read(),
+            BTreeSet::new(),
+        ))));
         let verify_written = if backend_writable && meta.read().backend != BackendKind::Host {
             VerifyAfterWrite::configured_delay().map(|delay| {
                 VerifyAfterWrite::start(
@@ -767,6 +784,7 @@ impl ArgosFs {
             write_fence,
             quota_runtime,
             meta,
+            capacity_snapshot,
             dirty_host_shards: Arc::new(Mutex::new(BTreeSet::new())),
             inode_locks: Arc::new(Mutex::new(BTreeMap::new())),
             cache: Arc::new(cache),
@@ -791,6 +809,24 @@ impl ArgosFs {
             .as_ref()
             .map(|verify| verify.skipped())
             .unwrap_or(0)
+    }
+
+    /// Finish the delayed verifier before producing an offline maintenance
+    /// report. Call only after all repairs have completed and sync succeeded.
+    pub fn finish_maintenance_verification(&self, report: &mut FsckReport) {
+        if let Some(verify) = &self.verify_written {
+            verify.drain();
+            report.write_verify_checks = verify.checks();
+            report.write_verify_retries = verify.retries();
+            report.write_verify_failures = verify.failures();
+            report.write_verify_skipped = verify.skipped();
+            if report.write_verify_failures != 0 {
+                report.errors.push(format!(
+                    "read-after-write verification failed for {} shard(s)",
+                    report.write_verify_failures
+                ));
+            }
+        }
     }
 
     pub fn root(&self) -> &Path {
@@ -822,6 +858,25 @@ impl ArgosFs {
             self.read_advisory.project(&mut snapshot);
             snapshot
         })
+    }
+
+    /// Last capacity published by a durable metadata commit.  statfs falls
+    /// back to this without taking the metadata lock, so a long checkpoint
+    /// cannot keep `df` frozen at a mount-time value.
+    pub(crate) fn published_capacity_snapshot(&self) -> Option<CapacitySnapshot> {
+        self.capacity_snapshot.read().clone()
+    }
+
+    /// Republish advisory capacity from `meta`, which the caller must hold for
+    /// writing.  Host volumes keep their existing statfs path: their fallback
+    /// accounting may scan every inode, which must not run on each mutation.
+    fn publish_capacity_snapshot_locked(&self, meta: &Metadata) {
+        if meta.backend == BackendKind::Host {
+            return;
+        }
+        let unavailable = self.runtime_unavailable_devices();
+        let snapshot = CapacitySnapshot::from_metadata(self.root.as_path(), meta, unavailable);
+        *self.capacity_snapshot.write() = Some(snapshot);
     }
 
     #[cfg(test)]
@@ -1098,6 +1153,8 @@ impl ArgosFs {
             state.raw_uncommitted_metadata_dirty = false;
             state.raw_advisory_metadata_dirty = false;
             state.raw_checkpoint_required = false;
+            drop(state);
+            self.publish_capacity_snapshot_locked(&meta);
             durability?;
             return Ok(());
         }
@@ -2348,6 +2405,13 @@ impl ArgosFs {
         let checkpoint = checkpoint
             || state.raw_checkpoint_required
             || (state.raw_uncommitted_metadata_dirty && !incremental_integrity_enabled);
+        let array_splice_enabled = incremental_integrity_enabled
+            && current_members.iter().all(|sb| {
+                sb.required_feature_flags & raw_format::REQUIRED_FEATURE_ARRAY_SPLICE != 0
+            });
+        // The prepared delta is built before append_transaction; keep the
+        // feature decision active for both stages.
+        let _splice_guard = journal::allow_array_splice(array_splice_enabled);
 
         // The committed image is shared rather than cloned for every group commit.
         // A full rollback image is only needed if reclaiming old extents changes
@@ -2475,6 +2539,7 @@ impl ArgosFs {
                 state.dirty_transactions = 0;
                 state.dirty_since = None;
                 state.pending_reclaims.clear();
+                self.publish_capacity_snapshot_locked(meta);
                 match durability {
                     Ok(()) => {
                         state.last_error = None;
@@ -2502,6 +2567,7 @@ impl ArgosFs {
                 state.dirty_transactions = 0;
                 state.dirty_since = None;
                 state.pending_reclaims.clear();
+                self.publish_capacity_snapshot_locked(meta);
                 state.last_error = Some(err.to_string());
                 Err(err)
             }
@@ -2515,6 +2581,8 @@ impl ArgosFs {
                     meta.integrity = before_integrity;
                 }
                 self.rebuild_quota_runtime_locked(meta)?;
+                // The failed transaction did not make reclaimed space durable.
+                // Retain the previous published snapshot.
                 self.fence_on_quorum_loss(&err);
                 state.last_error = Some(err.to_string());
                 Err(err)
@@ -2565,13 +2633,56 @@ impl ArgosFs {
         meta.txid += 1;
         meta.updated_at = now_f64();
         if meta.backend != BackendKind::Host {
-            journal::prepare_metadata_integrity_with_previous(meta, previous_meta_hash.clone())?;
-            if bulk_import_enabled() {
-                return Ok(());
-            }
             let superblocks = self.metadata_superblocks_locked(meta)?;
+            // The committed baseline excludes advisory read counters and all
+            // uncommitted namespace mutations. Use it even for callers that
+            // only supplied an inode-local rollback image (or none at all).
+            let active_members = meta
+                .disks
+                .values()
+                .filter(|disk| disk.status != DiskStatus::Removed)
+                .count();
+            let v2_base = {
+                let state = self.deferred_commit.lock();
+                (!state.raw_checkpoint_required
+                    && !state.raw_uncommitted_metadata_dirty
+                    && active_members > 0
+                    && superblocks.len() == active_members
+                    && superblocks.iter().all(|sb| {
+                        sb.required_feature_flags & raw_format::REQUIRED_FEATURE_DELTA_INTEGRITY
+                            != 0
+                    }))
+                .then(|| state.durable_metadata.clone())
+                .flatten()
+                .filter(|base| {
+                    base.txid == previous_txid
+                        && base.integrity.meta_hash == previous_meta_hash
+                        && previous_meta_hash.len() == 64
+                })
+            };
+            let mut prepared_delta = {
+                let _integrity_timer = self.commit_metrics.timer(CommitPhase::Integrity);
+                if let Some(base) = v2_base.as_deref() {
+                    Some(journal::prepare_delta_integrity_with_delta(meta, base)?)
+                } else {
+                    journal::prepare_metadata_integrity_with_previous(
+                        meta,
+                        previous_meta_hash.clone(),
+                    )?;
+                    None
+                }
+            };
             let unavailable = self.quarantined_devices.lock().clone();
-            if let Err(precommit_err) = self.validate_data_durability_locked(meta, &unavailable) {
+            let validation = {
+                let _timer = self.commit_metrics.timer(CommitPhase::DurabilityValidation);
+                let mut state = self.deferred_commit.lock();
+                Self::validate_deferred_data_durability(
+                    meta,
+                    &unavailable,
+                    &mut state.durability_cache,
+                )
+            };
+            if let Err(precommit_err) = validation {
                 self.fence_on_quorum_loss(&precommit_err);
                 if let Some(previous) = previous_metadata {
                     *meta = previous.clone();
@@ -2592,23 +2703,40 @@ impl ArgosFs {
                     .filter(|previous| previous.integrity.meta_hash == previous_meta_hash)
             };
             let details = json!({"txid": meta.txid, "previous_meta_hash": previous_meta_hash, "details": details});
-            let commit = |backend: &dyn StorageBackend| match replay_previous {
-                Some(previous) => raw_store::append_transaction_with_trusted_integrity_quorum(
-                    backend,
-                    &superblocks,
-                    meta,
-                    Some(previous),
-                    action,
-                    details.clone(),
-                ),
-                None => raw_store::append_transaction_quorum(
-                    backend,
-                    &superblocks,
-                    meta,
-                    None,
-                    action,
-                    details.clone(),
-                ),
+            let mut commit = |backend: &dyn StorageBackend| {
+                let _timer = self.commit_metrics.timer(CommitPhase::Journal);
+                if let Some(base) = v2_base.as_deref() {
+                    return raw_store::append_transaction_with_trusted_integrity_quorum_measured(
+                        backend,
+                        &superblocks,
+                        meta,
+                        raw_store::PreparedJournalBase {
+                            previous: base,
+                            delta: prepared_delta.take(),
+                        },
+                        &self.commit_metrics,
+                        action,
+                        details.clone(),
+                    );
+                }
+                match replay_previous {
+                    Some(previous) => raw_store::append_transaction_with_trusted_integrity_quorum(
+                        backend,
+                        &superblocks,
+                        meta,
+                        Some(previous),
+                        action,
+                        details.clone(),
+                    ),
+                    None => raw_store::append_transaction_quorum(
+                        backend,
+                        &superblocks,
+                        meta,
+                        None,
+                        action,
+                        details.clone(),
+                    ),
+                }
             };
             let result = if self.open_backend_covers_superblocks(&superblocks) {
                 commit(&*self.backend)
@@ -2631,6 +2759,7 @@ impl ArgosFs {
                         state.last_error = Some(err.to_string());
                         drop(state);
                         self.rebuild_quota_runtime_locked(meta)?;
+                        self.publish_capacity_snapshot_locked(meta);
                         return Err(err);
                     }
                 }
@@ -2639,10 +2768,13 @@ impl ArgosFs {
                     if Self::transaction_error_is_committed(&commit_err) {
                         meta.inodes.mark_committed();
                         let mut state = self.deferred_commit.lock();
+                        state.durable_metadata = Some(Arc::new(meta.clone()));
                         state.raw_uncommitted_metadata_dirty = false;
                         state.raw_advisory_metadata_dirty = false;
+                        state.durability_cache = None;
                         drop(state);
                         self.rebuild_quota_runtime_locked(meta)?;
+                        self.publish_capacity_snapshot_locked(meta);
                     }
                     let should_restore = !Self::transaction_error_is_committed(&commit_err)
                         && (previous_metadata.is_none()
@@ -2661,8 +2793,14 @@ impl ArgosFs {
             }
             meta.inodes.mark_committed();
             let mut state = self.deferred_commit.lock();
+            state.durable_metadata = Some(Arc::new(meta.clone()));
+            if let Some(cache) = &mut state.durability_cache {
+                cache.inodes = meta.inodes.clone();
+            }
             state.raw_uncommitted_metadata_dirty = false;
             state.raw_advisory_metadata_dirty = false;
+            drop(state);
+            self.publish_capacity_snapshot_locked(meta);
             return Ok(());
         }
         let result = journal::append_transaction_checked(
@@ -2716,6 +2854,8 @@ impl ArgosFs {
         state.raw_uncommitted_metadata_dirty = true;
         state.raw_advisory_metadata_dirty = false;
         state.raw_checkpoint_required = true;
+        drop(state);
+        self.publish_capacity_snapshot_locked(meta);
         Ok(())
     }
 

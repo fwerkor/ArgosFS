@@ -48,6 +48,7 @@ pub struct VerifyAfterWrite {
     queue: Mutex<QueueState>,
     work: Condvar,
     stop: AtomicBool,
+    draining: AtomicBool,
     next_serial: AtomicU64,
     delay: Duration,
     max_retries: u32,
@@ -94,6 +95,7 @@ impl VerifyAfterWrite {
             queue: Mutex::new(QueueState::default()),
             work: Condvar::new(),
             stop: AtomicBool::new(false),
+            draining: AtomicBool::new(false),
             next_serial: AtomicU64::new(0),
             delay,
             max_retries: max_retries.min(10),
@@ -190,7 +192,6 @@ impl VerifyAfterWrite {
         Self::remove_active(&mut self.queue.lock().expect("verify queue"), op);
     }
 
-    #[cfg(test)]
     pub fn checks(&self) -> u64 {
         self.checks.load(Ordering::Relaxed)
     }
@@ -199,7 +200,6 @@ impl VerifyAfterWrite {
         self.failures.load(Ordering::Relaxed)
     }
 
-    #[cfg(test)]
     pub fn retries(&self) -> u64 {
         self.retries.load(Ordering::Relaxed)
     }
@@ -213,7 +213,12 @@ impl VerifyAfterWrite {
             let op = {
                 let mut queue = self.queue.lock().expect("verify queue");
                 loop {
-                    if self.stop.load(Ordering::Relaxed) {
+                    if self.stop.load(Ordering::Acquire) {
+                        if self.draining.load(Ordering::Relaxed) {
+                            if let Some(op) = queue.pending.pop_front() {
+                                break op;
+                            }
+                        }
                         return;
                     }
                     let now = Instant::now();
@@ -284,8 +289,12 @@ impl VerifyAfterWrite {
             })
     }
 
+    fn aborting(&self) -> bool {
+        self.stop.load(Ordering::Acquire) && !self.draining.load(Ordering::Relaxed)
+    }
+
     fn verify(&self, primary: &dyn StorageBackend, mut op: VerifyOp) {
-        if !self.is_current(&op) || self.stop.load(Ordering::Relaxed) {
+        if !self.is_current(&op) || self.aborting() {
             self.skipped.fetch_add(1, Ordering::Relaxed);
             self.finish(&op);
             return;
@@ -316,7 +325,7 @@ impl VerifyAfterWrite {
             .and_then(|()| backend.drop_cache(&op.disk_id, op.offset, op.length as u64))
         {
             Ok(()) => {
-                if self.stop.load(Ordering::Relaxed) || !self.is_current(&op) {
+                if self.aborting() || !self.is_current(&op) {
                     self.skipped.fetch_add(1, Ordering::Relaxed);
                     self.finish(&op);
                     return;
@@ -338,7 +347,7 @@ impl VerifyAfterWrite {
             }
             Err(err) => Some(format!("flush or cache eviction failed: {err}")),
         };
-        if self.stop.load(Ordering::Relaxed) || !self.is_current(&op) {
+        if self.aborting() || !self.is_current(&op) {
             self.skipped.fetch_add(1, Ordering::Relaxed);
             self.finish(&op);
             return;
@@ -353,7 +362,7 @@ impl VerifyAfterWrite {
             self.retries.fetch_add(1, Ordering::Relaxed);
             let mut queue = self.queue.lock().expect("verify queue");
             if queue.active.get(&(op.disk_id.clone(), op.offset)) == Some(&op.serial)
-                && !self.stop.load(Ordering::Relaxed)
+                && !self.aborting()
             {
                 self.bounded_push(&mut queue, op);
             } else {
@@ -389,18 +398,39 @@ impl VerifyAfterWrite {
     }
 
     pub fn stop(&self) {
-        if self.stop.swap(true, Ordering::AcqRel) {
-            return;
-        }
+        self.close(false);
+    }
+
+    /// Offline maintenance has stopped producing writes and synced data.
+    /// Verify the remaining queue without waiting out the sampling delay.
+    pub fn drain(&self) {
+        self.close(true);
+    }
+
+    fn close(&self, drain: bool) {
         let mut queue = self.queue.lock().expect("verify queue");
-        let remaining = queue.pending.len();
-        queue.pending.clear();
-        queue.active.clear();
-        self.skipped.fetch_add(remaining as u64, Ordering::Relaxed);
+        if !self.stop.load(Ordering::Relaxed) {
+            self.draining.store(drain, Ordering::Relaxed);
+            self.stop.store(true, Ordering::Release);
+            if !drain {
+                let remaining = queue.pending.len();
+                queue.pending.clear();
+                queue.active.clear();
+                self.skipped.fetch_add(remaining as u64, Ordering::Relaxed);
+            }
+        }
         drop(queue);
         self.work.notify_all();
-        if let Some(handle) = self.handle.lock().expect("verify handle").take() {
-            let _ = handle.join();
+        let mut handle = self.handle.lock().expect("verify handle");
+        let Some(worker) = handle.take() else {
+            return;
+        };
+        if worker.join().is_err() {
+            let mut queue = self.queue.lock().expect("verify queue");
+            let remaining = queue.active.len() as u64;
+            self.skipped.fetch_add(remaining, Ordering::Relaxed);
+            queue.pending.clear();
+            queue.active.clear();
         }
         let skipped = self.skipped();
         if skipped != 0 {
