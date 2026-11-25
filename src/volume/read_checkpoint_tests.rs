@@ -559,7 +559,25 @@ fn verified_unclean_reopen_defers_reanchor_through_read_only_syncs() {
     fs.upgrade_delta_integrity().unwrap();
     fs.write_file("/archive", b"durable", 0o600).unwrap();
     fs.sync().unwrap();
-    drop(fs); // deliberately omit mark_clean_unmount
+    assert_eq!(
+        fs.metadata_snapshot().integrity.hash_scheme,
+        Some(journal::DELTA_INTEGRITY_SCHEME)
+    );
+    // Drop normally marks a writable raw pool clean. Suppress only that
+    // cleanup to model a crash after the durable sync, while still allowing
+    // Drop to stop the verifier and release the backend handles.
+    fs.backend_writable = false;
+    drop(fs);
+    {
+        let recovered = raw_store::open_pool(BackendKind::LoopBlock, &images, false).unwrap();
+        assert!(recovered.superblocks.iter().all(|sb| !sb.clean));
+        assert_eq!(recovered.report.invalid_entries, 0);
+        assert_eq!(
+            recovered.report.errors,
+            vec!["pool was not cleanly unmounted".to_string()]
+        );
+        assert!(recovered.recovery_verified);
+    }
     let mut fs = ArgosFs::open_loop(&images, true).unwrap();
     assert!(fs.deferred_commit.lock().raw_mount_reanchor_pending);
     let audit = Arc::new(WriteAuditBackend::new(
