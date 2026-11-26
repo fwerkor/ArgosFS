@@ -1597,7 +1597,7 @@ fn offline_delta_integrity_upgrade_replays_transactions_and_fences_downgrade() {
 }
 
 #[test]
-fn v2_recovery_checkpoint_reanchors_normalized_metadata_before_next_delta() {
+fn v2_recovery_uses_authenticated_base_for_successive_deltas() {
     let dir = tempfile::tempdir().unwrap();
     let images = (0..3)
         .map(|index| dir.path().join(format!("v2-restart-{index}.img")))
@@ -1626,12 +1626,24 @@ fn v2_recovery_checkpoint_reanchors_normalized_metadata_before_next_delta() {
     drop(fs);
 
     let fs = ArgosFs::open_loop(&images, true).unwrap();
-    assert!(fs.deferred_commit.lock().raw_checkpoint_required);
+    assert!(!fs.deferred_commit.lock().raw_checkpoint_required);
     fs.write_file("/second", b"two", 0o600).unwrap();
     fs.sync().unwrap();
-    // The first post-recovery checkpoint verifies the normalized current
-    // namespace rather than treating its recovered v2 digest as canonical.
-    assert_eq!(fs.metadata_snapshot().integrity.hash_scheme, None);
+    // The first post-recovery delta must use the exact recovered image,
+    // not treat the normalized live v2 digest as a canonical hash.
+    assert_eq!(
+        fs.metadata_snapshot().integrity.hash_scheme,
+        Some(journal::DELTA_INTEGRITY_SCHEME)
+    );
+    assert_eq!(
+        fs.commit_metrics()
+            .snapshots()
+            .find(|(name, _)| *name == CommitPhase::Checkpoint.name())
+            .unwrap()
+            .1
+            .count,
+        0
+    );
     assert!(!fs.deferred_commit.lock().raw_checkpoint_required);
     fs.write_file("/third", b"three", 0o600).unwrap();
     fs.sync().unwrap();
@@ -1641,6 +1653,7 @@ fn v2_recovery_checkpoint_reanchors_normalized_metadata_before_next_delta() {
     );
     drop(fs);
     let recovered = ArgosFs::open_loop(&images, false).unwrap();
+    assert_eq!(recovered.transaction_report().unwrap().invalid_entries, 0);
     for (path, contents) in [
         ("/first", b"one".as_slice()),
         ("/second", b"two".as_slice()),
