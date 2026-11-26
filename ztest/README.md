@@ -36,11 +36,27 @@ rate so one injected metadata error does not immediately fence the whole pool.
 ## What it verifies
 
 - every crash reopens the pool and runs `scrub()`;
-- `unrecoverable_files` must be zero and `scrub()` must report no errors;
-- every file in the host-side oracle must exist and match its BLAKE3 digest;
+- damage to durable oracle files is repaired, or is recorded as expected loss
+  when the cycle's fault log proves that more than `m` shards in one stripe were
+  destructively faulted;
+- damage within the parity budget (`m` or fewer shards) must be repaired; an
+  unrecoverable stripe in that case is a hard failure;
+- every remaining file in the host-side oracle must exist and match its BLAKE3
+  digest;
 - after the random cycles, a deterministic parity drill damages one committed
   data shard in a backing image and requires scrub to report a repaired file
   (`damaged_files >= 1`, `repaired_files >= 1`) without losing the file.
+
+### Expected loss
+
+A pool with `m` parity shards cannot reconstruct `m + 1` damaged shards in one
+stripe. ztest matches scrub's unrecoverable `(inode, stripe)` results against
+the cycle fault log and counts distinct shards hit by destructive faults
+(`durable_bit_rot`, `write_bit_rot`, `torn_write`, `lost_write`). If more than
+`m` were hit, the path is retired from the pool and from the oracle and listed
+in the run summary's `expected_loss` array. Transient read faults and
+indeterminate EIO-after-write events are not counted, so a recovery failure
+within the parity budget still aborts the run.
 
 The oracle is an epoch manifest stored **outside** the pool. An epoch is
 published only after `ArgosFs::sync()` succeeds. A crash during the next epoch
