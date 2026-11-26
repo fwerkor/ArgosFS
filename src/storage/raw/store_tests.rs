@@ -1124,11 +1124,11 @@ fn journal_recovery_ignores_one_member_payload_eio_when_quorum_is_readable() {
         fail_from: failed.journal.offset + RAW_HEADER_SIZE as u64 + 36,
         fail_to: failed.journal.offset + failed.journal.length,
     };
-    let mut decoded = BTreeMap::new();
+    let decoded = parking_lot::Mutex::new(BTreeMap::new());
     let mut candidates = Vec::new();
     for sb in &superblocks {
         candidates.extend(
-            read_metadata_candidates_cached(&backend, sb, &mut decoded)
+            read_metadata_candidates_cached(&backend, sb, &decoded)
                 .unwrap()
                 .into_iter()
                 .map(|(metadata, report)| (sb.disk_id.clone(), metadata, report)),
@@ -1900,13 +1900,13 @@ fn checkpoint_uses_old_encoding_when_it_fits() {
 fn recovery_validates_each_slot_but_decodes_identical_checkpoints_once() {
     let (_dir, images, metadata, superblocks) = quorum_fixture();
     let backend = block_backend_for(&images);
-    let mut decoded = BTreeMap::new();
+    let decoded = parking_lot::Mutex::new(BTreeMap::new());
     for sb in &superblocks {
-        let reports = read_metadata_candidates_cached(&backend, sb, &mut decoded).unwrap();
+        let reports = read_metadata_candidates_cached(&backend, sb, &decoded).unwrap();
         assert_eq!(reports.len(), 2);
-        let shared = decoded.values().next().unwrap();
+        let shared = decoded.lock().values().next().unwrap().clone();
         for (candidate, _) in &reports {
-            assert!(Arc::ptr_eq(candidate.as_ref().unwrap(), shared));
+            assert!(Arc::ptr_eq(candidate.as_ref().unwrap(), &shared));
         }
         assert!(
             reports.iter().all(|(_, report)| report.valid),
@@ -1914,8 +1914,8 @@ fn recovery_validates_each_slot_but_decodes_identical_checkpoints_once() {
         );
     }
     // Three independent voting devices, two slots each, but one parsed state.
-    assert_eq!(decoded.len(), 1);
-    assert_eq!(decoded.values().next().unwrap().txid, metadata.txid);
+    assert_eq!(decoded.lock().len(), 1);
+    assert_eq!(decoded.lock().values().next().unwrap().txid, metadata.txid);
 
     // A matching header cannot trick the cache into voting for damaged data.
     let sb = &superblocks[1];
@@ -1936,11 +1936,11 @@ fn recovery_validates_each_slot_but_decodes_identical_checkpoints_once() {
     backend
         .write_at(&sb.disk_id, slot_offset + body, &byte)
         .unwrap();
-    let reports = read_metadata_candidates_cached(&backend, sb, &mut decoded).unwrap();
+    let reports = read_metadata_candidates_cached(&backend, sb, &decoded).unwrap();
     assert!(!reports[0].1.valid);
     assert!(reports[0].1.error.as_ref().unwrap().contains("checksum"));
     assert!(reports[1].1.valid);
-    assert_eq!(decoded.len(), 1);
+    assert_eq!(decoded.lock().len(), 1);
     // The rest of the pool still forms a valid quorum.
     let recovered = recover_metadata(&backend, &superblocks).unwrap();
     assert_eq!(recovered.txid, metadata.txid);

@@ -237,7 +237,9 @@ fn torn_new_slot_does_not_destroy_old_checkpoint_or_quorum_recovery() {
     .unwrap();
     assert!(report.failed_devices.contains_key(&sb.disk_id));
     assert!(!torn.fail_once.load(std::sync::atomic::Ordering::Relaxed));
-    let candidates = read_metadata_candidates_cached(&backend, sb, &mut BTreeMap::new()).unwrap();
+    let candidates =
+        read_metadata_candidates_cached(&backend, sb, &parking_lot::Mutex::new(BTreeMap::new()))
+            .unwrap();
     assert_eq!(candidates.iter().filter(|(_, r)| r.valid).count(), 1);
     assert!(candidates
         .iter()

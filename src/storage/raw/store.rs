@@ -685,23 +685,65 @@ fn write_superblock_clean_state_member(
     backend.flush_device(&copy.disk_id)
 }
 
+type MemberCheckpointCandidate = (String, Option<Arc<Metadata>>, MetadataCandidateReport);
+
+/// Bound concurrent checkpoint payload buffers by the physical slot sizes.
+/// Distinct members can read in parallel, but each member's slots retain
+/// their original order and every physical copy must pass its own checksum.
+fn read_all_checkpoint_candidates(
+    backend: &dyn StorageBackend,
+    superblocks: &[RawSuperblock],
+) -> Result<Vec<MemberCheckpointCandidate>> {
+    const MAX_WORKERS: usize = 4;
+    const PAYLOAD_BUDGET: u64 = 256 * 1024 * 1024;
+    let slot_max = superblocks
+        .iter()
+        .map(|sb| sb.metadata.length / 2)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let workers = (PAYLOAD_BUDGET / slot_max).clamp(1, MAX_WORKERS as u64) as usize;
+    let decoded = parking_lot::Mutex::new(BTreeMap::new());
+    let mut candidates = Vec::new();
+    for batch in superblocks.chunks(workers) {
+        if batch.len() == 1 {
+            let sb = &batch[0];
+            candidates.extend(
+                read_metadata_candidates_cached(backend, sb, &decoded)?
+                    .into_iter()
+                    .map(|(m, r)| (sb.disk_id.clone(), m, r)),
+            );
+            continue;
+        }
+        let results = std::thread::scope(|scope| {
+            let jobs = batch
+                .iter()
+                .map(|sb| {
+                    let decoded = &decoded;
+                    scope.spawn(move || read_metadata_candidates_cached(backend, sb, decoded))
+                })
+                .collect::<Vec<_>>();
+            jobs.into_iter()
+                .map(|job| {
+                    job.join()
+                        .map_err(|_| ArgosError::Invalid("checkpoint read worker panicked".into()))
+                        .and_then(|r| r)
+                })
+                .collect::<Vec<_>>()
+        });
+        for (sb, result) in batch.iter().zip(results) {
+            candidates.extend(result?.into_iter().map(|(m, r)| (sb.disk_id.clone(), m, r)));
+        }
+    }
+    Ok(candidates)
+}
+
 fn load_or_recover(
     backend: &dyn StorageBackend,
     superblocks: &[RawSuperblock],
     checkpoint_replay: bool,
 ) -> Result<(Metadata, TransactionReport)> {
-    // Checkpoints replicated across members have identical serialized contents.
-    // Verify each physical copy, but deserialize each distinct payload only once.
-    let mut decoded = BTreeMap::new();
-    let mut candidates = Vec::new();
-    for sb in superblocks {
-        candidates.extend(
-            read_metadata_candidates_cached(backend, sb, &mut decoded)?
-                .into_iter()
-                .map(|(metadata, report)| (sb.disk_id.clone(), metadata, report)),
-        );
-    }
-    drop(decoded);
+    let candidates = read_all_checkpoint_candidates(backend, superblocks)?;
     let mut report = TransactionReport::default();
     report.metadata_candidates = candidates
         .iter()
