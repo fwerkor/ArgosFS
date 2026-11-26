@@ -422,10 +422,10 @@ pub fn run() -> Result<()> {
                 RootMountMode::ReadWrite | RootMountMode::DegradedReadWrite
             );
             if write {
-                let preflight_fs =
-                    open_backend(None, backend, images.clone(), devices.clone(), false)?;
+                let (preflight_fs, report) =
+                    open_backend_for_preflight(backend, images.clone(), devices.clone())?;
                 validate_requested_pool(&preflight_fs, pool.as_deref())?;
-                rootfs::preflight_volume(&preflight_fs, mode)?;
+                rootfs::preflight_volume_from_open(&preflight_fs, mode, report)?;
                 // The writable open builds its own recovery snapshot. Keeping
                 // the read-only preflight handle alive across the blocking
                 // FUSE mount would pin two independent inode tables.
@@ -440,9 +440,9 @@ pub fn run() -> Result<()> {
                     metrics_listen.as_deref(),
                 )?;
             } else {
-                let fs = open_backend(None, backend, images, devices, false)?;
+                let (fs, report) = open_backend_for_preflight(backend, images, devices)?;
                 validate_requested_pool(&fs, pool.as_deref())?;
-                rootfs::preflight_volume(&fs, mode)?;
+                rootfs::preflight_volume_from_open(&fs, mode, report)?;
                 fusefs::mount_volume_with_metrics(
                     fs,
                     target,
@@ -454,15 +454,10 @@ pub fn run() -> Result<()> {
         }
         Command::PreflightRoot { storage, mode } => {
             let storage = storage.resolve(BackendKind::LoopBlock)?;
-            let fs = open_backend(
-                None,
-                storage.backend,
-                storage.images,
-                storage.devices,
-                false,
-            )?;
+            let (fs, open_report) =
+                open_backend_for_preflight(storage.backend, storage.images, storage.devices)?;
             validate_requested_pool(&fs, storage.pool.as_deref())?;
-            let report = rootfs::preflight_report(&fs, mode);
+            let report = rootfs::preflight_report_from_open(&fs, mode, open_report);
             print_preflight_report(&report, json)?;
             if !report.ok {
                 bail!("root preflight failed: {}", report.errors.join("; "));
@@ -482,15 +477,10 @@ pub fn run() -> Result<()> {
         }
         Command::MountRecovery { storage, target } => {
             let storage = storage.resolve(BackendKind::LoopBlock)?;
-            let fs = open_backend(
-                None,
-                storage.backend,
-                storage.images,
-                storage.devices,
-                false,
-            )?;
+            let (fs, report) =
+                open_backend_for_preflight(storage.backend, storage.images, storage.devices)?;
             validate_requested_pool(&fs, storage.pool.as_deref())?;
-            rootfs::preflight_volume(&fs, RootMountMode::Recovery)?;
+            rootfs::preflight_volume_from_open(&fs, RootMountMode::Recovery, report)?;
             fusefs::mount_volume(fs, target, true, root_mount_options(vec!["ro".to_string()]))?;
         }
         Command::Put { root, local, path } => {
@@ -1228,6 +1218,23 @@ fn open_backend(
             write,
         )?,
     })
+}
+
+fn open_backend_for_preflight(
+    backend: BackendKind,
+    images: Vec<PathBuf>,
+    devices: Vec<PathBuf>,
+) -> Result<(ArgosFs, Option<TransactionReport>)> {
+    let paths = match backend {
+        BackendKind::LoopBlock => require_paths(images, "loop backend requires --images")?,
+        BackendKind::RawBlock => require_paths(devices, "raw backend requires --devices")?,
+        BackendKind::Host => {
+            return open_backend(None, backend, images, devices, false).map(|fs| (fs, None))
+        }
+    };
+    Ok(ArgosFs::open_block_backend_with_report(
+        backend, &paths, false,
+    )?)
 }
 
 fn import_args(
