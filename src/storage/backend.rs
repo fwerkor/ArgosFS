@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -29,6 +29,10 @@ pub trait StorageBackend: Send + Sync {
     fn backend_kind(&self) -> BackendKind;
     fn list_devices(&self) -> Result<Vec<BackendDeviceInfo>>;
     fn read_at(&self, device_id: &DeviceId, offset: u64, buf: &mut [u8]) -> Result<()>;
+    /// Read scattered shard payloads without speculative readahead where supported.
+    fn read_shard_at(&self, device_id: &DeviceId, offset: u64, buf: &mut [u8]) -> Result<()> {
+        self.read_at(device_id, offset, buf)
+    }
     fn write_at(&self, device_id: &DeviceId, offset: u64, data: &[u8]) -> Result<()>;
     fn flush_device(&self, device_id: &DeviceId) -> Result<()>;
     fn flush_all(&self) -> Result<()>;
@@ -118,10 +122,8 @@ pub struct FileBlockBackend {
 struct BlockDevice {
     path: PathBuf,
     file: File,
-    /// Second handle on the same device for large bulk reads.  See
-    /// `open_block_device` for why the shard-data handle cannot use the
-    /// kernel's readahead.
-    bulk_file: Option<File>,
+    /// Independent read-only handle for scattered shard reads.
+    shard_file: Option<File>,
     capacity: u64,
 }
 
@@ -197,30 +199,18 @@ impl StorageBackend for FileBlockBackend {
             .collect())
     }
 
-    fn read_at(&self, device_id: &DeviceId, offset: u64, mut buf: &mut [u8]) -> Result<()> {
+    fn read_at(&self, device_id: &DeviceId, offset: u64, buf: &mut [u8]) -> Result<()> {
+        read_exact_at(&self.device(device_id)?.file, device_id, offset, buf)
+    }
+
+    fn read_shard_at(&self, device_id: &DeviceId, offset: u64, buf: &mut [u8]) -> Result<()> {
         let device = self.device(device_id)?;
-        // Shard payloads arrive in chunk-sized reads (<= the layout chunk
-        // size); metadata checkpoints and journal replay use larger bulk
-        // reads.  Each handle keeps the readahead policy suited to its
-        // traffic.  See `open_block_device`.
-        let file = match &device.bulk_file {
-            Some(bulk) if buf.len() >= BULK_READ_BYTES => bulk,
-            _ => &device.file,
-        };
-        let mut cursor = offset;
-        while !buf.is_empty() {
-            let read = file.read_at(buf, cursor)?;
-            if read == 0 {
-                return Err(ArgosError::Io(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    format!("short read on {device_id} at offset {cursor}"),
-                )));
-            }
-            cursor = cursor.saturating_add(read as u64);
-            let (_, rest) = buf.split_at_mut(read);
-            buf = rest;
-        }
-        Ok(())
+        read_exact_at(
+            device.shard_file.as_ref().unwrap_or(&device.file),
+            device_id,
+            offset,
+            buf,
+        )
     }
 
     fn write_at(&self, device_id: &DeviceId, offset: u64, mut data: &[u8]) -> Result<()> {
@@ -304,42 +294,42 @@ impl StorageBackend for FileBlockBackend {
     }
 }
 
-/// Reads at least this large are bulk metadata checkpoints or journal
-/// replay, which are sequential and benefit from the kernel's readahead.
-/// Anything smaller is a shard payload read.
-const BULK_READ_BYTES: usize = 512 * 1024;
+fn read_exact_at(file: &File, device_id: &DeviceId, offset: u64, mut buf: &mut [u8]) -> Result<()> {
+    let mut cursor = offset;
+    while !buf.is_empty() {
+        let read = file.read_at(buf, cursor)?;
+        if read == 0 {
+            return Err(ArgosError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                format!("short read on {device_id} at offset {cursor}"),
+            )));
+        }
+        cursor = cursor.saturating_add(read as u64);
+        let (_, rest) = buf.split_at_mut(read);
+        buf = rest;
+    }
+    Ok(())
+}
+
+fn same_open_device(first: &File, second: &File) -> Result<bool> {
+    let a = first.metadata()?;
+    let b = second.metadata()?;
+    Ok(a.dev() == b.dev() && a.ino() == b.ino() && a.rdev() == b.rdev())
+}
 
 fn open_block_device(path: &Path, write: bool, random_data_reads: bool) -> Result<BlockDevice> {
-    let open = || -> Result<File> {
-        Ok(OpenOptions::new()
-            .read(true)
-            .write(write)
-            .create(false)
-            .open(path)?)
-    };
-    let mut file = open()?;
-    let bulk_file = if random_data_reads {
-        // Shard extents are allocated in write order, so the per-member
-        // stream of a logically sequential file read is scattered (measured:
-        // 5.5 % of consecutive data-shard reads on a member are physically
-        // contiguous during a full repository verify).  Buffered reads are
-        // one chunk at most (256 KiB by default), which makes the kernel's
-        // readahead window (queue/read_ahead_kb, 2 MiB on the USB members)
-        // issue about twice the requested bytes and throw nearly all of the
-        // prefetch away again.
-        //
-        // POSIX_FADV_RANDOM disables readahead for this handle only.  The
-        // pages still stay in the page cache, so repeated reads still hit.
-        // Measured on a nine-member 4+4 pool (`borg check --verify-data` of a
-        // 9.0 GB repository): member reads 17.5 GB -> 7.7 GB, wall
-        // 145 s -> 85 s.  A sequential 265 MB file probe went from 362 MB to
-        // 185 MB of member reads and from 2.5 s to 1.7 s.
-        //
-        // Bulk metadata reads keep a separate handle with the default
-        // policy: disabling readahead for them adds ~17 s to a fresh mount
-        // (3132 sequential 1 MiB metadata reads).
-        advise_random_access(&file);
-        Some(open()?)
+    let mut file = OpenOptions::new().read(true).write(write).open(path)?;
+    // Independent open descriptions preserve sequential metadata readahead.
+    // If the path changes or a second open fails, keep the original handle
+    // and its default policy rather than reading from a different device.
+    let shard_file = if random_data_reads {
+        match File::open(path) {
+            Ok(shard) if same_open_device(&file, &shard).unwrap_or(false) => {
+                advise_random_access(&shard);
+                Some(shard)
+            }
+            _ => None,
+        }
     } else {
         None
     };
@@ -347,7 +337,7 @@ fn open_block_device(path: &Path, write: bool, random_data_reads: bool) -> Resul
     Ok(BlockDevice {
         path: path.to_path_buf(),
         file,
-        bulk_file,
+        shard_file,
         capacity,
     })
 }
