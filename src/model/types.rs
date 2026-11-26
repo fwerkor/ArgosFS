@@ -797,6 +797,12 @@ pub struct FsckReport {
     pub shard_read_recovered: u64,
     pub orphan_shards: u64,
     pub removed_orphans: u64,
+    /// Allocated raw extent bytes with no durable shard reference.
+    #[serde(default)]
+    pub orphan_extent_bytes: u64,
+    /// Raw orphan bytes returned to the free list by this pass.
+    #[serde(default)]
+    pub reclaimed_extent_bytes: u64,
     /// Journal regions reset because they held only stale entries below the
     /// selected metadata checkpoint.  Set by `fsck --repair`.
     #[serde(default)]

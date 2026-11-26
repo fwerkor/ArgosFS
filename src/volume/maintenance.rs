@@ -1211,14 +1211,14 @@ impl ArgosFs {
             callback(total, total, &report);
         }
         let meta = self.meta.read();
-        let refs = meta
-            .inodes
-            .values()
-            .flat_map(|inode| inode.blocks.iter())
-            .flat_map(|block| block.shards.iter())
-            .map(|shard| (shard.disk_id.clone(), shard.relpath.clone()))
-            .collect::<BTreeSet<_>>();
         if meta.backend == BackendKind::Host {
+            let refs = meta
+                .inodes
+                .values()
+                .flat_map(|inode| inode.blocks.iter())
+                .flat_map(|block| block.shards.iter())
+                .map(|shard| (shard.disk_id.clone(), shard.relpath.clone()))
+                .collect::<BTreeSet<_>>();
             maintenance_after_read_delay();
             for (disk_id, disk) in &meta.disks {
                 let disk_root = relative_or_absolute(&self.root, &disk.path);
@@ -1243,28 +1243,60 @@ impl ArgosFs {
                     }
                 }
             }
-        } else {
-            for (disk_id, allocator_state) in &meta.raw_pool.allocators {
-                let extents = meta
-                    .inodes
-                    .values()
-                    .flat_map(|inode| inode.blocks.iter())
-                    .flat_map(|block| block.shards.iter())
-                    .filter_map(|shard| match shard.location.as_ref() {
-                        Some(ShardLocation::RawExtent(extent)) if &extent.disk_id == disk_id => {
-                            Some(extent.clone())
-                        }
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
-                if let Err(err) = allocator::validate_allocations(allocator_state, extents) {
-                    report.errors.push(err.to_string());
+        } else if !repair && !remove_orphans {
+            // A live deferred transaction still owns its retired extents until
+            // the journal commits. Do not misclassify these as allocator leaks.
+            let state = self.deferred_commit.lock();
+            match raw_orphan_plans(&meta, &state.pending_reclaims) {
+                Ok(plans) => {
+                    report.orphan_extent_bytes = plans.iter().map(|(_, bytes, _)| *bytes).sum()
                 }
+                Err(err) => report.errors.push(err.to_string()),
             }
         }
         drop(meta);
         if repair || remove_orphans {
             let mut meta = self.meta.write();
+            // The exclusive mutation barrier drains in-flight reservations.
+            // Publish deferred reclamation before using referenced bytes as
+            // allocation authority; otherwise old extents can be freed twice.
+            // A read-only check has no local deferred writes to publish.
+            if meta.backend != BackendKind::Host
+                && self.backend_writable
+                && (meta.config.defer_metadata_commit || bulk_import_enabled())
+            {
+                self.commit_deferred_locked(&mut meta, false)?;
+            }
+            let before = meta.clone();
+            let mut metadata_changed = report.removed_orphans > 0;
+            if meta.backend != BackendKind::Host {
+                let plans = {
+                    let state = self.deferred_commit.lock();
+                    raw_orphan_plans(&meta, &state.pending_reclaims)
+                };
+                match plans {
+                    Ok(plans) => {
+                        report.orphan_extent_bytes = plans.iter().map(|(_, bytes, _)| *bytes).sum();
+                        if remove_orphans && report.errors.is_empty() {
+                            for (disk_id, bytes, replacement) in plans {
+                                if meta
+                                    .disks
+                                    .get(&disk_id)
+                                    .is_some_and(|disk| disk.status == DiskStatus::Online)
+                                    && !self.is_device_quarantined(&disk_id)
+                                {
+                                    if let Some(replacement) = replacement {
+                                        meta.raw_pool.allocators.insert(disk_id, replacement);
+                                        report.reclaimed_extent_bytes += bytes;
+                                        metadata_changed = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => report.errors.push(err.to_string()),
+                }
+            }
             let mut referenced_usage = BTreeMap::<String, u64>::new();
             for shard in meta
                 .inodes
@@ -1272,16 +1304,9 @@ impl ArgosFs {
                 .flat_map(|inode| inode.blocks.iter())
                 .flat_map(|block| block.shards.iter())
             {
-                let current = referenced_usage
-                    .get(&shard.disk_id)
-                    .copied()
-                    .unwrap_or(0u64);
-                referenced_usage.insert(
-                    shard.disk_id.clone(),
-                    current.saturating_add(shard_accounted_size(shard)),
-                );
+                let current = referenced_usage.entry(shard.disk_id.clone()).or_default();
+                *current = current.saturating_add(shard_accounted_size(shard));
             }
-            let mut metadata_changed = report.removed_orphans > 0;
             for (disk_id, disk) in meta.disks.iter_mut() {
                 let used_bytes = referenced_usage.get(disk_id).copied().unwrap_or(0);
                 if disk.used_bytes != used_bytes {
@@ -1290,7 +1315,31 @@ impl ArgosFs {
                 }
             }
             if metadata_changed {
-                self.commit_locked(&mut meta, "fsck", json!({"report": report}))?;
+                if let Err(err) = self.ensure_block_backend_writable_locked(&meta) {
+                    *meta = before;
+                    return Err(err);
+                }
+                if let Err(err) = self.commit_locked_with_previous(
+                    &mut meta,
+                    Some(&before),
+                    "fsck",
+                    json!({"report": report}),
+                ) {
+                    // Raw commits with a caller-owned snapshot leave rollback
+                    // to the caller. Conflicts already reload durable metadata.
+                    if meta.backend != BackendKind::Host
+                        && !Self::transaction_error_is_committed(&err)
+                        && !matches!(err, ArgosError::Conflict(_))
+                    {
+                        *meta = before;
+                    }
+                    return Err(err);
+                }
+                if meta.backend != BackendKind::Host
+                    && (meta.config.defer_metadata_commit || bulk_import_enabled())
+                {
+                    self.commit_deferred_locked(&mut meta, false)?;
+                }
             }
         }
         report.shard_read_retries = self
@@ -1468,6 +1517,44 @@ impl ArgosFs {
     pub fn scrub(&self) -> Result<FsckReport> {
         self.fsck(true, true)
     }
+}
+
+type RawOrphanPlan = (String, u64, Option<RawAllocatorState>);
+
+fn raw_orphan_plans(meta: &Metadata, pending: &[FileBlock]) -> Result<Vec<RawOrphanPlan>> {
+    let mut extents = BTreeMap::<String, Vec<PhysicalExtent>>::new();
+    for shard in meta
+        .inodes
+        .values()
+        .flat_map(|inode| inode.blocks.iter())
+        .chain(pending.iter())
+        .flat_map(|block| block.shards.iter())
+    {
+        match &shard.location {
+            Some(ShardLocation::RawExtent(extent))
+                if extent.disk_id == shard.disk_id
+                    && meta.raw_pool.allocators.contains_key(&extent.disk_id) =>
+            {
+                extents
+                    .entry(extent.disk_id.clone())
+                    .or_default()
+                    .push(extent.clone());
+            }
+            _ => {
+                return Err(ArgosError::CorruptedMetadata(format!(
+                    "missing or inconsistent raw extent for {} slot {}",
+                    shard.disk_id, shard.slot
+                )))
+            }
+        }
+    }
+    let mut plans = Vec::new();
+    for (disk_id, state) in &meta.raw_pool.allocators {
+        let (bytes, repaired) =
+            allocator::orphan_reclaim_plan(state, extents.remove(disk_id).unwrap_or_default())?;
+        plans.push((disk_id.clone(), bytes, repaired));
+    }
+    Ok(plans)
 }
 
 fn maintenance_after_read_delay() {

@@ -1552,7 +1552,7 @@ fn print_fsck_report(report: &FsckReport, explicit_json: bool) -> Result<()> {
         return Ok(());
     }
     println!(
-        "checked files={} directories={} damaged={} repaired={} unrecoverable={} missing_shards={} checksum_errors={} shard_read_retries={} shard_read_recovered={} orphans={} journals_reset={} write_verify_checks={} write_verify_retries={} write_verify_failures={} write_verify_skipped={}",
+        "checked files={} directories={} damaged={} repaired={} unrecoverable={} missing_shards={} checksum_errors={} shard_read_retries={} shard_read_recovered={} orphans={} orphan_extent_bytes={} reclaimed_extent_bytes={} journals_reset={} write_verify_checks={} write_verify_retries={} write_verify_failures={} write_verify_skipped={}",
         report.files_checked,
         report.directories_checked,
         report.damaged_files,
@@ -1563,6 +1563,8 @@ fn print_fsck_report(report: &FsckReport, explicit_json: bool) -> Result<()> {
         report.shard_read_retries,
         report.shard_read_recovered,
         report.orphan_shards,
+        report.orphan_extent_bytes,
+        report.reclaimed_extent_bytes,
         report.journals_reset,
         report.write_verify_checks,
         report.write_verify_retries,
