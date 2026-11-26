@@ -55,6 +55,30 @@ lifecycle gate. It creates a three-device pool, imports a dataset, adds a new
 device, drains and removes an old device, replaces another device, reshapes the
 pool, scrubs/fscks it, exports the dataset, and checks byte-for-byte equality.
 
+## Randomized crash/fault ztest
+
+`ztest/` is a separate, workspace-excluded package with its own `Cargo.toml`.
+It is the ztest-style continuous stress tool:
+
+```bash
+cd ztest
+cargo test
+cargo run --release -- run --cycles 20 --min-faults 50
+```
+
+The supervisor creates a 3+2 loop pool, runs concurrent namespace/data
+workloads through a fault-injecting `StorageBackend` wrapper, kills the worker
+with `SIGKILL`, then reopens, scrubs, and verifies every committed file against
+a host-side BLAKE3 oracle. Injected faults include EIO, silent read/write bit
+rot, torn writes, lost writes, skipped flush barriers, and a volatile write-back
+window. A final parity drill damages a data shard in a backing image and
+requires scrub to reconstruct it without losing the file. See `ztest/README.md`
+for the fault model and tuning flags.
+
+The wrapper uses `ArgosFs::open_loop_with_backend`/`open_raw_with_backend`, a
+`#[doc(hidden)]` seam that installs the wrapper before recovery. The normal
+`open_loop`/`open_raw` paths are unchanged.
+
 `scripts/compat/run_deep_roundtrip.sh` adds host-filesystem import/export
 coverage for byte-preserving names, hardlinks, symlinks, xattrs, metadata, and
 CLI path literals. Its default mode does not require `/dev/fuse`.

@@ -4,6 +4,10 @@ ArgosFS uses `cargo-fuzz`/libFuzzer for in-process coverage-guided testing in
 addition to the stateful randomized model, mounted FUSE, block-fault, and QEMU
 chaos suites.
 
+For crash/bit-rot/torn-write/flush-loss stress with a fault-injecting backend
+wrapper and a host-side durability oracle, see the workspace-excluded
+`ztest/` package and `ztest/README.md`.
+
 The current targets deliberately mix malformed-input exploration with
 valid-structure invariants so libFuzzer can reach deep logic quickly:
 

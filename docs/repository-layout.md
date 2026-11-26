@@ -12,6 +12,9 @@ ArgosFS keeps implementation, integration assets, validation harnesses, and rese
 - `scripts/compat/` contains mounted-FUSE and optional POSIX compatibility checks.
 - `scripts/experiments/` contains artifact-evaluation experiment drivers.
 - `scripts/validation/` contains retained end-to-end validation workflows.
+- `ztest/` is the workspace-excluded `argosfs-ztest` package: a randomized
+  concurrency, crash, bit-rot, torn-write, and flush-loss stress harness with a
+  host-side durability oracle and a deterministic parity-reconstruction drill.
 - `integrations/` contains initramfs and systemd templates for generic Linux and CapOS.
 - `website/` contains the static project website.
 

@@ -185,6 +185,25 @@ pub fn preflight_devices_empty(
 }
 
 pub fn open_pool(kind: BackendKind, paths: &[PathBuf], write: bool) -> Result<RawOpen> {
+    open_pool_with_backend(kind, paths, write, |backend| backend)
+}
+
+/// Open a pool through a caller-supplied backend wrapper.
+///
+/// This exists for out-of-tree fault-injection and test harnesses. The wrapper
+/// is installed before recovery reads any journal or checkpoint, so injected
+/// read/write behaviour also covers mount-time replay. Normal callers should
+/// use [`open_pool`].
+#[doc(hidden)]
+pub fn open_pool_with_backend<F>(
+    kind: BackendKind,
+    paths: &[PathBuf],
+    write: bool,
+    wrap: F,
+) -> Result<RawOpen>
+where
+    F: FnOnce(Arc<dyn StorageBackend>) -> Arc<dyn StorageBackend>,
+{
     let scanned = scan_paths(kind, paths);
     let mut devices = Vec::new();
     let mut superblocks = Vec::new();
@@ -261,9 +280,9 @@ pub fn open_pool(kind: BackendKind, paths: &[PathBuf], write: bool) -> Result<Ra
         .iter()
         .cloned()
         .collect::<std::collections::BTreeMap<_, _>>();
-    let backend: Arc<dyn StorageBackend> = Arc::new(GuardedBackend::new(Arc::new(
+    let backend: Arc<dyn StorageBackend> = Arc::new(GuardedBackend::new(wrap(Arc::new(
         FileBlockBackend::open_with_ids(kind, devices, write)?,
-    )));
+    ))));
     let (mut metadata, mut report) = load_or_recover(&*backend, &superblocks, write)?;
     if metadata.backend != kind {
         return Err(ArgosError::IncompatibleFormat(format!(

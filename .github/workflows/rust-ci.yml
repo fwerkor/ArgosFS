@@ -153,6 +153,13 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      - name: Check standalone ztest harness
+        run: |
+          cargo fmt --manifest-path ztest/Cargo.toml -- --check
+          cargo clippy --manifest-path ztest/Cargo.toml --locked --all-targets -- -D warnings
+          cargo test --manifest-path ztest/Cargo.toml --locked
+          cargo run --manifest-path ztest/Cargo.toml --locked -- run --seed 356 --cycles 2 --kill-after-ms-min 400 --kill-after-ms-max 600 --min-faults 0 --read-error-pct 0 --read-flip-pct 0 --bit-rot-pct 0 --write-error-pct 0 --write-eio-after-pct 0 --write-bit-rot-pct 0 --torn-write-pct 0 --lost-write-pct 0 --drop-flush-pct 0
+
       - name: Build documentation with warnings denied
         env:
           RUSTDOCFLAGS: -D warnings
