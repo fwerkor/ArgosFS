@@ -5,9 +5,21 @@ pub struct MemberBalanceReport {
     pub member: String,
     pub moved_shards: u64,
     pub bytes_moved: u64,
+    pub data_shards_moved: u64,
+    pub parity_shards_moved: u64,
     pub used_before: u64,
     pub used_after: u64,
     pub target_bytes: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct MemberBalanceOptions {
+    /// Restrict migration to this file or directory subtree.
+    pub path: Option<String>,
+    pub min_inode: Option<InodeId>,
+    pub max_inode: Option<InodeId>,
+    /// Prefer systematic data shards over parity when selecting a donor.
+    pub prefer_data: bool,
 }
 
 impl ArgosFs {
@@ -15,16 +27,61 @@ impl ArgosFs {
     /// Copy verified encoded shards, at most one per stripe, and preserve the
     /// logical block, all other physical references, and inode timestamps.
     pub fn rebalance_member(&self, target: &str, max_shards: usize) -> Result<MemberBalanceReport> {
+        self.rebalance_member_with_options(target, max_shards, &MemberBalanceOptions::default())
+    }
+
+    pub fn rebalance_member_with_options(
+        &self,
+        target: &str,
+        max_shards: usize,
+        options: &MemberBalanceOptions,
+    ) -> Result<MemberBalanceReport> {
+        if options
+            .min_inode
+            .zip(options.max_inode)
+            .is_some_and(|(min, max)| min > max)
+        {
+            return Err(ArgosError::Invalid(
+                "minimum inode exceeds maximum inode".into(),
+            ));
+        }
         self.sync()?;
         let (mut ids, mut report) = {
             let meta = self.meta.read();
             self.ensure_block_backend_writable_locked(&meta)?;
             let disk = self.balance_target(&meta, target)?;
-            let ids = meta
-                .inodes
-                .iter()
-                .filter_map(|(id, inode)| (inode.kind == NodeKind::File).then_some(*id))
-                .collect::<Vec<_>>();
+            let in_range = |id: InodeId| {
+                options.min_inode.is_none_or(|min| id >= min)
+                    && options.max_inode.is_none_or(|max| id <= max)
+            };
+            let ids = if let Some(path) = &options.path {
+                let root = self.resolve_path_locked(&meta, path, true, 40)?;
+                let mut stack = vec![root];
+                let mut seen = BTreeSet::new();
+                let mut files = Vec::new();
+                while let Some(id) = stack.pop() {
+                    if !seen.insert(id) {
+                        continue;
+                    }
+                    let inode = meta
+                        .inodes
+                        .get(&id)
+                        .ok_or_else(|| ArgosError::NotFound(format!("inode {id}")))?;
+                    match inode.kind {
+                        NodeKind::Directory => stack.extend(inode.entries.values().copied()),
+                        NodeKind::File if in_range(id) => files.push(id),
+                        _ => {}
+                    }
+                }
+                files
+            } else {
+                meta.inodes
+                    .iter()
+                    .filter_map(|(id, inode)| {
+                        (inode.kind == NodeKind::File && in_range(*id)).then_some(*id)
+                    })
+                    .collect::<Vec<_>>()
+            };
             (
                 ids,
                 MemberBalanceReport {
@@ -67,6 +124,7 @@ impl ArgosFs {
             let mut retired = Vec::new();
             let mut moved = 0u64;
             let mut bytes = 0u64;
+            let mut data_moved = 0u64;
             let mut donor_debt = BTreeMap::<String, u64>::new();
             let result = (|| -> Result<()> {
                 for block in &mut blocks {
@@ -119,11 +177,22 @@ impl ArgosFs {
                                 .then_some((index, used as f64 / source.capacity_bytes as f64))
                         })
                         .collect::<Vec<_>>();
-                    candidates.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                    let k = layout_by_id(&meta, block_layout_id(block))?.k;
+                    candidates.sort_by(|a, b| {
+                        let data_order = if options.prefer_data {
+                            (block.shards[a.0].slot >= k).cmp(&(block.shards[b.0].slot >= k))
+                        } else {
+                            std::cmp::Ordering::Equal
+                        };
+                        data_order
+                            .then_with(|| b.1.total_cmp(&a.1))
+                            .then_with(|| a.0.cmp(&b.0))
+                    });
                     let Some((index, _)) = candidates.first().copied() else {
                         continue;
                     };
                     let source = block.shards[index].clone();
+                    data_moved += u64::from(source.slot < k);
                     let Some(data) = self.read_shard_verified_locked(&meta, &source)? else {
                         return Err(ArgosError::CorruptedMetadata(format!(
                             "cannot rebalance unverified shard {}:{}",
@@ -185,6 +254,8 @@ impl ArgosFs {
             }
             report.moved_shards += moved;
             report.bytes_moved += bytes;
+            report.data_shards_moved += data_moved;
+            report.parity_shards_moved += moved - data_moved;
         }
         self.sync()?;
         report.used_after = self

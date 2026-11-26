@@ -687,51 +687,57 @@ fn write_superblock_clean_state_member(
 
 type MemberCheckpointCandidate = (String, Option<Arc<Metadata>>, MetadataCandidateReport);
 
-/// Bound concurrent checkpoint payload buffers by the physical slot sizes.
-/// Distinct members can read in parallel, but each member's slots retain
-/// their original order and every physical copy must pass its own checksum.
+/// Bound concurrent checkpoint payload buffers by the actual stored lengths,
+/// not by the reserved slot capacity. Oversized payloads run alone.
 fn read_all_checkpoint_candidates(
     backend: &dyn StorageBackend,
     superblocks: &[RawSuperblock],
 ) -> Result<Vec<MemberCheckpointCandidate>> {
     const MAX_WORKERS: usize = 4;
     const PAYLOAD_BUDGET: u64 = 256 * 1024 * 1024;
-    let slot_max = superblocks
-        .iter()
-        .map(|sb| sb.metadata.length / 2)
-        .max()
-        .unwrap_or(1)
-        .max(1);
-    let workers = (PAYLOAD_BUDGET / slot_max).clamp(1, MAX_WORKERS as u64) as usize;
     let decoded = parking_lot::Mutex::new(BTreeMap::new());
     let mut candidates = Vec::new();
-    for batch in superblocks.chunks(workers) {
-        if batch.len() == 1 {
-            let sb = &batch[0];
-            candidates.extend(
-                read_metadata_candidates_cached(backend, sb, &decoded)?
-                    .into_iter()
-                    .map(|(m, r)| (sb.disk_id.clone(), m, r)),
-            );
-            continue;
+    let mut plans = superblocks
+        .iter()
+        .map(|sb| {
+            let headers = read_checkpoint_headers(backend, sb);
+            let bytes = checkpoint_payload_budget(sb, &headers);
+            (sb, headers, bytes)
+        })
+        .peekable();
+    while let Some(first) = plans.next() {
+        let mut bytes = first.2;
+        let mut batch = vec![first];
+        while batch.len() < MAX_WORKERS
+            && plans
+                .peek()
+                .is_some_and(|next| bytes.saturating_add(next.2) <= PAYLOAD_BUDGET)
+        {
+            let next = plans.next().expect("peeked checkpoint");
+            bytes += next.2;
+            batch.push(next);
         }
         let results = std::thread::scope(|scope| {
             let jobs = batch
-                .iter()
-                .map(|sb| {
+                .into_iter()
+                .map(|(sb, headers, _)| {
                     let decoded = &decoded;
-                    scope.spawn(move || read_metadata_candidates_cached(backend, sb, decoded))
+                    scope.spawn(move || {
+                        (
+                            sb,
+                            read_metadata_candidates_from_headers(backend, sb, decoded, headers),
+                        )
+                    })
                 })
                 .collect::<Vec<_>>();
             jobs.into_iter()
                 .map(|job| {
                     job.join()
                         .map_err(|_| ArgosError::Invalid("checkpoint read worker panicked".into()))
-                        .and_then(|r| r)
                 })
-                .collect::<Vec<_>>()
-        });
-        for (sb, result) in batch.iter().zip(results) {
+                .collect::<Result<Vec<_>>>()
+        })?;
+        for (sb, result) in results {
             candidates.extend(result?.into_iter().map(|(m, r)| (sb.disk_id.clone(), m, r)));
         }
     }
@@ -806,6 +812,9 @@ fn load_or_recover(
     if checkpoint_replay && report.replayed {
         journal::inject_crash(FaultPoint::DuringReplay.as_str())?;
         let member_superblocks = metadata_member_superblocks(superblocks, &metadata);
+        if can_retain_replayed_journal(&metadata, &member_superblocks, &report) {
+            return Ok((metadata, report));
+        }
         let checkpoint_report =
             write_metadata_copies_quorum(backend, &member_superblocks, &metadata)?;
         let failed_checkpoint_members = checkpoint_report
@@ -834,6 +843,57 @@ fn load_or_recover(
         }
     }
     Ok((metadata, report))
+}
+
+/// Keeping the existing replay base is safe only when every active member
+/// has the same validated journal tip at the selected transaction. Divergent,
+/// missing, legacy and damaged members still take the conservative reanchor.
+fn can_retain_replayed_journal(
+    metadata: &Metadata,
+    members: &[RawSuperblock],
+    report: &TransactionReport,
+) -> bool {
+    if metadata.integrity.hash_scheme != Some(journal::DELTA_INTEGRITY_SCHEME)
+        || !report.errors.is_empty()
+        || report.invalid_entries != 0
+        || members.len()
+            != metadata
+                .disks
+                .values()
+                .filter(|d| d.status != DiskStatus::Removed)
+                .count()
+        || !metadata
+            .disks
+            .values()
+            .all(|d| matches!(d.status, DiskStatus::Online | DiskStatus::Removed))
+        || members
+            .iter()
+            .any(|sb| sb.required_feature_flags & REQUIRED_FEATURE_DELTA_INTEGRITY == 0)
+    {
+        return false;
+    }
+    let mut tip = None;
+    for sb in members {
+        let Some(member) = report
+            .raw_journal_members
+            .iter()
+            .find(|m| m.disk_id == sb.disk_id)
+        else {
+            return false;
+        };
+        if !member.readable
+            || member.error.is_some()
+            || member.invalid_entries != 0
+            || member.last_valid_txid != metadata.txid
+            || member.last_valid_generation != metadata.integrity.generation
+            || member.last_valid_record_hash.is_empty()
+            || tip.is_some_and(|hash: &str| hash != member.last_valid_record_hash)
+        {
+            return false;
+        }
+        tip = Some(member.last_valid_record_hash.as_str());
+    }
+    tip.is_some()
 }
 
 fn metadata_has_voting_member(metadata: &Metadata, disk_id: &str) -> bool {

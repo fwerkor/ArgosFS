@@ -352,7 +352,7 @@ impl ArgosFs {
                 .all(|d| d.status == DiskStatus::Online)
             && opened.superblocks.len() == opened.metadata.disks.len())
         .then_some(opened.report);
-        let reanchor_can_wait = opened.recovery_verified
+        let can_reuse_delta_base = opened.recovery_verified
             && opened.superblocks.len()
                 == opened
                     .metadata
@@ -365,7 +365,12 @@ impl ArgosFs {
                 .disks
                 .values()
                 .all(|disk| matches!(disk.status, DiskStatus::Online | DiskStatus::Removed));
-        let durable_metadata = if reanchor_can_wait {
+        // A verified degraded recovery still has a durable quorum. Do not
+        // persist discovery-only normalization for an advisory read or sync;
+        // a subsequent real mutation must use the conservative checkpoint.
+        let reanchor_can_wait =
+            can_reuse_delta_base || (opened.recovery_verified && opened.durable_metadata.is_some());
+        let durable_metadata = if can_reuse_delta_base {
             opened.durable_metadata
         } else {
             None
@@ -429,11 +434,11 @@ impl ArgosFs {
         if let Some(durable) = durable_metadata {
             state.durable_metadata = Some(Arc::new(durable));
         }
-        // A fully verified, complete pool has a durable recovery base even
-        // after an unclean shutdown. Mount-time normalization can be anchored
-        // with the first real mutation; advisory reads and a clean unmount do
-        // not need to publish it. Missing members or recovery errors retain
-        // the conservative eager checkpoint.
+        // A verified pool has a durable recovery base even after an unclean
+        // shutdown. Discovery-only normalization can wait for the first real
+        // mutation; advisory reads and clean unmount need not publish it.
+        // Degraded v2 pools still require a full reanchor at that mutation.
+        // Unverified recovery retains the eager checkpoint.
         state.raw_mount_reanchor_pending = reanchor_can_wait
             && raw_uncommitted_metadata_dirty
             && !meta.read().integrity.meta_hash.is_empty();

@@ -652,3 +652,44 @@ fn clean_legacy_reopen_with_relocated_members_does_not_checkpoint_reads() {
     fs.mark_clean_unmount().unwrap();
     assert_eq!(audit.totals(), [0, 0, 3 * 3 * 4096]);
 }
+
+#[test]
+fn verified_degraded_v2_mount_defers_reanchor_until_mutation() {
+    let (_dir, images, mut fs, _) = raw_fixture();
+    fs.upgrade_delta_integrity().unwrap();
+    fs.write_file("/archive", b"durable archive", 0o600)
+        .unwrap();
+    fs.sync().unwrap();
+    fs.mark_clean_unmount().unwrap();
+    drop(fs);
+
+    std::fs::rename(&images[2], images[2].with_extension("absent")).unwrap();
+    let present = &images[..2];
+    let mut fs = ArgosFs::open_loop(present, true).unwrap();
+    assert_eq!(
+        fs.metadata_snapshot().disks["disk-0002"].status,
+        DiskStatus::Offline
+    );
+    assert!(fs.deferred_commit.lock().raw_mount_reanchor_pending);
+    assert!(fs.deferred_commit.lock().raw_checkpoint_required);
+    let audit = Arc::new(WriteAuditBackend::new(
+        fs.backend.clone(),
+        &fs.raw_superblocks,
+    ));
+    fs.backend = audit.clone();
+    assert_eq!(fs.read_file("/archive", false).unwrap(), b"durable archive");
+    assert!(!fs.sync_deferred_if_dirty().unwrap());
+    fs.sync().unwrap();
+    assert_eq!(audit.totals(), [0, 0, 0]);
+
+    fs.create_file_path("/new", 0o600).unwrap();
+    fs.sync().unwrap();
+    assert!(!fs.deferred_commit.lock().raw_mount_reanchor_pending);
+    assert!(audit.totals()[0] > 0, "degraded mutation must reanchor");
+    fs.mark_clean_unmount().unwrap();
+    drop(fs);
+    let fs = ArgosFs::open_loop(present, false).unwrap();
+    assert_eq!(fs.read_file("/archive", false).unwrap(), b"durable archive");
+    assert_eq!(fs.read_file("/new", false).unwrap(), b"");
+    assert_eq!(fs.transaction_report().unwrap().invalid_entries, 0);
+}

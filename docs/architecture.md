@@ -215,6 +215,11 @@ An offline rebuild may move a missing member's shards to surviving members.
 When the original member returns online, unmount the pool and run
 `argosfs rebalance --devices <comma-separated-members> --member <disk-id>`.
 Use `--images` for a loop pool and `--max-shards N` for a bounded pass.
+Use `--path /repository` to restrict the pass to a file or directory subtree,
+`--min-inode` / `--max-inode` for an inclusive inode range, and `--prefer-data`
+to select systematic data shards before eligible parity shards. The JSON report
+separates data and parity moves. These filters do not override capacity, tier,
+or failure-domain constraints.
 This moves verified encoded shards onto the target without rewriting files,
 changing encryption or duplicating a stripe on one member. Old extents are
 reclaimed only by the durable metadata transaction. It balances by capacity

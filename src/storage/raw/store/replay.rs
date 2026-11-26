@@ -134,7 +134,8 @@ pub(super) fn scan_journal_metadata(
         }
         member.readable = true;
         let mut cursor = RAW_HEADER_SIZE as u64;
-        let end = get_u64(&header, 24)?.min(sb.journal.length);
+        let declared_end = get_u64(&header, 24)?;
+        let end = declared_end.min(sb.journal.length);
         member.journal_end = end;
         while cursor + 36 <= end {
             let mut entry_header = [0u8; 36];
@@ -396,6 +397,12 @@ pub(super) fn scan_journal_metadata(
                 }
             }
             cursor += 36 + len as u64;
+        }
+        // A short trailing fragment (or out-of-range end pointer) must
+        // not be accepted as an appendable, fully verified replay chain.
+        if report.invalid_entries == invalid_before && (declared_end != end || cursor != end) {
+            report.invalid_entries += 1;
+            member.error = Some("raw journal ends outside a complete record".into());
         }
         member.valid_entries = report.valid_entries.saturating_sub(valid_before);
         member.invalid_entries = report.invalid_entries.saturating_sub(invalid_before);

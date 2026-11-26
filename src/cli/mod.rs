@@ -807,6 +807,10 @@ pub fn run() -> Result<()> {
             storage,
             member,
             max_shards,
+            path,
+            min_inode,
+            max_inode,
+            prefer_data,
         } => {
             let default_backend = if root.is_some() {
                 BackendKind::Host
@@ -824,7 +828,16 @@ pub fn run() -> Result<()> {
             let fs = open_backend(root, storage.backend, storage.images, storage.devices, true)?;
             validate_requested_pool(&fs, storage.pool.as_deref())?;
             if let Some(member) = member {
-                let report = fs.rebalance_member(&member, max_shards.unwrap_or(usize::MAX))?;
+                let report = fs.rebalance_member_with_options(
+                    &member,
+                    max_shards.unwrap_or(usize::MAX),
+                    &crate::volume::MemberBalanceOptions {
+                        path,
+                        min_inode,
+                        max_inode,
+                        prefer_data,
+                    },
+                )?;
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
                 let rewritten = fs.rebalance()?;

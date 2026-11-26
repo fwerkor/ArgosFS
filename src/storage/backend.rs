@@ -33,6 +33,11 @@ pub trait StorageBackend: Send + Sync {
     fn read_shard_at(&self, device_id: &DeviceId, offset: u64, buf: &mut [u8]) -> Result<()> {
         self.read_at(device_id, offset, buf)
     }
+    /// Read an explicitly sized checkpoint range without speculative readahead.
+    /// Checkpoint readers already batch contiguous pages themselves.
+    fn read_recovery_at(&self, device_id: &DeviceId, offset: u64, buf: &mut [u8]) -> Result<()> {
+        self.read_shard_at(device_id, offset, buf)
+    }
     fn write_at(&self, device_id: &DeviceId, offset: u64, data: &[u8]) -> Result<()>;
     fn flush_device(&self, device_id: &DeviceId) -> Result<()>;
     fn flush_all(&self) -> Result<()>;
