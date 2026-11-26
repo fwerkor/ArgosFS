@@ -52,5 +52,6 @@ codegen-units = 1
 strip = "symbols"
 
 [workspace]
-# The standalone libFuzzer package is not a workspace member.
-exclude = ["fuzz"]
+# The standalone libFuzzer package and the out-of-tree ztest harness are not
+# workspace members.
+exclude = ["fuzz", "ztest"]

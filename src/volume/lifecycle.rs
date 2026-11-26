@@ -196,6 +196,32 @@ impl ArgosFs {
         Self::open_block_backend(BackendKind::RawBlock, devices, write)
     }
 
+    /// Open a loop-image pool through a caller-supplied backend wrapper.
+    ///
+    /// This is a test-only seam for out-of-tree fault-injection harnesses. The
+    /// wrapper is installed before journal recovery, so it covers mount-time
+    /// reads as well as mounted I/O. Normal callers should use [`Self::open_loop`].
+    #[doc(hidden)]
+    pub fn open_loop_with_backend<F>(images: &[PathBuf], write: bool, wrap: F) -> Result<Self>
+    where
+        F: FnOnce(Arc<dyn StorageBackend>) -> Arc<dyn StorageBackend>,
+    {
+        Self::open_block_backend_with_report_and(BackendKind::LoopBlock, images, write, wrap)
+            .map(|(fs, _)| fs)
+    }
+
+    /// Open a raw-device pool through a caller-supplied backend wrapper.
+    ///
+    /// See [`Self::open_loop_with_backend`].
+    #[doc(hidden)]
+    pub fn open_raw_with_backend<F>(devices: &[PathBuf], write: bool, wrap: F) -> Result<Self>
+    where
+        F: FnOnce(Arc<dyn StorageBackend>) -> Arc<dyn StorageBackend>,
+    {
+        Self::open_block_backend_with_report_and(BackendKind::RawBlock, devices, write, wrap)
+            .map(|(fs, _)| fs)
+    }
+
     pub(super) fn create_block_backend(
         kind: BackendKind,
         paths: &[PathBuf],
@@ -338,7 +364,19 @@ impl ArgosFs {
         paths: &[PathBuf],
         write: bool,
     ) -> Result<(Self, Option<TransactionReport>)> {
-        let opened = raw_store::open_pool(kind, paths, write)?;
+        Self::open_block_backend_with_report_and(kind, paths, write, |backend| backend)
+    }
+
+    fn open_block_backend_with_report_and<F>(
+        kind: BackendKind,
+        paths: &[PathBuf],
+        write: bool,
+        wrap: F,
+    ) -> Result<(Self, Option<TransactionReport>)>
+    where
+        F: FnOnce(Arc<dyn StorageBackend>) -> Arc<dyn StorageBackend>,
+    {
+        let opened = raw_store::open_pool_with_backend(kind, paths, write, wrap)?;
         // Removed devices may have been examined during discovery but are
         // excluded by a normal transaction audit. Do not reuse that report.
         let report = (!write
