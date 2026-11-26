@@ -328,7 +328,30 @@ impl ArgosFs {
         paths: &[PathBuf],
         write: bool,
     ) -> Result<Self> {
+        Self::open_block_backend_with_report(kind, paths, write).map(|(fs, _)| fs)
+    }
+
+    /// Return the open-time audit only for a healthy, complete read-only
+    /// discovery. Callers must consume it immediately before any mutation.
+    pub(crate) fn open_block_backend_with_report(
+        kind: BackendKind,
+        paths: &[PathBuf],
+        write: bool,
+    ) -> Result<(Self, Option<TransactionReport>)> {
         let opened = raw_store::open_pool(kind, paths, write)?;
+        // Removed devices may have been examined during discovery but are
+        // excluded by a normal transaction audit. Do not reuse that report.
+        let report = (!write
+            && opened.recovery_verified
+            && opened.report.errors.is_empty()
+            && opened.report.metadata_candidates.len() == opened.superblocks.len() * 2
+            && opened
+                .metadata
+                .disks
+                .values()
+                .all(|d| d.status == DiskStatus::Online)
+            && opened.superblocks.len() == opened.metadata.disks.len())
+        .then_some(opened.report);
         let reanchor_can_wait = opened.recovery_verified
             && opened.superblocks.len()
                 == opened
@@ -359,6 +382,7 @@ impl ArgosFs {
             reanchor_can_wait,
             durable_metadata,
         )
+        .map(|fs| (fs, report))
     }
 
     pub(super) fn from_block_parts(

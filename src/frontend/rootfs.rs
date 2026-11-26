@@ -1,5 +1,5 @@
 use crate::error::{ArgosError, Result};
-use crate::types::{BackendKind, DiskStatus, Metadata, NodeKind};
+use crate::types::{BackendKind, DiskStatus, Metadata, NodeKind, TransactionReport};
 use crate::ArgosFs;
 use serde::Serialize;
 
@@ -92,7 +92,15 @@ pub fn preflight_root(backend: BackendKind, mode: RootMountMode, degraded: bool)
 }
 
 pub fn preflight_volume(fs: &ArgosFs, mode: RootMountMode) -> Result<RootPreflightReport> {
-    let report = preflight_report(fs, mode);
+    preflight_volume_from_open(fs, mode, None)
+}
+
+pub(crate) fn preflight_volume_from_open(
+    fs: &ArgosFs,
+    mode: RootMountMode,
+    open_report: Option<TransactionReport>,
+) -> Result<RootPreflightReport> {
+    let report = preflight_report_from_open(fs, mode, open_report);
     if report.ok {
         Ok(report)
     } else {
@@ -101,6 +109,14 @@ pub fn preflight_volume(fs: &ArgosFs, mode: RootMountMode) -> Result<RootPreflig
 }
 
 pub fn preflight_report(fs: &ArgosFs, mode: RootMountMode) -> RootPreflightReport {
+    preflight_report_from_open(fs, mode, None)
+}
+
+pub(crate) fn preflight_report_from_open(
+    fs: &ArgosFs,
+    mode: RootMountMode,
+    open_report: Option<TransactionReport>,
+) -> RootPreflightReport {
     let meta = fs.metadata_snapshot();
     let backend = meta.backend;
     // A member marked Removed has already been rewritten out of the pool by
@@ -168,7 +184,10 @@ pub fn preflight_report(fs: &ArgosFs, mode: RootMountMode) -> RootPreflightRepor
 
     let mut replayed = false;
     let mut invalid_journal_entries = 0;
-    match fs.transaction_report() {
+    match open_report
+        .map(Ok)
+        .unwrap_or_else(|| fs.transaction_report())
+    {
         Ok(report) => {
             replayed = report.replayed;
             invalid_journal_entries = report.invalid_entries;

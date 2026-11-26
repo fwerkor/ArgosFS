@@ -395,3 +395,43 @@ fn preflight_report_classifies_invalid_journal_as_rw_error_and_ro_warning() {
         .iter()
         .any(|issue| issue.code == "transaction-audit-warning"));
 }
+
+#[test]
+fn verified_open_report_matches_fresh_preflight_and_degraded_open_falls_back() {
+    let dir = tempdir().unwrap();
+    let images = (0..3)
+        .map(|i| dir.path().join(format!("member-{i}.img")))
+        .collect::<Vec<_>>();
+    let fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            ..Default::default()
+        },
+        32 * 1024 * 1024,
+        "preflight-reuse",
+        false,
+    )
+    .unwrap();
+    create_switch_root_dirs(&fs);
+    fs.sync().unwrap();
+    fs.mark_clean_unmount().unwrap();
+    drop(fs);
+    let (fs, report) =
+        ArgosFs::open_block_backend_with_report(BackendKind::LoopBlock, &images, false).unwrap();
+    assert!(report.is_some());
+    let reused = preflight_report_from_open(&fs, RootMountMode::ReadWrite, report);
+    let fresh = preflight_report(&fs, RootMountMode::ReadWrite);
+    assert!(fresh.ok);
+    assert_eq!(
+        serde_json::to_value(reused).unwrap(),
+        serde_json::to_value(fresh).unwrap()
+    );
+    drop(fs);
+    let (fs, report) =
+        ArgosFs::open_block_backend_with_report(BackendKind::LoopBlock, &images[..2], false)
+            .unwrap();
+    assert!(report.is_none());
+    assert!(preflight_report_from_open(&fs, RootMountMode::DegradedReadOnly, report).degraded);
+}
