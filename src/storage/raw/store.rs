@@ -71,6 +71,8 @@ const RAW_SCAN_RETRY_DELAY: std::time::Duration = std::time::Duration::from_mill
 pub struct RawOpen {
     /// Recovery selected a verified state and all requested dirty flags were written.
     pub recovery_verified: bool,
+    /// Exact recovered v2 image, before device discovery changes live fields.
+    pub(crate) durable_metadata: Option<Metadata>,
     pub backend: Arc<dyn StorageBackend>,
     pub metadata: Metadata,
     pub report: TransactionReport,
@@ -273,6 +275,13 @@ pub fn open_pool(kind: BackendKind, paths: &[PathBuf], write: bool) -> Result<Ra
     // state, but only members named by that selected state may participate in
     // subsequent writable fanout or be exposed to the mounted volume.
     let superblocks = metadata_member_superblocks(&superblocks, &metadata);
+    let durable_metadata = (write
+        && metadata.integrity.hash_scheme == Some(journal::DELTA_INTEGRITY_SCHEME)
+        && metadata.integrity.meta_hash.len() == 64
+        && superblocks
+            .iter()
+            .all(|sb| sb.required_feature_flags & REQUIRED_FEATURE_DELTA_INTEGRITY != 0))
+    .then(|| metadata.clone());
     let present = superblocks
         .iter()
         .map(|sb| sb.disk_id.clone())
@@ -322,6 +331,7 @@ pub fn open_pool(kind: BackendKind, paths: &[PathBuf], write: bool) -> Result<Ra
     }
     Ok(RawOpen {
         recovery_verified,
+        durable_metadata,
         backend,
         metadata,
         report,
