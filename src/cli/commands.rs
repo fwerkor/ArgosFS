@@ -601,8 +601,19 @@ pub(super) enum Command {
         #[arg(long)]
         member: Option<String>,
     },
-    #[command(about = "Redistribute host-backend files across disks")]
-    Rebalance { root: PathBuf },
+    #[command(about = "Redistribute files or return a raw member to service")]
+    Rebalance {
+        /// Host-backend volume directory. Omit for loop/raw selectors.
+        root: Option<PathBuf>,
+        #[command(flatten)]
+        storage: PoolArgs,
+        /// Rebalance encoded shards onto this online raw/loop member (unmount first).
+        #[arg(long)]
+        member: Option<String>,
+        /// Bound a member rebalance pass to this many shard moves.
+        #[arg(long, requires = "member")]
+        max_shards: Option<usize>,
+    },
     #[command(about = "Migrate data to a new k+m erasure layout")]
     Reshape {
         /// Host-backend volume directory. Omit for loop/raw selectors.

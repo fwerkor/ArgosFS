@@ -812,12 +812,39 @@ pub fn run() -> Result<()> {
             fs.finish_maintenance_verification(&mut report);
             print_fsck_report(&report, json)?;
         }
-        Command::Rebalance { root } => {
-            let rewritten = ArgosFs::open(root)?.rebalance()?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&serde_json::json!({"rewritten_files": rewritten}))?
-            );
+        Command::Rebalance {
+            root,
+            storage,
+            member,
+            max_shards,
+        } => {
+            let default_backend = if root.is_some() {
+                BackendKind::Host
+            } else {
+                BackendKind::LoopBlock
+            };
+            let storage = storage.resolve(default_backend)?;
+            validate_root_backend(root.as_deref(), storage.backend)?;
+            if storage.backend != BackendKind::Host && member.is_none() {
+                bail!("raw/loop rebalance requires --member");
+            }
+            if storage.backend == BackendKind::Host && member.is_some() {
+                bail!("--member is only supported for raw/loop storage");
+            }
+            let fs = open_backend(root, storage.backend, storage.images, storage.devices, true)?;
+            validate_requested_pool(&fs, storage.pool.as_deref())?;
+            if let Some(member) = member {
+                let report = fs.rebalance_member(&member, max_shards.unwrap_or(usize::MAX))?;
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                let rewritten = fs.rebalance()?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({"rewritten_files": rewritten})
+                    )?
+                );
+            }
         }
         Command::Reshape {
             root,
