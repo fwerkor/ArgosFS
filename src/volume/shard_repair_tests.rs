@@ -325,7 +325,7 @@ fn raw_fsck_reclaims_unreferenced_extents_and_preserves_live_data() {
     let images = (0..3)
         .map(|i| dir.path().join(format!("reclaim-{i}.img")))
         .collect::<Vec<_>>();
-    let fs = ArgosFs::create_loop(
+    let mut fs = ArgosFs::create_loop(
         &images,
         VolumeConfig {
             k: 2,
@@ -353,6 +353,16 @@ fn raw_fsck_reclaims_unreferenced_extents_and_preserves_live_data() {
             generation,
         )
         .unwrap();
+        // Persist actual bytes in the orphaned range, not just a synthetic
+        // allocator entry. Model a durable allocation with no inode owner.
+        fs.backend
+            .write_at(
+                &extent.disk_id,
+                extent.offset,
+                &vec![0xa5; extent.length as usize],
+            )
+            .unwrap();
+        fs.backend.flush_device(&extent.disk_id).unwrap();
         fs.commit_locked(&mut meta, "test-unreferenced-allocation", json!({}))
             .unwrap();
         extent
@@ -361,7 +371,9 @@ fn raw_fsck_reclaims_unreferenced_extents_and_preserves_live_data() {
     let check = fs.fsck(false, false).unwrap();
     assert_eq!(check.orphan_extent_bytes, lost.length);
     assert_eq!(check.reclaimed_extent_bytes, 0);
-    fs.mark_clean_unmount().unwrap();
+    // Simulate loss of the daemon after durable publication, before clean
+    // unmount. The allocator leak must remain discoverable after replay.
+    fs.backend_writable = false;
     drop(fs);
 
     let readonly = ArgosFs::open_loop(&images, false).unwrap();
