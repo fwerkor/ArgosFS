@@ -121,6 +121,7 @@ mod deferred_flush_tests;
 mod helpers;
 mod maintenance;
 mod maintenance_key;
+mod member_balance;
 mod metadata_budget;
 mod namespace;
 mod read_advisory;
@@ -147,6 +148,7 @@ mod stripe_fanout_tests;
 pub use autopilot::{AutopilotConfig, ReshapeReport};
 pub(crate) use capacity::CapacitySnapshot;
 use helpers::*;
+pub use member_balance::MemberBalanceReport;
 use namespace::*;
 
 #[derive(Clone, Debug)]

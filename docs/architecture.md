@@ -200,3 +200,16 @@ For CapOS rootfs, initramfs runs `scan`, optional `replay-journal`, optional
 `fsck`, `preflight-root`, then `mount-root` at `/sysroot`, verifies an init
 binary, and uses `switch_root`. The post-switch systemd assets provide health,
 watchdog, and recovery hooks around the same CLI preflight/fsck path.
+
+### Returning raw members to service
+
+An offline rebuild may move a missing member's shards to surviving members.
+When the original member returns online, unmount the pool and run
+`argosfs rebalance --devices <comma-separated-members> --member <disk-id>`.
+Use `--images` for a loop pool and `--max-shards N` for a bounded pass.
+This moves verified encoded shards onto the target without rewriting files,
+changing encryption or duplicating a stripe on one member. Old extents are
+reclaimed only by the durable metadata transaction. It balances by capacity
+within a storage tier and does not reduce failure-domain diversity. A pass may
+stop short of the average if no safe placement is available; scrub separately
+to repair actual damage. The operation is deliberately not a mount side effect.
