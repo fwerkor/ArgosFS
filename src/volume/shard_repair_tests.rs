@@ -361,6 +361,22 @@ fn raw_fsck_reclaims_unreferenced_extents_and_preserves_live_data() {
     let check = fs.fsck(false, false).unwrap();
     assert_eq!(check.orphan_extent_bytes, lost.length);
     assert_eq!(check.reclaimed_extent_bytes, 0);
+    fs.mark_clean_unmount().unwrap();
+    drop(fs);
+
+    let readonly = ArgosFs::open_loop(&images, false).unwrap();
+    assert!(matches!(
+        readonly.fsck(false, true),
+        Err(ArgosError::ReadonlyRequired(_))
+    ));
+    assert_eq!(
+        readonly.fsck(false, false).unwrap().orphan_extent_bytes,
+        lost.length
+    );
+    assert_eq!(readonly.read_file("/file", false).unwrap(), payload);
+    drop(readonly);
+
+    let fs = ArgosFs::open_loop(&images, true).unwrap();
     let fixed = fs.fsck(false, true).unwrap();
     assert_eq!(fixed.reclaimed_extent_bytes, lost.length);
     assert_eq!(fs.fsck(false, false).unwrap().orphan_extent_bytes, 0);
@@ -368,6 +384,9 @@ fn raw_fsck_reclaims_unreferenced_extents_and_preserves_live_data() {
     fs.mark_clean_unmount().unwrap();
     drop(fs);
     let fs = ArgosFs::open_loop(&images, false).unwrap();
-    assert_eq!(fs.fsck(false, false).unwrap().orphan_extent_bytes, 0);
+    let checked = fs.fsck(true, true).unwrap();
+    assert!(checked.errors.is_empty(), "{checked:?}");
+    assert_eq!(checked.orphan_extent_bytes, 0);
+    assert_eq!(checked.reclaimed_extent_bytes, 0);
     assert_eq!(fs.read_file("/file", false).unwrap(), payload);
 }
