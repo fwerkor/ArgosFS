@@ -330,7 +330,7 @@ impl VerifyAfterWrite {
                     self.finish(&op);
                     return;
                 }
-                match backend.read_at(&op.disk_id, op.offset, &mut data) {
+                match backend.read_shard_at(&op.disk_id, op.offset, &mut data) {
                     Ok(()) if content_hash_matches(&data, &op.hash) => None,
                     Ok(()) => Some("content hash mismatch".to_string()),
                     Err(err) => Some(format!("read failed: {err}")),

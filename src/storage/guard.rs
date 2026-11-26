@@ -230,6 +230,37 @@ impl GuardedBackend {
     }
 }
 
+impl GuardedBackend {
+    fn read_with_policy(
+        &self,
+        device_id: &String,
+        offset: u64,
+        buf: &mut [u8],
+        shard: bool,
+    ) -> Result<()> {
+        let inner = self.inner.clone();
+        let id = device_id.clone();
+        let length = buf.len();
+        let data = self.run(device_id, "read", move || {
+            let mut data = vec![0u8; length];
+            if shard {
+                inner.read_shard_at(&id, offset, &mut data)?;
+            } else {
+                inner.read_at(&id, offset, &mut data)?;
+            }
+            Ok(data)
+        })?;
+        if data.len() != buf.len() {
+            return Err(ArgosError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("short read on {device_id} at offset {offset}"),
+            )));
+        }
+        buf.copy_from_slice(&data);
+        Ok(())
+    }
+}
+
 impl StorageBackend for GuardedBackend {
     fn backend_kind(&self) -> BackendKind {
         self.inner.backend_kind()
@@ -247,22 +278,11 @@ impl StorageBackend for GuardedBackend {
     }
 
     fn read_at(&self, device_id: &String, offset: u64, buf: &mut [u8]) -> Result<()> {
-        let inner = self.inner.clone();
-        let id = device_id.clone();
-        let length = buf.len();
-        let data = self.run(device_id, "read", move || {
-            let mut data = vec![0u8; length];
-            inner.read_at(&id, offset, &mut data)?;
-            Ok(data)
-        })?;
-        if data.len() != buf.len() {
-            return Err(ArgosError::Io(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                format!("short read on {device_id} at offset {offset}"),
-            )));
-        }
-        buf.copy_from_slice(&data);
-        Ok(())
+        self.read_with_policy(device_id, offset, buf, false)
+    }
+
+    fn read_shard_at(&self, device_id: &String, offset: u64, buf: &mut [u8]) -> Result<()> {
+        self.read_with_policy(device_id, offset, buf, true)
     }
 
     fn write_at(&self, device_id: &String, offset: u64, data: &[u8]) -> Result<()> {
