@@ -61,17 +61,20 @@ impl Oracle {
             Ok(mut file) => {
                 let mut data = Vec::new();
                 file.read_to_end(&mut data)?;
-                serde_json::from_slice(&data).map_err(|err| {
+                let oracle: Self = serde_json::from_slice(&data).map_err(|err| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("oracle {} is not valid JSON: {err}", path.display()),
                     )
-                })
+                })?;
+                if oracle.version != ORACLE_VERSION {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unsupported oracle version",
+                    ));
+                }
+                Ok(oracle)
             }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Self {
-                version: ORACLE_VERSION,
-                epochs: BTreeMap::new(),
-            }),
             Err(err) => Err(err),
         }
     }
@@ -88,7 +91,7 @@ impl Oracle {
             file.sync_all()?;
         }
         fs::rename(&tmp, path)?;
-        sync_dir(parent);
+        sync_dir(parent)?;
         Ok(())
     }
 
@@ -128,10 +131,8 @@ fn temp_path(path: &Path) -> PathBuf {
     tmp
 }
 
-fn sync_dir(path: &Path) {
-    if let Ok(dir) = File::open(path) {
-        let _ = dir.sync_all();
-    }
+fn sync_dir(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
 }
 
 #[cfg(test)]
@@ -143,7 +144,11 @@ mod tests {
     fn oracle_round_trips_and_retires_old_epochs() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("oracle.json");
-        let mut oracle = Oracle::load(&path).unwrap();
+        assert_eq!(
+            Oracle::load(&path).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        let mut oracle = Oracle::default();
         assert_eq!(oracle.next_epoch(), 1);
         oracle.epochs.insert(
             1,

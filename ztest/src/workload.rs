@@ -23,6 +23,7 @@ pub struct WorkerConfig {
     pub files_per_epoch: usize,
     pub keep_epochs: usize,
     pub fault: FaultConfig,
+    pub ready: PathBuf,
 }
 
 struct LocalModel {
@@ -108,7 +109,9 @@ pub fn run_worker(config: WorkerConfig) -> Result<()> {
     ensure_dir(&fs, "/scratch")?;
     let oracle = Oracle::load(&config.oracle)?;
     cleanup_unpublished(&fs, &oracle);
-    let _ = fs.sync();
+    remove_tree(&fs, "/scratch");
+    ensure_dir(&fs, "/scratch")?;
+    fs.sync()?;
     bootstrap_oracle(&fs, &config)?;
     fault.arm();
 
@@ -131,6 +134,8 @@ pub fn run_worker(config: WorkerConfig) -> Result<()> {
             .name(format!("ztest-chaos-{thread_index}"))
             .spawn(move || chaos_loop(fs, config, thread_index))?;
     }
+
+    std::fs::File::create(&config.ready)?;
 
     // The supervisor kills this process with SIGKILL. Never return normally;
     // that would make an early exit look like a successful test.
@@ -221,7 +226,7 @@ fn chaos_loop(fs: ArgosFs, config: WorkerConfig, thread_index: usize) -> ! {
             .seed
             .wrapping_add((thread_index as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
     );
-    let root = format!("/scratch/t{thread_index:02}");
+    let root = format!("/scratch/s{:016x}-t{thread_index:02}", config.seed);
     let _ = fs.mkdir(&root, 0o755);
     let mut model = LocalModel::new();
 
@@ -288,7 +293,7 @@ fn chaos_loop(fs: ArgosFs, config: WorkerConfig, thread_index: usize) -> ! {
                     let size = rng.below(config.max_file_bytes.saturating_add(1)) as u64;
                     if fs.truncate_path(&path, size).is_ok() {
                         if let Some(data) = model.files.get_mut(&path) {
-                            data.truncate(size as usize);
+                            data.resize(size as usize, 0);
                         }
                     }
                 }
@@ -401,7 +406,7 @@ pub fn remove_tree(fs: &ArgosFs, path: &str) {
 pub fn verify_oracle(fs: &ArgosFs, oracle: &Oracle) -> Vec<String> {
     let mut failures = Vec::new();
     for (path, record) in oracle.all_files() {
-        match fs.read_file(path, true) {
+        match fs.read_file(path, false) {
             Ok(data) => {
                 if !record.matches(&data) {
                     failures.push(format!(

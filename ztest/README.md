@@ -27,7 +27,7 @@ The fault backend wraps the normal loop/raw backend:
 | volatile window | holds writes in a userspace write-back window; `SIGKILL` loses them |
 | process kill | supervisor sends `SIGKILL` to the workload child |
 
-Fault decisions are deterministic from `--seed`. Injection is disabled while
+Fault streams derive from `--seed` and cycle number; concurrent operation ordering may vary between runs. Injection is disabled while
 the pool is opened and only armed after mount, so recovery itself is clean; the
 crash is what exercises recovery. By default, durable read/write bit rot is
 restricted to the data region, and metadata/journal write faults run at a lower
@@ -66,8 +66,8 @@ cargo run --release -- run --cycles 2 --min-faults 1 --no-parity-drill
 ```
 
 A typical nightly job can use a fixed seed for replay, or omit it to generate
-one. The JSON summary prints the seed and fault counts. Artifacts (images,
-per-cycle worker logs, fault event log, oracle) are retained on failure and when
+one. The seed and artifact directory are printed at startup, and the JSON summary prints fault counts. An explicit `--work-dir` must not already exist. Artifacts (images,
+per-cycle worker and fault event logs, oracle) are retained on failure and when
 `--keep-work-dir` is set.
 
 Useful fault-rate options are percentages: `--read-error-pct`,

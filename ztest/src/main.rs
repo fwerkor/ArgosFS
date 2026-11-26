@@ -29,7 +29,7 @@ enum Command {
 
 #[derive(Parser)]
 struct RunArgs {
-    /// Directory for images, logs, and the oracle. Removed on success unless --keep-work-dir.
+    /// New directory for images, logs, and the oracle (must not exist). Removed on success unless --keep-work-dir.
     #[arg(long)]
     work_dir: Option<PathBuf>,
     #[arg(long)]

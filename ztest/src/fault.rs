@@ -335,11 +335,12 @@ impl FaultBackend {
         if buf.is_empty() {
             return 0;
         }
-        let flips = 1 + rng.below(self.config.bits_per_flip.max(1));
-        for _ in 0..flips {
-            let position = rng.below(buf.len());
-            let bit = (rng.next_u64() % 8) as u8;
-            buf[position] ^= 1u8 << bit;
+        let bits = buf.len().saturating_mul(8);
+        let flips = 1 + rng.below(self.config.bits_per_flip.max(1).min(bits));
+        let start = rng.below(bits);
+        for step in 0..flips {
+            let position = (start + step) % bits;
+            buf[position / 8] ^= 1u8 << (position % 8);
         }
         flips
     }
@@ -390,8 +391,6 @@ impl FaultBackend {
         } else {
             inner.read_at(device_id, offset, buf)?;
         }
-        apply_pending(&pending, offset, buf);
-
         if durable_bit_rot {
             let flips = {
                 let mut state = self.state();
@@ -402,9 +401,14 @@ impl FaultBackend {
             // the unwrapped inner backend; a second fault decision here would
             // make the corruption non-deterministic.
             inner.write_at(device_id, offset, buf)?;
+            inner.flush_device(device_id)?;
             self.stats.durable_bit_rots.fetch_add(1, Ordering::Relaxed);
             self.event("durable_bit_rot", device_id, offset, flips);
-        } else if transient_flip {
+        }
+        // Pending writes shadow physical media, but must not be accidentally
+        // persisted as a side effect of a durable read-bit-rot fault.
+        apply_pending(&pending, offset, buf);
+        if transient_flip {
             let flips = {
                 let mut state = self.state();
                 let device = Self::device(&mut state, &self.config, device_id);
@@ -423,6 +427,8 @@ impl FaultBackend {
     fn commit_pending(&self, device_id: &DeviceId, state: &mut DeviceState) -> Result<()> {
         let inner = self.inner();
         while !state.pending.is_empty() {
+            let pending = &state.pending[0];
+            inner.write_at(device_id, pending.offset, &pending.data)?;
             let pending = state.pending.remove(0);
             state.pending_bytes = state
                 .pending_bytes
@@ -430,7 +436,6 @@ impl FaultBackend {
             self.stats
                 .pending_write_bytes
                 .fetch_sub(pending.data.len() as u64, Ordering::Relaxed);
-            inner.write_at(device_id, pending.offset, &pending.data)?;
         }
         Ok(())
     }
@@ -569,6 +574,10 @@ impl StorageBackend for FaultBackend {
         if self.config.volatile_window_bytes == 0
             || payload.len() as u64 > self.config.volatile_window_bytes
         {
+            // A large write cannot overtake older overlapping buffered writes.
+            let mut state = self.state();
+            let device = Self::device(&mut state, &self.config, device_id);
+            self.commit_pending(device_id, device)?;
             inner.write_at(device_id, offset, payload)?;
         } else {
             let mut state = self.state();
@@ -582,6 +591,8 @@ impl StorageBackend for FaultBackend {
                 .pending_write_bytes
                 .fetch_add(payload.len() as u64, Ordering::Relaxed);
             while device.pending_bytes > self.config.volatile_window_bytes {
+                let pending = &device.pending[0];
+                inner.write_at(device_id, pending.offset, &pending.data)?;
                 let pending = device.pending.remove(0);
                 device.pending_bytes = device
                     .pending_bytes
@@ -589,7 +600,6 @@ impl StorageBackend for FaultBackend {
                 self.stats
                     .pending_write_bytes
                     .fetch_sub(pending.data.len() as u64, Ordering::Relaxed);
-                inner.write_at(device_id, pending.offset, &pending.data)?;
             }
         }
 
@@ -806,6 +816,7 @@ mod tests {
             durable_bit_rot: 0.0,
             write_error: 0.0,
             write_error_after_write: 0.0,
+            write_bit_rot: 0.0,
             torn_write: 0.0,
             lost_write: 0.0,
             drop_flush: 0.0,
@@ -913,6 +924,19 @@ mod tests {
         fault.flush_device(&"disk-0000".to_string()).unwrap();
         assert_eq!(stats.snapshot().dropped_flushes, 1);
         assert!(inner.bytes("disk-0000")[..12].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn large_write_does_not_overtake_pending_overlap() {
+        let mut config = quiet_config();
+        config.volatile_window_bytes = 8;
+        let (fault, inner, _) = backend(config);
+        let id = "disk-0000".to_string();
+        fault.arm();
+        fault.write_at(&id, 0, b"old").unwrap();
+        fault.write_at(&id, 0, b"new bytes").unwrap();
+        fault.flush_device(&id).unwrap();
+        assert_eq!(&inner.bytes(&id)[..9], b"new bytes");
     }
 
     #[test]

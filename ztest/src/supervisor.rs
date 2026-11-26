@@ -101,21 +101,20 @@ pub fn run(config: RunConfig) -> Result<RunOutcome> {
         Some(path) => path.clone(),
         None => std::env::temp_dir().join(format!("argosfs-ztest-{seed:016x}")),
     };
-    if work_dir.exists() {
-        if config.work_dir.is_some() {
-            fs::remove_dir_all(&work_dir)
-                .with_context(|| format!("remove existing work dir {}", work_dir.display()))?;
-        } else {
-            bail!("work dir already exists: {}", work_dir.display());
-        }
-    }
-    fs::create_dir_all(&work_dir)
-        .with_context(|| format!("create work dir {}", work_dir.display()))?;
+    // Never delete a user-supplied directory, even when it is empty.
+    // Atomic creation also rejects symlinks and concurrent runs.
+    fs::create_dir(&work_dir).with_context(|| {
+        format!(
+            "create fresh work dir {} (must not exist)",
+            work_dir.display()
+        )
+    })?;
+    let work_dir = fs::canonicalize(&work_dir)?;
+    eprintln!("ztest: seed {seed}, work dir {}", work_dir.display());
     let images = (0..config.devices)
         .map(|index| work_dir.join(format!("disk{index}.img")))
         .collect::<Vec<_>>();
     let oracle_path = work_dir.join("oracle.json");
-    let fault_log = work_dir.join("faults.jsonl");
     let worker_config_path = work_dir.join("worker.json");
 
     let volume_config = VolumeConfig {
@@ -134,7 +133,7 @@ pub fn run(config: RunConfig) -> Result<RunOutcome> {
             volume_config,
             config.image_size,
             "argosfs-ztest",
-            true,
+            false,
         )
         .context("create ztest loop pool")?;
         ensure_dir(&fs, "/committed")?;
@@ -156,29 +155,36 @@ pub fn run(config: RunConfig) -> Result<RunOutcome> {
     let mut fault = config.fault.clone();
     fault.seed = seed;
     fault.data_floor = data_floor;
-    let worker_config = WorkerConfig {
+    let mut worker_config = WorkerConfig {
         images: images.clone(),
         oracle: oracle_path.clone(),
-        fault_log: fault_log.clone(),
+        fault_log: work_dir.join("cycle-000.faults.jsonl"),
         seed,
         threads: config.threads,
         max_file_bytes: config.max_file_bytes,
         files_per_epoch: config.files_per_epoch,
         keep_epochs: config.keep_epochs,
         fault,
+        ready: work_dir.join("worker.ready"),
     };
-    fs::write(
-        &worker_config_path,
-        serde_json::to_vec_pretty(&worker_config)?,
-    )
-    .with_context(|| format!("write {}", worker_config_path.display()))?;
     Oracle::default().save(&oracle_path)?;
-    File::create(&fault_log)?;
 
     let executable = std::env::current_exe().context("locate ztest executable")?;
     let mut rng = SupervisorRng::new(seed ^ 0x5A5A_1234_DEAD_BEEF);
     let mut cycles_done = 0usize;
+    let mut faults = BTreeMap::<String, u64>::new();
     for cycle in 0..config.cycles {
+        worker_config.fault_log = work_dir.join(format!("cycle-{cycle:03}.faults.jsonl"));
+        File::create(&worker_config.fault_log)?;
+        worker_config.seed = seed.wrapping_add(cycle as u64);
+        worker_config.fault.seed = worker_config.seed;
+        if worker_config.ready.exists() {
+            fs::remove_file(&worker_config.ready)?;
+        }
+        fs::write(
+            &worker_config_path,
+            serde_json::to_vec_pretty(&worker_config)?,
+        )?;
         let log_path = work_dir.join(format!("cycle-{cycle:03}.worker.log"));
         let stdout = OpenOptions::new()
             .create(true)
@@ -195,9 +201,28 @@ pub fn run(config: RunConfig) -> Result<RunOutcome> {
             .spawn()
             .with_context(|| format!("spawn ztest worker for cycle {cycle}"))?;
 
+        // Do not count a crash during boot as a mounted-workload cycle.
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        while !worker_config.ready.exists() {
+            if let Some(status) = child.try_wait()? {
+                bail!(
+                    "cycle {cycle}: worker exited before readiness: {status}; see {}",
+                    log_path.display()
+                );
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill()?;
+                child.wait()?;
+                bail!(
+                    "cycle {cycle}: worker readiness timed out; see {}",
+                    log_path.display()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let kill_after = rng.between(config.kill_after_min, config.kill_after_max);
         std::thread::sleep(kill_after);
-        let _ = child.kill();
+        child.kill().context("kill ztest worker")?;
         let status = child.wait().context("wait for ztest worker")?;
         if status.signal() != Some(SENTINEL_SIGKILL) {
             let details = fs::read_to_string(&log_path).unwrap_or_default();
@@ -206,6 +231,9 @@ pub fn run(config: RunConfig) -> Result<RunOutcome> {
 
         verify_recovery(&images, &oracle_path, cycle)
             .with_context(|| format!("cycle {cycle} recovery verification"))?;
+        for (kind, count) in summarize_faults(&worker_config.fault_log)? {
+            *faults.entry(kind).or_default() += count;
+        }
         cycles_done += 1;
         eprintln!(
             "ztest: cycle {cycle} killed after {} ms, recovered and verified",
@@ -213,7 +241,6 @@ pub fn run(config: RunConfig) -> Result<RunOutcome> {
         );
     }
 
-    let faults = summarize_faults(&fault_log)?;
     let total_faults: u64 = faults.values().sum();
     if total_faults < config.min_faults {
         bail!(
@@ -244,11 +271,12 @@ pub fn run(config: RunConfig) -> Result<RunOutcome> {
 }
 
 fn validate(config: &RunConfig) -> Result<()> {
-    if config.devices < config.k + config.m {
+    let shards = config.k.checked_add(config.m).context("k+m overflow")?;
+    if config.devices < shards {
         bail!(
             "--devices {} is smaller than k+m {}",
             config.devices,
-            config.k + config.m
+            shards
         );
     }
     if config.k == 0 {
@@ -260,6 +288,12 @@ fn validate(config: &RunConfig) -> Result<()> {
     if config.kill_after_min > config.kill_after_max {
         bail!("--kill-after-ms-min must not exceed --kill-after-ms-max");
     }
+    if config.files_per_epoch == 0 || config.max_file_bytes == 0 || config.keep_epochs == 0 {
+        bail!("file count, maximum file size and retained epochs must be positive");
+    }
+    if config.parity_drill && config.m == 0 {
+        bail!("parity drill requires m > 0; use --no-parity-drill for a parity-free layout");
+    }
     if config.threads == 0 {
         bail!("--threads must be at least 1");
     }
@@ -270,6 +304,9 @@ fn verify_recovery(images: &[PathBuf], oracle_path: &Path, cycle: usize) -> Resu
     let fs = ArgosFs::open_loop(images, true)
         .with_context(|| format!("open pool after cycle {cycle} crash"))?;
     let oracle = Oracle::load(oracle_path)?;
+    if oracle.all_files().next().is_none() {
+        bail!("cycle {cycle}: empty durability oracle");
+    }
     // Remove unreferenced data left by the epoch that was in flight. This is
     // the same offline repair a user would run after a power loss.
     let report = fs
@@ -293,8 +330,13 @@ fn verify_recovery(images: &[PathBuf], oracle_path: &Path, cycle: usize) -> Resu
             failures.join("\n")
         );
     }
-    fs.sync()?;
+    fs.mark_clean_unmount()?;
     drop(fs);
+    let reopened = ArgosFs::open_loop(images, false).context("reopen recovered pool read-only")?;
+    let failures = verify_oracle(&reopened, &oracle);
+    if !failures.is_empty() {
+        bail!("cycle {cycle}: persisted repair/oracle verification failed: {failures:#?}");
+    }
     Ok(())
 }
 
@@ -328,23 +370,27 @@ fn run_parity_drill(images: &[PathBuf], oracle_path: &Path) -> Result<Option<Par
                     else {
                         continue;
                     };
-                    if extent.length == 0 {
+                    if extent.length == 0 || shard.size == 0 {
                         continue;
                     }
                     let Some(disk) = meta.disks.get(&extent.disk_id) else {
                         continue;
                     };
-                    let disk_path = if disk.path.is_absolute() {
-                        disk.path.clone()
-                    } else {
-                        fs.root().join(&disk.path)
-                    };
+                    // Only corrupt a backing file created by this run, never
+                    // an arbitrary path read from recovered metadata.
+                    let disk_path = fs::canonicalize(&disk.path)?;
+                    if !images.contains(&disk_path) {
+                        bail!(
+                            "parity drill selected a path outside the test pool: {}",
+                            disk_path.display()
+                        );
+                    }
                     candidate = Some((
                         path.clone(),
                         extent.disk_id.clone(),
                         disk_path,
                         extent.offset,
-                        extent.length,
+                        extent.length.min(shard.size as u64),
                     ));
                     break 'paths;
                 }
@@ -359,25 +405,29 @@ fn run_parity_drill(images: &[PathBuf], oracle_path: &Path) -> Result<Option<Par
     };
 
     let payload_len = length.min(4096) as usize;
-    let payload = vec![0xA5u8; payload_len.max(1)];
+    let mut payload = vec![0u8; payload_len];
     let damage_offset = offset + (length.saturating_sub(payload.len() as u64)) / 2;
     {
         let file = OpenOptions::new()
+            .read(true)
             .write(true)
             .open(&disk_path)
             .with_context(|| format!("open backing image {}", disk_path.display()))?;
-        file.write_at(&payload, damage_offset).with_context(|| {
-            format!(
-                "damage raw shard at {damage_offset} on {}",
-                disk_path.display()
-            )
-        })?;
+        file.read_exact_at(&mut payload, damage_offset)?;
+        payload[0] ^= 1;
+        file.write_all_at(&payload, damage_offset)
+            .with_context(|| {
+                format!(
+                    "damage raw shard at {damage_offset} on {}",
+                    disk_path.display()
+                )
+            })?;
         file.sync_all()?;
     }
 
     let fs = ArgosFs::open_loop(images, true).context("reopen pool for parity drill")?;
     let report = fs.scrub().context("scrub after parity drill damage")?;
-    if report.damaged_files == 0 || report.repaired_files == 0 {
+    if report.damaged_files == 0 || report.repaired_files == 0 || report.reconstructed_shards == 0 {
         bail!(
             "parity drill damage was not detected and repaired: damaged={} repaired={} errors={:#?}",
             report.damaged_files,
@@ -385,7 +435,7 @@ fn run_parity_drill(images: &[PathBuf], oracle_path: &Path) -> Result<Option<Par
             report.errors
         );
     }
-    if report.unrecoverable_files != 0 {
+    if report.unrecoverable_files != 0 || !report.errors.is_empty() {
         bail!(
             "parity drill made {} file(s) unrecoverable: {:#?}",
             report.unrecoverable_files,
@@ -401,8 +451,20 @@ fn run_parity_drill(images: &[PathBuf], oracle_path: &Path) -> Result<Option<Par
             failures.join("\n")
         );
     }
-    fs.sync()?;
+    fs.mark_clean_unmount()?;
     drop(fs);
+    let reopened = ArgosFs::open_loop(images, false).context("reopen parity-repaired pool")?;
+    let persisted = reopened.fsck(false, false)?;
+    if persisted.damaged_files != 0
+        || persisted.unrecoverable_files != 0
+        || !persisted.errors.is_empty()
+    {
+        bail!("parity repair did not persist: {persisted:#?}");
+    }
+    let failures = verify_oracle(&reopened, &oracle);
+    if !failures.is_empty() {
+        bail!("persisted parity repair violated oracle: {failures:#?}");
+    }
     Ok(Some(ParityDrillReport {
         path,
         disk_id,
@@ -415,7 +477,7 @@ fn run_parity_drill(images: &[PathBuf], oracle_path: &Path) -> Result<Option<Par
 }
 
 fn summarize_faults(path: &Path) -> Result<BTreeMap<String, u64>> {
-    let text = fs::read_to_string(path).unwrap_or_default();
+    let text = fs::read_to_string(path)?;
     let mut counts = BTreeMap::new();
     for line in text.lines() {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -423,6 +485,9 @@ fn summarize_faults(path: &Path) -> Result<BTreeMap<String, u64>> {
             continue;
         };
         if let Some(kind) = value.get("kind").and_then(|kind| kind.as_str()) {
+            if kind == "dropped_pending" {
+                continue;
+            }
             *counts.entry(kind.to_string()).or_insert(0) += 1;
         }
     }
