@@ -655,7 +655,7 @@ pub(super) fn read_metadata_candidates(
     backend: &dyn StorageBackend,
     sb: &RawSuperblock,
 ) -> Result<Vec<(Option<Arc<Metadata>>, MetadataCandidateReport)>> {
-    read_metadata_candidates_cached(backend, sb, &mut BTreeMap::new())
+    read_metadata_candidates_cached(backend, sb, &parking_lot::Mutex::new(BTreeMap::new()))
 }
 
 // This cache exists only during one recovery. Its key covers the entire slot
@@ -664,7 +664,7 @@ pub(super) fn read_metadata_candidates(
 pub(super) fn read_metadata_candidates_cached(
     backend: &dyn StorageBackend,
     sb: &RawSuperblock,
-    decoded: &mut BTreeMap<String, Arc<Metadata>>,
+    decoded: &parking_lot::Mutex<BTreeMap<String, Arc<Metadata>>>,
 ) -> Result<Vec<(Option<Arc<Metadata>>, MetadataCandidateReport)>> {
     let slot_len = sb.metadata.length / 2;
     let mut out = Vec::new();
@@ -684,6 +684,9 @@ pub(super) fn read_metadata_candidates_cached(
                 let candidate = (|| -> Result<Arc<Metadata>> {
                     let bytes = read_metadata_payload(backend, sb, offset, slot_len, &header)?;
                     let key = sha256_hex(&header);
+                    // Physical reads and hashing overlap across members. Only
+                    // deserialization/cache publication is serialized.
+                    let mut decoded = decoded.lock();
                     if let Some(metadata) = decoded.get(&key) {
                         return Ok(metadata.clone());
                     }
@@ -836,7 +839,7 @@ pub(super) fn read_tree_metadata_candidate(
     let page_count = checked_usize(get_u64(header, 152)?, "raw metadata page count")?;
     let index_len = checked_usize(get_u64(header, 160)?, "raw metadata index length")?;
     let index_hash = get_fixed_hex(header, 168, HASH_HEX_LEN)?;
-    if len == 0 {
+    if len == 0 || len as u64 > slot_len.saturating_sub(RAW_HEADER_SIZE as u64) {
         return Err(ArgosError::CorruptedMetadata(
             "invalid raw metadata length".to_string(),
         ));

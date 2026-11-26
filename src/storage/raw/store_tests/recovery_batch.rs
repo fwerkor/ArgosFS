@@ -7,6 +7,7 @@ struct CountingRecoveryReads {
     first_body_byte: u64,
     last_body_byte: u64,
     body_calls: AtomicUsize,
+    overlap: Option<(AtomicUsize, AtomicUsize)>,
 }
 
 impl StorageBackend for CountingRecoveryReads {
@@ -20,6 +21,14 @@ impl StorageBackend for CountingRecoveryReads {
         if device == &self.device && offset >= self.first_body_byte && offset < self.last_body_byte
         {
             self.body_calls.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some((active, peak)) = &self.overlap {
+            let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(count, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(15));
+            let result = self.inner.read_at(device, offset, bytes);
+            active.fetch_sub(1, Ordering::SeqCst);
+            return result;
         }
         self.inner.read_at(device, offset, bytes)
     }
@@ -163,6 +172,7 @@ fn recovery_reads_checkpoint_in_large_batches_and_verifies_each_page() {
         first_body_byte: slot + data_start,
         last_body_byte: slot + data_start + bytes.len() as u64,
         body_calls: AtomicUsize::new(0),
+        overlap: None,
     };
     let result =
         read_tree_metadata_candidate(&counted, sb, slot, sb.metadata.length / 2, &header).unwrap();
@@ -276,6 +286,7 @@ fn journal_tip_scans_all_records_using_bounded_contiguous_reads() {
         first_body_byte: start,
         last_body_byte: start + body.len() as u64,
         body_calls: AtomicUsize::new(0),
+        overlap: None,
     };
     assert_eq!(
         journal_tip_identity(&counted, sb).unwrap(),
@@ -295,4 +306,28 @@ fn journal_tip_scans_all_records_using_bounded_contiguous_reads() {
         journal_tip_identity(&counted, sb),
         Err(ArgosError::Checksum(_))
     ));
+}
+
+#[test]
+fn checkpoint_recovery_overlaps_members_and_shares_decoded_images() {
+    let (_dir, images, base, superblocks) = quorum_fixture();
+    let backend = CountingRecoveryReads {
+        inner: block_backend_for(&images),
+        device: String::new(),
+        first_body_byte: 0,
+        last_body_byte: 0,
+        body_calls: AtomicUsize::new(0),
+        overlap: Some((AtomicUsize::new(0), AtomicUsize::new(0))),
+    };
+    let candidates = read_all_checkpoint_candidates(&backend, &superblocks).unwrap();
+    assert_eq!(candidates.len(), superblocks.len() * 2);
+    let (_, peak) = backend.overlap.as_ref().unwrap();
+    assert!(peak.load(Ordering::SeqCst) >= 2);
+    let shared = candidates[0].1.as_ref().unwrap();
+    for (id, (disk, candidate, report)) in candidates.iter().enumerate() {
+        assert_eq!(disk, &superblocks[id / 2].disk_id);
+        assert!(report.valid);
+        assert!(Arc::ptr_eq(shared, candidate.as_ref().unwrap()));
+        assert_eq!(report.txid, base.txid);
+    }
 }
