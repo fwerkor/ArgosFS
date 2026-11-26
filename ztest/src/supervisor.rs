@@ -5,10 +5,10 @@ use crate::fault::FaultConfig;
 use crate::oracle::Oracle;
 use crate::workload::{cleanup_unpublished, ensure_dir, remove_tree, verify_oracle, WorkerConfig};
 use anyhow::{bail, Context, Result};
-use argosfs::types::{BackendKind, Compression, VolumeConfig};
+use argosfs::types::{BackendKind, Compression, FsckReport, Metadata, ShardLocation, VolumeConfig};
 use argosfs::ArgosFs;
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::os::unix::process::ExitStatusExt;
@@ -26,6 +26,10 @@ pub struct RunOutcome {
     pub faults: BTreeMap<String, u64>,
     pub total_faults: u64,
     pub recovered: bool,
+    /// Committed files retired because the fault model destroyed more shards
+    /// than the pool's parity budget could reconstruct.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub expected_loss: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parity_drill: Option<ParityDrillReport>,
 }
@@ -172,6 +176,7 @@ pub fn run(config: RunConfig) -> Result<RunOutcome> {
     let executable = std::env::current_exe().context("locate ztest executable")?;
     let mut rng = SupervisorRng::new(seed ^ 0x5A5A_1234_DEAD_BEEF);
     let mut cycles_done = 0usize;
+    let mut expected_loss = Vec::new();
     let mut faults = BTreeMap::<String, u64>::new();
     for cycle in 0..config.cycles {
         worker_config.fault_log = work_dir.join(format!("cycle-{cycle:03}.faults.jsonl"));
@@ -229,8 +234,10 @@ pub fn run(config: RunConfig) -> Result<RunOutcome> {
             bail!("cycle {cycle}: worker exited before SIGKILL with {status:?}\n{details}");
         }
 
-        verify_recovery(&images, &oracle_path, cycle)
-            .with_context(|| format!("cycle {cycle} recovery verification"))?;
+        expected_loss.extend(
+            verify_recovery(&images, &oracle_path, &worker_config.fault_log, cycle)
+                .with_context(|| format!("cycle {cycle} recovery verification"))?,
+        );
         for (kind, count) in summarize_faults(&worker_config.fault_log)? {
             *faults.entry(kind).or_default() += count;
         }
@@ -262,6 +269,7 @@ pub fn run(config: RunConfig) -> Result<RunOutcome> {
         faults,
         total_faults,
         recovered: true,
+        expected_loss,
         parity_drill,
     };
     if !config.keep_work_dir {
@@ -300,12 +308,24 @@ fn validate(config: &RunConfig) -> Result<()> {
     Ok(())
 }
 
-fn verify_recovery(images: &[PathBuf], oracle_path: &Path, cycle: usize) -> Result<()> {
+fn verify_recovery(
+    images: &[PathBuf],
+    oracle_path: &Path,
+    fault_log: &Path,
+    cycle: usize,
+) -> Result<Vec<String>> {
     let fs = ArgosFs::open_loop(images, true)
         .with_context(|| format!("open pool after cycle {cycle} crash"))?;
-    let oracle = Oracle::load(oracle_path)?;
+    let mut oracle = Oracle::load(oracle_path)?;
     if oracle.all_files().next().is_none() {
         bail!("cycle {cycle}: empty durability oracle");
+    }
+    let mut oracle_inodes = BTreeMap::new();
+    for (path, _) in oracle.all_files() {
+        let inode = fs
+            .resolve_path(path, true)
+            .with_context(|| format!("resolve committed path {path}"))?;
+        oracle_inodes.insert(inode, path.clone());
     }
     // Scratch and unpublished epochs are disposable by design: a crash may
     // leave a partial epoch, and scratch mutations may legitimately fail under
@@ -319,15 +339,36 @@ fn verify_recovery(images: &[PathBuf], oracle_path: &Path, cycle: usize) -> Resu
     let report = fs
         .scrub()
         .with_context(|| format!("scrub after cycle {cycle} crash"))?;
-    if report.unrecoverable_files != 0 {
+    // An unrecoverable committed stripe is only a test failure when the
+    // injected faults did not exceed the pool's parity budget. If more than
+    // `m` shards in one stripe were hit by destructive faults, data loss is
+    // the expected outcome of the fault model, not a filesystem bug.
+    let meta = fs.metadata_snapshot();
+    let classification = classify_scrub_failures(&meta, &oracle_inodes, fault_log, &report)
+        .with_context(|| format!("cycle {cycle}: classify scrub failures against the fault log"))?;
+    if !classification.unexpected.is_empty() {
         bail!(
-            "cycle {cycle}: scrub found {} unrecoverable file(s): {:#?}",
-            report.unrecoverable_files,
-            report.errors
+            "cycle {cycle}: scrub reported unexpected damage:\n{}",
+            classification.unexpected.join("\n")
         );
     }
-    if !report.errors.is_empty() {
-        bail!("cycle {cycle}: scrub reported errors: {:#?}", report.errors);
+    // The fault model knowingly destroyed more shards than parity can rebuild.
+    // Retire those paths from the pool and from the durability oracle so later
+    // cycles do not keep rediscovering a loss that was already explained.
+    let expected_loss = classification.expected_loss_paths;
+    if !expected_loss.is_empty() {
+        for path in &expected_loss {
+            fs.unlink_path(path)
+                .with_context(|| format!("retire expected-loss file {path}"))?;
+            for files in oracle.epochs.values_mut() {
+                files.remove(path);
+            }
+        }
+        fs.sync()
+            .context("sync after retiring expected-loss files")?;
+        oracle
+            .save(oracle_path)
+            .context("save oracle after retiring expected-loss files")?;
     }
     let failures = verify_oracle(&fs, &oracle);
     if !failures.is_empty() {
@@ -344,7 +385,7 @@ fn verify_recovery(images: &[PathBuf], oracle_path: &Path, cycle: usize) -> Resu
     if !failures.is_empty() {
         bail!("cycle {cycle}: persisted repair/oracle verification failed: {failures:#?}");
     }
-    Ok(())
+    Ok(expected_loss)
 }
 
 /// Remove scratch files and committed epochs that the durable oracle does not
@@ -382,6 +423,168 @@ fn discard_disposable_state(fs: &ArgosFs, oracle: &Oracle) -> Result<()> {
     Ok(())
 }
 
+/// Fault kinds that definitely leave a shard damaged or stale. Transient read
+/// errors, read-side bit flips, and indeterminate EIO-after-write events are
+/// excluded: they may be retried or may have committed correctly, so counting
+/// them could hide a real recovery bug behind the expected-loss exemption.
+const DESTRUCTIVE_FAULT_KINDS: &[&str] = &[
+    "durable_bit_rot",
+    "write_bit_rot",
+    "torn_write",
+    "lost_write",
+];
+
+#[derive(Debug)]
+struct DestructiveFault {
+    device: String,
+    offset: u64,
+}
+
+fn read_destructive_faults(path: &Path) -> Result<Vec<DestructiveFault>> {
+    let text =
+        fs::read_to_string(path).with_context(|| format!("read fault log {}", path.display()))?;
+    let mut faults = Vec::new();
+    for line in text.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            // A SIGKILL can leave a partial trailing line.
+            continue;
+        };
+        let Some(kind) = value.get("kind").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        if !DESTRUCTIVE_FAULT_KINDS.contains(&kind) {
+            continue;
+        }
+        let Some(device) = value.get("device").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let Some(offset) = value.get("offset").and_then(|value| value.as_u64()) else {
+            continue;
+        };
+        faults.push(DestructiveFault {
+            device: device.to_string(),
+            offset,
+        });
+    }
+    Ok(faults)
+}
+
+/// Parse the scrub detail `inode N: stripe S ...`.
+fn parse_unrecoverable_stripe(message: &str) -> Option<(u64, &str)> {
+    let rest = message.strip_prefix("inode ")?;
+    let (inode, rest) = rest.split_once(": stripe ")?;
+    let inode = inode.parse::<u64>().ok()?;
+    let stripe = rest
+        .split([' ', ':'])
+        .next()
+        .filter(|stripe| !stripe.is_empty())?;
+    Some((inode, stripe))
+}
+
+/// Return the shard slots in `stripe_id` that received a destructive injected
+/// fault. A fault matches a shard when its device and I/O start offset fall in
+/// the shard's raw extent.
+fn stripe_damaged_slots(
+    meta: &Metadata,
+    inode_id: u64,
+    stripe_id: &str,
+    faults: &[DestructiveFault],
+) -> Option<BTreeSet<usize>> {
+    let inode = meta.inodes.get(&inode_id)?;
+    let mut damaged = BTreeSet::new();
+    let mut found = false;
+    for block in &inode.blocks {
+        if block.stripe_id != stripe_id {
+            continue;
+        }
+        found = true;
+        for shard in &block.shards {
+            let Some(ShardLocation::RawExtent(extent)) = &shard.location else {
+                continue;
+            };
+            let end = extent
+                .offset
+                .saturating_add(extent.length.max(shard.size as u64));
+            if faults.iter().any(|fault| {
+                fault.device == extent.disk_id
+                    && fault.offset >= extent.offset
+                    && fault.offset < end
+            }) {
+                damaged.insert(shard.slot);
+            }
+        }
+    }
+    found.then_some(damaged)
+}
+
+#[derive(Debug, Default)]
+struct ScrubClassification {
+    /// Damage that is not explained by faults exceeding the parity budget.
+    unexpected: Vec<String>,
+    /// Committed files that must be retired because the fault model destroyed
+    /// more shards than the pool's redundancy can reconstruct.
+    expected_loss_paths: Vec<String>,
+}
+
+/// Drop scrub failures that are an expected consequence of the injected fault
+/// model. An unrecoverable committed stripe is expected when more than `m`
+/// distinct shards in it received destructive faults; with at most `m` damaged
+/// shards, erasure coding should still have reconstructed it.
+fn classify_scrub_failures(
+    meta: &Metadata,
+    oracle_inodes: &BTreeMap<u64, String>,
+    fault_log: &Path,
+    report: &FsckReport,
+) -> Result<ScrubClassification> {
+    if report.unrecoverable_files as usize > report.errors.len() {
+        bail!(
+            "scrub reported {} unrecoverable file(s) but only {} error message(s)",
+            report.unrecoverable_files,
+            report.errors.len()
+        );
+    }
+    if report.errors.is_empty() {
+        return Ok(ScrubClassification::default());
+    }
+    let faults = read_destructive_faults(fault_log)?;
+    let mut classification = ScrubClassification::default();
+    let mut expected_loss = BTreeSet::new();
+    for message in &report.errors {
+        let Some((inode_id, stripe_id)) = parse_unrecoverable_stripe(message) else {
+            classification.unexpected.push(message.clone());
+            continue;
+        };
+        let Some(path) = oracle_inodes.get(&inode_id) else {
+            // Disposable/scratch state should already be gone before scrub.
+            // Damage there is never durable data loss.
+            continue;
+        };
+        let Some(damaged_slots) = stripe_damaged_slots(meta, inode_id, stripe_id, &faults) else {
+            classification
+                .unexpected
+                .push(format!("{message} (stripe layout not found)"));
+            continue;
+        };
+        if damaged_slots.len() > meta.config.m {
+            eprintln!(
+                "ztest: expected loss: {path} inode {inode_id} stripe {stripe_id} had {} destructive injected fault shard(s), m={} (slots {:?})",
+                damaged_slots.len(),
+                meta.config.m,
+                damaged_slots
+            );
+            expected_loss.insert(path.clone());
+        } else {
+            classification.unexpected.push(format!(
+                "{message} (only {} shard(s) had destructive injected faults, m={})",
+                damaged_slots.len(),
+                meta.config.m
+            ));
+        }
+    }
+    classification.expected_loss_paths = expected_loss.into_iter().collect();
+    Ok(classification)
+}
+
 /// Deterministic end-to-end parity check after the random cycles.
 ///
 /// Random bit rot can miss the data extents on a short run. This drill picks a
@@ -391,6 +594,9 @@ fn run_parity_drill(images: &[PathBuf], oracle_path: &Path) -> Result<Option<Par
     let (path, disk_id, disk_path, offset, length) = {
         let fs = ArgosFs::open_loop(images, true).context("open pool for parity drill")?;
         let oracle = Oracle::load(oracle_path)?;
+        if oracle.all_files().next().is_none() {
+            return Ok(None);
+        }
         let meta = fs.metadata_snapshot();
         if meta.config.m == 0 {
             return Ok(None);
@@ -620,7 +826,222 @@ mod tests {
             file.sync_all().unwrap();
         }
 
-        verify_recovery(&images, &oracle_path, 0)
-            .expect("damaged scratch file must not fail committed-data recovery");
+        verify_recovery(
+            &images,
+            &oracle_path,
+            &temp.path().join("cycle-000.faults.jsonl"),
+            0,
+        )
+        .expect("damaged scratch file must not fail committed-data recovery");
+    }
+
+    /// A committed stripe with more than `m` destructively faulted shards is
+    /// expected data loss under the fault model. At `m` or fewer it is a real
+    /// failure, because parity should still have reconstructed it.
+    #[test]
+    fn fault_budget_exceeded_is_expected_loss() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let images = (0..4)
+            .map(|index| temp.path().join(format!("disk{index}.img")))
+            .collect::<Vec<_>>();
+        let oracle_path = temp.path().join("oracle.json");
+        let fault_log = temp.path().join("cycle-000.faults.jsonl");
+        let committed = vec![0x5Au8; 8192];
+        let fs = ArgosFs::create_loop(
+            &images,
+            VolumeConfig {
+                k: 2,
+                m: 2,
+                chunk_size: 4096,
+                compression: Compression::None,
+                fsname: "argosfs-ztest-unit".to_string(),
+                ..VolumeConfig::default()
+            },
+            32 * 1024 * 1024,
+            "argosfs-ztest-unit",
+            false,
+        )
+        .unwrap();
+        ensure_dir(&fs, "/committed").unwrap();
+        fs.write_file("/committed/keep.bin", &committed, 0o644)
+            .unwrap();
+        fs.sync().unwrap();
+
+        let mut oracle = Oracle::default();
+        oracle.epochs.insert(
+            1,
+            BTreeMap::from([(
+                "/committed/keep.bin".to_string(),
+                FileRecord::for_bytes(&committed),
+            )]),
+        );
+        oracle.save(&oracle_path).unwrap();
+
+        let meta = fs.metadata_snapshot();
+        let ino = fs.resolve_path("/committed/keep.bin", true).unwrap();
+        let inode = meta.inodes.get(&ino).unwrap();
+        let block = &inode.blocks[0];
+        let stripe = block.stripe_id.clone();
+        let shards = block
+            .shards
+            .iter()
+            .filter_map(|shard| match &shard.location {
+                Some(ShardLocation::RawExtent(extent)) => {
+                    Some((extent.disk_id.clone(), extent.offset))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(shards.len() >= 3);
+        let report = FsckReport {
+            unrecoverable_files: 1,
+            errors: vec![format!(
+                "inode {ino}: stripe {stripe} has 1/2 verified shards available"
+            )],
+            ..FsckReport::default()
+        };
+
+        let write_log = |count: usize| {
+            let lines = shards
+                .iter()
+                .take(count)
+                .map(|(device, offset)| {
+                    serde_json::json!({
+                        "kind": "durable_bit_rot",
+                        "device": device,
+                        "offset": offset,
+                        "bytes": 2,
+                    })
+                    .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::write(&fault_log, format!("{lines}\n")).unwrap();
+        };
+
+        let oracle_inodes = BTreeMap::from([(ino, "/committed/keep.bin".to_string())]);
+
+        // m + 1 damaged shards: expected loss, not a filesystem failure.
+        write_log(3);
+        let classification =
+            classify_scrub_failures(&meta, &oracle_inodes, &fault_log, &report).unwrap();
+        assert!(
+            classification.unexpected.is_empty(),
+            "more than m damaged shards should be expected loss: {:?}",
+            classification.unexpected
+        );
+        assert_eq!(
+            classification.expected_loss_paths,
+            vec!["/committed/keep.bin".to_string()]
+        );
+
+        // m damaged shards: parity should have recovered the stripe.
+        write_log(2);
+        let classification =
+            classify_scrub_failures(&meta, &oracle_inodes, &fault_log, &report).unwrap();
+        assert!(
+            !classification.unexpected.is_empty(),
+            "damage within the parity budget must still fail the run"
+        );
+        assert!(classification.expected_loss_paths.is_empty());
+    }
+
+    /// End-to-end: an over-parity committed loss is retired from the pool and
+    /// from the oracle instead of failing every subsequent recovery cycle.
+    #[test]
+    fn expected_loss_retires_committed_file() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let images = (0..4)
+            .map(|index| temp.path().join(format!("disk{index}.img")))
+            .collect::<Vec<_>>();
+        let oracle_path = temp.path().join("oracle.json");
+        let fault_log = temp.path().join("cycle-000.faults.jsonl");
+        let committed = vec![0x5Au8; 8192];
+        let mut extents = Vec::new();
+        {
+            let fs = ArgosFs::create_loop(
+                &images,
+                VolumeConfig {
+                    k: 2,
+                    m: 2,
+                    chunk_size: 4096,
+                    compression: Compression::None,
+                    fsname: "argosfs-ztest-unit".to_string(),
+                    ..VolumeConfig::default()
+                },
+                32 * 1024 * 1024,
+                "argosfs-ztest-unit",
+                false,
+            )
+            .unwrap();
+            ensure_dir(&fs, "/committed").unwrap();
+            fs.write_file("/committed/keep.bin", &committed, 0o644)
+                .unwrap();
+            fs.sync().unwrap();
+
+            let mut oracle = Oracle::default();
+            oracle.epochs.insert(
+                1,
+                BTreeMap::from([(
+                    "/committed/keep.bin".to_string(),
+                    FileRecord::for_bytes(&committed),
+                )]),
+            );
+            oracle.save(&oracle_path).unwrap();
+
+            let meta = fs.metadata_snapshot();
+            let ino = fs.resolve_path("/committed/keep.bin", true).unwrap();
+            let inode = meta.inodes.get(&ino).unwrap();
+            let block = &inode.blocks[0];
+            for shard in block.shards.iter().take(3) {
+                let Some(ShardLocation::RawExtent(extent)) = &shard.location else {
+                    panic!("committed shard is not a raw extent");
+                };
+                let disk = meta.disks.get(&extent.disk_id).unwrap();
+                extents.push((disk.path.clone(), extent.disk_id.clone(), extent.offset));
+            }
+        }
+        assert_eq!(extents.len(), 3);
+
+        let lines = extents
+            .iter()
+            .map(|(_, device, offset)| {
+                serde_json::json!({
+                    "kind": "durable_bit_rot",
+                    "device": device,
+                    "offset": offset,
+                    "bytes": 2,
+                })
+                .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&fault_log, format!("{lines}\n")).unwrap();
+        for (path, _, offset) in extents {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            let mut byte = [0u8; 1];
+            file.read_exact_at(&mut byte, offset).unwrap();
+            byte[0] ^= 0xFF;
+            file.write_all_at(&byte, offset).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let expected =
+            verify_recovery(&images, &oracle_path, &fault_log, 0).expect("expected loss");
+        assert_eq!(expected, vec!["/committed/keep.bin".to_string()]);
+        assert_eq!(
+            Oracle::load(&oracle_path).unwrap().all_files().count(),
+            0,
+            "expected-loss path must be removed from the oracle"
+        );
+        let fs = ArgosFs::open_loop(&images, false).unwrap();
+        assert!(
+            fs.resolve_path("/committed/keep.bin", true).is_err(),
+            "expected-loss file must be removed from the pool"
+        );
     }
 }
