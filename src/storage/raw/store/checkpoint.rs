@@ -666,17 +666,76 @@ pub(super) fn read_metadata_candidates_cached(
     sb: &RawSuperblock,
     decoded: &parking_lot::Mutex<BTreeMap<String, Arc<Metadata>>>,
 ) -> Result<Vec<(Option<Arc<Metadata>>, MetadataCandidateReport)>> {
+    read_metadata_candidates_from_headers(
+        backend,
+        sb,
+        decoded,
+        read_checkpoint_headers(backend, sb),
+    )
+}
+
+pub(super) type CheckpointHeaders = [Result<Vec<u8>>; 2];
+
+pub(super) fn read_checkpoint_headers(
+    backend: &dyn StorageBackend,
+    sb: &RawSuperblock,
+) -> CheckpointHeaders {
+    std::array::from_fn(|slot| {
+        let mut header = vec![0; RAW_HEADER_SIZE];
+        backend.read_recovery_at(
+            &sb.disk_id,
+            sb.metadata.offset + slot as u64 * (sb.metadata.length / 2),
+            &mut header,
+        )?;
+        Ok(header)
+    })
+}
+
+/// Upper bound for the encoded payload and index simultaneously held by
+/// one member worker. The same headers are used for the subsequent reads.
+pub(super) fn checkpoint_payload_budget(sb: &RawSuperblock, headers: &CheckpointHeaders) -> u64 {
+    let slot_len = sb.metadata.length / 2;
+    headers
+        .iter()
+        .filter_map(|header| {
+            let header = header.as_ref().ok()?;
+            if &header[..16] != METADATA_MAGIC {
+                return None;
+            }
+            let len = get_u64(header, 32).ok()?;
+            if len == 0 || len > slot_len.saturating_sub(RAW_HEADER_SIZE as u64) {
+                return None;
+            }
+            let index = match get_u32(header, 20).ok()? {
+                METADATA_FORMAT_LEGACY => 0,
+                METADATA_FORMAT_TREE | METADATA_FORMAT_TREE_ZSTD => get_u64(header, 160).ok()?,
+                _ => return None,
+            };
+            if index > slot_len.saturating_sub(RAW_HEADER_SIZE as u64) {
+                return None;
+            }
+            Some(len.saturating_add(index))
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+pub(super) fn read_metadata_candidates_from_headers(
+    backend: &dyn StorageBackend,
+    sb: &RawSuperblock,
+    decoded: &parking_lot::Mutex<BTreeMap<String, Arc<Metadata>>>,
+    headers: CheckpointHeaders,
+) -> Result<Vec<(Option<Arc<Metadata>>, MetadataCandidateReport)>> {
     let slot_len = sb.metadata.length / 2;
     let mut out = Vec::new();
-    for slot in 0..2u64 {
-        let offset = sb.metadata.offset + slot * slot_len;
-        let mut header = vec![0u8; RAW_HEADER_SIZE];
+    for (slot, header) in headers.into_iter().enumerate() {
+        let offset = sb.metadata.offset + slot as u64 * slot_len;
         let mut report = MetadataCandidateReport {
             path: format!("{}:metadata-slot-{slot}", sb.disk_id),
             ..MetadataCandidateReport::default()
         };
-        let metadata = match backend.read_at(&sb.disk_id, offset, &mut header) {
-            Ok(()) if &header[..16] == METADATA_MAGIC => {
+        let metadata = match header {
+            Ok(header) if &header[..16] == METADATA_MAGIC => {
                 report.present = true;
                 // A matching header is not evidence of valid physical data.
                 // read_metadata_payload checks its stored checksum and every
@@ -708,7 +767,7 @@ pub(super) fn read_metadata_candidates_cached(
                     }
                 }
             }
-            Ok(()) => None,
+            Ok(_) => None,
             Err(err) => {
                 report.error = Some(err.to_string());
                 None
@@ -814,7 +873,7 @@ fn read_legacy_metadata_candidate(
         ));
     }
     let mut bytes = vec![0u8; len];
-    backend.read_at(&sb.disk_id, offset + RAW_HEADER_SIZE as u64, &mut bytes)?;
+    backend.read_recovery_at(&sb.disk_id, offset + RAW_HEADER_SIZE as u64, &mut bytes)?;
     if sha256_hex(&bytes) != stored_hash {
         return Err(ArgosError::Checksum(
             "raw metadata checksum mismatch".to_string(),
@@ -867,7 +926,7 @@ pub(super) fn read_tree_metadata_candidate(
         ));
     }
     let mut index = vec![0u8; index_len];
-    backend.read_at(&sb.disk_id, offset + RAW_HEADER_SIZE as u64, &mut index)?;
+    backend.read_recovery_at(&sb.disk_id, offset + RAW_HEADER_SIZE as u64, &mut index)?;
     if sha256_hex(&index) != index_hash {
         return Err(ArgosError::Checksum(
             "raw metadata index checksum mismatch".to_string(),
@@ -911,7 +970,7 @@ pub(super) fn read_tree_metadata_candidate(
         let begin = first * page_size;
         let end = (last * page_size).min(len);
         bytes.resize(end, 0);
-        backend.read_at(
+        backend.read_recovery_at(
             &sb.disk_id,
             offset + data_start + begin as u64,
             &mut bytes[begin..end],

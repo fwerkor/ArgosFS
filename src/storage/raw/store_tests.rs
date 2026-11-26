@@ -2143,10 +2143,69 @@ fn delta_integrity_v2_journal_quorum_replays_without_checkpoint() {
     assert_eq!(recovered.raw_pool.pool_name, "journal-delta-v2");
     assert_eq!(report.invalid_entries, 0, "{:?}", report.errors);
 
+    // A healthy writable replay must preserve the existing durable chain
+    // rather than copy the entire metadata image and truncate its journal.
+    let before = report.raw_journal_members;
+    let (recovered, report) = load_or_recover(&backend, &upgraded, true).unwrap();
+    assert!(report.replayed);
+    assert_eq!(recovered.integrity.meta_hash, next.integrity.meta_hash);
+    let (_, audit) = load_or_recover(&backend, &upgraded, false).unwrap();
+    assert!(
+        audit.replayed,
+        "writable open must not checkpoint the replay"
+    );
+    for (old, new) in before.iter().zip(&audit.raw_journal_members) {
+        assert_eq!(old.journal_end, new.journal_end);
+        assert_eq!(old.last_valid_record_hash, new.last_valid_record_hash);
+    }
+    // A second transaction extends the retained replay chain and is still
+    // recoverable after another open.
+    let mut later = next.clone();
+    later.raw_pool.pool_name = "journal-delta-v2-after-reopen".into();
+    later.txid += 1;
+    later.updated_at += 1.0;
+    journal::prepare_delta_integrity(&mut later, &next).unwrap();
+    append_transaction_with_trusted_integrity_quorum(
+        &backend,
+        &upgraded,
+        &later,
+        Some(&next),
+        "v2-after-reopen",
+        serde_json::json!({"previous_meta_hash":next.integrity.meta_hash}),
+    )
+    .unwrap();
+    let (recovered, audit) = load_or_recover(&backend, &upgraded, false).unwrap();
+    assert!(audit.replayed);
+    assert_eq!(audit.invalid_entries, 0);
+    assert_eq!(recovered.integrity.meta_hash, later.integrity.meta_hash);
+
     // Without a quorum of downgrade-fencing feature flags, v2 metadata must
     // never be selected for use (nor trusted as a crash-recovery base).
     let error = load_or_recover(&backend, &superblocks, false).unwrap_err();
     assert!(matches!(error, ArgosError::IncompatibleFormat(_)));
+
+    // A partial trailing record on one member is not an appendable tip.
+    // The remaining quorum still recovers the last acknowledged state, but
+    // writable open must reanchor and reset instead of retaining the tail.
+    let sb = &upgraded[0];
+    let mut header = vec![0; RAW_HEADER_SIZE];
+    backend
+        .read_at(&sb.disk_id, sb.journal.offset, &mut header)
+        .unwrap();
+    let end = get_u64(&header, 24).unwrap();
+    put_u64(&mut header, 24, end + 1);
+    backend
+        .write_at(&sb.disk_id, sb.journal.offset, &header)
+        .unwrap();
+    backend.flush_device(&sb.disk_id).unwrap();
+    assert!(journal_tip_identity(&backend, sb).is_err());
+    let (recovered, report) = load_or_recover(&backend, &upgraded, true).unwrap();
+    assert_eq!(recovered.integrity.meta_hash, later.integrity.meta_hash);
+    assert!(report.replayed);
+    assert!(report.invalid_entries > 0);
+    let (_, audit) = load_or_recover(&backend, &upgraded, false).unwrap();
+    assert!(!audit.replayed);
+    assert_eq!(audit.invalid_entries, 0);
 }
 
 #[test]

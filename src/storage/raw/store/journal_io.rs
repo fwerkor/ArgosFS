@@ -294,7 +294,12 @@ pub(super) fn journal_tip_identity(
     if &header[..16] != JOURNAL_MAGIC {
         return Ok(None);
     }
-    let end = get_u64(&header, 24)?.min(sb.journal.length);
+    let end = get_u64(&header, 24)?;
+    if end < RAW_HEADER_SIZE as u64 || end > sb.journal.length {
+        return Err(ArgosError::CorruptedMetadata(
+            "raw journal end outside region".into(),
+        ));
+    }
     let mut cursor = RAW_HEADER_SIZE as u64;
     let mut reader = JournalTipReader {
         backend,
@@ -332,6 +337,11 @@ pub(super) fn journal_tip_identity(
         }
         tip = Some((record.txid, record.meta_hash));
         cursor += 36 + len as u64;
+    }
+    if cursor != end {
+        return Err(ArgosError::CorruptedMetadata(
+            "raw journal ends outside a complete record".into(),
+        ));
     }
     Ok(tip)
 }

@@ -331,3 +331,19 @@ fn checkpoint_recovery_overlaps_members_and_shares_decoded_images() {
         assert_eq!(report.txid, base.txid);
     }
 }
+
+#[test]
+fn checkpoint_budget_counts_stored_payload_not_reserved_capacity() {
+    let (_dir, images, _, superblocks) = quorum_fixture();
+    let backend = block_backend_for(&images);
+    let sb = &superblocks[0];
+    let headers = read_checkpoint_headers(&backend, sb);
+    let actual = checkpoint_payload_budget(sb, &headers);
+    assert!(actual > 0);
+    assert!(actual < sb.metadata.length / 2);
+    // Enlarging only the reserved capacity cannot change the memory required
+    // by these already read headers, as on a large real raw member.
+    let mut large = sb.clone();
+    large.metadata.length = 488 * 1024 * 1024;
+    assert_eq!(checkpoint_payload_budget(&large, &headers), actual);
+}
