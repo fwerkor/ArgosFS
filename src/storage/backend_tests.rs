@@ -145,3 +145,45 @@ fn opening_missing_devices_returns_io_errors() {
         Err(ArgosError::Io(_))
     ));
 }
+
+#[test]
+fn raw_members_separate_shard_and_bulk_read_handles() {
+    // Shard payload reads use a POSIX_FADV_RANDOM handle so the kernel does
+    // not prefetch past a chunk-sized read; large metadata reads keep a
+    // second handle with the default readahead policy.
+    let size = 2 * BULK_READ_BYTES as u64;
+    let mut file = NamedTempFile::new().unwrap();
+    file.write_all(&vec![0x5au8; size as usize]).unwrap();
+    file.as_file().write_at(b"tail", size - 4).unwrap();
+    let path = file.path().to_path_buf();
+
+    let raw = FileBlockBackend::open_raw(std::slice::from_ref(&path), false).unwrap();
+    let device = raw.device(&"disk-0000".to_string()).unwrap();
+    assert!(device.bulk_file.is_some());
+
+    let mut small = vec![0u8; 4096];
+    raw.read_at(&"disk-0000".to_string(), 0, &mut small)
+        .unwrap();
+    assert_eq!(small, vec![0x5au8; 4096]);
+
+    let offset = BULK_READ_BYTES as u64 - 8;
+    let mut large = vec![0u8; BULK_READ_BYTES];
+    raw.read_at(&"disk-0000".to_string(), offset, &mut large)
+        .unwrap();
+    assert_eq!(large[..8], [0x5au8; 8]);
+    assert_eq!(large[BULK_READ_BYTES - 8..], [0x5au8; 8]);
+
+    let mut tail = vec![0u8; 4];
+    raw.read_at(&"disk-0000".to_string(), size - 4, &mut tail)
+        .unwrap();
+    assert_eq!(tail, b"tail");
+
+    // Loop images keep a single handle: their backing file is host storage,
+    // where the default readahead policy is left alone.
+    let loop_backend = FileBlockBackend::open_loop(&[path], false).unwrap();
+    assert!(loop_backend
+        .device(&"disk-0000".to_string())
+        .unwrap()
+        .bulk_file
+        .is_none());
+}

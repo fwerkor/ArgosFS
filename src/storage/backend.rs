@@ -118,6 +118,10 @@ pub struct FileBlockBackend {
 struct BlockDevice {
     path: PathBuf,
     file: File,
+    /// Second handle on the same device for large bulk reads.  See
+    /// `open_block_device` for why the shard-data handle cannot use the
+    /// kernel's readahead.
+    bulk_file: Option<File>,
     capacity: u64,
 }
 
@@ -135,9 +139,10 @@ impl FileBlockBackend {
         devices: Vec<(DeviceId, PathBuf)>,
         write: bool,
     ) -> Result<Self> {
+        let random_data_reads = kind == BackendKind::RawBlock;
         let mut map = BTreeMap::new();
         for (device_id, path) in devices {
-            let device = open_block_device(&path, write)?;
+            let device = open_block_device(&path, write, random_data_reads)?;
             map.insert(device_id, device);
         }
         Ok(Self {
@@ -147,10 +152,11 @@ impl FileBlockBackend {
     }
 
     fn open(paths: &[PathBuf], kind: BackendKind, write: bool) -> Result<Self> {
+        let random_data_reads = kind == BackendKind::RawBlock;
         let mut map = BTreeMap::new();
         for (index, path) in paths.iter().enumerate() {
             let id = format!("disk-{index:04}");
-            let device = open_block_device(path, write)?;
+            let device = open_block_device(path, write, random_data_reads)?;
             map.insert(id, device);
         }
         Ok(Self {
@@ -193,9 +199,17 @@ impl StorageBackend for FileBlockBackend {
 
     fn read_at(&self, device_id: &DeviceId, offset: u64, mut buf: &mut [u8]) -> Result<()> {
         let device = self.device(device_id)?;
+        // Shard payloads arrive in chunk-sized reads (<= the layout chunk
+        // size); metadata checkpoints and journal replay use larger bulk
+        // reads.  Each handle keeps the readahead policy suited to its
+        // traffic.  See `open_block_device`.
+        let file = match &device.bulk_file {
+            Some(bulk) if buf.len() >= BULK_READ_BYTES => bulk,
+            _ => &device.file,
+        };
         let mut cursor = offset;
         while !buf.is_empty() {
-            let read = device.file.read_at(buf, cursor)?;
+            let read = file.read_at(buf, cursor)?;
             if read == 0 {
                 return Err(ArgosError::Io(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -290,19 +304,63 @@ impl StorageBackend for FileBlockBackend {
     }
 }
 
-fn open_block_device(path: &Path, write: bool) -> Result<BlockDevice> {
-    let mut file = OpenOptions::new()
-        .read(true)
-        .write(write)
-        .create(false)
-        .open(path)?;
+/// Reads at least this large are bulk metadata checkpoints or journal
+/// replay, which are sequential and benefit from the kernel's readahead.
+/// Anything smaller is a shard payload read.
+const BULK_READ_BYTES: usize = 512 * 1024;
+
+fn open_block_device(path: &Path, write: bool, random_data_reads: bool) -> Result<BlockDevice> {
+    let open = || -> Result<File> {
+        Ok(OpenOptions::new()
+            .read(true)
+            .write(write)
+            .create(false)
+            .open(path)?)
+    };
+    let mut file = open()?;
+    let bulk_file = if random_data_reads {
+        // Shard extents are allocated in write order, so the per-member
+        // stream of a logically sequential file read is scattered (measured:
+        // 5.5 % of consecutive data-shard reads on a member are physically
+        // contiguous during a full repository verify).  Buffered reads are
+        // one chunk at most (256 KiB by default), which makes the kernel's
+        // readahead window (queue/read_ahead_kb, 2 MiB on the USB members)
+        // issue about twice the requested bytes and throw nearly all of the
+        // prefetch away again.
+        //
+        // POSIX_FADV_RANDOM disables readahead for this handle only.  The
+        // pages still stay in the page cache, so repeated reads still hit.
+        // Measured on a nine-member 4+4 pool (`borg check --verify-data` of a
+        // 9.0 GB repository): member reads 17.5 GB -> 7.7 GB, wall
+        // 145 s -> 85 s.  A sequential 265 MB file probe went from 362 MB to
+        // 185 MB of member reads and from 2.5 s to 1.7 s.
+        //
+        // Bulk metadata reads keep a separate handle with the default
+        // policy: disabling readahead for them adds ~17 s to a fresh mount
+        // (3132 sequential 1 MiB metadata reads).
+        advise_random_access(&file);
+        Some(open()?)
+    } else {
+        None
+    };
     let capacity = detect_capacity(&mut file)?;
     Ok(BlockDevice {
         path: path.to_path_buf(),
         file,
+        bulk_file,
         capacity,
     })
 }
+
+#[cfg(target_os = "linux")]
+fn advise_random_access(file: &File) {
+    // Best effort: a kernel or filesystem without advice support just keeps
+    // its default readahead.
+    let _ = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_RANDOM) };
+}
+
+#[cfg(not(target_os = "linux"))]
+fn advise_random_access(_file: &File) {}
 
 fn detect_capacity(file: &mut File) -> Result<u64> {
     let len = file.metadata()?.len();
