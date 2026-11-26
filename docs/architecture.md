@@ -200,3 +200,11 @@ For CapOS rootfs, initramfs runs `scan`, optional `replay-journal`, optional
 `fsck`, `preflight-root`, then `mount-root` at `/sysroot`, verifies an init
 binary, and uses `switch_root`. The post-switch systemd assets provide health,
 watchdog, and recovery hooks around the same CLI preflight/fsck path.
+
+Raw `fsck` reports `orphan_extent_bytes` (allocated ranges below the
+allocator high-water mark with no shard reference). On an unmounted pool,
+`fsck --remove-orphans` or a full scrub can return those ranges on online
+members to the free list, reporting `reclaimed_extent_bytes`. Overlapping
+or malformed extents block reclamation; pending group-commit reclamations
+are not treated as orphans. No device data is discarded or overwritten by
+the free-list repair itself.

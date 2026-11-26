@@ -265,6 +265,71 @@ pub fn validate_allocations(
     Ok(())
 }
 
+/// Plan recovery of allocated-but-unreferenced bytes below the high-water
+/// mark. Never turn an overlap or malformed allocation into free space.
+pub(crate) fn orphan_reclaim_plan(
+    state: &RawAllocatorState,
+    mut live: Vec<PhysicalExtent>,
+) -> Result<(u64, Option<RawAllocatorState>)> {
+    validate_allocations(state, live.clone())?;
+    let block = state.block_size.max(4096);
+    let valid_range = |offset: u64, length: u64| {
+        length > 0
+            && offset >= state.data_start
+            && offset.is_multiple_of(block)
+            && length.is_multiple_of(block)
+            && offset
+                .checked_add(length)
+                .is_some_and(|end| end <= state.next_offset)
+    };
+    if state.next_offset < state.data_start
+        || state.next_offset > state.data_end
+        || !state.next_offset.is_multiple_of(block)
+        || !state.data_start.is_multiple_of(block)
+        || live.iter().any(|e| !valid_range(e.offset, e.length))
+        || state
+            .free_extents
+            .iter()
+            .any(|e| !valid_range(e.offset, e.length))
+    {
+        return Err(ArgosError::CorruptedMetadata(
+            "invalid allocator high-water mark or extent alignment".into(),
+        ));
+    }
+    live.sort_by_key(|extent| extent.offset);
+    let mut cursor = state.data_start;
+    let mut free = Vec::new();
+    for extent in live {
+        if extent.offset > cursor {
+            free.push(RawFreeExtent {
+                offset: cursor,
+                length: extent.offset - cursor,
+            });
+        }
+        cursor = extent.offset + extent.length;
+    }
+    if cursor < state.next_offset {
+        free.push(RawFreeExtent {
+            offset: cursor,
+            length: state.next_offset - cursor,
+        });
+    }
+    let bytes: u64 = free.iter().map(|e| e.length).sum();
+    let known: u64 = state.free_extents.iter().map(|e| e.length).sum();
+    let orphan_bytes = bytes.checked_sub(known).ok_or_else(|| {
+        ArgosError::CorruptedMetadata(
+            "allocator free space exceeds unreferenced extent space".into(),
+        )
+    })?;
+    if orphan_bytes == 0 {
+        return Ok((0, None));
+    }
+    let mut repaired = state.clone();
+    repaired.free_extents = free.into_iter().collect();
+    repaired.free_extents.mark_normalized();
+    Ok((orphan_bytes, Some(repaired)))
+}
+
 fn coalesce(state: &mut RawAllocatorState) {
     let mut extents = std::mem::take(&mut state.free_extents)
         .into_iter()

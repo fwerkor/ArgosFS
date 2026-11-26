@@ -318,3 +318,56 @@ fn raw_extent_reconstruction_is_restartable_and_reclaims_old_allocations() {
     assert!(checked.errors.is_empty(), "{checked:?}");
     assert_eq!(reopened.scrub().unwrap().reconstructed_shards, 0);
 }
+
+#[test]
+fn raw_fsck_reclaims_unreferenced_extents_and_preserves_live_data() {
+    let dir = tempdir().unwrap();
+    let images = (0..3)
+        .map(|i| dir.path().join(format!("reclaim-{i}.img")))
+        .collect::<Vec<_>>();
+    let fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            compression: Compression::None,
+            defer_metadata_commit: true,
+            ..Default::default()
+        },
+        32 * 1024 * 1024,
+        "reclaim",
+        false,
+    )
+    .unwrap();
+    let payload = bytes();
+    fs.write_file("/file", &payload, 0o600).unwrap();
+    fs.sync().unwrap();
+    let lost = {
+        let mut meta = fs.meta.write();
+        let generation = meta.txid + 1;
+        let extent = allocator::allocate(
+            meta.raw_pool.allocators.get_mut("disk-0000").unwrap(),
+            "disk-0000",
+            8192,
+            generation,
+        )
+        .unwrap();
+        fs.commit_locked(&mut meta, "test-unreferenced-allocation", json!({}))
+            .unwrap();
+        extent
+    };
+    fs.sync().unwrap();
+    let check = fs.fsck(false, false).unwrap();
+    assert_eq!(check.orphan_extent_bytes, lost.length);
+    assert_eq!(check.reclaimed_extent_bytes, 0);
+    let fixed = fs.fsck(false, true).unwrap();
+    assert_eq!(fixed.reclaimed_extent_bytes, lost.length);
+    assert_eq!(fs.fsck(false, false).unwrap().orphan_extent_bytes, 0);
+    assert_eq!(fs.read_file("/file", false).unwrap(), payload);
+    fs.mark_clean_unmount().unwrap();
+    drop(fs);
+    let fs = ArgosFs::open_loop(&images, false).unwrap();
+    assert_eq!(fs.fsck(false, false).unwrap().orphan_extent_bytes, 0);
+    assert_eq!(fs.read_file("/file", false).unwrap(), payload);
+}

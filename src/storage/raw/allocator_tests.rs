@@ -599,3 +599,32 @@ fn indexed_capacity_matches_scan_after_mutations_and_legacy_edits() {
     state.free_extents = state.free_extents.iter().rev().cloned().collect();
     check(&state);
 }
+
+#[test]
+fn orphan_reclaim_only_recovers_unreferenced_allocated_ranges() {
+    let mut state = init_allocator(4096, 32 * 4096, 4096);
+    let a = allocate(&mut state, "disk", 4096, 1).unwrap();
+    let orphan = allocate(&mut state, "disk", 8192, 1).unwrap();
+    let b = allocate(&mut state, "disk", 4096, 1).unwrap();
+    let already_free = allocate(&mut state, "disk", 4096, 1).unwrap();
+    free(&mut state, &already_free).unwrap();
+    let (bytes, plan) = orphan_reclaim_plan(&state, vec![a.clone(), b.clone()]).unwrap();
+    assert_eq!(bytes, orphan.length);
+    let mut repaired = plan.unwrap();
+    assert_eq!(
+        orphan_reclaim_plan(&repaired, vec![a.clone(), b.clone()])
+            .unwrap()
+            .0,
+        0
+    );
+    assert_eq!(
+        allocate(&mut repaired, "disk", orphan.length, 2)
+            .unwrap()
+            .offset,
+        orphan.offset
+    );
+    assert!(orphan_reclaim_plan(&state, vec![a.clone(), a]).is_err());
+    let mut bad = state.clone();
+    bad.next_offset = b.offset;
+    assert!(orphan_reclaim_plan(&bad, vec![b]).is_err());
+}
