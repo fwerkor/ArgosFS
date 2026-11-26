@@ -390,3 +390,71 @@ fn raw_fsck_reclaims_unreferenced_extents_and_preserves_live_data() {
     assert_eq!(checked.reclaimed_extent_bytes, 0);
     assert_eq!(fs.read_file("/file", false).unwrap(), payload);
 }
+
+#[test]
+fn raw_fsck_failed_immediate_commit_restores_allocator_and_txid() {
+    let dir = tempdir().unwrap();
+    let images = (0..3)
+        .map(|i| dir.path().join(format!("rollback-{i}.img")))
+        .collect::<Vec<_>>();
+    let fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            compression: Compression::None,
+            defer_metadata_commit: false,
+            ..Default::default()
+        },
+        32 * 1024 * 1024,
+        "rollback",
+        false,
+    )
+    .unwrap();
+    let payload = bytes();
+    fs.write_file("/file", &payload, 0o600).unwrap();
+    let lost = {
+        let mut meta = fs.meta.write();
+        let generation = meta.txid + 1;
+        let extent = allocator::allocate(
+            meta.raw_pool.allocators.get_mut("disk-0000").unwrap(),
+            "disk-0000",
+            8192,
+            generation,
+        )
+        .unwrap();
+        fs.commit_locked(&mut meta, "test-unreferenced-allocation", json!({}))
+            .unwrap();
+        extent
+    };
+    fs.sync().unwrap();
+    let before = fs.metadata_snapshot();
+    {
+        let _crash = journal::thread_crash_point(FaultPoint::AfterPartialJournalFanout.as_str());
+        assert!(matches!(
+            fs.fsck(false, true),
+            Err(ArgosError::InjectedCrash(_))
+        ));
+    }
+    let after = fs.metadata_snapshot();
+    assert_eq!(after.txid, before.txid);
+    assert_eq!(
+        serde_json::to_value(&after.raw_pool.allocators).unwrap(),
+        serde_json::to_value(&before.raw_pool.allocators).unwrap()
+    );
+    assert_eq!(
+        fs.fsck(false, false).unwrap().orphan_extent_bytes,
+        lost.length
+    );
+    assert_eq!(fs.read_file("/file", false).unwrap(), payload);
+    assert_eq!(
+        fs.fsck(false, true).unwrap().reclaimed_extent_bytes,
+        lost.length
+    );
+    fs.mark_clean_unmount().unwrap();
+    drop(fs);
+    let reopened = ArgosFs::open_loop(&images, false).unwrap();
+    assert_eq!(reopened.fsck(false, false).unwrap().orphan_extent_bytes, 0);
+    assert_eq!(reopened.read_file("/file", false).unwrap(), payload);
+}

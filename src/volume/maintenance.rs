@@ -1319,12 +1319,22 @@ impl ArgosFs {
                     *meta = before;
                     return Err(err);
                 }
-                self.commit_locked_with_previous(
+                if let Err(err) = self.commit_locked_with_previous(
                     &mut meta,
                     Some(&before),
                     "fsck",
                     json!({"report": report}),
-                )?;
+                ) {
+                    // Raw commits with a caller-owned snapshot leave rollback
+                    // to the caller. Conflicts already reload durable metadata.
+                    if meta.backend != BackendKind::Host
+                        && !Self::transaction_error_is_committed(&err)
+                        && !matches!(err, ArgosError::Conflict(_))
+                    {
+                        *meta = before;
+                    }
+                    return Err(err);
+                }
                 if meta.backend != BackendKind::Host
                     && (meta.config.defer_metadata_commit || bulk_import_enabled())
                 {
