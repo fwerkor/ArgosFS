@@ -148,7 +148,7 @@ mod stripe_fanout_tests;
 pub use autopilot::{AutopilotConfig, ReshapeReport};
 pub(crate) use capacity::CapacitySnapshot;
 use helpers::*;
-pub use member_balance::MemberBalanceReport;
+pub use member_balance::{MemberBalanceOptions, MemberBalanceReport};
 use namespace::*;
 
 #[derive(Clone, Debug)]

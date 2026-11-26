@@ -613,6 +613,18 @@ pub(super) enum Command {
         /// Bound a member rebalance pass to this many shard moves.
         #[arg(long, requires = "member")]
         max_shards: Option<usize>,
+        /// Restrict member rebalance to a file or directory in the pool.
+        #[arg(long, requires = "member")]
+        path: Option<String>,
+        /// Minimum inode ID (inclusive).
+        #[arg(long, requires = "member")]
+        min_inode: Option<u64>,
+        /// Maximum inode ID (inclusive).
+        #[arg(long, requires = "member")]
+        max_inode: Option<u64>,
+        /// Prefer systematic data shards over parity shards.
+        #[arg(long, requires = "member")]
+        prefer_data: bool,
     },
     #[command(about = "Migrate data to a new k+m erasure layout")]
     Reshape {
