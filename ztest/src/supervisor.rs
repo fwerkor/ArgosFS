@@ -3,7 +3,7 @@
 
 use crate::fault::FaultConfig;
 use crate::oracle::Oracle;
-use crate::workload::{ensure_dir, verify_oracle, WorkerConfig};
+use crate::workload::{cleanup_unpublished, ensure_dir, remove_tree, verify_oracle, WorkerConfig};
 use anyhow::{bail, Context, Result};
 use argosfs::types::{BackendKind, Compression, VolumeConfig};
 use argosfs::ArgosFs;
@@ -307,6 +307,13 @@ fn verify_recovery(images: &[PathBuf], oracle_path: &Path, cycle: usize) -> Resu
     if oracle.all_files().next().is_none() {
         bail!("cycle {cycle}: empty durability oracle");
     }
+    // Scratch and unpublished epochs are disposable by design: a crash may
+    // leave a partial epoch, and scratch mutations may legitimately fail under
+    // injected faults. Remove them before scrubbing so an unrecoverable
+    // scratch file is not mistaken for durable data loss. The worker performs
+    // the same cleanup before it starts.
+    discard_disposable_state(&fs, &oracle)
+        .with_context(|| format!("cycle {cycle}: discard disposable state"))?;
     // Remove unreferenced data left by the epoch that was in flight. This is
     // the same offline repair a user would run after a power loss.
     let report = fs
@@ -336,6 +343,41 @@ fn verify_recovery(images: &[PathBuf], oracle_path: &Path, cycle: usize) -> Resu
     let failures = verify_oracle(&reopened, &oracle);
     if !failures.is_empty() {
         bail!("cycle {cycle}: persisted repair/oracle verification failed: {failures:#?}");
+    }
+    Ok(())
+}
+
+/// Remove scratch files and committed epochs that the durable oracle does not
+/// name. They are allowed to be absent, partial, or damaged after a crash, so
+/// leaving them in the pool makes scrub report damage that no caller ever
+/// promised to keep.
+fn discard_disposable_state(fs: &ArgosFs, oracle: &Oracle) -> Result<()> {
+    cleanup_unpublished(fs, oracle);
+    remove_tree(fs, "/scratch");
+    fs.sync().context("sync after disposable-state cleanup")?;
+    if fs.attr_path("/scratch", false).is_ok() {
+        bail!("/scratch still exists after disposable-state cleanup");
+    }
+    let committed = fs
+        .resolve_path("/committed", true)
+        .context("resolve /committed during disposable-state cleanup")?;
+    for entry in fs
+        .readdir(committed)
+        .context("read /committed during disposable-state cleanup")?
+    {
+        let Some(epoch) = entry
+            .name
+            .strip_prefix("epoch-")
+            .and_then(|digits| digits.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        if !oracle.epochs.contains_key(&epoch) {
+            bail!(
+                "/committed/{} still exists after disposable-state cleanup",
+                entry.name
+            );
+        }
     }
     Ok(())
 }
@@ -500,4 +542,85 @@ fn entropy_seed() -> u64 {
         .map(|duration| duration.as_nanos() as u64)
         .unwrap_or(0);
     nanos ^ ((std::process::id() as u64) << 32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::oracle::FileRecord;
+    use argosfs::types::ShardLocation;
+
+    /// A damaged scratch file must not be reported as durable data loss. Only
+    /// the host-side oracle names data that recovery promises to preserve.
+    #[test]
+    fn damaged_scratch_does_not_fail_recovery() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let images = (0..4)
+            .map(|index| temp.path().join(format!("disk{index}.img")))
+            .collect::<Vec<_>>();
+        let oracle_path = temp.path().join("oracle.json");
+        let committed = vec![0x5Au8; 8192];
+        let scratch = vec![0xA5u8; 8192];
+        let mut extents = Vec::new();
+        {
+            let fs = ArgosFs::create_loop(
+                &images,
+                VolumeConfig {
+                    k: 2,
+                    m: 2,
+                    chunk_size: 4096,
+                    compression: Compression::None,
+                    fsname: "argosfs-ztest-unit".to_string(),
+                    ..VolumeConfig::default()
+                },
+                32 * 1024 * 1024,
+                "argosfs-ztest-unit",
+                false,
+            )
+            .unwrap();
+            ensure_dir(&fs, "/committed").unwrap();
+            ensure_dir(&fs, "/scratch").unwrap();
+            fs.write_file("/committed/keep.bin", &committed, 0o644)
+                .unwrap();
+            fs.write_file("/scratch/bad.bin", &scratch, 0o644).unwrap();
+            fs.sync().unwrap();
+
+            let mut oracle = Oracle::default();
+            oracle.epochs.insert(
+                1,
+                BTreeMap::from([(
+                    "/committed/keep.bin".to_string(),
+                    FileRecord::for_bytes(&committed),
+                )]),
+            );
+            oracle.save(&oracle_path).unwrap();
+
+            let meta = fs.metadata_snapshot();
+            let ino = fs.resolve_path("/scratch/bad.bin", true).unwrap();
+            let inode = meta.inodes.get(&ino).unwrap();
+            for shard in inode.blocks[0].shards.iter().take(3) {
+                let Some(ShardLocation::RawExtent(extent)) = &shard.location else {
+                    panic!("scratch shard is not a raw extent");
+                };
+                let disk = meta.disks.get(&extent.disk_id).unwrap();
+                extents.push((disk.path.clone(), extent.offset));
+            }
+        }
+        assert_eq!(extents.len(), 3);
+        for (path, offset) in extents {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            let mut byte = [0u8; 1];
+            file.read_exact_at(&mut byte, offset).unwrap();
+            byte[0] ^= 0xFF;
+            file.write_all_at(&byte, offset).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        verify_recovery(&images, &oracle_path, 0)
+            .expect("damaged scratch file must not fail committed-data recovery");
+    }
 }
