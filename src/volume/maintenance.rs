@@ -1260,7 +1260,9 @@ impl ArgosFs {
             // The exclusive mutation barrier drains in-flight reservations.
             // Publish deferred reclamation before using referenced bytes as
             // allocation authority; otherwise old extents can be freed twice.
+            // A read-only check has no local deferred writes to publish.
             if meta.backend != BackendKind::Host
+                && self.backend_writable
                 && (meta.config.defer_metadata_commit || bulk_import_enabled())
             {
                 self.commit_deferred_locked(&mut meta, false)?;
@@ -1313,6 +1315,10 @@ impl ArgosFs {
                 }
             }
             if metadata_changed {
+                if let Err(err) = self.ensure_block_backend_writable_locked(&meta) {
+                    *meta = before;
+                    return Err(err);
+                }
                 self.commit_locked_with_previous(
                     &mut meta,
                     Some(&before),
