@@ -2224,10 +2224,13 @@ impl ArgosFs {
         if self.is_device_quarantined(disk_id) {
             return Err(ArgosError::MissingDevice(disk_id.to_string()));
         }
-        let result = match self.backend.read_at(&disk_id.to_string(), offset, buf) {
+        let result = match self
+            .backend
+            .read_shard_at(&disk_id.to_string(), offset, buf)
+        {
             Err(ArgosError::MissingDevice(_)) if meta.backend != BackendKind::Host => {
                 let backend = self.single_device_backend_locked(meta, disk_id, false)?;
-                backend.read_at(&disk_id.to_string(), offset, buf)
+                backend.read_shard_at(&disk_id.to_string(), offset, buf)
             }
             other => other,
         };
