@@ -320,7 +320,7 @@ impl ArgosFs {
             Arc::new(GuardedBackend::new(Arc::new(backend_file)));
         raw_store::initialize_pool(backend.clone(), &superblocks, &mut meta, force)?;
         raw_store::write_superblock_clean_state(&*backend, &superblocks, false)?;
-        Self::from_block_parts(paths, backend, true, superblocks, meta, false)
+        Self::from_block_parts(paths, backend, true, superblocks, meta, false, None)
     }
 
     pub(super) fn open_block_backend(
@@ -342,6 +342,11 @@ impl ArgosFs {
                 .disks
                 .values()
                 .all(|disk| matches!(disk.status, DiskStatus::Online | DiskStatus::Removed));
+        let durable_metadata = if reanchor_can_wait {
+            opened.durable_metadata
+        } else {
+            None
+        };
         let mut meta = opened.metadata;
         normalize_metadata_layouts(&mut meta);
         recompute_disk_usage_from_metadata(&mut meta);
@@ -352,6 +357,7 @@ impl ArgosFs {
             opened.superblocks,
             meta,
             reanchor_can_wait,
+            durable_metadata,
         )
     }
 
@@ -362,6 +368,7 @@ impl ArgosFs {
         superblocks: Vec<RawSuperblock>,
         meta: Metadata,
         reanchor_can_wait: bool,
+        durable_metadata: Option<Metadata>,
     ) -> Result<Self> {
         if meta.format != FORMAT_VERSION {
             return Err(ArgosError::Invalid(format!(
@@ -377,7 +384,8 @@ impl ArgosFs {
             .and_then(|path| path.parent())
             .map(Path::to_path_buf)
             .unwrap_or_else(std::env::temp_dir);
-        let raw_uncommitted_metadata_dirty = meta.backend != BackendKind::Host
+        let raw_uncommitted_metadata_dirty = durable_metadata.is_none()
+            && meta.backend != BackendKind::Host
             && (meta.integrity.meta_hash.is_empty()
                 || meta.integrity.hash_scheme == Some(journal::DELTA_INTEGRITY_SCHEME)
                 || (meta.integrity.hash_scheme.is_none()
@@ -390,6 +398,13 @@ impl ArgosFs {
         let meta = Arc::new(MetadataLock::new(meta));
         let mut state =
             DeferredCommitState::new_with_raw_dirty(&meta.read(), raw_uncommitted_metadata_dirty);
+        // Keep the exact authenticated v2 image, not the normalized live view.
+        // The first real delta must account for any changed member paths,
+        // allocation counters and layout normalization relative to that image.
+        // A missing or unverified member keeps the conservative reanchor path.
+        if let Some(durable) = durable_metadata {
+            state.durable_metadata = Some(Arc::new(durable));
+        }
         // A fully verified, complete pool has a durable recovery base even
         // after an unclean shutdown. Mount-time normalization can be anchored
         // with the first real mutation; advisory reads and a clean unmount do

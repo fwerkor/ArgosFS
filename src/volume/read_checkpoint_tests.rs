@@ -466,7 +466,7 @@ fn immediate_raw_reads_and_clean_unmount_do_not_checkpoint() {
 }
 
 #[test]
-fn clean_reopened_v2_pool_defers_reanchor_until_real_mutation() {
+fn clean_reopened_v2_pool_uses_exact_durable_delta_base() {
     let dir = tempfile::tempdir().unwrap();
     let images = (0..3)
         .map(|i| dir.path().join(format!("v2-reopen-{i}.img")))
@@ -496,7 +496,7 @@ fn clean_reopened_v2_pool_defers_reanchor_until_real_mutation() {
     fs.mark_clean_unmount().unwrap();
     drop(fs);
     let mut fs = ArgosFs::open_loop(&images, true).unwrap();
-    assert!(fs.deferred_commit.lock().raw_mount_reanchor_pending);
+    assert!(!fs.deferred_commit.lock().raw_mount_reanchor_pending);
     let audit = Arc::new(WriteAuditBackend::new(
         fs.backend.clone(),
         &fs.raw_superblocks,
@@ -513,19 +513,41 @@ fn clean_reopened_v2_pool_defers_reanchor_until_real_mutation() {
     fs.mark_clean_unmount().unwrap();
     assert_eq!(audit.totals(), [0, 0, 3 * 3 * 4096]);
     drop(fs);
-    let fs = ArgosFs::open_loop(&images, true).unwrap();
+    let moved = images
+        .iter()
+        .map(|path| {
+            let new = path.with_extension("moved");
+            std::fs::rename(path, &new).unwrap();
+            new
+        })
+        .collect::<Vec<_>>();
+    let fs = ArgosFs::open_loop(&moved, true).unwrap();
     assert_eq!(
         fs.metadata_snapshot().integrity.meta_hash,
         baseline.integrity.meta_hash
     );
-    assert!(fs.deferred_commit.lock().raw_mount_reanchor_pending);
+    assert!(!fs.deferred_commit.lock().raw_mount_reanchor_pending);
+    assert_eq!(
+        fs.deferred_commit
+            .lock()
+            .durable_metadata
+            .as_ref()
+            .unwrap()
+            .disks["disk-0000"]
+            .path,
+        images[0]
+    );
+    assert_eq!(fs.metadata_snapshot().disks["disk-0000"].path, moved[0]);
     fs.write_file("/after", b"durable after reopen", 0o600)
         .unwrap();
     fs.sync().unwrap();
-    assert_eq!(phase(&fs, CommitPhase::Checkpoint), 1);
+    assert_eq!(phase(&fs, CommitPhase::Checkpoint), 0);
     assert!(!fs.deferred_commit.lock().raw_mount_reanchor_pending);
     drop(fs);
-    let fs = ArgosFs::open_loop(&images, false).unwrap();
+    let recovered = raw_store::open_pool(BackendKind::LoopBlock, &moved, false).unwrap();
+    assert_eq!(recovered.metadata.disks["disk-0000"].path, moved[0]);
+    assert!(recovered.recovery_verified);
+    let fs = ArgosFs::open_loop(&moved, false).unwrap();
     assert_eq!(
         fs.read_file("/before", false).unwrap(),
         b"durable before reopen"
@@ -538,7 +560,7 @@ fn clean_reopened_v2_pool_defers_reanchor_until_real_mutation() {
 }
 
 #[test]
-fn verified_unclean_reopen_defers_reanchor_through_read_only_syncs() {
+fn verified_unclean_reopen_reuses_durable_delta_base() {
     let dir = tempfile::tempdir().unwrap();
     let images = (0..3)
         .map(|i| dir.path().join(format!("unclean-{i}.img")))
@@ -579,7 +601,7 @@ fn verified_unclean_reopen_defers_reanchor_through_read_only_syncs() {
         assert!(recovered.recovery_verified);
     }
     let mut fs = ArgosFs::open_loop(&images, true).unwrap();
-    assert!(fs.deferred_commit.lock().raw_mount_reanchor_pending);
+    assert!(!fs.deferred_commit.lock().raw_mount_reanchor_pending);
     let audit = Arc::new(WriteAuditBackend::new(
         fs.backend.clone(),
         &fs.raw_superblocks,
@@ -594,7 +616,8 @@ fn verified_unclean_reopen_defers_reanchor_through_read_only_syncs() {
     fs.write_file("/new", b"new", 0o600).unwrap();
     fs.sync().unwrap();
     assert!(!fs.deferred_commit.lock().raw_mount_reanchor_pending);
-    assert!(audit.totals()[0] > 0);
+    assert_eq!(audit.totals()[0], 0);
+    assert!(audit.totals()[1] > 0);
     fs.mark_clean_unmount().unwrap();
     drop(fs);
     let fs = ArgosFs::open_loop(&images, false).unwrap();
