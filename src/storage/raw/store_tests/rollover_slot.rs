@@ -679,3 +679,133 @@ fn partial_checkpoint_write_keeps_the_previous_quorum_on_an_even_member_pool() {
     );
     assert_eq!(recovered.unwrap().txid, previous.txid);
 }
+
+#[test]
+fn stable_membership_discards_a_newer_unquorate_checkpoint_tail() {
+    let dir = tempdir().unwrap();
+    let images = (0..6)
+        .map(|index| dir.path().join(format!("stable-{index}.img")))
+        .collect::<Vec<_>>();
+    let fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 4,
+            m: 2,
+            chunk_size: 4096,
+            ..VolumeConfig::default()
+        },
+        MIN_DEVICE_BYTES,
+        "stable-membership-test",
+        false,
+    )
+    .unwrap();
+    fs.write_file("/base", b"durable-base", 0o600).unwrap();
+    fs.sync().unwrap();
+    let metadata = fs.metadata_snapshot();
+    drop(fs);
+    let superblocks: Vec<RawSuperblock> = images
+        .iter()
+        .map(|path| {
+            inspect_device(BackendKind::LoopBlock, path.clone())
+                .unwrap()
+                .0
+        })
+        .collect();
+    let backend = block_backend_for(&images);
+    write_dual_slot_checkpoint(&backend, &superblocks, &metadata);
+
+    // Simulate an indeterminate checkpoint that reached three of six members.
+    // The quorum requirement is four, so this tail was never acknowledged.
+    let committed = next_metadata(&metadata, "acknowledged-replay");
+    append_transaction_with_trusted_integrity_quorum(
+        &backend,
+        &superblocks,
+        &committed,
+        Some(&metadata),
+        "committed-delta",
+        serde_json::json!({}),
+    )
+    .unwrap();
+    let newer = next_metadata(&committed, "unquorate-tail");
+    let checkpoint = prepare_checkpoint_writes(&newer, &superblocks).unwrap();
+    for sb in &superblocks[..3] {
+        write_metadata_slot(&backend, sb, sb.metadata.offset, &checkpoint, None).unwrap();
+    }
+
+    // Recovery selects the older quorate state. Writing it back must discard
+    // the unacknowledged minority tail instead of refusing the checkpoint.
+    let selected = recover_metadata(&backend, &superblocks).unwrap();
+    assert_eq!(selected.txid, committed.txid);
+    let (recovered, report) = load_or_recover(&backend, &superblocks, true)
+        .expect("writable recovery must discard an unquorate tail");
+    assert!(report.replayed);
+    assert_eq!(recovered.txid, committed.txid);
+    let recovered = recover_metadata(&backend, &superblocks).unwrap();
+    assert_eq!(recovered.txid, committed.txid);
+    assert_eq!(recovered.inodes.len(), metadata.inodes.len());
+}
+
+#[test]
+fn explicit_checkpoint_does_not_erase_certified_minority_base() {
+    let (_dir, images, previous, mut superblocks) = quorum_fixture();
+    let backend = block_backend_for(&images);
+    let lengths = superblocks
+        .iter()
+        .map(|sb| sb.journal.length)
+        .collect::<Vec<_>>();
+    let base = next_metadata(&previous, "certified-base");
+    force_small_rollover_journal(&backend, &mut superblocks);
+    append_transaction_with_trusted_integrity_quorum(
+        &backend,
+        &superblocks,
+        &base,
+        Some(&previous),
+        "rollover",
+        serde_json::json!({"payload": "x".repeat(64 * 1024)}),
+    )
+    .unwrap();
+    for (sb, len) in superblocks.iter_mut().zip(lengths) {
+        sb.journal.length = len;
+    }
+    let tip = next_metadata(&base, "acknowledged-tip");
+    append_transaction_with_trusted_integrity_quorum(
+        &backend,
+        &superblocks,
+        &tip,
+        Some(&base),
+        "delta",
+        serde_json::json!({}),
+    )
+    .unwrap();
+    for sb in &superblocks[..2] {
+        let slot = checkpoint_slot_txids(&backend, sb)
+            .iter()
+            .position(|txid| *txid == base.txid)
+            .unwrap();
+        backend
+            .write_at(
+                &sb.disk_id,
+                sb.metadata.offset + slot as u64 * (sb.metadata.length / 2),
+                &[0; 16],
+            )
+            .unwrap();
+    }
+    let selected = recover_metadata(&backend, &superblocks).unwrap();
+    assert_eq!(selected.txid, tip.txid);
+    let survivor = &superblocks[2];
+    let before = checkpoint_slot_txids(&backend, survivor);
+    let failing = WriteFailBackend {
+        inner: block_backend_for(&images),
+        failed: superblocks[..2]
+            .iter()
+            .map(|sb| sb.disk_id.clone())
+            .collect(),
+    };
+    assert!(write_recovered_metadata_copies_quorum(&failing, &superblocks, &selected).is_err());
+    assert!(checkpoint_slot_txids(&backend, survivor).contains(&base.txid));
+    assert!(before.contains(&base.txid));
+    assert_eq!(
+        recover_metadata(&backend, &superblocks).unwrap().txid,
+        tip.txid
+    );
+}

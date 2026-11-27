@@ -61,12 +61,21 @@ fn write_metadata_members_parallel(
     })
 }
 
+#[cfg(test)]
 pub(crate) fn write_metadata_copies_quorum(
     backend: &dyn StorageBackend,
     superblocks: &[RawSuperblock],
     metadata: &Metadata,
 ) -> Result<QuorumWriteReport> {
-    write_metadata_copies_quorum_impl(backend, superblocks, metadata, None)
+    write_metadata_copies_quorum_impl(backend, superblocks, metadata, None, false)
+}
+
+pub(super) fn write_recovered_metadata_copies_quorum(
+    backend: &dyn StorageBackend,
+    superblocks: &[RawSuperblock],
+    metadata: &Metadata,
+) -> Result<QuorumWriteReport> {
+    write_metadata_copies_quorum_impl(backend, superblocks, metadata, None, true)
 }
 
 pub(crate) fn write_metadata_copies_quorum_measured(
@@ -75,7 +84,7 @@ pub(crate) fn write_metadata_copies_quorum_measured(
     metadata: &Metadata,
     metrics: &CommitMetrics,
 ) -> Result<QuorumWriteReport> {
-    write_metadata_copies_quorum_impl(backend, superblocks, metadata, Some(metrics))
+    write_metadata_copies_quorum_impl(backend, superblocks, metadata, Some(metrics), false)
 }
 
 fn write_metadata_copies_quorum_impl(
@@ -83,6 +92,7 @@ fn write_metadata_copies_quorum_impl(
     superblocks: &[RawSuperblock],
     metadata: &Metadata,
     metrics: Option<&CommitMetrics>,
+    replay_selected: bool,
 ) -> Result<QuorumWriteReport> {
     let need = metadata_quorum_requirement(metadata);
     if superblocks.len() < need {
@@ -102,7 +112,13 @@ fn write_metadata_copies_quorum_impl(
     // checkpoint with a majority (e.g. one of two members completes while the
     // other keeps only the old slot). The protected subset is also the same
     // quorum rule used for journal rollover.
-    let (protected_targets, blocked) = protected_explicit_checkpoint_targets(backend, superblocks)?;
+    // Only the actual recovery path has established the authoritative replay
+    // winner. Ordinary checkpoint writes must preserve certified minority bases.
+    let (protected_targets, blocked) = protected_explicit_checkpoint_targets(
+        backend,
+        superblocks,
+        replay_selected.then_some(metadata),
+    )?;
     let writable = superblocks
         .iter()
         .filter(|sb| !blocked.contains(&sb.disk_id))
@@ -553,14 +569,18 @@ pub(super) fn protected_rollover_slot_targets(
 /// Preserve those bases instead of treating the rollover-only refusal as a
 /// permanent inability to checkpoint. Never overwrite two distinct necessary
 /// bases on a member before the new checkpoint is durable.
+type CheckpointIdentity = (u64, u64, String);
+type MemberCheckpointSlots = BTreeMap<String, Vec<(u64, CheckpointIdentity)>>;
+
 fn protected_explicit_checkpoint_targets(
     backend: &dyn StorageBackend,
     superblocks: &[RawSuperblock],
+    replay_selected: Option<&Metadata>,
 ) -> Result<(BTreeMap<String, u64>, BTreeSet<String>)> {
-    type Key = (u64, u64, String);
     let decoded = parking_lot::Mutex::new(BTreeMap::new());
-    let mut votes = BTreeMap::<Key, (usize, BTreeSet<String>)>::new();
-    let mut members = BTreeMap::<String, Vec<(u64, Key)>>::new();
+    let mut votes = BTreeMap::<CheckpointIdentity, (usize, BTreeSet<String>)>::new();
+    let mut members = MemberCheckpointSlots::new();
+    let mut catalog = BTreeMap::new();
     // Verify each member independently and share only decoded payloads. An
     // internally valid foreign checkpoint is not a recovery anchor here.
     let results = std::thread::scope(|scope| {
@@ -576,12 +596,18 @@ fn protected_explicit_checkpoint_targets(
             .collect::<Vec<_>>()
     });
     for (sb, candidates) in results {
-        for (slot, (candidate, _)) in candidates?.into_iter().enumerate() {
+        for (slot, (candidate, report)) in candidates?.into_iter().enumerate() {
             let Some(candidate) = candidate else {
                 continue;
             };
             if Uuid::parse_str(&candidate.uuid).ok() != Some(sb.pool_uuid) {
                 continue;
+            }
+            if replay_selected.is_some() {
+                catalog.insert(
+                    (sb.disk_id.clone(), slot as u64),
+                    (sb.disk_id.clone(), Some(candidate.clone()), report),
+                );
             }
             let key = (
                 candidate.txid,
@@ -608,7 +634,7 @@ fn protected_explicit_checkpoint_targets(
         .map(|(key, _)| (key.0, key.1));
     let mut targets = BTreeMap::new();
     let mut blocked = BTreeSet::new();
-    for (disk, slots) in members {
+    for (disk, slots) in &members {
         let important = slots
             .iter()
             .filter(|(_, key)| anchor.is_none_or(|anchor| (key.0, key.1) >= anchor))
@@ -616,11 +642,99 @@ fn protected_explicit_checkpoint_targets(
         match important.as_slice() {
             [] => {}
             [first, second] if first.1 != second.1 => {
-                blocked.insert(disk);
+                blocked.insert(disk.clone());
             }
             [first, ..] => {
-                targets.insert(disk, 1 - first.0);
+                targets.insert(disk.clone(), 1 - first.0);
             }
+        }
+    }
+    if let Some(selected) = replay_selected.filter(|_| !blocked.is_empty()) {
+        // The ordinary planner protects every plausible replay base. During
+        // recovery we know the exact authoritative state, so verify a less
+        // restrictive plan using the same recovery algorithm, with the target
+        // slots logically absent. No disk writes or journal resets occur here.
+        return replay_protected_checkpoint_targets(
+            backend,
+            superblocks,
+            selected,
+            catalog,
+            &members,
+        );
+    }
+    Ok((targets, blocked))
+}
+
+/// Retain a sufficient recovery witness, even if every new checkpoint write
+/// fails. Never infer historical membership from currently online members.
+fn replay_protected_checkpoint_targets(
+    backend: &dyn StorageBackend,
+    superblocks: &[RawSuperblock],
+    selected: &Metadata,
+    mut catalog: BTreeMap<(String, u64), MemberCheckpointCandidate>,
+    members: &MemberCheckpointSlots,
+) -> Result<(BTreeMap<String, u64>, BTreeSet<String>)> {
+    let pool = superblocks.first().map(|sb| sb.pool_uuid);
+    let original = catalog.values().cloned().collect::<Vec<_>>();
+    let anchor = select_quorum_metadata_candidate_for_pool(&original, pool)?;
+    let identity = |m: &Metadata| -> Result<_> {
+        Ok((m.txid, m.integrity.generation, metadata_hash_for_replay(m)?))
+    };
+    let anchor_key = anchor.as_deref().map(identity).transpose()?;
+    let selected_key = identity(selected)?;
+    let mut targets = BTreeMap::new();
+    let mut blocked = BTreeSet::new();
+    for (disk, slots) in members {
+        let mut choices = slots.iter().collect::<Vec<_>>();
+        // Prefer retaining the original quorum anchor, then the most recent
+        // state not newer than the replay winner. Try the other slot if needed.
+        choices.sort_by_key(|(_, key)| {
+            (
+                anchor_key.as_ref() == Some(key),
+                key.0 <= selected.txid,
+                key.0,
+                key.1,
+            )
+        });
+        for (keep, _) in choices.into_iter().rev() {
+            let target = 1 - keep;
+            let slot = (disk.clone(), target);
+            let removed = catalog.remove(&slot);
+            let safe = if removed.is_none() {
+                true
+            } else {
+                let retained = catalog.values().cloned().collect::<Vec<_>>();
+                let base = select_quorum_metadata_candidate_for_pool(&retained, pool)?;
+                // Preserve the exact original quorum anchor throughout all
+                // partial writes, not merely the same final replay result.
+                if base.as_deref().map(identity).transpose()? != anchor_key {
+                    false
+                } else {
+                    let journal = read_latest_journal_metadata(
+                        backend,
+                        superblocks,
+                        &mut TransactionReport::default(),
+                        base.as_deref(),
+                        &retained,
+                    )?;
+                    let winner = match (base, journal) {
+                        (Some(base), Some(journal)) if journal.txid > base.txid => Some(journal),
+                        (Some(base), _) => Some(base),
+                        (None, journal) => journal,
+                    };
+                    winner.as_deref().map(identity).transpose()?.as_ref() == Some(&selected_key)
+                }
+            };
+            if safe {
+                targets.insert(disk.clone(), target);
+                break;
+            }
+            if let Some(removed) = removed {
+                catalog.insert(slot, removed);
+            }
+        }
+        if !targets.contains_key(disk) {
+            blocked.insert(disk.clone());
         }
     }
     Ok((targets, blocked))
