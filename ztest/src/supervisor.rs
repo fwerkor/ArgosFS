@@ -3,10 +3,12 @@
 
 use crate::fault::FaultConfig;
 use crate::oracle::Oracle;
-use crate::workload::{cleanup_unpublished, ensure_dir, remove_tree, verify_oracle, WorkerConfig};
+use crate::workload::{
+    cleanup_unpublished_checked, ensure_dir, remove_tree_checked, verify_oracle, WorkerConfig,
+};
 use anyhow::{bail, Context, Result};
 use argosfs::types::{BackendKind, Compression, FsckReport, Metadata, ShardLocation, VolumeConfig};
-use argosfs::ArgosFs;
+use argosfs::{ArgosError, ArgosFs};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
@@ -315,6 +317,65 @@ fn validate(config: &RunConfig) -> Result<()> {
     Ok(())
 }
 
+/// Open a writable recovery mount and remove disposable state.
+///
+/// The first writable open after a crash can be fenced by its own cleanup
+/// transaction when the injected fault left the journal at a durability
+/// boundary: the commit needs a metadata quorum, fails, and fences the mount.
+/// That fence is in-memory only. Reopening performs recovery again, clears the
+/// transient fence, and lets the cleanup finish; the same thing happens when a
+/// service restarts a fenced mount. Only a fence that survives repeated
+/// recovery is a hard failure; unrelated errors fail immediately.
+fn open_and_clean_recovered_pool(
+    images: &[PathBuf],
+    oracle: &Oracle,
+    cycle: usize,
+) -> Result<ArgosFs> {
+    with_cleanup_retries(
+        3,
+        |attempt| {
+            ArgosFs::open_loop(images, true)
+                .with_context(|| format!("open pool after cycle {cycle} crash (attempt {attempt})"))
+        },
+        |fs| {
+            discard_disposable_state(fs, oracle)
+                .with_context(|| format!("cycle {cycle}: discard disposable state"))
+        },
+    )
+}
+
+fn with_cleanup_retries<T>(
+    attempts: usize,
+    mut open: impl FnMut(usize) -> Result<T>,
+    mut clean: impl FnMut(&T) -> Result<()>,
+) -> Result<T> {
+    for attempt in 1..=attempts {
+        let value = open(attempt)?;
+        match clean(&value) {
+            Ok(()) => return Ok(value),
+            Err(err) if attempt < attempts && is_recoverable_cleanup_error(&err) => {
+                eprintln!(
+                    "ztest: disposable-state cleanup attempt {attempt}/{attempts} failed: {err:#}"
+                );
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    bail!("cleanup retries require at least one attempt")
+}
+
+fn is_recoverable_cleanup_error(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<ArgosError>(),
+        Some(
+            ArgosError::ReadonlyRequired(_)
+                | ArgosError::QuorumUnavailable { .. }
+                | ArgosError::RetryableQuorumUnavailable { .. }
+                | ArgosError::IndeterminateCommit(_)
+        )
+    )
+}
+
 fn verify_recovery(
     images: &[PathBuf],
     oracle_path: &Path,
@@ -322,12 +383,16 @@ fn verify_recovery(
     cycle: usize,
     allow_expected_loss: bool,
 ) -> Result<Vec<String>> {
-    let fs = ArgosFs::open_loop(images, true)
-        .with_context(|| format!("open pool after cycle {cycle} crash"))?;
     let mut oracle = Oracle::load(oracle_path)?;
     if oracle.all_files().next().is_none() {
         bail!("cycle {cycle}: empty durability oracle");
     }
+    // Scratch and unpublished epochs are disposable by design: a crash may
+    // leave a partial epoch, and scratch mutations may legitimately fail under
+    // injected faults. Remove them before scrubbing so an unrecoverable
+    // scratch file is not mistaken for durable data loss. The worker performs
+    // the same cleanup before it starts.
+    let fs = open_and_clean_recovered_pool(images, &oracle, cycle)?;
     let mut oracle_inodes = BTreeMap::new();
     for (path, _) in oracle.all_files() {
         let inode = fs
@@ -335,13 +400,6 @@ fn verify_recovery(
             .with_context(|| format!("resolve committed path {path}"))?;
         oracle_inodes.insert(inode, path.clone());
     }
-    // Scratch and unpublished epochs are disposable by design: a crash may
-    // leave a partial epoch, and scratch mutations may legitimately fail under
-    // injected faults. Remove them before scrubbing so an unrecoverable
-    // scratch file is not mistaken for durable data loss. The worker performs
-    // the same cleanup before it starts.
-    discard_disposable_state(&fs, &oracle)
-        .with_context(|| format!("cycle {cycle}: discard disposable state"))?;
     // Remove unreferenced data left by the epoch that was in flight. This is
     // the same offline repair a user would run after a power loss.
     let report = fs
@@ -404,11 +462,13 @@ fn verify_recovery(
 /// leaving them in the pool makes scrub report damage that no caller ever
 /// promised to keep.
 fn discard_disposable_state(fs: &ArgosFs, oracle: &Oracle) -> Result<()> {
-    cleanup_unpublished(fs, oracle);
-    remove_tree(fs, "/scratch");
+    cleanup_unpublished_checked(fs, oracle).context("remove unpublished epochs")?;
+    remove_tree_checked(fs, "/scratch").context("remove /scratch")?;
     fs.sync().context("sync after disposable-state cleanup")?;
-    if fs.attr_path("/scratch", false).is_ok() {
-        bail!("/scratch still exists after disposable-state cleanup");
+    match fs.attr_path("/scratch", false) {
+        Ok(_) => bail!("/scratch still exists after disposable-state cleanup"),
+        Err(ArgosError::NotFound(_)) => {}
+        Err(err) => return Err(err).context("check /scratch after disposable-state cleanup"),
     }
     let committed = fs
         .resolve_path("/committed", true)
@@ -1058,5 +1118,88 @@ mod tests {
             fs.resolve_path("/committed/keep.bin", true).is_err(),
             "expected-loss file must be removed from the pool"
         );
+    }
+
+    #[test]
+    fn cleanup_retries_until_a_fresh_open_succeeds() {
+        let mut opens = 0;
+        let mut cleans = 0;
+        let value = with_cleanup_retries(
+            3,
+            |_| {
+                opens += 1;
+                Ok(opens)
+            },
+            |_| {
+                cleans += 1;
+                if cleans < 3 {
+                    return Err(ArgosError::ReadonlyRequired("transient write fence".into()))
+                        .context("cleanup");
+                }
+                Ok(())
+            },
+        )
+        .expect("third attempt should succeed");
+        assert_eq!(value, 3);
+        assert_eq!(opens, 3);
+        assert_eq!(cleans, 3);
+    }
+
+    #[test]
+    fn cleanup_surfaces_the_last_failure_after_all_attempts() {
+        let mut cleans = 0;
+        let err = with_cleanup_retries(
+            3,
+            |_| Ok(()),
+            |_| {
+                cleans += 1;
+                Err(ArgosError::ReadonlyRequired(format!(
+                    "persistent cleanup failure {cleans}"
+                )))
+                .context("cleanup")
+            },
+        )
+        .expect_err("all attempts fail");
+        assert_eq!(cleans, 3);
+        assert!(format!("{err:#}").contains("persistent cleanup failure 3"));
+    }
+
+    #[test]
+    fn cleanup_does_not_retry_unrelated_failures() {
+        for failure in [
+            ArgosError::CorruptedMetadata("invalid inode".into()),
+            ArgosError::CommittedDurabilityLoss("lost committed data".into()),
+        ] {
+            let mut opens = 0;
+            let message = failure.to_string();
+            let mut failure = Some(failure);
+            let err = with_cleanup_retries(
+                3,
+                |_| {
+                    opens += 1;
+                    Ok(())
+                },
+                |_| Err(failure.take().expect("must not retry")).context("cleanup"),
+            )
+            .expect_err("unexpected failure must be surfaced");
+            assert_eq!(opens, 1);
+            assert!(format!("{err:#}").contains(&message));
+        }
+    }
+
+    #[test]
+    fn cleanup_does_not_retry_failed_open() {
+        let mut opens = 0;
+        let err = with_cleanup_retries(
+            3,
+            |_| {
+                opens += 1;
+                Err::<(), _>(ArgosError::ReadonlyRequired("cannot open pool".into()).into())
+            },
+            |_| panic!("cleanup must not run without a mount"),
+        )
+        .expect_err("open failure must be surfaced");
+        assert_eq!(opens, 1);
+        assert!(format!("{err:#}").contains("cannot open pool"));
     }
 }

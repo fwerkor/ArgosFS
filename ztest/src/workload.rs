@@ -355,18 +355,17 @@ pub fn epoch_dir(epoch: u64) -> String {
 /// This cleans up partial epochs from a crash and retired epochs from a crash
 /// between the oracle rename and the delete loop.
 pub fn cleanup_unpublished(fs: &ArgosFs, oracle: &Oracle) {
+    let _ = cleanup_unpublished_inner(fs, oracle, true);
+}
+
+pub fn cleanup_unpublished_checked(fs: &ArgosFs, oracle: &Oracle) -> Result<()> {
+    cleanup_unpublished_inner(fs, oracle, false)
+}
+
+fn cleanup_unpublished_inner(fs: &ArgosFs, oracle: &Oracle, best_effort: bool) -> Result<()> {
     let root = "/committed";
-    let ino = match fs.resolve_path(root, true) {
-        Ok(ino) => ino,
-        Err(_) => return,
-    };
-    let Ok(entries) = fs.readdir(ino) else {
-        return;
-    };
-    for entry in entries {
-        if entry.name == "." || entry.name == ".." {
-            continue;
-        }
+    let ino = fs.resolve_path(root, true)?;
+    for entry in fs.readdir(ino)? {
         let Some(epoch) = entry
             .name
             .strip_prefix("epoch-")
@@ -375,31 +374,52 @@ pub fn cleanup_unpublished(fs: &ArgosFs, oracle: &Oracle) {
             continue;
         };
         if !oracle.epochs.contains_key(&epoch) {
-            remove_tree(fs, &format!("{root}/{}", entry.name));
+            let result = remove_tree_inner(fs, &format!("{root}/{}", entry.name), best_effort);
+            if !best_effort {
+                result?;
+            }
         }
     }
+    Ok(())
 }
 
 pub fn remove_tree(fs: &ArgosFs, path: &str) {
-    let Ok(attr) = fs.attr_path(path, false) else {
-        return;
+    let _ = remove_tree_inner(fs, path, true);
+}
+
+pub fn remove_tree_checked(fs: &ArgosFs, path: &str) -> Result<()> {
+    remove_tree_inner(fs, path, false)
+}
+
+fn remove_tree_inner(fs: &ArgosFs, path: &str, best_effort: bool) -> Result<()> {
+    let attr = match fs.attr_path(path, false) {
+        Ok(attr) => attr,
+        Err(ArgosError::NotFound(_)) => return Ok(()),
+        Err(err) => return Err(err.into()),
     };
     match attr.kind {
         NodeKind::Directory => {
-            if let Ok(entries) = fs.readdir(attr.ino) {
-                for entry in entries {
-                    if entry.name == "." || entry.name == ".." {
-                        continue;
-                    }
-                    remove_tree(fs, &format!("{path}/{}", entry.name));
+            let entries = match fs.readdir(attr.ino) {
+                Ok(entries) => entries,
+                Err(_) if best_effort => Vec::new(),
+                Err(err) => return Err(err.into()),
+            };
+            for entry in entries {
+                if entry.name == "." || entry.name == ".." {
+                    continue;
+                }
+                let result = remove_tree_inner(fs, &format!("{path}/{}", entry.name), best_effort);
+                if !best_effort {
+                    result?;
                 }
             }
-            let _ = fs.rmdir_path(path);
+            fs.rmdir_path(path)?;
         }
         NodeKind::File | NodeKind::Symlink | NodeKind::Special => {
-            let _ = fs.unlink_path(path);
+            fs.unlink_path(path)?;
         }
     }
+    Ok(())
 }
 
 /// Verify the durable oracle after a crash. Returns a list of violated paths.
