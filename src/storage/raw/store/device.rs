@@ -157,9 +157,7 @@ pub fn inspect_device(kind: BackendKind, path: PathBuf) -> Result<(RawSuperblock
     let id = "disk-0000".to_string();
     let capacity = backend.capacity(&id)?;
     let mut sb = vec![0u8; SUPERBLOCK_SIZE];
-    let mut label = vec![0u8; DEVICE_LABEL_SIZE];
     backend.read_at(&id, PRIMARY_SUPERBLOCK_OFFSET, &mut sb)?;
-    backend.read_at(&id, DEVICE_LABEL_OFFSET, &mut label)?;
     let decode = |bytes: &[u8]| -> Result<RawSuperblock> {
         let superblock = RawSuperblock::decode(bytes)?;
         superblock.validate_device_capacity(capacity)?;
@@ -178,9 +176,49 @@ pub fn inspect_device(kind: BackendKind, path: PathBuf) -> Result<(RawSuperblock
             })?
         }
     };
-    let label = RawDeviceLabel::decode(&label)?;
-    validate_label_matches_superblock(&superblock, &label)?;
+    let label = read_label_with_backup(&*backend, &id, &superblock)?;
     Ok((superblock, label))
+}
+
+/// Read a device label, falling back to the backup copy next to the backup
+/// superblock. The primary label is refreshed on every writable open and clean
+/// unmount, so a single torn 4 KiB label write must not remove an otherwise
+/// healthy member from the pool.
+pub(super) fn read_label_with_backup(
+    backend: &dyn StorageBackend,
+    device_id: &str,
+    superblock: &RawSuperblock,
+) -> Result<RawDeviceLabel> {
+    let mut primary = vec![0u8; DEVICE_LABEL_SIZE];
+    let primary_result = backend
+        .read_at(&device_id.to_string(), DEVICE_LABEL_OFFSET, &mut primary)
+        .and_then(|()| RawDeviceLabel::decode(&primary))
+        .and_then(|label| {
+            validate_label_matches_superblock(superblock, &label)?;
+            Ok(label)
+        });
+    match primary_result {
+        Ok(label) => Ok(label),
+        Err(primary_err) => {
+            let mut backup = vec![0u8; DEVICE_LABEL_SIZE];
+            let backup_offset = superblock.backup_superblock_offset + SUPERBLOCK_SIZE as u64;
+            backend
+                .read_at(&device_id.to_string(), backup_offset, &mut backup)
+                .and_then(|()| RawDeviceLabel::decode(&backup))
+                .and_then(|label| {
+                    validate_label_matches_superblock(superblock, &label)?;
+                    Ok(label)
+                })
+                .map_err(|backup_err| {
+                    if matches!(backup_err, ArgosError::DeviceFailed { .. } | ArgosError::DeviceTimeout { .. }) {
+                        return backup_err;
+                    }
+                    ArgosError::CorruptedMetadata(format!(
+                        "primary device label failed ({primary_err}); backup label failed ({backup_err})"
+                    ))
+                })
+        }
+    }
 }
 
 fn scan_one_path(kind: BackendKind, path: &PathBuf) -> ScannedDevice {
@@ -228,12 +266,7 @@ pub(super) fn scan_one_path_once(kind: BackendKind, path: &PathBuf) -> ScannedDe
     let capacity = backend.capacity(&id).unwrap_or(0);
     match read_superblock_with_backup(&*backend, &id, capacity) {
         Ok((sb, source)) => {
-            let label_result = (|| {
-                let mut label = vec![0u8; DEVICE_LABEL_SIZE];
-                backend.read_at(&id, DEVICE_LABEL_OFFSET, &mut label)?;
-                let label = RawDeviceLabel::decode(&label)?;
-                validate_label_matches_superblock(&sb, &label)
-            })();
+            let label_result = read_label_with_backup(&*backend, &id, &sb).map(|_label| ());
             if let Err(err) = label_result {
                 return ScannedDevice {
                     path: path.clone(),
