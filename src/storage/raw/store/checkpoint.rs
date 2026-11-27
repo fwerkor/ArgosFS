@@ -102,17 +102,27 @@ fn write_metadata_copies_quorum_impl(
     // checkpoint with a majority (e.g. one of two members completes while the
     // other keeps only the old slot). The protected subset is also the same
     // quorum rule used for journal rollover.
-    let protected_targets = protected_rollover_slot_targets(backend, superblocks, need)?;
+    let (protected_targets, blocked) = protected_explicit_checkpoint_targets(backend, superblocks)?;
+    let writable = superblocks
+        .iter()
+        .filter(|sb| !blocked.contains(&sb.disk_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if writable.len() < need {
+        return Err(ArgosError::Conflict(
+            "no safe checkpoint targets on a quorum; preserve existing replay bases".to_string(),
+        ));
+    }
     let mut report = QuorumWriteReport::default();
     let mut durable = 0usize;
     let mut uncertain_write = false;
     for (disk_id, result) in write_metadata_members_parallel(
         backend,
-        superblocks,
+        &writable,
         metadata,
         &checkpoint,
         metrics,
-        protected_targets.as_ref(),
+        Some(&protected_targets),
     ) {
         match result {
             Ok(()) => durable += 1,
@@ -122,6 +132,12 @@ fn write_metadata_copies_quorum_impl(
                 report.record_failure(&disk_id, &err);
             }
         }
+    }
+    for disk_id in blocked {
+        report.record_failure(
+            &disk_id,
+            &ArgosError::Conflict("both checkpoint slots hold distinct recovery bases".to_string()),
+        );
     }
     if durable < need {
         return Err(if uncertain_write {
@@ -529,6 +545,85 @@ pub(super) fn protected_rollover_slot_targets(
         ));
     }
     Ok(None)
+}
+
+/// Explicit checkpoint writes do not reset journals. During topology changes
+/// the current quorum may be larger than the previous checkpoint's own quorum,
+/// and a newly bootstrapped member may carry a newer minority checkpoint.
+/// Preserve those bases instead of treating the rollover-only refusal as a
+/// permanent inability to checkpoint. Never overwrite two distinct necessary
+/// bases on a member before the new checkpoint is durable.
+fn protected_explicit_checkpoint_targets(
+    backend: &dyn StorageBackend,
+    superblocks: &[RawSuperblock],
+) -> Result<(BTreeMap<String, u64>, BTreeSet<String>)> {
+    type Key = (u64, u64, String);
+    let decoded = parking_lot::Mutex::new(BTreeMap::new());
+    let mut votes = BTreeMap::<Key, (usize, BTreeSet<String>)>::new();
+    let mut members = BTreeMap::<String, Vec<(u64, Key)>>::new();
+    // Verify each member independently and share only decoded payloads. An
+    // internally valid foreign checkpoint is not a recovery anchor here.
+    let results = std::thread::scope(|scope| {
+        let jobs = superblocks
+            .iter()
+            .map(|sb| {
+                let decoded = &decoded;
+                scope.spawn(move || (sb, read_metadata_candidates_cached(backend, sb, decoded)))
+            })
+            .collect::<Vec<_>>();
+        jobs.into_iter()
+            .map(|job| job.join().expect("checkpoint verifier panicked"))
+            .collect::<Vec<_>>()
+    });
+    for (sb, candidates) in results {
+        for (slot, (candidate, _)) in candidates?.into_iter().enumerate() {
+            let Some(candidate) = candidate else {
+                continue;
+            };
+            if Uuid::parse_str(&candidate.uuid).ok() != Some(sb.pool_uuid) {
+                continue;
+            }
+            let key = (
+                candidate.txid,
+                candidate.integrity.generation,
+                super::replay::metadata_hash_for_replay(&candidate)?,
+            );
+            if metadata_has_voting_member(&candidate, &sb.disk_id) {
+                votes
+                    .entry(key.clone())
+                    .or_insert_with(|| (metadata_quorum_requirement(&candidate), BTreeSet::new()))
+                    .1
+                    .insert(sb.disk_id.clone());
+            }
+            members
+                .entry(sb.disk_id.clone())
+                .or_default()
+                .push((slot as u64, key));
+        }
+    }
+    let anchor = votes
+        .iter()
+        .rev()
+        .find(|(_, (required, present))| present.len() >= *required)
+        .map(|(key, _)| (key.0, key.1));
+    let mut targets = BTreeMap::new();
+    let mut blocked = BTreeSet::new();
+    for (disk, slots) in members {
+        let important = slots
+            .iter()
+            .filter(|(_, key)| anchor.is_none_or(|anchor| (key.0, key.1) >= anchor))
+            .collect::<Vec<_>>();
+        match important.as_slice() {
+            [] => {}
+            [first, second] if first.1 != second.1 => {
+                blocked.insert(disk);
+            }
+            [first, ..] => {
+                targets.insert(disk, 1 - first.0);
+            }
+        }
+    }
+    Ok((targets, blocked))
 }
 
 pub(super) fn write_metadata_member(

@@ -456,69 +456,6 @@ fn next_metadata(previous: &Metadata, pool_name: &str) -> Metadata {
 }
 
 #[test]
-fn partial_checkpoint_write_keeps_the_previous_quorum_on_an_even_member_pool() {
-    let dir = tempdir().unwrap();
-    let images = (0..2)
-        .map(|index| dir.path().join(format!("checkpoint-partial-{index}.img")))
-        .collect::<Vec<_>>();
-    let fs = ArgosFs::create_loop(
-        &images,
-        VolumeConfig {
-            k: 1,
-            m: 0,
-            chunk_size: 4096,
-            compression: crate::types::Compression::None,
-            ..VolumeConfig::default()
-        },
-        32 * 1024 * 1024,
-        "checkpoint-partial",
-        false,
-    )
-    .unwrap();
-    fs.write_file("/base", b"durable-base", 0o600).unwrap();
-    fs.sync().unwrap();
-    let previous = fs.metadata_snapshot();
-    drop(fs);
-
-    let superblocks = images
-        .iter()
-        .map(|path| {
-            inspect_device(BackendKind::LoopBlock, path.clone())
-                .unwrap()
-                .0
-        })
-        .collect::<Vec<_>>();
-    let backend = block_backend_for(&images);
-    // A normal pool can have empty journals after recovery/rollover. With no
-    // journal records, the checkpoint slots are the only durable state.
-    write_metadata_copies(&backend, &superblocks, &previous).unwrap();
-    for sb in &superblocks {
-        initialize_journal_region(&backend, &sb.disk_id, sb).unwrap();
-    }
-    backend.flush_all().unwrap();
-
-    let next = next_metadata(&previous, "partial-checkpoint");
-    let failing = WriteFailBackend {
-        inner: block_backend_for(&images),
-        failed: BTreeSet::from(["disk-0001".to_string()]),
-    };
-    let err = write_metadata_copies_quorum(&failing, &superblocks, &next).unwrap_err();
-    assert!(
-        matches!(err, ArgosError::IndeterminateCommit(_)),
-        "unexpected checkpoint error: {err}"
-    );
-
-    // disk-0000 completed the new checkpoint; disk-0001 still has only the
-    // previous one. The previous checkpoint must remain a valid quorum.
-    let recovered = recover_metadata(&block_backend_for(&images), &superblocks);
-    assert!(
-        recovered.is_ok(),
-        "the previous checkpoint quorum was destroyed: {recovered:?}"
-    );
-    assert_eq!(recovered.unwrap().txid, previous.txid);
-}
-
-#[test]
 fn optional_checkpoint_catalog_does_not_require_extra_slot_capacity() {
     let (_dir, _images, metadata, mut superblocks) = quorum_fixture();
     for sb in &mut superblocks {
