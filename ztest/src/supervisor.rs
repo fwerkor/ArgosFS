@@ -64,6 +64,7 @@ pub struct RunConfig {
     pub kill_after_max: Duration,
     pub min_faults: u64,
     pub parity_drill: bool,
+    pub allow_expected_loss: bool,
     pub fault: FaultConfig,
 }
 
@@ -235,8 +236,14 @@ pub fn run(config: RunConfig) -> Result<RunOutcome> {
         }
 
         expected_loss.extend(
-            verify_recovery(&images, &oracle_path, &worker_config.fault_log, cycle)
-                .with_context(|| format!("cycle {cycle} recovery verification"))?,
+            verify_recovery(
+                &images,
+                &oracle_path,
+                &worker_config.fault_log,
+                cycle,
+                config.allow_expected_loss,
+            )
+            .with_context(|| format!("cycle {cycle} recovery verification"))?,
         );
         for (kind, count) in summarize_faults(&worker_config.fault_log)? {
             *faults.entry(kind).or_default() += count;
@@ -313,6 +320,7 @@ fn verify_recovery(
     oracle_path: &Path,
     fault_log: &Path,
     cycle: usize,
+    allow_expected_loss: bool,
 ) -> Result<Vec<String>> {
     let fs = ArgosFs::open_loop(images, true)
         .with_context(|| format!("open pool after cycle {cycle} crash"))?;
@@ -357,6 +365,9 @@ fn verify_recovery(
     // cycles do not keep rediscovering a loss that was already explained.
     let expected_loss = classification.expected_loss_paths;
     if !expected_loss.is_empty() {
+        if !allow_expected_loss {
+            bail!("cycle {cycle}: possible over-budget damage to committed files (strict oracle): {expected_loss:?}");
+        }
         for path in &expected_loss {
             fs.unlink_path(path)
                 .with_context(|| format!("retire expected-loss file {path}"))?;
@@ -555,8 +566,9 @@ fn classify_scrub_failures(
             continue;
         };
         let Some(path) = oracle_inodes.get(&inode_id) else {
-            // Disposable/scratch state should already be gone before scrub.
-            // Damage there is never durable data loss.
+            // Cleanup has already removed known disposable paths. Any
+            // remaining error is unexplained and must fail the run.
+            classification.unexpected.push(message.clone());
             continue;
         };
         let Some(damaged_slots) = stripe_damaged_slots(meta, inode_id, stripe_id, &faults) else {
@@ -831,6 +843,7 @@ mod tests {
             &oracle_path,
             &temp.path().join("cycle-000.faults.jsonl"),
             0,
+            false,
         )
         .expect("damaged scratch file must not fail committed-data recovery");
     }
@@ -1031,7 +1044,7 @@ mod tests {
         }
 
         let expected =
-            verify_recovery(&images, &oracle_path, &fault_log, 0).expect("expected loss");
+            verify_recovery(&images, &oracle_path, &fault_log, 0, true).expect("expected loss");
         assert_eq!(expected, vec!["/committed/keep.bin".to_string()]);
         assert_eq!(
             Oracle::load(&oracle_path).unwrap().all_files().count(),

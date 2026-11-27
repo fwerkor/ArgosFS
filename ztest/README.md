@@ -36,9 +36,8 @@ rate so one injected metadata error does not immediately fence the whole pool.
 ## What it verifies
 
 - every crash reopens the pool and runs `scrub()`;
-- damage to durable oracle files is repaired, or is recorded as expected loss
-  when the cycle's fault log proves that more than `m` shards in one stripe were
-  destructively faulted;
+- damage to durable oracle files is a hard failure by default; exploratory
+  runs with `--allow-expected-loss` may retire candidate over-budget losses;
 - damage within the parity budget (`m` or fewer shards) must be repaired; an
   unrecoverable stripe in that case is a hard failure;
 - every remaining file in the host-side oracle must exist and match its BLAKE3
@@ -48,6 +47,11 @@ rate so one injected metadata error does not immediately fence the whole pool.
   (`damaged_files >= 1`, `repaired_files >= 1`) without losing the file.
 
 ### Expected loss
+
+Strict oracle verification is the default. Pass `--allow-expected-loss` only
+for exploratory fault-model runs, not durability acceptance. A fault log
+records I/O locations, not the lifetime of an extent or proof that a later
+write did not repair it, so attribution is heuristic.
 
 A pool with `m` parity shards cannot reconstruct `m + 1` damaged shards in one
 stripe. ztest matches scrub's unrecoverable `(inode, stripe)` results against

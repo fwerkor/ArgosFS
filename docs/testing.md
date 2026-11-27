@@ -295,3 +295,5 @@ Known limits:
 - The complete xfstests generic suite remains local-run only; required CI uses
   the mounted compatibility and pjdfstest subsets plus dedicated block and QEMU
   fault scenarios.
+
+For ztest durability acceptance, keep strict oracle verification (the default). `--allow-expected-loss` is an exploratory mode with heuristic fault attribution, not a durability guarantee.
