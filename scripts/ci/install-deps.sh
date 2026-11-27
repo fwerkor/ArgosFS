@@ -16,6 +16,20 @@ prefer_stable_ubuntu_mirrors() {
 	done
 }
 
+# GitHub-hosted Ubuntu images ship Microsoft's optional package feed.
+# ArgosFS does not use it, and its intermittent HTTP 403 otherwise makes
+# apt-get update fail even when the required Ubuntu repositories are healthy.
+# Keep changes scoped to disposable GitHub Actions runners.
+disable_unused_microsoft_feed() {
+	[[ ${GITHUB_ACTIONS:-} == true ]] || return 0
+	local source
+	for source in /etc/apt/sources.list.d/microsoft-prod.list /etc/apt/sources.list.d/microsoft-prod.sources; do
+		[[ -f "$source" ]] || continue
+		# These dedicated runner-image files contain only the optional feed.
+		sudo mv -- "$source" "$source.disabled"
+	done
+}
+
 apt_get() {
 	local attempt
 	local max_attempts=4
@@ -37,6 +51,7 @@ apt_get() {
 	done
 }
 
+disable_unused_microsoft_feed
 prefer_stable_ubuntu_mirrors
 apt_get update
 apt_get install -y --no-install-recommends \
