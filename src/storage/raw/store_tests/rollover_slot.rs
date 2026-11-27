@@ -679,3 +679,55 @@ fn partial_checkpoint_write_keeps_the_previous_quorum_on_an_even_member_pool() {
     );
     assert_eq!(recovered.unwrap().txid, previous.txid);
 }
+
+#[test]
+fn stable_membership_discards_a_newer_unquorate_checkpoint_tail() {
+    let dir = tempdir().unwrap();
+    let images = (0..6)
+        .map(|index| dir.path().join(format!("stable-{index}.img")))
+        .collect::<Vec<_>>();
+    let fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 4,
+            m: 2,
+            chunk_size: 4096,
+            ..VolumeConfig::default()
+        },
+        MIN_DEVICE_BYTES,
+        "stable-membership-test",
+        false,
+    )
+    .unwrap();
+    fs.write_file("/base", b"durable-base", 0o600).unwrap();
+    fs.sync().unwrap();
+    let metadata = fs.metadata_snapshot();
+    drop(fs);
+    let superblocks: Vec<RawSuperblock> = images
+        .iter()
+        .map(|path| {
+            inspect_device(BackendKind::LoopBlock, path.clone())
+                .unwrap()
+                .0
+        })
+        .collect();
+    let backend = block_backend_for(&images);
+    write_dual_slot_checkpoint(&backend, &superblocks, &metadata);
+
+    // Simulate an indeterminate checkpoint that reached three of six members.
+    // The quorum requirement is four, so this tail was never acknowledged.
+    let newer = next_metadata(&metadata, "unquorate-tail");
+    let checkpoint = prepare_checkpoint_writes(&newer, &superblocks).unwrap();
+    for sb in &superblocks[..3] {
+        write_metadata_slot(&backend, sb, sb.metadata.offset, &checkpoint, None).unwrap();
+    }
+
+    // Recovery selects the older quorate state. Writing it back must discard
+    // the unacknowledged minority tail instead of refusing the checkpoint.
+    let report = write_metadata_copies_quorum(&backend, &superblocks, &metadata)
+        .expect("stable membership must allow discarding an unquorate tail");
+    assert_eq!(report.failed_devices.len(), 0);
+    let recovered = recover_metadata(&backend, &superblocks).unwrap();
+    assert_eq!(recovered.txid, metadata.txid);
+    assert_eq!(recovered.inodes.len(), metadata.inodes.len());
+}

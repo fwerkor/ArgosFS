@@ -102,7 +102,26 @@ fn write_metadata_copies_quorum_impl(
     // checkpoint with a majority (e.g. one of two members completes while the
     // other keeps only the old slot). The protected subset is also the same
     // quorum rule used for journal rollover.
-    let (protected_targets, blocked) = protected_explicit_checkpoint_targets(backend, superblocks)?;
+    //
+    // If every active member is present and online, membership is unchanged
+    // since the checkpoints were written. A checkpoint on fewer than `need`
+    // members then cannot have been acknowledged, so it is safe to discard a
+    // newer minority checkpoint and preserve the quorum anchor instead.
+    let active_members = metadata
+        .disks
+        .values()
+        .filter(|disk| disk.status != DiskStatus::Removed)
+        .count();
+    let stable_membership = superblocks.len() == active_members
+        && metadata
+            .disks
+            .values()
+            .all(|disk| matches!(disk.status, DiskStatus::Online | DiskStatus::Removed))
+        && superblocks
+            .iter()
+            .all(|sb| metadata_has_voting_member(metadata, &sb.disk_id));
+    let (protected_targets, blocked) =
+        protected_explicit_checkpoint_targets(backend, superblocks, stable_membership)?;
     let writable = superblocks
         .iter()
         .filter(|sb| !blocked.contains(&sb.disk_id))
@@ -556,6 +575,7 @@ pub(super) fn protected_rollover_slot_targets(
 fn protected_explicit_checkpoint_targets(
     backend: &dyn StorageBackend,
     superblocks: &[RawSuperblock],
+    stable_membership: bool,
 ) -> Result<(BTreeMap<String, u64>, BTreeSet<String>)> {
     type Key = (u64, u64, String);
     let decoded = parking_lot::Mutex::new(BTreeMap::new());
@@ -609,6 +629,24 @@ fn protected_explicit_checkpoint_targets(
     let mut targets = BTreeMap::new();
     let mut blocked = BTreeSet::new();
     for (disk, slots) in members {
+        if stable_membership {
+            if let Some(anchor) = anchor {
+                // With unchanged membership the newest quorate checkpoint is
+                // the only acknowledged base. Keep that base on every member
+                // that has it; on a member without it, keep the newest older
+                // base. Any newer minority checkpoint is an unacknowledged
+                // tail and can be replaced by the new checkpoint.
+                let preserve = slots
+                    .iter()
+                    .filter(|(_, key)| (key.0, key.1) <= anchor)
+                    .max_by_key(|(_, key)| (key.0, key.1))
+                    .or_else(|| slots.iter().max_by_key(|(_, key)| (key.0, key.1)));
+                if let Some((slot, _)) = preserve {
+                    targets.insert(disk, 1 - slot);
+                }
+                continue;
+            }
+        }
         let important = slots
             .iter()
             .filter(|(_, key)| anchor.is_none_or(|anchor| (key.0, key.1) >= anchor))
