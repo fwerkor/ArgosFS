@@ -434,6 +434,60 @@ fn next_metadata(previous: &Metadata, pool_name: &str) -> Metadata {
 }
 
 #[test]
+fn torn_primary_label_falls_back_to_the_backup_label() {
+    use std::os::unix::fs::FileExt;
+
+    let dir = tempdir().unwrap();
+    let images = (0..2)
+        .map(|index| dir.path().join(format!("backup-label-{index}.img")))
+        .collect::<Vec<_>>();
+    let fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            chunk_size: 4096,
+            compression: crate::types::Compression::None,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "backup-label",
+        false,
+    )
+    .unwrap();
+    fs.write_file("/file", b"survives a torn label", 0o600)
+        .unwrap();
+    fs.sync().unwrap();
+    fs.mark_clean_unmount().unwrap();
+    drop(fs);
+
+    // The clean-state update refreshes both labels and their generation.
+    let (superblock, _) = inspect_device(BackendKind::LoopBlock, images[1].clone()).unwrap();
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&images[1])
+        .unwrap();
+    file.write_all_at(
+        &[0u8; crate::raw_format::DEVICE_LABEL_SIZE],
+        crate::raw_format::DEVICE_LABEL_OFFSET,
+    )
+    .unwrap();
+    file.sync_all().unwrap();
+
+    let scanned = scan_paths(BackendKind::LoopBlock, &images);
+    assert!(
+        scanned.iter().all(|device| device.valid),
+        "a torn primary label must not invalidate the backup label: {scanned:?}"
+    );
+    let reopened = ArgosFs::open_loop(&images, false).unwrap();
+    assert_eq!(
+        reopened.read_file("/file", false).unwrap(),
+        b"survives a torn label"
+    );
+    assert!(superblock.backup_superblock_offset > crate::raw_format::DEVICE_LABEL_OFFSET);
+}
+
+#[test]
 fn optional_checkpoint_catalog_does_not_require_extra_slot_capacity() {
     let (_dir, _images, metadata, mut superblocks) = quorum_fixture();
     for sb in &mut superblocks {
