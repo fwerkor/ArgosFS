@@ -1043,6 +1043,8 @@ mod tests {
             file.sync_all().unwrap();
         }
 
+        assert!(verify_recovery(&images, &oracle_path, &fault_log, 0, false).is_err());
+        assert_eq!(Oracle::load(&oracle_path).unwrap().all_files().count(), 1);
         let expected =
             verify_recovery(&images, &oracle_path, &fault_log, 0, true).expect("expected loss");
         assert_eq!(expected, vec!["/committed/keep.bin".to_string()]);

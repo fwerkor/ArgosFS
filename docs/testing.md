@@ -72,12 +72,12 @@ with `SIGKILL`, then reopens, scrubs, and verifies every committed file against
 a host-side BLAKE3 oracle. Injected faults include EIO, silent read/write bit
 rot, torn writes, lost writes, skipped flush barriers, and a volatile write-back
 window. A final parity drill damages a data shard in a backing image and
-requires scrub to reconstruct it without losing the file. When a cycle's fault
-log shows that more than the pool's `m` parity shards were destructively
-faulted in one stripe, the resulting committed loss is reported as expected and
-retired from the pool and oracle rather than failing the run; losses within the
-parity budget still fail. See `ztest/README.md` for the fault model and tuning
-flags.
+requires scrub to reconstruct it without losing the file. Strict oracle
+verification is the default; any unrecoverable committed file fails the run.
+For exploratory runs only, `--allow-expected-loss` enables heuristic attribution
+of over-budget losses and retirement of affected paths. The event log alone
+cannot prove that a fault still affects the current extent. See `ztest/README.md`
+for the fault model and tuning flags.
 
 The wrapper uses `ArgosFs::open_loop_with_backend`/`open_raw_with_backend`, a
 `#[doc(hidden)]` seam that installs the wrapper before recovery. The normal
@@ -295,5 +295,3 @@ Known limits:
 - The complete xfstests generic suite remains local-run only; required CI uses
   the mounted compatibility and pjdfstest subsets plus dedicated block and QEMU
   fault scenarios.
-
-For ztest durability acceptance, keep strict oracle verification (the default). `--allow-expected-loss` is an exploratory mode with heuristic fault attribution, not a durability guarantee.
