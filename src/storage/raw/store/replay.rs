@@ -91,6 +91,12 @@ pub(super) fn scan_journal_metadata(
     // Full metadata ownership is bounded by the current member replay tip,
     // the best retained tip, and an optional explicitly requested state.
     // Historical record/candidate indexes contain only identities and votes.
+    let expected_uuid = superblocks.first().map(|sb| sb.pool_uuid.to_string());
+    let base_metadata = base_metadata.filter(|metadata| {
+        expected_uuid
+            .as_deref()
+            .is_none_or(|uuid| metadata.uuid == uuid)
+    });
     let base_snapshot = base_metadata.cloned().map(Arc::new);
     let present = superblocks
         .iter()
@@ -117,6 +123,12 @@ pub(super) fn scan_journal_metadata(
             .filter(|(disk_id, _, _)| disk_id == &sb.disk_id)
         {
             if let Some(candidate) = candidate {
+                if expected_uuid
+                    .as_deref()
+                    .is_some_and(|uuid| candidate.uuid != uuid)
+                {
+                    continue;
+                }
                 checkpoint_candidates
                     .insert(metadata_hash_for_replay(candidate)?, candidate.clone());
             }
@@ -174,6 +186,24 @@ pub(super) fn scan_journal_metadata(
                         report.errors.push(format!(
                             "raw journal record at {}:{} has an invalid record hash",
                             sb.disk_id, cursor
+                        ));
+                        break;
+                    }
+                    // A reused or partially reformatted device can still carry
+                    // a valid record from another pool. The record hash
+                    // authenticates the UUID it claims, so compare that claim
+                    // with the pool the superblocks belong to before replaying.
+                    if expected_uuid
+                        .as_deref()
+                        .is_some_and(|uuid| record.volume_uuid != uuid)
+                    {
+                        report.invalid_entries += 1;
+                        report.errors.push(format!(
+                            "raw journal record at {}:{} belongs to pool {}, not {}",
+                            sb.disk_id,
+                            cursor,
+                            record.volume_uuid,
+                            expected_uuid.as_deref().unwrap_or("")
                         ));
                         break;
                     }
@@ -369,6 +399,23 @@ pub(super) fn scan_journal_metadata(
                     let Some(candidate) = candidate else {
                         break;
                     };
+                    // Validate both full snapshots and legacy delta results.
+                    // A matching record UUID is not enough when a delta can
+                    // modify the embedded metadata identity.
+                    if expected_uuid
+                        .as_deref()
+                        .is_some_and(|uuid| candidate.uuid != uuid)
+                    {
+                        report.invalid_entries += 1;
+                        report.errors.push(format!(
+                            "raw journal metadata at {}:{} belongs to pool {}, not {}",
+                            sb.disk_id,
+                            cursor,
+                            candidate.uuid,
+                            expected_uuid.as_deref().unwrap_or("")
+                        ));
+                        break;
+                    }
                     let candidate = Arc::new(candidate);
                     let proof = ReplayProof::from_metadata(&candidate, &sb.disk_id, &present)?;
                     if wanted == Some(&proof.key) {
