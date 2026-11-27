@@ -315,6 +315,54 @@ fn validate(config: &RunConfig) -> Result<()> {
     Ok(())
 }
 
+/// Open a writable recovery mount and remove disposable state.
+///
+/// The first writable open after a crash can be fenced by its own cleanup
+/// transaction when the injected fault left the journal at a durability
+/// boundary: the commit needs a metadata quorum, fails, and fences the mount.
+/// That fence is in-memory only. Reopening performs recovery again, clears the
+/// transient fence, and lets the cleanup finish; the same thing happens when a
+/// service restarts a fenced mount. Only a fence that survives repeated
+/// recovery is a hard failure.
+fn open_and_clean_recovered_pool(
+    images: &[PathBuf],
+    oracle: &Oracle,
+    cycle: usize,
+) -> Result<ArgosFs> {
+    with_cleanup_retries(
+        3,
+        |attempt| {
+            ArgosFs::open_loop(images, true)
+                .with_context(|| format!("open pool after cycle {cycle} crash (attempt {attempt})"))
+        },
+        |fs| {
+            discard_disposable_state(fs, oracle)
+                .with_context(|| format!("cycle {cycle}: discard disposable state"))
+        },
+    )
+}
+
+fn with_cleanup_retries<T>(
+    attempts: usize,
+    mut open: impl FnMut(usize) -> Result<T>,
+    mut clean: impl FnMut(&T) -> Result<()>,
+) -> Result<T> {
+    let mut last_error = None;
+    for attempt in 1..=attempts {
+        let value = open(attempt)?;
+        match clean(&value) {
+            Ok(()) => return Ok(value),
+            Err(err) => {
+                eprintln!(
+                    "ztest: disposable-state cleanup attempt {attempt}/{attempts} failed: {err:#}"
+                );
+                last_error = Some(err);
+            }
+        }
+    }
+    Err(last_error.expect("cleanup retries require at least one attempt"))
+}
+
 fn verify_recovery(
     images: &[PathBuf],
     oracle_path: &Path,
@@ -322,12 +370,16 @@ fn verify_recovery(
     cycle: usize,
     allow_expected_loss: bool,
 ) -> Result<Vec<String>> {
-    let fs = ArgosFs::open_loop(images, true)
-        .with_context(|| format!("open pool after cycle {cycle} crash"))?;
     let mut oracle = Oracle::load(oracle_path)?;
     if oracle.all_files().next().is_none() {
         bail!("cycle {cycle}: empty durability oracle");
     }
+    // Scratch and unpublished epochs are disposable by design: a crash may
+    // leave a partial epoch, and scratch mutations may legitimately fail under
+    // injected faults. Remove them before scrubbing so an unrecoverable
+    // scratch file is not mistaken for durable data loss. The worker performs
+    // the same cleanup before it starts.
+    let fs = open_and_clean_recovered_pool(images, &oracle, cycle)?;
     let mut oracle_inodes = BTreeMap::new();
     for (path, _) in oracle.all_files() {
         let inode = fs
@@ -335,13 +387,6 @@ fn verify_recovery(
             .with_context(|| format!("resolve committed path {path}"))?;
         oracle_inodes.insert(inode, path.clone());
     }
-    // Scratch and unpublished epochs are disposable by design: a crash may
-    // leave a partial epoch, and scratch mutations may legitimately fail under
-    // injected faults. Remove them before scrubbing so an unrecoverable
-    // scratch file is not mistaken for durable data loss. The worker performs
-    // the same cleanup before it starts.
-    discard_disposable_state(&fs, &oracle)
-        .with_context(|| format!("cycle {cycle}: discard disposable state"))?;
     // Remove unreferenced data left by the epoch that was in flight. This is
     // the same offline repair a user would run after a power loss.
     let report = fs
@@ -1058,5 +1103,45 @@ mod tests {
             fs.resolve_path("/committed/keep.bin", true).is_err(),
             "expected-loss file must be removed from the pool"
         );
+    }
+
+    #[test]
+    fn cleanup_retries_until_a_fresh_open_succeeds() {
+        let mut opens = 0;
+        let mut cleans = 0;
+        let value = with_cleanup_retries(
+            3,
+            |_| {
+                opens += 1;
+                Ok(opens)
+            },
+            |_| {
+                cleans += 1;
+                if cleans < 3 {
+                    bail!("transient write fence");
+                }
+                Ok(())
+            },
+        )
+        .expect("third attempt should succeed");
+        assert_eq!(value, 3);
+        assert_eq!(opens, 3);
+        assert_eq!(cleans, 3);
+    }
+
+    #[test]
+    fn cleanup_surfaces_the_last_failure_after_all_attempts() {
+        let mut cleans = 0;
+        let err = with_cleanup_retries(
+            3,
+            |_| Ok(()),
+            |_| {
+                cleans += 1;
+                bail!("persistent cleanup failure {cleans}");
+            },
+        )
+        .expect_err("all attempts fail");
+        assert_eq!(cleans, 3);
+        assert!(format!("{err:#}").contains("persistent cleanup failure 3"));
     }
 }
