@@ -9,8 +9,10 @@ mod device;
 use device::*;
 
 pub use checkpoint::write_metadata_copies;
+#[cfg(test)]
 pub(crate) use checkpoint::write_metadata_copies_quorum;
 pub(crate) use checkpoint::write_metadata_copies_quorum_measured;
+use checkpoint::write_recovered_metadata_copies_quorum;
 pub use device::inspect_device;
 pub use device::scan_paths;
 pub use device::superblock_for_device;
@@ -850,7 +852,7 @@ fn load_or_recover(
             return Ok((metadata, report));
         }
         let checkpoint_report =
-            write_metadata_copies_quorum(backend, &member_superblocks, &metadata)?;
+            write_recovered_metadata_copies_quorum(backend, &member_superblocks, &metadata)?;
         let failed_checkpoint_members = checkpoint_report
             .failed_devices
             .keys()
