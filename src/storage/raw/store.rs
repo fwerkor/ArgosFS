@@ -284,6 +284,20 @@ where
         FileBlockBackend::open_with_ids(kind, devices, write)?,
     ))));
     let (mut metadata, mut report) = load_or_recover(&*backend, &superblocks, write)?;
+    if let Some(pool) = pool_uuid {
+        let metadata_pool = Uuid::parse_str(&metadata.uuid).map_err(|err| {
+            ArgosError::CorruptedMetadata(format!(
+                "recovered metadata has an invalid pool UUID {:?}: {err}",
+                metadata.uuid
+            ))
+        })?;
+        if metadata_pool != pool {
+            return Err(ArgosError::CorruptedMetadata(format!(
+                "recovered metadata belongs to pool {}, but the superblocks advertise {pool}",
+                metadata.uuid
+            )));
+        }
+    }
     if metadata.backend != kind {
         return Err(ArgosError::IncompatibleFormat(format!(
             "metadata backend {:?} does not match requested {:?}",
@@ -774,7 +788,8 @@ fn load_or_recover(
         .iter()
         .map(|(_, _, report)| report.clone())
         .collect();
-    let mut best = select_quorum_metadata_candidate(&candidates)?;
+    let expected_pool = superblocks.first().map(|sb| sb.pool_uuid);
+    let mut best = select_quorum_metadata_candidate_for_pool(&candidates, expected_pool)?;
     let journal_best = read_latest_journal_metadata(
         backend,
         superblocks,
@@ -936,6 +951,13 @@ fn metadata_member_superblocks(
 fn select_quorum_metadata_candidate(
     candidates: &[(String, Option<Arc<Metadata>>, MetadataCandidateReport)],
 ) -> Result<Option<Arc<Metadata>>> {
+    select_quorum_metadata_candidate_for_pool(candidates, None)
+}
+
+fn select_quorum_metadata_candidate_for_pool(
+    candidates: &[(String, Option<Arc<Metadata>>, MetadataCandidateReport)],
+    expected_pool: Option<Uuid>,
+) -> Result<Option<Arc<Metadata>>> {
     let mut supported =
         BTreeMap::<(u64, u64, String), (Arc<Metadata>, std::collections::BTreeSet<String>)>::new();
     for (disk_id, metadata, _) in candidates {
@@ -943,6 +965,13 @@ fn select_quorum_metadata_candidate(
             continue;
         };
         if !metadata_has_voting_member(metadata, disk_id) {
+            continue;
+        }
+        // A valid checkpoint image from a previous pool can survive a forced
+        // reformat on a reused device. Its checksums only prove internal
+        // consistency, so bind it to the pool UUID advertised by the
+        // superblock before it can win a quorum vote.
+        if expected_pool.is_some_and(|pool| Uuid::parse_str(&metadata.uuid).ok() != Some(pool)) {
             continue;
         }
         let hash = metadata_hash_for_replay(metadata)?;

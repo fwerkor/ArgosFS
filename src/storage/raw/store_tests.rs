@@ -434,6 +434,47 @@ fn next_metadata(previous: &Metadata, pool_name: &str) -> Metadata {
 }
 
 #[test]
+fn foreign_pool_checkpoint_cannot_win_a_quorum() {
+    let (_dir, images, metadata, superblocks) = quorum_fixture();
+    let backend = block_backend_for(&images);
+
+    // A checksum-valid checkpoint from another pool with a higher txid, as
+    // could survive an interrupted forced reformat on a reused device.
+    let mut foreign = metadata.clone();
+    foreign.uuid = uuid::Uuid::new_v4().to_string();
+    foreign.txid = metadata.txid.saturating_add(10);
+    foreign.updated_at += 1.0;
+    journal::prepare_metadata_integrity_with_previous(
+        &mut foreign,
+        metadata.integrity.meta_hash.clone(),
+    )
+    .unwrap();
+    let checkpoint = prepare_checkpoint_writes(&foreign, &superblocks).unwrap();
+    for sb in superblocks.iter().take(2) {
+        write_metadata_slot(&backend, sb, sb.metadata.offset, &checkpoint, None).unwrap();
+    }
+
+    let recovered = recover_metadata(&backend, &superblocks).unwrap();
+    assert_eq!(recovered.uuid, metadata.uuid);
+    assert_ne!(recovered.uuid, foreign.uuid);
+
+    // The same binding applies to a full journal snapshot from the foreign
+    // pool: its record hash is valid, but it must not be replayed against
+    // these superblocks.
+    append_transaction(
+        &backend,
+        &superblocks,
+        &foreign,
+        "foreign-pool",
+        serde_json::json!({}),
+    )
+    .unwrap();
+    let recovered = recover_metadata(&backend, &superblocks).unwrap();
+    assert_eq!(recovered.uuid, metadata.uuid);
+    assert_ne!(recovered.uuid, foreign.uuid);
+}
+
+#[test]
 fn optional_checkpoint_catalog_does_not_require_extra_slot_capacity() {
     let (_dir, _images, metadata, mut superblocks) = quorum_fixture();
     for sb in &mut superblocks {
