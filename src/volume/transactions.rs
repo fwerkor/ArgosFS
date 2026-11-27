@@ -361,7 +361,15 @@ impl ArgosFs {
 
         let durability = match result {
             Ok(report) => self.apply_quorum_write_report(meta, report),
-            Err(err) if Self::transaction_error_is_committed(&err) => Err(err),
+            Err(err) if Self::transaction_error_is_committed(&err) => {
+                // The commit may have exposed the new state on some members,
+                // but recovery has not yet decided whether it is durable.
+                // Every other commit path fences here; a deferred group commit
+                // must do the same instead of continuing to acknowledge writes
+                // against a state that may disappear on the next mount.
+                self.fence_on_quorum_loss(&err);
+                Err(err)
+            }
             Err(err) => {
                 if let Some(snapshot) = before_commit {
                     *meta = snapshot;
