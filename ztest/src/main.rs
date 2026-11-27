@@ -68,6 +68,9 @@ struct RunArgs {
     /// Disable the deterministic end-to-end parity reconstruction drill.
     #[arg(long)]
     no_parity_drill: bool,
+    /// Allow heuristic over-budget loss retirement in exploratory stress runs.
+    #[arg(long)]
+    allow_expected_loss: bool,
 
     /// Percentage of reads that return EIO.
     #[arg(long, default_value_t = 0.10)]
@@ -218,6 +221,7 @@ fn run_config(args: RunArgs) -> Result<RunConfig> {
         kill_after_max: Duration::from_millis(args.kill_after_ms_max),
         min_faults: args.min_faults,
         parity_drill: !args.no_parity_drill,
+        allow_expected_loss: args.allow_expected_loss,
         fault,
     })
 }
