@@ -265,28 +265,22 @@ pub fn load_or_recover(root: &Path) -> Result<RecoveredMetadata> {
         let bytes = match serialized {
             Some(bytes) => bytes,
             None => {
-                // A journal-only recovery has no copy bytes to reuse. Its
-                // integrity hash may be a raw-delta digest or the decoded-float
-                // fallback rather than the canonical checkpoint digest, so the
-                // old "does it re-serialize to the stored hash?" test rejected
-                // exactly the states that replay had just validated.
-                //
-                // Materialize a fresh canonical checkpoint instead. The hash
-                // is computed over the exact pretty bytes that are written, so
-                // the next mount can validate the repaired copies without the
-                // journal.
-                let mut repaired = metadata.clone();
-                repaired.integrity = MetadataIntegrity {
-                    generation: repaired.txid,
-                    previous_meta_hash: String::new(),
-                    meta_hash: String::new(),
-                    hash_scheme: None,
-                };
-                let probe = serde_json::to_vec_pretty(&repaired)?;
-                repaired.integrity.meta_hash = canonical_metadata_hash_bytes(&probe)?;
-                let bytes = serde_json::to_vec_pretty(&repaired)?;
-                metadata = repaired;
-                bytes
+                // Keep the authenticated transaction identity whenever its
+                // decoded state still serializes to valid checkpoint bytes.
+                let bytes = serde_json::to_vec_pretty(&metadata)?;
+                if canonical_metadata_hash_bytes(&bytes)? == metadata.integrity.meta_hash
+                    && metadata.integrity.hash_scheme.is_none()
+                {
+                    bytes
+                } else {
+                    // The wire representation changed on decoding. Materialize
+                    // a canonical copy without discarding the transaction's
+                    // generation or predecessor. The next append must establish
+                    // a full journal checkpoint if the canonical hash changed.
+                    metadata.integrity.hash_scheme = None;
+                    metadata.integrity.meta_hash = canonical_metadata_hash_bytes(&bytes)?;
+                    serde_json::to_vec_pretty(&metadata)?
+                }
             }
         };
         write_metadata_copies_bytes(root, &bytes)?;
@@ -296,10 +290,15 @@ pub fn load_or_recover(root: &Path) -> Result<RecoveredMetadata> {
 }
 
 pub fn scan(root: &Path) -> Result<TransactionReport> {
+    scan_with_metadata_tip(root).map(|(report, _)| report)
+}
+
+fn scan_with_metadata_tip(root: &Path) -> Result<(TransactionReport, Option<String>)> {
+    let mut metadata_tip = None;
     let mut report = TransactionReport::default();
     let mut previous_hash = String::new();
     let Some(text) = read_journal_text(root)? else {
-        return Ok(report);
+        return Ok((report, metadata_tip));
     };
     for (line_no, raw) in text.lines().enumerate() {
         if raw.trim().is_empty() {
@@ -371,13 +370,16 @@ pub fn scan(root: &Path) -> Result<TransactionReport> {
                 }
             }
         }
+        if record.metadata.is_some() || record.metadata_delta.is_some() {
+            metadata_tip = Some(record.meta_hash.clone());
+        }
         report.valid_entries += 1;
         report.last_valid_txid = record.txid;
         report.last_valid_generation = record.generation;
         report.last_valid_record_hash = record.record_hash.clone();
         previous_hash = record.record_hash;
     }
-    Ok(report)
+    Ok((report, metadata_tip))
 }
 
 pub fn append_transaction(
@@ -397,7 +399,7 @@ pub fn append_transaction_checked(
     details: serde_json::Value,
 ) -> Result<()> {
     let _lock = FileLock::exclusive(&transaction_lock_path(root))?;
-    let report = scan(root)?;
+    let (report, metadata_tip) = scan_with_metadata_tip(root)?;
     let metadata_copy = latest_metadata_copy(root)?;
     let previous_metadata = match metadata_copy {
         Some(metadata) if metadata.txid >= report.last_valid_txid => metadata,
@@ -429,7 +431,9 @@ pub fn append_transaction_checked(
     };
     prepare_metadata_integrity(meta, previous_meta_hash)?;
     let previous_record_hash = report.last_valid_record_hash;
-    let should_checkpoint = should_write_checkpoint(root, meta.txid)?;
+    let should_checkpoint = metadata_tip.as_deref()
+        != Some(previous_metadata.integrity.meta_hash.as_str())
+        || should_write_checkpoint(root, meta.txid)?;
     let metadata_delta = if should_checkpoint {
         None
     } else {
