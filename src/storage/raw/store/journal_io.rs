@@ -855,7 +855,9 @@ fn checkpoint_members_and_reset_parallel(
                             // Missing/unverified members still receive both
                             // copies, as before. The protected subset by
                             // itself must contain a quorum.
-                            write_metadata_member(backend, sb, metadata, checkpoint, metrics)?;
+                            write_metadata_member(
+                                backend, sb, metadata, checkpoint, metrics, None,
+                            )?;
                         }
                         // Reset this member's journal only after its new
                         // checkpoint is physically flushed and published.

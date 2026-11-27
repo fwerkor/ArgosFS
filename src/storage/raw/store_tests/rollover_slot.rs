@@ -312,11 +312,24 @@ fn compressed_large_metadata_rollover_keeps_verified_old_slot() {
     );
     write_metadata_copies_quorum(&backend, &superblocks, &previous).unwrap();
     for sb in &superblocks {
-        let mut header = [0u8; RAW_HEADER_SIZE];
-        backend
-            .read_at(&sb.disk_id, sb.metadata.offset, &mut header)
-            .unwrap();
-        assert_eq!(get_u32(&header, 20).unwrap(), METADATA_FORMAT_TREE_ZSTD);
+        // The checkpoint update preserves the verified previous slot, so the
+        // new compressed image may live in either slot.
+        let mut found = false;
+        for slot in 0..2u64 {
+            let mut header = [0u8; RAW_HEADER_SIZE];
+            backend
+                .read_at(
+                    &sb.disk_id,
+                    sb.metadata.offset + slot * (sb.metadata.length / 2),
+                    &mut header,
+                )
+                .unwrap();
+            if get_u64(&header, 24).unwrap() == previous.txid {
+                assert_eq!(get_u32(&header, 20).unwrap(), METADATA_FORMAT_TREE_ZSTD);
+                found = true;
+            }
+        }
+        assert!(found, "new checkpoint slot not found on {}", sb.disk_id);
     }
     let targets = protected_rollover_slot_targets(&backend, &superblocks, 2)
         .unwrap()
@@ -602,4 +615,67 @@ fn unreadable_target_data_falls_back_to_full_verified_write() {
         read_tree_metadata_candidate(&backend, sb, slot, sb.metadata.length / 2, &header).unwrap(),
         bytes,
     );
+}
+
+#[test]
+fn partial_checkpoint_write_keeps_the_previous_quorum_on_an_even_member_pool() {
+    let dir = tempdir().unwrap();
+    let images = (0..2)
+        .map(|index| dir.path().join(format!("checkpoint-partial-{index}.img")))
+        .collect::<Vec<_>>();
+    let fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            chunk_size: 4096,
+            compression: crate::types::Compression::None,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "checkpoint-partial",
+        false,
+    )
+    .unwrap();
+    fs.write_file("/base", b"durable-base", 0o600).unwrap();
+    fs.sync().unwrap();
+    let previous = fs.metadata_snapshot();
+    drop(fs);
+
+    let superblocks = images
+        .iter()
+        .map(|path| {
+            inspect_device(BackendKind::LoopBlock, path.clone())
+                .unwrap()
+                .0
+        })
+        .collect::<Vec<_>>();
+    let backend = block_backend_for(&images);
+    // A normal pool can have empty journals after recovery/rollover. With no
+    // journal records, the checkpoint slots are the only durable state.
+    write_metadata_copies(&backend, &superblocks, &previous).unwrap();
+    for sb in &superblocks {
+        initialize_journal_region(&backend, &sb.disk_id, sb).unwrap();
+    }
+    backend.flush_all().unwrap();
+
+    let next = next_metadata(&previous, "partial-checkpoint");
+    let failing = WriteFailBackend {
+        inner: block_backend_for(&images),
+        failed: BTreeSet::from(["disk-0001".to_string()]),
+    };
+    let err = write_metadata_copies_quorum(&failing, &superblocks, &next).unwrap_err();
+    assert!(
+        matches!(err, ArgosError::IndeterminateCommit(_)),
+        "unexpected checkpoint error: {err}"
+    );
+
+    // disk-0000 completed the new checkpoint; disk-0001 still has only the
+    // previous one. The previous checkpoint must remain a valid quorum.
+    let recovered = recover_metadata(&block_backend_for(&images), &superblocks);
+    assert!(
+        recovered.is_ok(),
+        "the previous checkpoint quorum was destroyed: {recovered:?}"
+    );
+    assert_eq!(recovered.unwrap().txid, previous.txid);
 }
