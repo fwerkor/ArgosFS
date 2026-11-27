@@ -948,6 +948,7 @@ fn metadata_member_superblocks(
         .collect()
 }
 
+#[cfg(test)]
 fn select_quorum_metadata_candidate(
     candidates: &[(String, Option<Arc<Metadata>>, MetadataCandidateReport)],
 ) -> Result<Option<Arc<Metadata>>> {
