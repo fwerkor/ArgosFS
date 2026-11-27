@@ -1223,7 +1223,17 @@ impl Filesystem for ArgosFuse {
             };
             let reap_result = if last {
                 if flush_result.is_ok() {
-                    shared.volume.reap_unlinked_inode(file.ino)
+                    match shared.volume.reap_unlinked_inode(file.ino) {
+                        Ok(()) => Ok(()),
+                        Err(err) => {
+                            // A failed reap removes no dirty extent. Retain an
+                            // explicit retry marker so a later flush/sync can
+                            // finish reclaiming an unlinked inode instead of
+                            // leaking it until fsck.
+                            shared.writeback.lock().reap_after_flush.insert(file.ino);
+                            Err(err)
+                        }
+                    }
                 } else {
                     let mut writeback = shared.writeback.lock();
                     if writeback.dirty.contains_key(&file.ino) {
@@ -1231,7 +1241,13 @@ impl Filesystem for ArgosFuse {
                         Ok(())
                     } else {
                         drop(writeback);
-                        shared.volume.reap_unlinked_inode(file.ino)
+                        match shared.volume.reap_unlinked_inode(file.ino) {
+                            Ok(()) => Ok(()),
+                            Err(err) => {
+                                shared.writeback.lock().reap_after_flush.insert(file.ino);
+                                Err(err)
+                            }
+                        }
                     }
                 }
             } else {

@@ -1,6 +1,13 @@
 use super::*;
 
 impl ArgosFs {
+    /// Check that this mount can still persist writes. Used by frontend write
+    /// coalescing before acknowledging a buffered write.
+    pub(crate) fn ensure_backend_writable(&self) -> Result<()> {
+        let meta = self.meta.read();
+        self.ensure_block_backend_writable_locked(&meta)
+    }
+
     pub(super) fn ensure_block_backend_writable_locked(&self, meta: &Metadata) -> Result<()> {
         if meta.backend != BackendKind::Host && !self.backend_writable {
             return Err(ArgosError::ReadonlyRequired(

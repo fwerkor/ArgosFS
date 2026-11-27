@@ -382,6 +382,44 @@ fn fuse_writeback_flushes_merged_extent_to_volume() {
 }
 
 #[test]
+fn buffered_write_is_rejected_on_a_readonly_volume() {
+    let tmp = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|index| tmp.path().join(format!("readonly-write-{index}.img")))
+        .collect::<Vec<_>>();
+    let volume = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            compression: crate::types::Compression::None,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "readonly-write",
+        false,
+    )
+    .unwrap();
+    volume.write_file("/file", b"persisted", 0o600).unwrap();
+    volume.sync().unwrap();
+    drop(volume);
+
+    let readonly = ArgosFs::open_loop(&images, false).unwrap();
+    let ino = readonly.resolve_path("/file", true).unwrap();
+    let fuse = ArgosFuse::new(readonly.clone());
+    assert!(matches!(
+        fuse.queue_writeback_staged(ino, 0, b"must-not-be-acknowledged"),
+        Err(ArgosError::ReadonlyRequired(_))
+    ));
+    assert!(fuse.writeback.lock().dirty.is_empty());
+
+    // Closing a normally linked file must not report EROFS merely because the
+    // mount is read-only.
+    readonly.reap_unlinked_inode(ino).unwrap();
+}
+
+#[test]
 fn fuse_writeback_uses_the_successfully_opened_handle_after_mode_changes() {
     let tmp = tempfile::tempdir().unwrap();
     let volume = ArgosFs::create(

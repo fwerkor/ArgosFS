@@ -150,6 +150,9 @@ impl ArgosFuseShared {
         &self.writeback_locks[(ino as usize) % WRITEBACK_LOCK_STRIPES]
     }
 
+    /// Low-level merge primitive. Writability is checked once by
+    /// [`Self::queue_writeback_staged`], the production entry point, before it
+    /// calls this or any of the gap/extension helpers.
     pub(super) fn queue_writeback(&self, ino: InodeId, offset: u64, data: &[u8]) -> bool {
         if data.len() > FUSE_WRITEBACK_MAX_BYTES {
             return false;
@@ -272,6 +275,10 @@ impl ArgosFuseShared {
         offset: u64,
         data: &[u8],
     ) -> Result<bool> {
+        // Check before any merge path: a read-only or fenced mount must not
+        // accept a buffered write merely because a gap merge or large-stripe
+        // extension can hold it in memory.
+        self.volume.ensure_backend_writable()?;
         if self.queue_writeback(ino, offset, data) {
             return Ok(true);
         }
