@@ -400,11 +400,33 @@ fn quorum_fixture() -> (
                 .0
         })
         .collect();
-    // These raw-store tests explicitly require two durable metadata slots.
-    // Normal sync/unmount no longer checkpoints an already journal-durable
-    // transaction, so construct the checkpoint as part of the fixture.
-    write_metadata_copies_quorum(&block_backend_for(&images), &superblocks, &metadata).unwrap();
+    // These raw-store tests exercise dual-slot recovery, so seed both slots
+    // explicitly. Production checkpoint updates preserve the verified previous
+    // slot instead of overwriting both; the rollover tests cover that path.
+    write_dual_slot_checkpoint(&block_backend_for(&images), &superblocks, &metadata);
     (dir, images, metadata, superblocks)
+}
+
+/// Test fixture helper: publish one checkpoint image to both slots.
+fn write_dual_slot_checkpoint(
+    backend: &dyn StorageBackend,
+    superblocks: &[RawSuperblock],
+    metadata: &Metadata,
+) {
+    let checkpoint = prepare_checkpoint_writes(metadata, superblocks).unwrap();
+    for sb in superblocks {
+        let slot_len = sb.metadata.length / 2;
+        for slot in 0..2 {
+            write_metadata_slot(
+                backend,
+                sb,
+                sb.metadata.offset + slot * slot_len,
+                &checkpoint,
+                None,
+            )
+            .unwrap();
+        }
+    }
 }
 
 fn block_backend_for(images: &[PathBuf]) -> FileBlockBackend {
@@ -431,6 +453,69 @@ fn next_metadata(previous: &Metadata, pool_name: &str) -> Metadata {
     )
     .unwrap();
     next
+}
+
+#[test]
+fn partial_checkpoint_write_keeps_the_previous_quorum_on_an_even_member_pool() {
+    let dir = tempdir().unwrap();
+    let images = (0..2)
+        .map(|index| dir.path().join(format!("checkpoint-partial-{index}.img")))
+        .collect::<Vec<_>>();
+    let fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 1,
+            m: 0,
+            chunk_size: 4096,
+            compression: crate::types::Compression::None,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "checkpoint-partial",
+        false,
+    )
+    .unwrap();
+    fs.write_file("/base", b"durable-base", 0o600).unwrap();
+    fs.sync().unwrap();
+    let previous = fs.metadata_snapshot();
+    drop(fs);
+
+    let superblocks = images
+        .iter()
+        .map(|path| {
+            inspect_device(BackendKind::LoopBlock, path.clone())
+                .unwrap()
+                .0
+        })
+        .collect::<Vec<_>>();
+    let backend = block_backend_for(&images);
+    // A normal pool can have empty journals after recovery/rollover. With no
+    // journal records, the checkpoint slots are the only durable state.
+    write_metadata_copies(&backend, &superblocks, &previous).unwrap();
+    for sb in &superblocks {
+        initialize_journal_region(&backend, &sb.disk_id, sb).unwrap();
+    }
+    backend.flush_all().unwrap();
+
+    let next = next_metadata(&previous, "partial-checkpoint");
+    let failing = WriteFailBackend {
+        inner: block_backend_for(&images),
+        failed: BTreeSet::from(["disk-0001".to_string()]),
+    };
+    let err = write_metadata_copies_quorum(&failing, &superblocks, &next).unwrap_err();
+    assert!(
+        matches!(err, ArgosError::IndeterminateCommit(_)),
+        "unexpected checkpoint error: {err}"
+    );
+
+    // disk-0000 completed the new checkpoint; disk-0001 still has only the
+    // previous one. The previous checkpoint must remain a valid quorum.
+    let recovered = recover_metadata(&block_backend_for(&images), &superblocks);
+    assert!(
+        recovered.is_ok(),
+        "the previous checkpoint quorum was destroyed: {recovered:?}"
+    );
+    assert_eq!(recovered.unwrap().txid, previous.txid);
 }
 
 #[test]
@@ -1773,78 +1858,83 @@ fn compressed_checkpoint_quorum_round_trip_and_corruption_checks() {
     write_metadata_copies_quorum(&backend, &superblocks, &next).unwrap();
 
     for sb in &superblocks {
+        let mut new_slot = None;
+        let mut previous_slot = None;
         for slot in 0..2u64 {
+            let offset = sb.metadata.offset + slot * sb.metadata.length / 2;
             let mut header = [0u8; RAW_HEADER_SIZE];
-            backend
-                .read_at(
-                    &sb.disk_id,
-                    sb.metadata.offset + slot * sb.metadata.length / 2,
-                    &mut header,
-                )
-                .unwrap();
-            assert_eq!(get_u32(&header, 20).unwrap(), METADATA_FORMAT_TREE_ZSTD);
-            assert_eq!(
-                get_u64(&header, 232).unwrap(),
-                payload.original.as_ref().unwrap().0
-            );
-            let recovered = read_metadata_candidate(
-                &backend,
-                sb,
-                sb.metadata.offset + slot * sb.metadata.length / 2,
-                sb.metadata.length / 2,
-                &header,
-            )
-            .unwrap();
-            assert_eq!(recovered.txid, next.txid);
-            assert_eq!(recovered.integrity.meta_hash, next.integrity.meta_hash);
-            assert_eq!(recovered.inodes.len(), next.inodes.len());
+            backend.read_at(&sb.disk_id, offset, &mut header).unwrap();
+            let txid = get_u64(&header, 24).unwrap();
+            if txid == next.txid {
+                assert_eq!(get_u32(&header, 20).unwrap(), METADATA_FORMAT_TREE_ZSTD);
+                assert_eq!(
+                    get_u64(&header, 232).unwrap(),
+                    payload.original.as_ref().unwrap().0
+                );
+                let recovered =
+                    read_metadata_candidate(&backend, sb, offset, sb.metadata.length / 2, &header)
+                        .unwrap();
+                assert_eq!(recovered.txid, next.txid);
+                assert_eq!(recovered.integrity.meta_hash, next.integrity.meta_hash);
+                assert_eq!(recovered.inodes.len(), next.inodes.len());
+                assert!(new_slot.replace(slot).is_none());
+            } else {
+                // The checkpoint update preserves one verified previous slot.
+                assert_eq!(txid, previous.txid);
+                assert!(previous_slot.replace(slot).is_none());
+            }
         }
+        assert!(new_slot.is_some() && previous_slot.is_some());
     }
 
-    // Both earlier v1 and new compressed slots are valid recovery candidates;
-    // the quorum must choose the newer generation.
+    // The older v1 slot and the new compressed slot are both valid recovery
+    // candidates; the quorum must choose the newer generation.
     let recovered = recover_metadata(&backend, &superblocks).unwrap();
     assert_eq!(recovered.txid, next.txid);
     assert_eq!(recovered.inodes.len(), next.inodes.len());
 
     let sb = &superblocks[0];
+    let slot_len = sb.metadata.length / 2;
+    let new_slot = (0..2u64)
+        .find(|slot| {
+            let mut header = [0u8; RAW_HEADER_SIZE];
+            backend
+                .read_at(
+                    &sb.disk_id,
+                    sb.metadata.offset + slot * slot_len,
+                    &mut header,
+                )
+                .unwrap();
+            get_u64(&header, 24).unwrap() == next.txid
+        })
+        .unwrap();
+    let new_offset = sb.metadata.offset + new_slot * slot_len;
     let mut header = [0u8; RAW_HEADER_SIZE];
     backend
-        .read_at(&sb.disk_id, sb.metadata.offset, &mut header)
+        .read_at(&sb.disk_id, new_offset, &mut header)
         .unwrap();
     let original_header = header;
     put_u64(&mut header, 232, METADATA_DECOMPRESSED_MAX + 1);
     assert!(matches!(
-        read_metadata_candidate(
-            &backend,
-            sb,
-            sb.metadata.offset,
-            sb.metadata.length / 2,
-            &header
-        ),
+        read_metadata_candidate(&backend, sb, new_offset, slot_len, &header),
         Err(ArgosError::CorruptedMetadata(_))
     ));
     let index_end = get_u64(&original_header, 160).unwrap() + RAW_HEADER_SIZE as u64;
     let body_offset = align_up(index_end, METADATA_PAGE_SIZE as u64);
     let mut first = [0u8; 1];
     backend
-        .read_at(&sb.disk_id, sb.metadata.offset + body_offset, &mut first)
+        .read_at(&sb.disk_id, new_offset + body_offset, &mut first)
         .unwrap();
     first[0] ^= 0x01;
     backend
-        .write_at(&sb.disk_id, sb.metadata.offset + body_offset, &first)
+        .write_at(&sb.disk_id, new_offset + body_offset, &first)
         .unwrap();
     assert!(matches!(
-        read_metadata_candidate(
-            &backend,
-            sb,
-            sb.metadata.offset,
-            sb.metadata.length / 2,
-            &original_header
-        ),
+        read_metadata_candidate(&backend, sb, new_offset, slot_len, &original_header),
         Err(ArgosError::Checksum(_))
     ));
-    // Its second slot is still intact, so a single torn page is recoverable.
+    // The other members still hold the intact new checkpoint, so this single
+    // torn page is recoverable from a quorum.
     let recovered = recover_metadata(&backend, &superblocks).unwrap();
     assert_eq!(recovered.txid, next.txid);
 }

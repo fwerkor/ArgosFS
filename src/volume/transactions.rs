@@ -813,6 +813,16 @@ impl ArgosFs {
                 return Ok(());
             }
             let previous_meta_hash = meta.integrity.meta_hash.clone();
+            // This checkpoint may publish discovery/normalization changes
+            // (for example an offline member recorded during open) that were
+            // not a journal transaction. Advance the transaction identity so
+            // the preserved previous checkpoint cannot tie with the new one
+            // and win or lose recovery based on a hash comparison.
+            meta.txid = meta
+                .txid
+                .checked_add(1)
+                .ok_or_else(|| ArgosError::Invalid("metadata txid overflow".to_string()))?;
+            meta.updated_at = now_f64();
             journal::prepare_metadata_integrity_with_previous(&mut meta, previous_meta_hash)?;
             let superblocks = self.metadata_superblocks_locked(&meta)?;
             self.runtime

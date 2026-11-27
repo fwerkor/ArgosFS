@@ -312,11 +312,24 @@ fn compressed_large_metadata_rollover_keeps_verified_old_slot() {
     );
     write_metadata_copies_quorum(&backend, &superblocks, &previous).unwrap();
     for sb in &superblocks {
-        let mut header = [0u8; RAW_HEADER_SIZE];
-        backend
-            .read_at(&sb.disk_id, sb.metadata.offset, &mut header)
-            .unwrap();
-        assert_eq!(get_u32(&header, 20).unwrap(), METADATA_FORMAT_TREE_ZSTD);
+        // The checkpoint update preserves the verified previous slot, so the
+        // new compressed image may live in either slot.
+        let mut found = false;
+        for slot in 0..2u64 {
+            let mut header = [0u8; RAW_HEADER_SIZE];
+            backend
+                .read_at(
+                    &sb.disk_id,
+                    sb.metadata.offset + slot * (sb.metadata.length / 2),
+                    &mut header,
+                )
+                .unwrap();
+            if get_u64(&header, 24).unwrap() == previous.txid {
+                assert_eq!(get_u32(&header, 20).unwrap(), METADATA_FORMAT_TREE_ZSTD);
+                found = true;
+            }
+        }
+        assert!(found, "new checkpoint slot not found on {}", sb.disk_id);
     }
     let targets = protected_rollover_slot_targets(&backend, &superblocks, 2)
         .unwrap()

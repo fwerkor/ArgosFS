@@ -8,7 +8,10 @@ pub fn write_metadata_copies(
     // Store compact JSON: the metadata checkpoint has half the fixed metadata
     // region, and pretty-printing wastes about a third of that space.
     let checkpoint = prepare_checkpoint_writes(metadata, superblocks)?;
-    let writes = write_metadata_members_parallel(backend, superblocks, metadata, &checkpoint, None);
+    // Initialization deliberately overwrites both slots; there is no older
+    // acknowledged checkpoint to preserve on a freshly formatted device.
+    let writes =
+        write_metadata_members_parallel(backend, superblocks, metadata, &checkpoint, None, None);
     // Join all in-flight writes even when one member fails.
     for (_, result) in writes {
         result?;
@@ -18,12 +21,17 @@ pub fn write_metadata_copies(
 
 /// The payload is shared across members. Each member writes its own two slots
 /// in order, including the flush-before-header protocol, on a separate worker.
+///
+/// A `protected_targets` entry selects the single slot a member may overwrite.
+/// The other slot still holds the previously verified checkpoint, so a partial
+/// update can never destroy the last recoverable quorum.
 fn write_metadata_members_parallel(
     backend: &dyn StorageBackend,
     superblocks: &[RawSuperblock],
     metadata: &Metadata,
     checkpoint: &MetadataTreeCheckpoint,
     metrics: Option<&CommitMetrics>,
+    protected_targets: Option<&BTreeMap<String, u64>>,
 ) -> Vec<(String, Result<()>)> {
     std::thread::scope(|scope| {
         let jobs: Vec<_> = superblocks
@@ -35,7 +43,14 @@ fn write_metadata_members_parallel(
                     });
                     (
                         sb.disk_id.clone(),
-                        write_metadata_member(backend, sb, metadata, checkpoint, metrics),
+                        write_metadata_member(
+                            backend,
+                            sb,
+                            metadata,
+                            checkpoint,
+                            metrics,
+                            protected_targets.and_then(|targets| targets.get(&sb.disk_id).copied()),
+                        ),
                     )
                 })
             })
@@ -81,12 +96,24 @@ fn write_metadata_copies_quorum_impl(
         let _encode_timer = metrics.map(|metrics| metrics.timer(CommitPhase::CheckpointEncode));
         prepare_checkpoint_writes(metadata, superblocks)?
     };
+    // Before replacing a checkpoint, keep one physically verified old slot on
+    // a quorum of members. Writing both slots on every successful member while
+    // other members fail can otherwise leave neither the old nor the new
+    // checkpoint with a majority (e.g. one of two members completes while the
+    // other keeps only the old slot). The protected subset is also the same
+    // quorum rule used for journal rollover.
+    let protected_targets = protected_rollover_slot_targets(backend, superblocks, need)?;
     let mut report = QuorumWriteReport::default();
     let mut durable = 0usize;
     let mut uncertain_write = false;
-    for (disk_id, result) in
-        write_metadata_members_parallel(backend, superblocks, metadata, &checkpoint, metrics)
-    {
+    for (disk_id, result) in write_metadata_members_parallel(
+        backend,
+        superblocks,
+        metadata,
+        &checkpoint,
+        metrics,
+        protected_targets.as_ref(),
+    ) {
         match result {
             Ok(()) => durable += 1,
             Err(err) => {
@@ -510,6 +537,7 @@ pub(super) fn write_metadata_member(
     metadata: &Metadata,
     checkpoint: &MetadataTreeCheckpoint,
     metrics: Option<&CommitMetrics>,
+    protected_slot: Option<u64>,
 ) -> Result<()> {
     let slot_len = sb.metadata.length / 2;
     if checkpoint.required_len > slot_len {
@@ -518,6 +546,18 @@ pub(super) fn write_metadata_member(
             required: checkpoint.required_len,
             available: slot_len,
         });
+    }
+    if let Some(slot) = protected_slot {
+        // The opposite slot is a physically verified recovery anchor. Elide
+        // unchanged pages and publish this slot's header last, but never touch
+        // the anchor.
+        return write_metadata_slot_differential(
+            backend,
+            sb,
+            sb.metadata.offset + slot * slot_len,
+            checkpoint,
+            metrics,
+        );
     }
     let slot = (metadata.txid % 2) * slot_len;
     write_metadata_slot(backend, sb, sb.metadata.offset + slot, checkpoint, metrics)?;
