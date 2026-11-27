@@ -379,6 +379,108 @@ fn retryable_quorum_shortfall_does_not_write_fence_mount() {
     assert!(fs.write_fence.lock().is_some());
 }
 
+/// Injects a flush failure for selected members, leaving the write itself
+/// successful. That is enough to make the journal append durable on fewer
+/// members than a quorum, which is an indeterminate commit: the new state may
+/// already be recoverable even though the caller cannot prove it.
+struct JournalFlushFailure {
+    inner: Arc<dyn StorageBackend>,
+    fail: Arc<Mutex<BTreeSet<String>>>,
+}
+
+impl StorageBackend for JournalFlushFailure {
+    fn backend_kind(&self) -> BackendKind {
+        self.inner.backend_kind()
+    }
+    fn list_devices(&self) -> Result<Vec<crate::backend::BackendDeviceInfo>> {
+        self.inner.list_devices()
+    }
+    fn read_at(&self, device_id: &String, offset: u64, buf: &mut [u8]) -> Result<()> {
+        self.inner.read_at(device_id, offset, buf)
+    }
+    fn write_at(&self, device_id: &String, offset: u64, data: &[u8]) -> Result<()> {
+        self.inner.write_at(device_id, offset, data)
+    }
+    fn flush_device(&self, device_id: &String) -> Result<()> {
+        if self.fail.lock().contains(device_id) {
+            return Err(ArgosError::Io(std::io::Error::from_raw_os_error(libc::EIO)));
+        }
+        self.inner.flush_device(device_id)
+    }
+    fn flush_all(&self) -> Result<()> {
+        self.inner.flush_all()
+    }
+    fn drop_cache(&self, device_id: &String, offset: u64, length: u64) -> Result<()> {
+        self.inner.drop_cache(device_id, offset, length)
+    }
+    fn capacity(&self, device_id: &String) -> Result<u64> {
+        self.inner.capacity(device_id)
+    }
+    fn device_status(&self, device_id: &String) -> Result<DiskStatus> {
+        self.inner.device_status(device_id)
+    }
+    fn capabilities(&self) -> crate::backend::BackendCapabilities {
+        self.inner.capabilities()
+    }
+}
+
+#[test]
+fn indeterminate_deferred_group_commit_fences_further_mutations() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..3)
+        .map(|index| dir.path().join(format!("indeterminate-fence-{index}.img")))
+        .collect::<Vec<_>>();
+    let mut fs = ArgosFs::create_loop(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            compression: Compression::None,
+            defer_metadata_commit: true,
+            defer_journal_flush: true,
+            defer_data_flush: false,
+            ..VolumeConfig::default()
+        },
+        32 * 1024 * 1024,
+        "indeterminate-fence",
+        false,
+    )
+    .unwrap();
+    fs.upgrade_delta_integrity().unwrap();
+    fs.write_file("/baseline", b"baseline", 0o600).unwrap();
+    fs.sync().unwrap();
+    assert!(fs.write_fence.lock().is_none());
+
+    // Leave one real transaction pending in the group-commit buffer.
+    fs.write_file("/pending", b"pending", 0o600).unwrap();
+    let fail = Arc::new(Mutex::new(BTreeSet::from([
+        "disk-0000".to_string(),
+        "disk-0001".to_string(),
+    ])));
+    fs.backend = Arc::new(JournalFlushFailure {
+        inner: fs.backend.clone(),
+        fail,
+    });
+
+    // The journal entries reach all three members but only disk-0002 reports a
+    // durable flush, so a quorum cannot confirm the commit. Recovery may still
+    // select it, and the mount must stop accepting writes until then.
+    let err = fs.sync().unwrap_err();
+    assert!(
+        matches!(err, ArgosError::IndeterminateCommit(_)),
+        "unexpected commit error: {err}"
+    );
+    assert!(
+        fs.write_fence.lock().is_some(),
+        "an indeterminate group commit must fence the mount"
+    );
+    assert!(matches!(
+        fs.write_file("/baseline", b"blocked", 0o600),
+        Err(ArgosError::ReadonlyRequired(_))
+    ));
+}
+
 #[test]
 fn raw_journal_events_refresh_stale_read_telemetry_integrity() {
     let dir = tempfile::tempdir().unwrap();
