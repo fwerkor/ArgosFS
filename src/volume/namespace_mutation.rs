@@ -283,10 +283,13 @@ impl ArgosFs {
         // inode's block map) for the overwhelmingly common read-only close.
         {
             let meta = self.meta.read();
-            self.ensure_block_backend_writable_locked(&meta)?;
+            // Closing a normally linked file is not a mutation. Check that
+            // before the writability gate, or every last close on a read-only
+            // or write-fenced pool reports EROFS for no reason.
             if meta.inodes.get(&ino).is_none_or(|inode| inode.nlink != 0) {
                 return Ok(());
             }
+            self.ensure_block_backend_writable_locked(&meta)?;
         }
         // Recheck after upgrading the lock: an inode could have been reaped
         // or linked again in the meantime.
