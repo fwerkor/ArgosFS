@@ -1,6 +1,7 @@
 use super::*;
 use crate::types::VolumeConfig;
 use crate::volume::ArgosFs;
+use std::io::Write;
 use std::sync::{Mutex, OnceLock};
 use tempfile::tempdir;
 
@@ -1326,6 +1327,44 @@ fn compaction_preserves_recoverable_delta_with_drifting_float() {
     assert_eq!(after.txid, next.txid);
     assert_eq!(after.integrity.meta_hash, before.integrity.meta_hash);
     assert_eq!(scan(dir.path()).unwrap().invalid_entries, 0);
+}
+
+#[test]
+fn stale_transaction_txid_cannot_be_appended() {
+    let (dir, fs) = volume();
+    let mut stale = fs.metadata_snapshot();
+    let err = append_transaction(dir.path(), &mut stale, "stale", json!({})).unwrap_err();
+    assert!(matches!(err, ArgosError::Conflict(_)), "{err}");
+}
+
+#[test]
+fn torn_non_utf8_journal_tail_does_not_hide_a_committed_record() {
+    let _guard = env_lock();
+    let (dir, fs) = volume();
+    fs.write_file("/file", b"old contents", 0o600).unwrap();
+    fs.sync().unwrap();
+
+    // The record is appended and fsynced before the metadata copies. Stop at
+    // that point so the journal is the only durable copy of the new contents.
+    {
+        let _crash = thread_crash_point("after-journal");
+        let err = fs.write_file("/file", b"new contents", 0o600).unwrap_err();
+        assert!(matches!(err, ArgosError::InjectedCrash(_)), "{err}");
+    }
+    drop(fs);
+
+    // Simulate a later append that was cut mid-UTF-8. The whole journal used
+    // to become unreadable (and therefore replay was silently disabled).
+    let mut journal = fs::OpenOptions::new()
+        .append(true)
+        .open(journal_path(dir.path()))
+        .unwrap();
+    journal.write_all(b"{\"torn\":\"\xff\"").unwrap();
+    journal.sync_all().unwrap();
+    drop(journal);
+
+    let reopened = ArgosFs::open(dir.path()).unwrap();
+    assert_eq!(reopened.read_file("/file", false).unwrap(), b"new contents");
 }
 
 #[test]

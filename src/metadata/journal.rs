@@ -265,16 +265,27 @@ pub fn load_or_recover(root: &Path) -> Result<RecoveredMetadata> {
         let bytes = match serialized {
             Some(bytes) => bytes,
             None => {
-                let bytes = serde_json::to_vec_pretty(&metadata)?;
-                if canonical_metadata_hash_bytes(&bytes)? != metadata.integrity.meta_hash {
-                    // A journal-only recovery is still useful. Do not replace
-                    // intact copies with bytes that fail their own checksum.
-                    report.errors.push(
-                        "replayed metadata cannot be safely re-serialized; left copies unchanged"
-                            .to_string(),
-                    );
-                    return Ok(RecoveredMetadata { metadata, report });
-                }
+                // A journal-only recovery has no copy bytes to reuse. Its
+                // integrity hash may be a raw-delta digest or the decoded-float
+                // fallback rather than the canonical checkpoint digest, so the
+                // old "does it re-serialize to the stored hash?" test rejected
+                // exactly the states that replay had just validated.
+                //
+                // Materialize a fresh canonical checkpoint instead. The hash
+                // is computed over the exact pretty bytes that are written, so
+                // the next mount can validate the repaired copies without the
+                // journal.
+                let mut repaired = metadata.clone();
+                repaired.integrity = MetadataIntegrity {
+                    generation: repaired.txid,
+                    previous_meta_hash: String::new(),
+                    meta_hash: String::new(),
+                    hash_scheme: None,
+                };
+                let probe = serde_json::to_vec_pretty(&repaired)?;
+                repaired.integrity.meta_hash = canonical_metadata_hash_bytes(&probe)?;
+                let bytes = serde_json::to_vec_pretty(&repaired)?;
+                metadata = repaired;
                 bytes
             }
         };
@@ -287,8 +298,7 @@ pub fn load_or_recover(root: &Path) -> Result<RecoveredMetadata> {
 pub fn scan(root: &Path) -> Result<TransactionReport> {
     let mut report = TransactionReport::default();
     let mut previous_hash = String::new();
-    let journal = journal_path(root);
-    let Ok(text) = fs::read_to_string(&journal) else {
+    let Some(text) = read_journal_text(root)? else {
         return Ok(report);
     };
     for (line_no, raw) in text.lines().enumerate() {
@@ -400,6 +410,16 @@ pub fn append_transaction_checked(
                 previous_metadata.txid
             )));
         }
+    }
+    // A transaction must advance the durable transaction ID. Re-appending an
+    // older (or unchanged) full snapshot after a newer record would make the
+    // journal's final state older than the records it replaces, and replay
+    // would then have to guess which snapshot is authoritative.
+    if meta.txid <= previous_metadata.txid {
+        return Err(ArgosError::Conflict(format!(
+            "transaction txid {} does not advance the durable txid {}",
+            meta.txid, previous_metadata.txid
+        )));
     }
     inject_crash("before-journal")?;
     let previous_meta_hash = if meta.integrity.meta_hash.is_empty() {
@@ -835,7 +855,7 @@ fn compact_journal_unlocked(root: &Path) -> Result<()> {
         return Ok(());
     }
     let journal = journal_path(root);
-    let Ok(text) = fs::read_to_string(&journal) else {
+    let Some(text) = read_journal_text(root)? else {
         return Ok(());
     };
     let records = valid_journal_chain_records(&text)?;
@@ -1001,8 +1021,7 @@ fn validate_metadata(meta: &mut Metadata, computed: &str) -> Result<()> {
 }
 
 fn report_latest_recoverable_metadata(root: &Path) -> Result<Option<Metadata>> {
-    let journal = journal_path(root);
-    let Ok(text) = fs::read_to_string(&journal) else {
+    let Some(text) = read_journal_text(root)? else {
         return Ok(None);
     };
     report_latest_recoverable_metadata_from_text(&text)
@@ -1123,8 +1142,7 @@ pub fn checkpoint_interval_txids() -> u64 {
 }
 
 fn has_valid_checkpoint(root: &Path) -> Result<bool> {
-    let journal = journal_path(root);
-    let Ok(text) = fs::read_to_string(&journal) else {
+    let Some(text) = read_journal_text(root)? else {
         return Ok(false);
     };
     let mut previous_hash = String::new();
@@ -1166,6 +1184,24 @@ fn metadata_paths(root: &Path) -> Vec<(String, PathBuf)> {
 
 fn journal_path(root: &Path) -> PathBuf {
     root.join(".argosfs/journal.jsonl")
+}
+
+/// Read the JSON-lines journal without requiring the final append to be a
+/// complete UTF-8 line.
+///
+/// `append_json_line` fsyncs only after the newline, so a crash can leave a
+/// partial record (possibly ending in the middle of a multi-byte sequence) or
+/// a complete record whose newline never reached the device. Decoding the file
+/// as lossy text keeps every earlier complete line available to replay and
+/// audit; the damaged fragment fails JSON parsing and is skipped like any other
+/// invalid line. A missing journal is an empty journal; any other read error is
+/// reported instead of being silently treated as an empty journal.
+fn read_journal_text(root: &Path) -> Result<Option<String>> {
+    match fs::read(journal_path(root)) {
+        Ok(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(ArgosError::Io(err)),
+    }
 }
 
 fn transaction_lock_path(root: &Path) -> PathBuf {

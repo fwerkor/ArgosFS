@@ -1,7 +1,7 @@
 use crate::error::{ArgosError, Result};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
@@ -197,10 +197,24 @@ pub fn append_json_line<T: serde::Serialize>(path: &Path, value: &T) -> Result<(
     }
     let mut file = OpenOptions::new()
         .create(true)
+        .read(true)
         .append(true)
         .mode(0o600)
         .open(path)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    // A crash after the serialized record but before its trailing newline
+    // leaves a complete JSON value at the tail. Start the next append on a
+    // fresh line so the old record and the new one are both parseable. A
+    // genuinely truncated tail becomes one invalid line, which readers skip,
+    // instead of swallowing the next record by concatenation.
+    if file.metadata()?.len() > 0 {
+        file.seek(SeekFrom::End(-1))?;
+        let mut last = [0u8; 1];
+        file.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            file.write_all(b"\n")?;
+        }
+    }
     serde_json::to_writer(&mut file, value)?;
     file.write_all(b"\n")?;
     file.sync_all()?;
