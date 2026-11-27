@@ -210,6 +210,9 @@ pub(super) fn read_label_with_backup(
                     Ok(label)
                 })
                 .map_err(|backup_err| {
+                    if matches!(backup_err, ArgosError::DeviceFailed { .. } | ArgosError::DeviceTimeout { .. }) {
+                        return backup_err;
+                    }
                     ArgosError::CorruptedMetadata(format!(
                         "primary device label failed ({primary_err}); backup label failed ({backup_err})"
                     ))
