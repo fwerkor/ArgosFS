@@ -129,9 +129,10 @@ pub fn exercise(
     dir: &Path,
     seed: u64,
     index: usize,
-    mode: Option<Mode>,
+    plan: (Option<Mode>, Option<u64>),
     verify: impl Fn(&ArgosFs) -> Result<()>,
 ) -> Result<ArgosFs> {
+    let (mode, cut) = plan;
     check_online(&fs, images)?;
     verify(&fs)?;
     let mut expected = bytes(seed, 60 * 1024);
@@ -229,6 +230,89 @@ pub fn exercise(
             "reshape progress lost on reopen"
         );
         verify(&fs)?;
+        if let Some(cut) = cut {
+            // Reshape may commit a bounded prefix before the interruption.
+            // Logical contents, identities and all acknowledged transactions
+            // must survive either outcome. Resume the same target afterwards.
+            fs.sync()?;
+            let durable = fs.metadata_snapshot().txid;
+            drop(fs);
+            let (interrupted, synced) = crate::atomic::run_interrupted(
+                images,
+                dir,
+                &format!("reshape-{index:05}"),
+                crate::atomic::WorkerAction::Reshape {
+                    k: target.0,
+                    m: target.1,
+                },
+                cut,
+                false,
+            )?;
+            fs = reopen(
+                images,
+                synced.unwrap_or(durable).max(durable),
+                "mount after interrupted reshape",
+            )?;
+            ensure!(
+                fs.read_file(SENTINEL, false)? == expected,
+                "interrupted reshape changed sentinel"
+            );
+            verify(&fs)?;
+            if synced.is_some() {
+                ensure!(
+                    fs.metadata_snapshot().txid > durable,
+                    "synced reshape step did not persist progress"
+                );
+            }
+            if cut == 2 {
+                ensure!(interrupted, "reshape interruption boundary was not reached");
+            }
+            let scrub = fs.scrub()?;
+            ensure!(
+                scrub.errors.is_empty() && scrub.unrecoverable_files == 0,
+                "interrupted reshape scrub: {:?}",
+                scrub.errors
+            );
+            fs.sync()?;
+            verify_clean(&fs)?;
+            // A separate one-shot write EIO in the same mixed-layout state.
+            // Cut zero ensures the fault occurs before a mutating I/O. The
+            // external oracle remains authoritative even if the request fails.
+            if fs.metadata_snapshot().reshape.is_some() {
+                let durable = fs.metadata_snapshot().txid;
+                drop(fs);
+                let (injected, synced) = crate::atomic::run_interrupted(
+                    images,
+                    dir,
+                    &format!("reshape-eio-{index:05}"),
+                    crate::atomic::WorkerAction::Reshape {
+                        k: target.0,
+                        m: target.1,
+                    },
+                    0,
+                    true,
+                )?;
+                ensure!(injected, "reshape EIO boundary was not reached");
+                fs = reopen(
+                    images,
+                    synced.unwrap_or(durable).max(durable),
+                    "mount after reshape EIO",
+                )?;
+                ensure!(
+                    fs.read_file(SENTINEL, false)? == expected,
+                    "reshape EIO changed sentinel"
+                );
+                verify(&fs)?;
+                let scrub = fs.scrub()?;
+                ensure!(
+                    scrub.errors.is_empty() && scrub.unrecoverable_files == 0,
+                    "reshape EIO scrub: {:?}",
+                    scrub.errors
+                );
+                fs.sync()?;
+                verify_clean(&fs)?;
+            }
+        }
         expected = concurrent(&fs, seed ^ 0x41, &expected, || {
             let report = fs.reshape_layout(target.0, target.1, None)?;
             ensure!(
@@ -264,6 +348,40 @@ pub fn exercise(
         verify(&fs)?;
         fs.mark_disk(&retired.id, DiskStatus::Online)?;
         check_online(&fs, images)?;
+        if let Some(cut) = cut {
+            fs.sync()?;
+            let durable = fs.metadata_snapshot().txid;
+            drop(fs);
+            // A bounded member move may legitimately have no eligible work.
+            // A completed no-op is legal; an interrupted move must preserve
+            // both the external oracle and physical consistency.
+            let (_, synced) = crate::atomic::run_interrupted(
+                images,
+                dir,
+                &format!("member-move-{index:05}"),
+                crate::atomic::WorkerAction::RebalanceMember { id: id.clone() },
+                cut,
+                false,
+            )?;
+            fs = reopen(
+                images,
+                synced.unwrap_or(durable).max(durable),
+                "mount after interrupted member move",
+            )?;
+            ensure!(
+                fs.read_file(SENTINEL, false)? == expected,
+                "interrupted member move changed sentinel"
+            );
+            verify(&fs)?;
+            let scrub = fs.scrub()?;
+            ensure!(
+                scrub.errors.is_empty() && scrub.unrecoverable_files == 0,
+                "interrupted member move scrub: {:?}",
+                scrub.errors
+            );
+            fs.sync()?;
+            verify_clean(&fs)?;
+        }
         expected = concurrent(&fs, seed ^ 0x42, &expected, || {
             let report = fs.rebalance_member(&id, 8)?;
             ensure!(report.moved_shards <= 8, "member rebalance exceeded budget");

@@ -59,6 +59,8 @@ pub enum Operation {
         seed: u64,
         #[serde(default)]
         mode: crate::topology::Mode,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cut: Option<u64>,
     },
     Capacity {
         seed: u64,
@@ -171,6 +173,7 @@ impl Trace {
                     ops.push(Operation::TopologyRound {
                         seed,
                         mode: crate::topology::Mode::round(rounds),
+                        cut: Some([2, 8, 16][rounds % 3]),
                     });
                     rounds += 1;
                 }
@@ -182,6 +185,7 @@ impl Trace {
             ops.push(Operation::TopologyRound {
                 seed: self.seed,
                 mode: crate::topology::Mode::Returning,
+                cut: Some(2),
             });
         }
         ops.push(Operation::Reopen);
@@ -474,17 +478,25 @@ pub fn execute(trace: &Trace, dir: &Path) -> Result<()> {
             verify(&fs, &expected).context("reopen operation")?;
             verify_clean(&fs).context("reopen operation")?;
         } else if matches!(op, Operation::Topology | Operation::TopologyRound { .. }) {
-            let (seed, mode) = match op {
-                Operation::TopologyRound { seed, mode } => (*seed, Some(*mode)),
-                _ => (trace.seed, None),
+            let (seed, mode, cut) = match op {
+                Operation::TopologyRound { seed, mode, cut } => (*seed, Some(*mode), *cut),
+                _ => (trace.seed, None, None),
             };
-            fs = crate::topology::exercise(fs, &mut images, &dir, seed, index, mode, |pool| {
-                verify(pool, &expected)?;
-                if let Some(features) = &features {
-                    features.verify(pool)?;
-                }
-                Ok(())
-            })
+            fs = crate::topology::exercise(
+                fs,
+                &mut images,
+                &dir,
+                seed,
+                index,
+                (mode, cut),
+                |pool| {
+                    verify(pool, &expected)?;
+                    if let Some(features) = &features {
+                        features.verify(pool)?;
+                    }
+                    Ok(())
+                },
+            )
             .context("topology operation")?;
             verify(&fs, &expected).context("topology operation")?;
         } else if let Operation::Atomic { operation, cut } = *op {
@@ -630,6 +642,21 @@ mod tests {
         let decoded: Trace = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(serde_json::to_vec(&decoded).unwrap(), encoded);
         assert_eq!(decoded.directory_entries, 12);
+        let cuts: Vec<_> = decoded
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                Operation::TopologyRound { cut, .. } => *cut,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cuts, [2, 8, 16]);
+        let old_round: Operation =
+            serde_json::from_str(r#"{"TopologyRound":{"seed":356,"mode":"Returning"}}"#).unwrap();
+        assert!(matches!(
+            old_round,
+            Operation::TopologyRound { cut: None, .. }
+        ));
         for mode in [
             crate::topology::Mode::Missing,
             crate::topology::Mode::Returning,

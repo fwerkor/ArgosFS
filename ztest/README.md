@@ -203,7 +203,18 @@ cargo run --release -- model --work-dir /tmp/combined-encrypted --seed 356 \
   --operations 0 --profile encrypted --topology
 ```
 
-The profiles cover representative combinations, not an exhaustive Cartesian
-product. Topology maintenance is tested with clean storage and foreground
-concurrency; random storage faults and crash recovery are still separate
-workloads. The topology sequence is reproducible but OS scheduling is not.
+New combined traces also record mutating-I/O cut boundaries (2, 8, and 16,
+rotated between rounds). The maintenance subprocess attempts a bounded reshape
+step and a bounded member move, and the supervisor verifies the observed
+SIGKILL marker or exact synced transaction ID before resuming the operation.
+An additional one-shot write EIO during an unfinished reshape must be observed;
+only explicit device/durability errors may explain a rejected request. Each
+recovery checks the external oracle before scrub, then verifies physical
+consistency after scrub. Older serialized traces without a cut remain valid.
+
+These profiles cover representative combinations, not an exhaustive Cartesian
+product. Full stochastic media faults across topology changes are not covered
+by the boundary drills; the separate `run` workload still exercises those media
+faults without dynamic membership. Loop images model process interruption,
+not actual power loss or all possible hardware failures. The topology sequence
+is reproducible but OS scheduling is not.
