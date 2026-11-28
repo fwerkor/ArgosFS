@@ -4,13 +4,13 @@
 use super::{Arena, Changes, CommitIo, CommitReport, PagedMetadata};
 use crate::backend::StorageBackend;
 use crate::error::{ArgosError, Result};
-use crate::types::{Inode, Metadata};
+use crate::types::Metadata;
 use serde::{de::DeserializeOwned, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use uuid::Uuid;
 
-const HEADER_KEY: u64 = 0;
+pub const PAGED_INTEGRITY_SCHEME: u32 = 3;
 const MAX_EXPANDED_RECORD: usize = 128 * 1024 * 1024;
 const JSON: u8 = 0;
 const LZ4: u8 = 1;
@@ -60,56 +60,16 @@ fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     }
 }
 
-fn header(metadata: &Metadata) -> Result<Vec<u8>> {
-    let mut header = metadata.clone();
-    header.inodes = Default::default();
-    header.checkpoint_member_catalog = None;
-    encode(&header)
-}
+mod records;
+use records::{decode_image, initial_records, plan_records, RecordIndex};
 
-fn initial_records(metadata: &Metadata) -> Result<Changes> {
-    let mut changes = Changes::from([(HEADER_KEY, Some(header(metadata)?))]);
-    for (&key, inode) in &metadata.inodes {
-        if key == HEADER_KEY || key != inode.id {
-            return Err(super::wire::corrupt(
-                "invalid metadata image inode identity",
-            ));
-        }
-        changes.insert(key, Some(encode(inode)?));
-    }
-    Ok(changes)
-}
-
-fn read_image(tree: &PagedMetadata, pool: Uuid) -> Result<Metadata> {
-    let mut records = tree.records()?;
-    let mut metadata: Metadata = decode(
-        &records
-            .remove(&HEADER_KEY)
-            .ok_or_else(|| super::wire::corrupt("missing metadata image header"))?,
-    )?;
-    if Uuid::parse_str(&metadata.uuid).ok() != Some(pool) || !metadata.inodes.is_empty() {
-        return Err(super::wire::corrupt("invalid metadata image header"));
-    }
-    for (key, bytes) in records {
-        let inode: Inode = decode(&bytes)?;
-        if key != inode.id {
-            return Err(super::wire::corrupt(
-                "metadata image inode identity mismatch",
-            ));
-        }
-        metadata.inodes.insert(key, inode);
-    }
-    metadata.inodes.mark_committed();
-    Ok(metadata)
-}
-
-/// Typed metadata image on dedicated experimental page arenas. The caller
-/// supplies transaction metadata, including its logical txid and integrity
-/// fields. This bridge does not yet replace the production journal protocol.
+/// Typed metadata image on dedicated authenticated page arenas. Each
+/// directory entry, block mapping and free extent has an independent record.
 pub struct ImageStore {
     tree: PagedMetadata,
     pool: Uuid,
     base: Metadata,
+    index: RecordIndex,
 }
 
 impl ImageStore {
@@ -121,21 +81,30 @@ impl ImageStore {
         let pool = Uuid::parse_str(&metadata.uuid)
             .map_err(|err| ArgosError::Invalid(format!("invalid metadata pool UUID: {err}")))?;
         // Validate and serialize all records before initializing any region.
-        let records = initial_records(metadata)?;
+        let (records, index) = initial_records(metadata)?;
         let mut tree = PagedMetadata::format(backend, *pool.as_bytes(), arenas)?;
-        tree.commit(&records)?;
+        let report = tree.commit(&records)?;
+        if metadata.integrity.hash_scheme == Some(PAGED_INTEGRITY_SCHEME) {
+            metadata.integrity.meta_hash = hex::encode(report.root_hash);
+        }
         metadata.inodes.mark_committed();
         Ok(Self {
             tree,
             pool,
             base: metadata.clone(),
+            index,
         })
     }
 
     pub fn open(backend: Arc<dyn StorageBackend>, pool: Uuid, arenas: Vec<Arena>) -> Result<Self> {
         let tree = PagedMetadata::open(backend, *pool.as_bytes(), arenas)?;
-        let base = read_image(&tree, pool)?;
-        Ok(Self { tree, pool, base })
+        let (base, index) = decode_image(tree.records()?, pool, tree.root_hash())?;
+        Ok(Self {
+            tree,
+            pool,
+            base,
+            index,
+        })
     }
 
     /// This is a cheap COW snapshot of the current inode table. Mutate the
@@ -149,39 +118,45 @@ impl ImageStore {
     /// Commit only candidate changed inode records and the metadata header.
     /// The caller's baseline advances only after a certified root commit.
     pub fn commit(&mut self, next: &mut Metadata) -> Result<CommitReport> {
+        self.commit_allowed(next, None)
+    }
+
+    pub(crate) fn commit_allowed(
+        &mut self,
+        next: &mut Metadata,
+        allowed: Option<&BTreeSet<String>>,
+    ) -> Result<CommitReport> {
         if Uuid::parse_str(&next.uuid).ok() != Some(self.pool) || next.txid <= self.base.txid {
             return Err(ArgosError::Invalid(
                 "metadata image must advance its pool transaction".into(),
             ));
         }
-        let mut changes = Changes::from([(HEADER_KEY, Some(header(next)?))]);
-        for key in self.base.inodes.changed_candidates(&next.inodes) {
-            match (self.base.inodes.get(&key), next.inodes.get(&key)) {
-                (None, None) => {}
-                (Some(_), None) if key != HEADER_KEY => {
-                    changes.insert(key, None);
-                }
-                (old, Some(inode)) if key != HEADER_KEY && key == inode.id => {
-                    let bytes = encode(inode)?;
-                    if old.map(encode).transpose()?.as_ref() != Some(&bytes) {
-                        changes.insert(key, Some(bytes));
-                    }
-                }
-                _ => {
-                    return Err(super::wire::corrupt(
-                        "invalid metadata image inode identity",
-                    ))
-                }
-            }
+        let (changes, index) = plan_records(&self.base, next, self.index.clone())?;
+        let report = self.tree.commit_allowed(&changes, allowed)?;
+        if next.integrity.hash_scheme == Some(PAGED_INTEGRITY_SCHEME) {
+            next.integrity.meta_hash = hex::encode(report.root_hash);
         }
-        let report = self.tree.commit(&changes)?;
         next.inodes.mark_committed();
         self.base = next.clone();
+        self.index = index;
         Ok(report)
+    }
+
+    pub(crate) fn recover(
+        backend: &dyn StorageBackend,
+        pool: Uuid,
+        arenas: Vec<Arena>,
+    ) -> Result<Metadata> {
+        let (records, hash) = super::recover_records(backend, *pool.as_bytes(), arenas)?;
+        decode_image(records, pool, hash).map(|(meta, _)| meta)
     }
 
     pub fn root_hash(&self) -> [u8; 32] {
         self.tree.root_hash()
+    }
+
+    pub(crate) fn confirm_all(&mut self, count: usize) -> Result<()> {
+        self.tree.confirm_all(count)
     }
 
     pub fn repair_stale(

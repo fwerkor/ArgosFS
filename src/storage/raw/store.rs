@@ -1,4 +1,6 @@
 use super::wire::{self, put_u32, put_u64};
+mod paged;
+pub(crate) use paged::commit as commit_paged_metadata;
 mod checkpoint;
 use checkpoint::*;
 mod journal_io;
@@ -75,6 +77,8 @@ pub struct RawOpen {
     pub recovery_verified: bool,
     /// Exact recovered v2 image, before device discovery changes live fields.
     pub(crate) durable_metadata: Option<Metadata>,
+    pub(crate) paged_metadata:
+        Option<Arc<parking_lot::Mutex<crate::storage::raw::paged_metadata::ImageStore>>>,
     pub backend: Arc<dyn StorageBackend>,
     pub metadata: Metadata,
     pub report: TransactionReport,
@@ -150,6 +154,15 @@ pub fn initialize_pool(
     metadata: &mut Metadata,
     force: bool,
 ) -> Result<()> {
+    initialize_pool_with_store(backend, superblocks, metadata, force).map(|_| ())
+}
+
+pub(crate) fn initialize_pool_with_store(
+    backend: Arc<dyn StorageBackend>,
+    superblocks: &[RawSuperblock],
+    metadata: &mut Metadata,
+    force: bool,
+) -> Result<Option<crate::storage::raw::paged_metadata::ImageStore>> {
     preflight_empty(&*backend, superblocks, force)?;
     for sb in superblocks {
         let device_id = sb.disk_id.clone();
@@ -164,7 +177,12 @@ pub fn initialize_pool(
             sb.backup_superblock_offset + SUPERBLOCK_SIZE as u64,
             &sb.device_label().encode(),
         )?;
-        initialize_journal_region(&*backend, &device_id, sb)?;
+        if !paged::uses_paged(superblocks) {
+            initialize_journal_region(&*backend, &device_id, sb)?;
+        }
+    }
+    if paged::uses_paged(superblocks) {
+        return paged::initialize(backend, superblocks, metadata).map(Some);
     }
     write_metadata_copies(&*backend, superblocks, metadata)?;
     append_journal(
@@ -175,7 +193,8 @@ pub fn initialize_pool(
         "mkfs",
         serde_json::json!({}),
     )?;
-    backend.flush_all()
+    backend.flush_all()?;
+    Ok(None)
 }
 
 pub fn preflight_devices_empty(
@@ -285,7 +304,22 @@ where
     let backend: Arc<dyn StorageBackend> = Arc::new(GuardedBackend::new(wrap(Arc::new(
         FileBlockBackend::open_with_ids(kind, devices, write)?,
     ))));
-    let (mut metadata, mut report) = load_or_recover(&*backend, &superblocks, write)?;
+    let paged_metadata = if paged::uses_paged(&superblocks) {
+        Some(Arc::new(parking_lot::Mutex::new(paged::open(
+            backend.clone(),
+            &superblocks,
+            write,
+        )?)))
+    } else {
+        None
+    };
+    let (mut metadata, mut report) = if let Some(store) = &paged_metadata {
+        let metadata = store.lock().snapshot();
+        let report = paged::report(&metadata);
+        (metadata, report)
+    } else {
+        load_or_recover(&*backend, &superblocks, write)?
+    };
     if let Some(pool) = pool_uuid {
         let metadata_pool = Uuid::parse_str(&metadata.uuid).map_err(|err| {
             ArgosError::CorruptedMetadata(format!(
@@ -310,12 +344,13 @@ where
     // state, but only members named by that selected state may participate in
     // subsequent writable fanout or be exposed to the mounted volume.
     let superblocks = metadata_member_superblocks(&superblocks, &metadata);
-    let durable_metadata = (write
-        && metadata.integrity.hash_scheme == Some(journal::DELTA_INTEGRITY_SCHEME)
-        && metadata.integrity.meta_hash.len() == 64
-        && superblocks
-            .iter()
-            .all(|sb| sb.required_feature_flags & REQUIRED_FEATURE_DELTA_INTEGRITY != 0))
+    let durable_metadata = (paged_metadata.is_some()
+        || (write
+            && metadata.integrity.hash_scheme == Some(journal::DELTA_INTEGRITY_SCHEME)
+            && metadata.integrity.meta_hash.len() == 64
+            && superblocks
+                .iter()
+                .all(|sb| sb.required_feature_flags & REQUIRED_FEATURE_DELTA_INTEGRITY != 0)))
     .then(|| metadata.clone());
     let present = superblocks
         .iter()
@@ -367,6 +402,7 @@ where
     Ok(RawOpen {
         recovery_verified,
         durable_metadata,
+        paged_metadata,
         backend,
         metadata,
         report,
@@ -522,6 +558,7 @@ pub(crate) fn upgrade_delta_integrity_members(
     superblocks: &[RawSuperblock],
     metadata: &Metadata,
 ) -> Result<Vec<RawSuperblock>> {
+    paged::reject_paged(superblocks)?;
     let active = metadata
         .disks
         .iter()
@@ -589,6 +626,32 @@ pub(crate) fn array_splice_feature_enabled(superblocks: &[RawSuperblock]) -> boo
         && superblocks
             .iter()
             .all(|sb| sb.required_feature_flags & REQUIRED_FEATURE_ARRAY_SPLICE != 0)
+}
+
+/// Offline conversion from legacy checkpoint storage to authenticated pages.
+/// All active members must be supplied and no other writer may be mounted.
+pub fn upgrade_paged_metadata(
+    kind: BackendKind,
+    paths: &[PathBuf],
+    requested_pool: Option<&str>,
+    arena_bytes: Option<u64>,
+) -> Result<Metadata> {
+    if kind == BackendKind::Host {
+        return Err(ArgosError::Unsupported(
+            "paged upgrade requires raw or loop backend".into(),
+        ));
+    }
+    let mut superblocks = Vec::new();
+    let mut devices = Vec::new();
+    for path in paths {
+        let (sb, _) = inspect_device(kind, path.clone())?;
+        devices.push((sb.disk_id.clone(), path.clone()));
+        superblocks.push(sb);
+    }
+    let backend: Arc<dyn StorageBackend> = Arc::new(GuardedBackend::new(Arc::new(
+        FileBlockBackend::open_with_ids(kind, devices, true)?,
+    )));
+    paged::upgrade(backend, &superblocks, requested_pool, arena_bytes)
 }
 
 pub fn recover_metadata(
@@ -784,6 +847,9 @@ fn load_or_recover(
     superblocks: &[RawSuperblock],
     checkpoint_replay: bool,
 ) -> Result<(Metadata, TransactionReport)> {
+    if paged::uses_paged(superblocks) {
+        return paged::recover(backend, superblocks);
+    }
     let candidates = read_all_checkpoint_candidates(backend, superblocks)?;
     let mut report = TransactionReport::default();
     report.metadata_candidates = candidates

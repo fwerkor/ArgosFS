@@ -94,6 +94,7 @@ pub fn run() -> Result<()> {
             defer_data_flush,
             deferred_commit_interval_ms,
             deferred_commit_max_transactions,
+            paged_metadata,
             force,
         } => {
             let storage = storage.resolve(BackendKind::Host)?;
@@ -120,6 +121,7 @@ pub fn run() -> Result<()> {
             };
             let fs = match storage.backend {
                 BackendKind::Host => {
+                    reject_option(paged_metadata, "--paged-metadata", BackendKind::Host)?;
                     reject_option(image_size.is_some(), "--image-size", BackendKind::Host)?;
                     reject_option(
                         pool_name.is_some() || storage.pool.is_some(),
@@ -138,7 +140,12 @@ pub fn run() -> Result<()> {
                     let pool_name = pool_name
                         .or(storage.pool)
                         .unwrap_or_else(|| "argosfs-root".to_string());
-                    ArgosFs::create_loop(
+                    let create = if paged_metadata {
+                        ArgosFs::create_loop_paged
+                    } else {
+                        ArgosFs::create_loop
+                    };
+                    create(
                         &paths,
                         config,
                         image_size.unwrap_or(DEFAULT_LOOP_IMAGE_SIZE),
@@ -156,7 +163,11 @@ pub fn run() -> Result<()> {
                     let pool_name = pool_name
                         .or(storage.pool)
                         .unwrap_or_else(|| "argosfs-root".to_string());
-                    ArgosFs::create_raw(&paths, config, &pool_name, force)?
+                    if paged_metadata {
+                        ArgosFs::create_raw_paged(&paths, config, &pool_name, force)?
+                    } else {
+                        ArgosFs::create_raw(&paths, config, &pool_name, force)?
+                    }
                 }
             };
             print_health_report(&fs.health_report(), json, true)?;
@@ -189,6 +200,35 @@ pub fn run() -> Result<()> {
                     ],
                     "pool_uuid": fs.metadata_snapshot().uuid
                 })
+            );
+        }
+        Command::UpgradePagedMetadata {
+            storage,
+            offline_confirmed,
+            arena_size,
+        } => {
+            if !offline_confirmed {
+                bail!("unmount all other writers, supply all active members, then pass --offline-confirmed");
+            }
+            let storage = storage.resolve(BackendKind::LoopBlock)?;
+            let paths = match storage.backend {
+                BackendKind::LoopBlock => {
+                    require_paths(storage.images, "upgrade requires all loop images")?
+                }
+                BackendKind::RawBlock => {
+                    require_paths(storage.devices, "upgrade requires all raw devices")?
+                }
+                BackendKind::Host => bail!("upgrade-paged-metadata requires raw or loop backend"),
+            };
+            let meta = crate::raw_store::upgrade_paged_metadata(
+                storage.backend,
+                &paths,
+                storage.pool.as_deref(),
+                arena_size,
+            )?;
+            println!(
+                "{}",
+                serde_json::json!({"upgraded": true, "pool_uuid": meta.uuid, "txid": meta.txid, "required_feature": "raw-paged-metadata-v1"})
             );
         }
         Command::Scan { storage } => {

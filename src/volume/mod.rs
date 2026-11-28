@@ -131,6 +131,8 @@ mod shard_repair;
 mod shard_repair_tests;
 use shard_repair::RepairCounters;
 #[cfg(test)]
+mod paged_metadata_tests;
+#[cfg(test)]
 mod read_advisory_tests;
 #[cfg(test)]
 mod read_cache_range_tests;
@@ -321,6 +323,7 @@ pub struct ArgosFs {
     backend: Arc<dyn StorageBackend>,
     backend_writable: bool,
     raw_superblocks: Arc<Vec<RawSuperblock>>,
+    paged_metadata: Option<Arc<Mutex<crate::storage::raw::paged_metadata::ImageStore>>>,
     meta: Arc<MetadataLock>,
     /// Advisory statfs view republished after durable metadata commits.  It is
     /// intentionally independent of `meta` so statfs cannot block on a slow
@@ -345,6 +348,7 @@ impl Clone for ArgosFs {
             backend: self.backend.clone(),
             backend_writable: self.backend_writable,
             raw_superblocks: self.raw_superblocks.clone(),
+            paged_metadata: self.paged_metadata.clone(),
             meta: self.meta.clone(),
             capacity_snapshot: self.capacity_snapshot.clone(),
             quota_runtime: self.quota_runtime.clone(),
@@ -512,6 +516,10 @@ impl ArgosFs {
     /// member. Call only after unmounting all other processes using this pool;
     /// this API cannot fence an unrelated legacy daemon already mounted.
     pub fn upgrade_delta_integrity(&mut self) -> Result<()> {
+        if self.paged_metadata.is_some() {
+            return Ok(());
+        }
+
         if self.runtime.mount_owners.load(Ordering::Acquire) != 1 {
             return Err(ArgosError::Conflict(
                 "raw integrity upgrade requires a unique volume handle".to_string(),

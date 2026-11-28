@@ -148,6 +148,7 @@ impl ArgosFs {
             backend: Arc::new(HostFsBackend::new(&root)),
             backend_writable: true,
             raw_superblocks: Arc::new(Vec::new()),
+            paged_metadata: None,
             root: Arc::new(root),
             deferred_commit: Arc::new(Mutex::new(DeferredCommitState::new(&meta))),
             quarantined_devices: Arc::new(Mutex::new(BTreeSet::new())),
@@ -188,6 +189,48 @@ impl ArgosFs {
         Self::create_block_backend(BackendKind::RawBlock, devices, config, pool_name, force)
     }
 
+    /// Create a new loop pool using the opt-in paged metadata disk format.
+    pub fn create_loop_paged(
+        images: &[PathBuf],
+        config: VolumeConfig,
+        image_size: u64,
+        pool_name: &str,
+        force: bool,
+    ) -> Result<Self> {
+        if force {
+            remove_stale_pool_cache(BackendKind::LoopBlock, images);
+        }
+        prepare_loop_images(images, image_size, force)?;
+        Self::create_block_backend_format(
+            BackendKind::LoopBlock,
+            images,
+            config,
+            pool_name,
+            force,
+            true,
+        )
+    }
+
+    /// Create a new raw pool using the opt-in paged metadata disk format.
+    pub fn create_raw_paged(
+        devices: &[PathBuf],
+        config: VolumeConfig,
+        pool_name: &str,
+        force: bool,
+    ) -> Result<Self> {
+        if force {
+            remove_stale_pool_cache(BackendKind::RawBlock, devices);
+        }
+        Self::create_block_backend_format(
+            BackendKind::RawBlock,
+            devices,
+            config,
+            pool_name,
+            force,
+            true,
+        )
+    }
+
     pub fn open_loop(images: &[PathBuf], write: bool) -> Result<Self> {
         Self::open_block_backend(BackendKind::LoopBlock, images, write)
     }
@@ -225,9 +268,20 @@ impl ArgosFs {
     pub(super) fn create_block_backend(
         kind: BackendKind,
         paths: &[PathBuf],
+        config: VolumeConfig,
+        pool_name: &str,
+        force: bool,
+    ) -> Result<Self> {
+        Self::create_block_backend_format(kind, paths, config, pool_name, force, false)
+    }
+
+    fn create_block_backend_format(
+        kind: BackendKind,
+        paths: &[PathBuf],
         mut config: VolumeConfig,
         pool_name: &str,
         force: bool,
+        paged: bool,
     ) -> Result<Self> {
         if config.k == 0 {
             return Err(ArgosError::Invalid("k must be positive".to_string()));
@@ -259,7 +313,7 @@ impl ArgosFs {
         let mut allocators = BTreeMap::new();
         for (index, info) in backend_file.list_devices()?.into_iter().enumerate() {
             let id = format!("disk-{index:04}");
-            let sb = raw_store::superblock_for_device(
+            let mut sb = raw_store::superblock_for_device(
                 pool_uuid,
                 index,
                 &id,
@@ -269,6 +323,9 @@ impl ArgosFs {
                 info.capacity,
                 pool_name,
             )?;
+            if paged {
+                sb.required_feature_flags |= raw_format::REQUIRED_FEATURE_PAGED_METADATA;
+            }
             let allocator = allocator::init_allocator(
                 sb.data.offset,
                 sb.data.length,
@@ -341,12 +398,25 @@ impl ArgosFs {
             checkpoint_member_catalog: None,
         };
         normalize_metadata_layouts(&mut meta);
-        journal::prepare_metadata_integrity_for_external_store(&mut meta)?;
+        if !paged {
+            journal::prepare_metadata_integrity_for_external_store(&mut meta)?;
+        }
         let backend: Arc<dyn StorageBackend> =
             Arc::new(GuardedBackend::new(Arc::new(backend_file)));
-        raw_store::initialize_pool(backend.clone(), &superblocks, &mut meta, force)?;
+        let paged_metadata =
+            raw_store::initialize_pool_with_store(backend.clone(), &superblocks, &mut meta, force)?
+                .map(|store| Arc::new(Mutex::new(store)));
         raw_store::write_superblock_clean_state(&*backend, &superblocks, false)?;
-        Self::from_block_parts(paths, backend, true, superblocks, meta, false, None)
+        Self::from_block_parts(
+            paths,
+            backend,
+            true,
+            superblocks,
+            meta,
+            false,
+            None,
+            paged_metadata,
+        )
     }
 
     pub(super) fn open_block_backend(
@@ -408,7 +478,7 @@ impl ArgosFs {
         // a subsequent real mutation must use the conservative checkpoint.
         let reanchor_can_wait =
             can_reuse_delta_base || (opened.recovery_verified && opened.durable_metadata.is_some());
-        let durable_metadata = if can_reuse_delta_base {
+        let durable_metadata = if can_reuse_delta_base || opened.paged_metadata.is_some() {
             opened.durable_metadata
         } else {
             None
@@ -424,10 +494,12 @@ impl ArgosFs {
             meta,
             reanchor_can_wait,
             durable_metadata,
+            opened.paged_metadata,
         )
         .map(|fs| (fs, report))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn from_block_parts(
         paths: &[PathBuf],
         backend: Arc<dyn StorageBackend>,
@@ -436,6 +508,7 @@ impl ArgosFs {
         meta: Metadata,
         reanchor_can_wait: bool,
         durable_metadata: Option<Metadata>,
+        paged_metadata: Option<Arc<Mutex<crate::storage::raw::paged_metadata::ImageStore>>>,
     ) -> Result<Self> {
         if meta.format != FORMAT_VERSION {
             return Err(ArgosError::Invalid(format!(
@@ -506,6 +579,7 @@ impl ArgosFs {
             backend,
             backend_writable,
             raw_superblocks: Arc::new(superblocks),
+            paged_metadata,
             deferred_commit,
             quarantined_devices,
             quarantine_since: Arc::new(Mutex::new(BTreeMap::new())),

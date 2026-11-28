@@ -14,7 +14,7 @@ fn inode(kind: NodeKind, mode: u32, uid: u32, gid: u32) -> Inode {
         atime: 0.0,
         mtime: 0.0,
         ctime: 0.0,
-        entries: BTreeMap::new(),
+        entries: Default::default(),
         target: None,
         inline_data: None,
         inline_sha256: String::new(),

@@ -65,6 +65,12 @@ impl ArgosFs {
         capacity_bytes: Option<u64>,
         rebalance: bool,
     ) -> Result<String> {
+        if self.paged_metadata.is_some() {
+            return Err(ArgosError::Unsupported(
+                "paged pool membership changes are not implemented".into(),
+            ));
+        }
+
         let mut meta = self.meta.write();
         self.ensure_block_backend_writable_locked(&meta)?;
         let next = meta
@@ -153,6 +159,12 @@ impl ArgosFs {
     }
 
     pub fn add_block_device(&self, path: PathBuf, image_size: u64, force: bool) -> Result<String> {
+        if self.paged_metadata.is_some() {
+            return Err(ArgosError::Unsupported(
+                "paged pool membership changes are not implemented".into(),
+            ));
+        }
+
         let kind = self.metadata_snapshot().backend;
         if kind == BackendKind::Host {
             return Err(ArgosError::Unsupported(
@@ -264,6 +276,12 @@ impl ArgosFs {
     }
 
     pub fn mark_disk(&self, disk_id: &str, status: DiskStatus) -> Result<()> {
+        if self.paged_metadata.is_some() && status == DiskStatus::Removed {
+            return Err(ArgosError::Unsupported(
+                "paged pool membership changes are not implemented".into(),
+            ));
+        }
+
         let mut meta = self.meta.write();
         self.ensure_block_backend_writable_locked(&meta)?;
         let disk = meta
@@ -562,6 +580,12 @@ impl ArgosFs {
     }
 
     pub fn remove_disk(&self, disk_id: &str) -> Result<u64> {
+        if self.paged_metadata.is_some() {
+            return Err(ArgosError::Unsupported(
+                "paged pool membership changes are not implemented".into(),
+            ));
+        }
+
         let rewritten = self.drain_disk(disk_id)?;
         let mut meta = self.meta.write();
         self.ensure_block_backend_writable_locked(&meta)?;

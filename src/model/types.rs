@@ -463,7 +463,7 @@ pub struct Disk {
     pub created_at: f64,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Shard {
     pub slot: usize,
     pub disk_id: String,
@@ -495,7 +495,7 @@ pub struct PhysicalExtent {
     pub flags: u32,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct FileBlock {
     #[serde(default)]
     pub layout_id: String,
@@ -536,7 +536,8 @@ pub struct Inode {
     pub atime: f64,
     pub mtime: f64,
     pub ctime: f64,
-    pub entries: BTreeMap<String, InodeId>,
+    /// Persistent ordered directory map: snapshots share untouched branches.
+    pub entries: imbl::OrdMap<String, InodeId>,
     pub target: Option<String>,
     #[serde(
         default,

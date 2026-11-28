@@ -156,7 +156,7 @@ pub(super) fn root_inode(created_at: f64) -> Inode {
         atime: created_at,
         mtime: created_at,
         ctime: created_at,
-        entries: BTreeMap::new(),
+        entries: Default::default(),
         target: None,
         inline_data: None,
         inline_sha256: String::new(),

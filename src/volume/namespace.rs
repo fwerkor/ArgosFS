@@ -1320,7 +1320,7 @@ impl ArgosFs {
             atime: now,
             mtime: now,
             ctime: now,
-            entries: BTreeMap::new(),
+            entries: Default::default(),
             target: Some(target_string.clone()),
             inline_data: None,
             inline_sha256: String::new(),

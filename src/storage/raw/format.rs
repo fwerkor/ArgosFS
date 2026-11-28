@@ -39,6 +39,10 @@ pub const REQUIRED_FEATURE_DELTA_INTEGRITY: u64 = 1 << 0;
 /// readers fail closed on this required bit instead of silently rejecting or
 /// misapplying a splice record.
 pub const REQUIRED_FEATURE_ARRAY_SPLICE: u64 = 1 << 1;
+/// Independent authenticated metadata page arena and immutable membership manifest.
+pub const REQUIRED_FEATURE_PAGED_METADATA: u64 = 1 << 3;
+/// Offline upgrade fence; old binaries cannot open a member while its new arena is staged.
+pub const REQUIRED_FEATURE_PAGED_MIGRATION: u64 = 1 << 4;
 /// Bits 8..15 of optional feature flags identify the erasure-code wire format.
 /// Zero is the implicit legacy ID used by superblocks formatted before #259.
 /// Both IDs currently use byte-identical GF(2^8) systematic Vandermonde parity.
@@ -48,8 +52,10 @@ pub const CODEC_ID_LEGACY_GF8: u8 = 0;
 pub const CODEC_ID_VANDERMONDE_GF8: u8 = 1;
 const CODEC_ID_SHIFT: u32 = 8;
 const CODEC_ID_MASK: u64 = 0xff << CODEC_ID_SHIFT;
-const SUPPORTED_REQUIRED_FEATURE_FLAGS: u64 =
-    REQUIRED_FEATURE_DELTA_INTEGRITY | REQUIRED_FEATURE_ARRAY_SPLICE;
+const SUPPORTED_REQUIRED_FEATURE_FLAGS: u64 = REQUIRED_FEATURE_DELTA_INTEGRITY
+    | REQUIRED_FEATURE_ARRAY_SPLICE
+    | REQUIRED_FEATURE_PAGED_METADATA
+    | REQUIRED_FEATURE_PAGED_MIGRATION;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RawRegion {

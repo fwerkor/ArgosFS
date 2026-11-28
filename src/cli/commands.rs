@@ -282,6 +282,9 @@ pub(super) enum Command {
         /// Maximum metadata transactions in one deferred group.
         #[arg(long, default_value_t = DEFAULT_DEFERRED_COMMIT_MAX_TRANSACTIONS)]
         deferred_commit_max_transactions: u64,
+        /// Opt into the new paged metadata disk format for a fresh raw/loop pool.
+        #[arg(long)]
+        paged_metadata: bool,
         /// Permit destructive replacement of recognized signatures or existing images.
         #[arg(long)]
         force: bool,
@@ -296,6 +299,17 @@ pub(super) enum Command {
         /// are stopped, and all active members are supplied.
         #[arg(long)]
         offline_confirmed: bool,
+    },
+    #[command(about = "Offline one-way conversion to persistent paged metadata")]
+    UpgradePagedMetadata {
+        #[command(flatten)]
+        storage: BackendArgs,
+        /// Confirm that all active members are supplied and all other writers are stopped.
+        #[arg(long)]
+        offline_confirmed: bool,
+        /// Reserve this much never-allocated space at the end of each member (default: existing metadata region size).
+        #[arg(long, value_parser = parse_byte_size_u64)]
+        arena_size: Option<u64>,
     },
     #[command(about = "Scan loop images or raw devices for ArgosFS signatures")]
     Scan {
