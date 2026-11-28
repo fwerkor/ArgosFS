@@ -1,8 +1,9 @@
 //! Reproducible, fault-free semantic workload with exact external state.
 //! Fault-free is deliberate: an arbitrary I/O failure cannot excuse a mismatch.
+use crate::combinations::{Features, Profile};
 use crate::invariants::verify_clean;
 use anyhow::{ensure, Context, Result};
-use argosfs::types::{Compression, DiskStatus, VolumeConfig};
+use argosfs::types::{Compression, VolumeConfig};
 use argosfs::{ArgosError, ArgosFs};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,6 +18,10 @@ pub struct Trace {
     pub seed: u64,
     pub paged: bool,
     pub ops: Vec<Operation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<Profile>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub directory_entries: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -47,6 +52,17 @@ pub enum Operation {
     Shared,
     Links,
     Topology,
+    Features {
+        seed: u64,
+    },
+    TopologyRound {
+        seed: u64,
+        #[serde(default)]
+        mode: crate::topology::Mode,
+    },
+    Capacity {
+        seed: u64,
+    },
     Atomic {
         operation: crate::atomic::Mutation,
         cut: u64,
@@ -64,10 +80,16 @@ impl Operation {
             Self::Reopen => "reopen",
             Self::Shared => "shared",
             Self::Links => "links",
-            Self::Topology => "topology",
+            Self::Topology | Self::TopologyRound { .. } => "topology",
+            Self::Features { .. } => "features",
+            Self::Capacity { .. } => "capacity",
             Self::Atomic { .. } => "atomic",
         }
     }
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 impl Trace {
@@ -126,7 +148,48 @@ impl Trace {
             seed,
             paged,
             ops,
+            profile: None,
+            directory_entries: 0,
         }
+    }
+
+    pub fn with_profile(mut self, profile: Profile, topology: bool) -> Self {
+        self.profile = Some(profile);
+        // Preserve the original operation order and interleave feature lifetimes
+        // and topology rounds with it. The serialized trace is the replay input.
+        let mut ops = vec![Operation::Features { seed: self.seed }];
+        let interval = if profile.encrypted() { 64 } else { 24 };
+        let mut rounds = 0;
+        for (i, op) in self.ops.into_iter().enumerate() {
+            if matches!(op, Operation::Topology | Operation::TopologyRound { .. }) {
+                continue;
+            }
+            ops.push(op);
+            if (i + 1) % interval == 0 {
+                let seed = self.seed.wrapping_add(i as u64 * 7919);
+                if topology {
+                    ops.push(Operation::TopologyRound {
+                        seed,
+                        mode: crate::topology::Mode::round(rounds),
+                    });
+                    rounds += 1;
+                }
+                ops.push(Operation::Reopen);
+                ops.push(Operation::Features { seed });
+            }
+        }
+        if topology && rounds == 0 {
+            ops.push(Operation::TopologyRound {
+                seed: self.seed,
+                mode: crate::topology::Mode::Returning,
+            });
+        }
+        ops.push(Operation::Reopen);
+        if matches!(profile, Profile::Uncompressed) {
+            ops.push(Operation::Capacity { seed: self.seed });
+        }
+        self.ops = ops;
+        self
     }
 }
 
@@ -300,55 +363,16 @@ fn links(fs: &ArgosFs) -> Result<()> {
     Ok(())
 }
 
-fn topology(fs: ArgosFs, images: &mut Vec<std::path::PathBuf>, dir: &Path) -> Result<ArgosFs> {
-    fs.write_file("/topology-sentinel", &data(60000, 23), 0o644)?;
-    fs.sync()?;
-    let retired = fs
-        .metadata_snapshot()
-        .disks
-        .values()
-        .find(|disk| disk.status == DiskStatus::Online)
-        .context("no online member")?
-        .clone();
-    let missing = retired.path.clone();
-    drop(fs);
-    images.retain(|p| *p != missing);
-    ensure!(
-        images.len() == 4,
-        "topology drill requires five active members"
-    );
-    let degraded = ArgosFs::open_loop(images, true)?;
-    ensure!(
-        degraded.read_file("/topology-sentinel", false)? == data(60000, 23),
-        "degraded read"
-    );
-    let replacement = dir.join(format!("replacement-{}.img", retired.id));
-    degraded.add_block_device(replacement.clone(), 96 * 1024 * 1024, false)?;
-    degraded.sync()?;
-    drop(degraded);
-    images.push(replacement);
-    let repaired = ArgosFs::open_loop(images, true)?;
-    repaired.remove_disk(&retired.id)?;
-    repaired.rebalance()?;
-    repaired.sync()?;
-    ensure!(
-        repaired.metadata_snapshot().disks[&retired.id].status == DiskStatus::Removed,
-        "retired member still active"
-    );
-    ensure!(
-        repaired.read_file("/topology-sentinel", false)? == data(60000, 23),
-        "replacement changed content"
-    );
-    repaired.unlink_path("/topology-sentinel")?;
-    Ok(repaired)
-}
-
 pub fn execute(trace: &Trace, dir: &Path) -> Result<()> {
     ensure!(trace.version == 1, "unsupported trace version");
+    ensure!(
+        trace.directory_entries <= 4096,
+        "directory entry count exceeds 4096"
+    );
     fs::create_dir(dir)?;
     let dir = fs::canonicalize(dir)?;
     let mut images: Vec<_> = (0..5).map(|i| dir.join(format!("disk{i}.img"))).collect();
-    let config = VolumeConfig {
+    let mut config = VolumeConfig {
         k: 3,
         m: 2,
         chunk_size: 32 * 1024,
@@ -356,13 +380,20 @@ pub fn execute(trace: &Trace, dir: &Path) -> Result<()> {
         l2_cache_bytes: 0,
         ..VolumeConfig::default()
     };
+    if let Some(profile) = trace.profile {
+        profile.configure(&mut config);
+    }
     let create = if trace.paged {
         ArgosFs::create_loop_paged
     } else {
         ArgosFs::create_loop_legacy
     };
     let mut fs = create(&images, config, 64 * 1024 * 1024, "ztest-model", false)?;
+    if trace.profile.is_some_and(Profile::encrypted) {
+        fs.enable_encryption(crate::combinations::TEST_KEY)?;
+    }
     fs.mkdir("/model", 0o755)?;
+    let mut features: Option<Features> = None;
     let mut expected = BTreeMap::<u8, Vec<u8>>::new();
     for (index, op) in trace.ops.iter().enumerate() {
         let result = (|| -> Result<()> {
@@ -419,7 +450,12 @@ pub fn execute(trace: &Trace, dir: &Path) -> Result<()> {
                         absent(fs.unlink_path(&path(slot)))?;
                     }
                 }
-                Operation::Reopen | Operation::Topology | Operation::Atomic { .. } => {}
+                Operation::Reopen
+                | Operation::Topology
+                | Operation::TopologyRound { .. }
+                | Operation::Features { .. }
+                | Operation::Capacity { .. }
+                | Operation::Atomic { .. } => {}
                 Operation::Shared => shared(&fs)?,
                 Operation::Links => links(&fs)?,
             }
@@ -437,14 +473,60 @@ pub fn execute(trace: &Trace, dir: &Path) -> Result<()> {
             );
             verify(&fs, &expected).context("reopen operation")?;
             verify_clean(&fs).context("reopen operation")?;
-        } else if matches!(op, Operation::Topology) {
-            fs = topology(fs, &mut images, &dir).context("topology operation")?;
+        } else if matches!(op, Operation::Topology | Operation::TopologyRound { .. }) {
+            let (seed, mode) = match op {
+                Operation::TopologyRound { seed, mode } => (*seed, Some(*mode)),
+                _ => (trace.seed, None),
+            };
+            fs = crate::topology::exercise(fs, &mut images, &dir, seed, index, mode, |pool| {
+                verify(pool, &expected)?;
+                if let Some(features) = &features {
+                    features.verify(pool)?;
+                }
+                Ok(())
+            })
+            .context("topology operation")?;
             verify(&fs, &expected).context("topology operation")?;
         } else if let Operation::Atomic { operation, cut } = *op {
             fs = crate::atomic::exercise(fs, &images, &dir, index, operation, cut)
                 .context("atomic operation")?;
             verify(&fs, &expected).context("atomic operation")?;
+        } else if let Operation::Capacity { seed } = *op {
+            let capacity_dir = dir.join(format!("capacity-{index:05}"));
+            crate::combinations::capacity(&capacity_dir, trace.paged, seed)
+                .context("capacity operation")?;
+            std::fs::remove_dir_all(capacity_dir)?;
+        } else if let Operation::Features { seed } = *op {
+            if let Some(old) = features.take() {
+                old.remove(&fs).context("features operation cleanup")?;
+            }
+            features = Some(
+                Features::create(
+                    &fs,
+                    seed,
+                    trace.profile.is_some_and(Profile::encrypted),
+                    trace.directory_entries,
+                )
+                .context("features operation")?,
+            );
         }
+        if let Some(features) = &features {
+            if matches!(
+                op,
+                Operation::Reopen
+                    | Operation::Topology
+                    | Operation::TopologyRound { .. }
+                    | Operation::Features { .. }
+                    | Operation::Atomic { .. }
+            ) {
+                features
+                    .verify(&fs)
+                    .with_context(|| format!("{} operation feature state", op.kind()))?;
+            }
+        }
+    }
+    if let Some(features) = features {
+        features.remove(&fs).context("final feature cleanup")?;
     }
     fs.sync()?;
     verify_clean(&fs).context("final invariant")?;
@@ -538,6 +620,28 @@ pub fn run(trace: Trace, dir: &Path, minimize: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn combined_trace_preserves_profiles_and_topology_modes() {
+        let mut trace =
+            Trace::generate(356, true, 72, true).with_profile(Profile::ZstdDeferred, true);
+        trace.directory_entries = 12;
+        let encoded = serde_json::to_vec(&trace).unwrap();
+        let decoded: Trace = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(serde_json::to_vec(&decoded).unwrap(), encoded);
+        assert_eq!(decoded.directory_entries, 12);
+        for mode in [
+            crate::topology::Mode::Missing,
+            crate::topology::Mode::Returning,
+            crate::topology::Mode::OnlineDrain,
+        ] {
+            assert!(decoded.ops.iter().any(|op| match op {
+                Operation::TopologyRound { mode: actual, .. } =>
+                    std::mem::discriminant(actual) == std::mem::discriminant(&mode),
+                _ => false,
+            }));
+        }
+    }
 
     #[test]
     fn generated_trace_roundtrips_and_reproduces() {

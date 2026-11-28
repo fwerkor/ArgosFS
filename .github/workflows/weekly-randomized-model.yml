@@ -179,7 +179,7 @@ jobs:
           if-no-files-found: ignore
 
   ztest-matrix:
-    name: ztest (${{ matrix.format }}, ${{ matrix.seed }})
+    name: ztest (${{ matrix.format }}, ${{ matrix.profile }}, ${{ matrix.seed }})
     needs: prepare-matrix
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -187,6 +187,7 @@ jobs:
       fail-fast: false
       matrix:
         format: [legacy, paged]
+        profile: [lz4-cache, zstd-deferred, uncompressed, encrypted]
         seed: ${{ fromJSON(needs.prepare-matrix.outputs.fault_seeds) }}
     steps:
       - uses: actions/checkout@v7
@@ -204,17 +205,27 @@ jobs:
         env:
           SEED: ${{ matrix.seed }}
           FORMAT: ${{ matrix.format }}
+          PROFILE: ${{ matrix.profile }}
         run: |
           bin="$(cargo metadata --manifest-path ztest/Cargo.toml --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')/release/argosfs-ztest"
           root="$RUNNER_TEMP/ztest"
           mkdir -p "$root"
-          "$bin" model --work-dir "$root/model" --seed "$SEED" --operations 256 --topology "--$FORMAT-metadata"
-          "$bin" run --work-dir "$root/crash" --seed "$SEED" --cycles 16 --kill-after-ms-min 500 --kill-after-ms-max 2500 --min-faults 1 --reorder-pending --recovery-cuts 3 --recovery-eios 1 "--$FORMAT-metadata"
+          if [ "$PROFILE" = encrypted ]; then
+            # Key derivation is intentionally expensive; avoid multiplying it by
+            # hundreds of directory entries and unrelated generic operations.
+            "$bin" model --work-dir "$root/model" --seed "$SEED" --operations 0 --topology --profile "$PROFILE" "--$FORMAT-metadata"
+          else
+            "$bin" model --work-dir "$root/model" --seed "$SEED" --operations 128 --topology --profile "$PROFILE" --directory-entries 128 "--$FORMAT-metadata"
+          fi
+          if [ "$PROFILE" = lz4-cache ]; then
+            "$bin" model --work-dir "$root/baseline" --seed "$SEED" --operations 256 --topology "--$FORMAT-metadata"
+            "$bin" run --work-dir "$root/crash" --seed "$SEED" --cycles 16 --kill-after-ms-min 500 --kill-after-ms-max 2500 --min-faults 1 --reorder-pending --recovery-cuts 3 --recovery-eios 1 "--$FORMAT-metadata"
+          fi
       - name: Upload trace and recovery artifacts
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: weekly-ztest-${{ matrix.format }}-${{ matrix.seed }}
+          name: weekly-ztest-${{ matrix.format }}-${{ matrix.profile }}-${{ matrix.seed }}
           path: ${{ runner.temp }}/ztest
           if-no-files-found: ignore
 

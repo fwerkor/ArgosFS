@@ -167,3 +167,43 @@ exploratory and are not durable-data guarantees.
 
 Both metadata formats are exercised by pull-request smoke tests and the
 weekly randomized CI matrix. The model does not replace mounted FUSE tests.
+
+### Combined features and repeated topology transitions
+
+Use `--profile` to add a quota/ACL/xattr/links/content oracle that remains live
+across normal operations, remounts, reshape, Autopilot and member replacement.
+A quota race must admit exactly one of two competing writers, and rejected
+writes must preserve the prior contents. The workload validates exact names,
+bytes, link counts, permissions, ACLs, xattrs and logical quota usage. Optional
+`--directory-entries` adds up to 4096 files to a nested quota subtree.
+
+| Profile | Initial configuration |
+|---|---|
+| `lz4-cache` | 2+2, LZ4, 32 KiB chunks, 512 KiB L2 |
+| `zstd-deferred` | 3+2, Zstd, 16 KiB chunks, L2, deferred metadata/data flush |
+| `uncompressed` | 4+1, no compression, 64 KiB chunks; independent real ENOSPC/reuse drill |
+| `encrypted` | 2+2, LZ4, encryption, L2; disposable fixture key, encrypted block assertions |
+
+With `--topology`, profiles interleave repeated transitions in the trace:
+member add, bounded reshape with a reopen before completion, explicit
+manual offline/online, bounded member rebalance and Autopilot, and then
+one of three member lifecycles (absent-member replacement, physical
+return after degraded writes, or online drain/removal). A foreground writer
+and maintenance thread run concurrently against the same pool; the entire
+external oracle is checked at intermediate transitions, not just at the end.
+The workload uses only fresh image files in its work directory. Failed runs
+retain images and the trace, including the profile and topology modes.
+
+```sh
+cargo run --release -- model --work-dir /tmp/combined-356 --seed 356 \
+  --operations 72 --profile zstd-deferred --topology --directory-entries 128
+cargo run --release -- model --work-dir /tmp/combined-replay \
+  --replay /tmp/combined-356/trace.json
+cargo run --release -- model --work-dir /tmp/combined-encrypted --seed 356 \
+  --operations 0 --profile encrypted --topology
+```
+
+The profiles cover representative combinations, not an exhaustive Cartesian
+product. Topology maintenance is tested with clean storage and foreground
+concurrency; random storage faults and crash recovery are still separate
+workloads. The topology sequence is reproducible but OS scheduling is not.
