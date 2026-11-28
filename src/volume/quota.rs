@@ -67,6 +67,16 @@ impl ArgosFs {
         Ok(())
     }
 
+    /// Namespace mutations only touch the quota runtime when a quota exists.
+    /// Rebuilding from the full inode map on every unlink/rename is
+    /// O(namespace); with no quota configured the runtime is already empty.
+    pub(super) fn refresh_quota_runtime_if_active_locked(&self, meta: &Metadata) -> Result<()> {
+        if self.has_directory_quotas() {
+            self.rebuild_quota_runtime_locked(meta)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn inherit_quota_memberships(&self, parent: InodeId, ino: InodeId) {
         let mut runtime = self.quota_runtime.write();
         let inherited = runtime
