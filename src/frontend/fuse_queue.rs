@@ -1,7 +1,7 @@
 //! Blocking FUSE operations run here, never on the kernel request readers.
 //!
-//! Consecutive reads for one inode may overlap; exclusive requests preserve
-//! their submission order as barriers. Independent inodes can
+//! Consecutive reads or disjoint direct writes for one inode may overlap;
+//! overlapping writes and exclusive requests preserve submission-order barriers. Independent inodes can
 //! progress in parallel; a slow checkpoint does not consume request readers.
 use parking_lot::{Condvar, Mutex};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -12,8 +12,15 @@ use std::thread::{self, JoinHandle};
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RequestKind {
+    Exclusive,
+    Read,
+    WriteRange { start: u64, end: u64 },
+}
+
 struct QueuedJob {
-    shared_read: bool,
+    kind: RequestKind,
     run: Job,
 }
 
@@ -21,6 +28,49 @@ struct QueuedJob {
 struct Active {
     readers: usize,
     exclusive: bool,
+    writes: Vec<(u64, u64)>,
+}
+
+impl Active {
+    fn accepts(&self, kind: RequestKind) -> bool {
+        if self.exclusive {
+            return false;
+        }
+        match kind {
+            RequestKind::Exclusive => self.readers == 0 && self.writes.is_empty(),
+            RequestKind::Read => self.writes.is_empty(),
+            RequestKind::WriteRange { start, end } => {
+                self.readers == 0 && self.writes.iter().all(|&(a, b)| end <= a || b <= start)
+            }
+        }
+    }
+
+    fn begin(&mut self, kind: RequestKind) {
+        match kind {
+            RequestKind::Exclusive => self.exclusive = true,
+            RequestKind::Read => self.readers += 1,
+            RequestKind::WriteRange { start, end } => self.writes.push((start, end)),
+        }
+    }
+
+    fn finish(&mut self, kind: RequestKind) {
+        match kind {
+            RequestKind::Exclusive => self.exclusive = false,
+            RequestKind::Read => self.readers -= 1,
+            RequestKind::WriteRange { start, end } => {
+                let position = self
+                    .writes
+                    .iter()
+                    .position(|&range| range == (start, end))
+                    .expect("running range");
+                self.writes.swap_remove(position);
+            }
+        }
+    }
+
+    fn empty(&self) -> bool {
+        !self.exclusive && self.readers == 0 && self.writes.is_empty()
+    }
 }
 
 #[derive(Default)]
@@ -40,7 +90,7 @@ impl State {
         let runnable = self
             .active
             .get(&inode)
-            .is_none_or(|active| !active.exclusive && (next.shared_read || active.readers == 0));
+            .is_none_or(|active| active.accepts(next.kind));
         if runnable && self.ready_set.insert(inode) {
             self.ready.push_back(inode);
             return true;
@@ -81,17 +131,17 @@ impl FuseRequestExecutor {
     /// Submission cannot block a FUSE request reader, including when all
     /// execution threads are doing slow I/O or waiting for metadata locks.
     pub(super) fn submit(&self, inode: u64, job: impl FnOnce() + Send + 'static) -> bool {
-        self.submit_kind(inode, false, job)
+        self.submit_kind(inode, RequestKind::Exclusive, job)
     }
 
     pub(super) fn submit_read(&self, inode: u64, job: impl FnOnce() + Send + 'static) -> bool {
-        self.submit_kind(inode, true, job)
+        self.submit_kind(inode, RequestKind::Read, job)
     }
 
-    fn submit_kind(
+    pub(super) fn submit_kind(
         &self,
         inode: u64,
-        shared_read: bool,
+        kind: RequestKind,
         job: impl FnOnce() + Send + 'static,
     ) -> bool {
         let mut state = self.shared.state.lock();
@@ -99,7 +149,7 @@ impl FuseRequestExecutor {
             return false;
         }
         state.jobs.entry(inode).or_default().push_back(QueuedJob {
-            shared_read,
+            kind,
             run: Box::new(job),
         });
         if state.schedule(inode) {
@@ -139,11 +189,7 @@ fn worker(shared: Arc<Shared>) {
                     let jobs = state.jobs.get_mut(&inode).expect("ready inode has jobs");
                     let job = jobs.pop_front().expect("ready inode has nonempty queue");
                     let active = state.active.entry(inode).or_default();
-                    if job.shared_read {
-                        active.readers += 1;
-                    } else {
-                        active.exclusive = true;
-                    }
+                    active.begin(job.kind);
                     if state.schedule(inode) {
                         shared.ready.notify_one();
                     }
@@ -158,19 +204,15 @@ fn worker(shared: Arc<Shared>) {
 
         // A panicking handler must not strand subsequent requests for its
         // inode. Dropping an unused fuser reply reports EIO to the caller.
-        let shared_read = job.shared_read;
+        let kind = job.kind;
         if catch_unwind(AssertUnwindSafe(job.run)).is_err() {
             eprintln!("argosfs: FUSE I/O task panicked");
         }
 
         let mut state = shared.state.lock();
         let active = state.active.get_mut(&inode).expect("running inode");
-        if shared_read {
-            active.readers -= 1;
-        } else {
-            active.exclusive = false;
-        }
-        if active.readers == 0 && !active.exclusive {
+        active.finish(kind);
+        if active.empty() {
             state.active.remove(&inode);
         }
         if state.schedule(inode) {
@@ -303,6 +345,67 @@ mod tests {
         release_tx.send(()).unwrap();
         release_tx.send(()).unwrap();
         completed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        executor.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    #[test]
+    fn disjoint_writes_overlap_but_overlapping_writes_and_barriers_wait() {
+        let mut executor = FuseRequestExecutor::start(4).unwrap();
+        let (started, events) = mpsc::channel();
+        let (release_a, wait_a) = mpsc::channel();
+        let (release_b, wait_b) = mpsc::channel();
+        let tx = started.clone();
+        assert!(executor.submit_kind(
+            1,
+            RequestKind::WriteRange { start: 0, end: 10 },
+            move || {
+                tx.send("a").unwrap();
+                wait_a.recv().unwrap();
+            }
+        ));
+        let tx = started.clone();
+        assert!(executor.submit_kind(
+            1,
+            RequestKind::WriteRange { start: 20, end: 30 },
+            move || {
+                tx.send("b").unwrap();
+                wait_b.recv().unwrap();
+            }
+        ));
+        let mut got = vec![
+            events.recv_timeout(Duration::from_secs(2)).unwrap(),
+            events.recv_timeout(Duration::from_secs(2)).unwrap(),
+        ];
+        got.sort();
+        assert_eq!(got, ["a", "b"]);
+        let (release_c, wait_c) = mpsc::channel();
+        let tx = started.clone();
+        assert!(executor.submit_kind(
+            1,
+            RequestKind::WriteRange { start: 5, end: 15 },
+            move || {
+                tx.send("c").unwrap();
+                wait_c.recv().unwrap();
+            }
+        ));
+        assert!(executor.submit(1, move || started.send("barrier").unwrap()));
+        assert!(events.recv_timeout(Duration::from_millis(40)).is_err());
+        release_a.send(()).unwrap();
+        assert_eq!(events.recv_timeout(Duration::from_secs(2)).unwrap(), "c");
+        release_c.send(()).unwrap();
+        assert!(events.recv_timeout(Duration::from_millis(40)).is_err());
+        release_b.send(()).unwrap();
+        assert_eq!(
+            events.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "barrier"
+        );
         executor.shutdown();
     }
 }

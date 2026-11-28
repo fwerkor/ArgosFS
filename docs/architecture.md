@@ -259,3 +259,11 @@ write staging and fsync durability barrier; repeated FLUSH requests report
 errors without releasing handles. The option is not enabled by default.
 Run `python3 tests/fuse_kernel_writeback.py --binary target/release/argosfs`
 on a Linux FUSE-capable host for mounted cache and permission regressions.
+
+For direct FUSE I/O, disjoint write ranges may run concurrently in the
+mount request executor. Overlapping writes, reads, and metadata operations
+retain ordered inode barriers; append and synchronous writes use the
+exclusive path. Linux direct handles advertise parallel direct writes.
+Use the existing persisted direct-I/O policy or the mount-only
+`-o direct_io` option (also available for raw/loop mounts). Direct I/O
+and kernel writeback are mutually exclusive mount modes.
