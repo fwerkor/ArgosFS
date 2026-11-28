@@ -2300,13 +2300,14 @@ fn immediate_v2_prepares_splices_only_after_all_members_upgrade() {
     let mut cursor = 0;
     let mut splices = 0;
     while cursor + 36 <= body.len() {
-        let n = u32::from_le_bytes(body[cursor..cursor + 4].try_into().unwrap()) as usize;
-        let record: serde_json::Value =
-            serde_json::from_slice(&body[cursor + 36..cursor + 36 + n]).unwrap();
-        if let Some(delta) = record["metadata_delta"].as_array() {
-            splices += delta.iter().filter(|op| op["op"] == "splice").count();
+        let (len, delta) = raw_store::journal_delta_for_test(sb, &body[cursor..]).unwrap();
+        if let Some(delta) = delta {
+            splices += delta
+                .iter()
+                .filter(|op| matches!(op, journal::MetadataDeltaOp::Splice { .. }))
+                .count();
         }
-        cursor += 36 + n;
+        cursor += len;
     }
     assert!(
         splices > 0,

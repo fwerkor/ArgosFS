@@ -18,6 +18,22 @@ pub use device::scan_paths;
 pub use device::superblock_for_device;
 pub use journal_io::reset_journals_after_checkpoint;
 
+#[cfg(test)]
+pub(crate) fn journal_delta_for_test(
+    sb: &RawSuperblock,
+    entry: &[u8],
+) -> Result<(usize, Option<Vec<journal::MetadataDeltaOp>>)> {
+    let header = entry
+        .get(..36)
+        .ok_or_else(|| ArgosError::CorruptedMetadata("truncated journal record header".into()))?;
+    let (len, compressed) = journal_entry_length(sb, header.try_into().unwrap())?;
+    let payload = entry
+        .get(36..36 + len)
+        .ok_or_else(|| ArgosError::CorruptedMetadata("truncated journal record payload".into()))?;
+    let record = decode_journal_payload(payload, compressed)?;
+    Ok((36 + len, record.metadata_delta))
+}
+
 use crate::backend::{FileBlockBackend, StorageBackend};
 use crate::commit_metrics::{CheckpointReason, CommitMetrics, CommitPhase, RawWriteKind};
 use crate::error::{ArgosError, Result};
