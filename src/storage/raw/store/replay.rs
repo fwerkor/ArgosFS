@@ -36,6 +36,7 @@ impl ReplayProof {
 pub(super) struct ReplayScan {
     pub(super) winner: Option<ReplayKey>,
     pub(super) retained: Option<Arc<Metadata>>,
+    stable_membership: bool,
 }
 
 pub(super) fn read_latest_journal_metadata(
@@ -45,6 +46,23 @@ pub(super) fn read_latest_journal_metadata(
     base_metadata: Option<&Metadata>,
     checkpoint_catalog: &[(String, Option<Arc<Metadata>>, MetadataCandidateReport)],
 ) -> Result<Option<Arc<Metadata>>> {
+    read_latest_journal_metadata_with_membership(
+        backend,
+        superblocks,
+        report,
+        base_metadata,
+        checkpoint_catalog,
+    )
+    .map(|(winner, _)| winner)
+}
+
+pub(super) fn read_latest_journal_metadata_with_membership(
+    backend: &dyn StorageBackend,
+    superblocks: &[RawSuperblock],
+    report: &mut TransactionReport,
+    base_metadata: Option<&Metadata>,
+    checkpoint_catalog: &[(String, Option<Arc<Metadata>>, MetadataCandidateReport)],
+) -> Result<(Option<Arc<Metadata>>, bool)> {
     let first = scan_journal_metadata(
         backend,
         superblocks,
@@ -54,10 +72,10 @@ pub(super) fn read_latest_journal_metadata(
         None,
     )?;
     let Some(winner) = first.winner else {
-        return Ok(None);
+        return Ok((None, first.stable_membership));
     };
     if let Some(metadata) = first.retained {
-        return Ok(Some(metadata));
+        return Ok((Some(metadata), first.stable_membership));
     }
     // A divergent/uncertified tail can make an older transaction the quorum
     // winner. Materialize that exact authenticated identity in a second pass
@@ -77,7 +95,10 @@ pub(super) fn read_latest_journal_metadata(
             "raw journal quorum changed during recovery replay".into(),
         ));
     }
-    Ok(second.retained)
+    Ok((
+        second.retained,
+        first.stable_membership && second.stable_membership,
+    ))
 }
 
 pub(super) fn scan_journal_metadata(
@@ -98,6 +119,25 @@ pub(super) fn scan_journal_metadata(
             .is_none_or(|uuid| metadata.uuid == uuid)
     });
     let base_snapshot = base_metadata.cloned().map(Arc::new);
+    // Only an unchanged voter set permits discarding an uncertified suffix
+    // on a fully present checkpoint membership. A newer membership may have
+    // voters not supplied to this open; leave its recovery evidence intact.
+    let same_membership = |candidate: &Metadata| {
+        base_metadata.is_some_and(|base| {
+            candidate.txid <= base.txid
+                || base
+                    .disks
+                    .iter()
+                    .filter(|(_, d)| d.status != DiskStatus::Removed)
+                    .map(|(id, _)| id)
+                    .eq(candidate
+                        .disks
+                        .iter()
+                        .filter(|(_, d)| d.status != DiskStatus::Removed)
+                        .map(|(id, _)| id))
+        })
+    };
+    let mut stable_membership = base_metadata.is_some();
     let present = superblocks
         .iter()
         .map(|sb| sb.disk_id.as_str())
@@ -129,6 +169,7 @@ pub(super) fn scan_journal_metadata(
                 {
                     continue;
                 }
+                stable_membership &= same_membership(candidate);
                 checkpoint_candidates
                     .insert(metadata_hash_for_replay(candidate)?, candidate.clone());
             }
@@ -426,6 +467,7 @@ pub(super) fn scan_journal_metadata(
                         ));
                         break;
                     }
+                    stable_membership &= same_membership(&candidate);
                     let candidate = Arc::new(candidate);
                     let proof = ReplayProof::from_metadata(&candidate, &sb.disk_id, &present)?;
                     if wanted == Some(&proof.key) {
@@ -522,6 +564,7 @@ pub(super) fn scan_journal_metadata(
     Ok(ReplayScan {
         winner: best,
         retained,
+        stable_membership,
     })
 }
 

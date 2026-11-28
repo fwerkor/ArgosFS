@@ -971,3 +971,154 @@ fn framed_checkpoint_reuses_inode_groups_and_rewrites_only_changed_pages() {
         exact
     );
 }
+
+#[test]
+fn writable_recovery_clears_verified_unquorate_journal_suffix_after_checkpoint() {
+    let dir = tempdir().unwrap();
+    let images: Vec<_> = (0..6)
+        .map(|i| dir.path().join(format!("split-{i}.img")))
+        .collect();
+    let fs = ArgosFs::create_loop_legacy(
+        &images,
+        VolumeConfig {
+            k: 3,
+            m: 2,
+            chunk_size: 4096,
+            ..VolumeConfig::default()
+        },
+        MIN_DEVICE_BYTES,
+        "split-tail",
+        false,
+    )
+    .unwrap();
+    fs.write_file("/base", b"durable-base", 0o600).unwrap();
+    fs.sync().unwrap();
+    let base = fs.metadata_snapshot();
+    drop(fs);
+    let superblocks: Vec<_> = images
+        .iter()
+        .map(|path| {
+            inspect_device(BackendKind::LoopBlock, path.clone())
+                .unwrap()
+                .0
+        })
+        .collect();
+    let backend = block_backend_for(&images);
+    write_dual_slot_checkpoint(&backend, &superblocks, &base);
+    for sb in &superblocks {
+        initialize_journal_region(&backend, &sb.disk_id, sb).unwrap();
+    }
+    backend.flush_all().unwrap();
+    let uncommitted = next_metadata(&base, "uncommitted-minority");
+    let (entry, _) = build_journal_entry(
+        &uncommitted,
+        Some(&base),
+        "partial-rewrite",
+        serde_json::json!({}),
+        true,
+    )
+    .unwrap();
+    for sb in &superblocks[..3] {
+        let (header, offset, end, rollover) =
+            journal_append_position(&backend, sb, entry.len()).unwrap();
+        assert!(!rollover);
+        append_journal_member(
+            &backend,
+            sb,
+            header,
+            offset,
+            end,
+            &entry,
+            JournalMemberWriteOptions {
+                flush: true,
+                metrics: None,
+            },
+        )
+        .unwrap();
+    }
+    let (selected, audit) = load_or_recover(&backend, &superblocks, false).unwrap();
+    assert_eq!(selected.txid, base.txid);
+    assert!(!audit.replayed);
+    assert_eq!(audit.invalid_entries, 0);
+    assert_eq!(audit.last_valid_txid, uncommitted.txid);
+    assert!(
+        raw_journal_end(&backend, &superblocks[0]) > RAW_HEADER_SIZE as u64,
+        "read-only audit must not erase evidence"
+    );
+    let (selected, _) = load_or_recover(&backend, &superblocks[..5], true).unwrap();
+    assert_eq!(selected.txid, base.txid);
+    assert!(
+        raw_journal_end(&backend, &superblocks[0]) > RAW_HEADER_SIZE as u64,
+        "incomplete membership must not discard an uncertified suffix"
+    );
+    let (selected, _) = load_or_recover(&backend, &superblocks, true).unwrap();
+    assert_eq!(selected.txid, base.txid);
+    for sb in &superblocks {
+        assert_eq!(raw_journal_end(&backend, sb), RAW_HEADER_SIZE as u64);
+    }
+    let next = next_metadata(&base, "next-committed-transaction");
+    append_transaction_with_trusted_integrity_quorum(
+        &backend,
+        &superblocks,
+        &next,
+        Some(&base),
+        "next",
+        serde_json::json!({}),
+    )
+    .unwrap();
+    let recovered = recover_metadata(&backend, &superblocks).unwrap();
+    assert_eq!(recovered.txid, next.txid);
+    assert_eq!(recovered.raw_pool.pool_name, "next-committed-transaction");
+
+    // Even if all voters of the selected checkpoint are supplied, a newer
+    // record with changed membership is not a stable-membership suffix.
+    write_dual_slot_checkpoint(&backend, &superblocks, &next);
+    for sb in &superblocks {
+        initialize_journal_region(&backend, &sb.disk_id, sb).unwrap();
+    }
+    backend.flush_all().unwrap();
+    let mut changed = next_metadata(&next, "uncommitted-membership-change");
+    changed
+        .disks
+        .get_mut(&superblocks[5].disk_id)
+        .unwrap()
+        .status = DiskStatus::Removed;
+    journal::prepare_metadata_integrity_with_previous(
+        &mut changed,
+        next.integrity.meta_hash.clone(),
+    )
+    .unwrap();
+    let (entry, _) = build_journal_entry(
+        &changed,
+        Some(&next),
+        "partial-membership",
+        serde_json::json!({}),
+        true,
+    )
+    .unwrap();
+    for sb in &superblocks[..2] {
+        let (header, offset, end, rollover) =
+            journal_append_position(&backend, sb, entry.len()).unwrap();
+        assert!(!rollover);
+        append_journal_member(
+            &backend,
+            sb,
+            header,
+            offset,
+            end,
+            &entry,
+            JournalMemberWriteOptions {
+                flush: true,
+                metrics: None,
+            },
+        )
+        .unwrap();
+    }
+    let (selected, audit) = load_or_recover(&backend, &superblocks, true).unwrap();
+    assert_eq!(selected.txid, next.txid);
+    assert_eq!(audit.invalid_entries, 0);
+    assert!(
+        raw_journal_end(&backend, &superblocks[0]) > RAW_HEADER_SIZE as u64,
+        "membership-changing suffix must be retained"
+    );
+}
