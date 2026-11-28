@@ -7,6 +7,18 @@ incompatible feature bit; the normal open and commit paths can exercise it.
 No user-facing V3 mkfs or upgrade is provided. Do not freeze the format until
 the remaining qualification gates pass.
 
+## Final-format snapshot architecture
+
+The required on-disk ownership model is specified in
+[Metadata V3: durable snapshots and shared data](metadata-v3-snapshots.md).
+It is a format release gate even for pools with no snapshots: immutable
+namespace root sets, typed graph edges, stable data object IDs with current
+placement indirection, a replicated logical ownership ledger separate from
+member-local page counts, and certified bounded retirement/GC must be
+implemented together. The legacy JSON snapshot command is only a metadata
+export. The design is not yet implemented; the current experimental wire
+format must not be frozen.
+
 ## Implemented core
 
 - The existing COW B+ tree, quorum body/root/certificate barriers, readback,
@@ -127,11 +139,14 @@ Before exposing any final-format mkfs/migration:
    quotas, verification, FUSE, CLI, health and Autopilot. Bound dirty
    memory, page caches, snapshot readers and maintenance windows.
 3. Replace full-copy paired-arena growth with dynamic metadata segment
-   growth/compaction and reclaim superseded regions; implement durable snapshot
-   and clone references (including data extents), and local metadata
-   repair. Generalize the physical map retention rules for the final root
-   catalog; add a safe allocator rebuild protocol when its own pages are
-   damaged.
+   growth/compaction and reclaim superseded regions. Implement the
+   [snapshot ownership design](metadata-v3-snapshots.md) in full, including
+   typed DAG edges, object placement indirection, reference ledgers, durable
+   retirement, shared-root clone lifecycle and snapshot-aware topology,
+   maintenance and recovery. Generalize local metadata repair and physical
+   map retention to the complete graph; add safe allocator rebuild protocols.
+   Snapshot semantics and format negotiation are mandatory even for an empty
+   snapshot catalog.
 4. Qualify V3 topology epochs and joint-quorum transitions under fault
    injection; design and
    connect authenticated source recovery to the implemented resumable
