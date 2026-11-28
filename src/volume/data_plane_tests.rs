@@ -670,7 +670,8 @@ fn inode_decode_rejects_size_mismatch_overflow_and_blocks_past_eof() {
         encrypted: false,
         nonce_hex: String::new(),
         storage_class: StorageTier::Warm,
-    }];
+    }]
+    .into();
     assert!(fs.decode_inode_data_locked(&mut meta, &inode).is_err());
 
     inode.size = 8;

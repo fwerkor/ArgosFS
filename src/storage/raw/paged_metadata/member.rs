@@ -359,7 +359,43 @@ impl Member {
         if !batch.is_empty() {
             backend.write_at(&self.arena.disk_id, self.arena.offset_of(start)?, &batch)?;
         }
-        backend.flush_device(&self.arena.disk_id)
+        backend.flush_device(&self.arena.disk_id)?;
+        // Verify only the newly written pages, coalesced in the same
+        // contiguous batches. This catches silent discarded/corrupted
+        // writes before they can become part of a certified root.
+        let mut batch = Vec::with_capacity(MAX_BATCH);
+        let mut start = 0;
+        let verify = |start: u64, expected: &[u8]| -> Result<()> {
+            let mut actual = vec![0; expected.len()];
+            backend.read_at(
+                &self.arena.disk_id,
+                self.arena.offset_of(start)?,
+                &mut actual,
+            )?;
+            if actual != expected {
+                return Err(ArgosError::Checksum(format!(
+                    "metadata body readback mismatch on {}",
+                    self.arena.disk_id
+                )));
+            }
+            Ok(())
+        };
+        for (&id, page) in &plan.pages {
+            if !batch.is_empty()
+                && (id != start + (batch.len() / PAGE_SIZE) as u64 || batch.len() == MAX_BATCH)
+            {
+                verify(start, &batch)?;
+                batch.clear();
+            }
+            if batch.is_empty() {
+                start = id;
+            }
+            batch.extend_from_slice(&page.bytes);
+        }
+        if !batch.is_empty() {
+            verify(start, &batch)?;
+        }
+        Ok(())
     }
 
     pub(super) fn publish(
@@ -368,18 +404,21 @@ impl Member {
         namespace: Hash,
         plan: Prepared,
     ) -> Result<CommitIo> {
-        self.arena.write(
-            backend,
-            plan.slot as u64,
-            &plan.root.encode(
-                super::member_identity(namespace, &self.arena.disk_id),
-                self.arena.pages(),
-                false,
-            ),
-        )?;
+        let bytes = plan.root.encode(
+            super::member_identity(namespace, &self.arena.disk_id),
+            self.arena.pages(),
+            false,
+        );
+        self.arena.write(backend, plan.slot as u64, &bytes)?;
         backend.flush_device(&self.arena.disk_id)?;
+        if self.arena.read(backend, plan.slot as u64)? != bytes {
+            return Err(ArgosError::Checksum(format!(
+                "metadata root readback mismatch on {}",
+                self.arena.disk_id
+            )));
+        }
         let io = CommitIo {
-            pages_read: plan.reads,
+            pages_read: plan.reads + plan.pages.len() + 1,
             pages_written: plan.pages.len() + 1,
         };
         // Only after the replacement root is durable can the retired root
@@ -440,16 +479,19 @@ impl Member {
             .root_slot(identity)
             .ok_or_else(|| corrupt("cannot certify missing root"))?;
         let root = self.roots[slot].unwrap();
-        self.arena.write(
-            backend,
-            slot as u64 + 2,
-            &root.encode(
-                super::member_identity(namespace, &self.arena.disk_id),
-                self.arena.pages(),
-                true,
-            ),
-        )?;
+        let bytes = root.encode(
+            super::member_identity(namespace, &self.arena.disk_id),
+            self.arena.pages(),
+            true,
+        );
+        self.arena.write(backend, slot as u64 + 2, &bytes)?;
         backend.flush_device(&self.arena.disk_id)?;
+        if self.arena.read(backend, slot as u64 + 2)? != bytes {
+            return Err(ArgosError::Checksum(format!(
+                "metadata certificate readback mismatch on {}",
+                self.arena.disk_id
+            )));
+        }
         self.certificates[slot] = Some(root);
         Ok(())
     }

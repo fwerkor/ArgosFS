@@ -23,6 +23,7 @@ enum Key {
     Disk(String),
     Allocator(String),
     Free(String, u64),
+    Event(u64),
 }
 
 #[derive(Deserialize, Serialize)]
@@ -35,6 +36,7 @@ enum Record {
     Disk(Box<Disk>),
     Allocator(String, RawAllocatorState),
     Free(String, RawFreeExtent),
+    Event(Box<PagedAuditEvent>),
 }
 
 impl Record {
@@ -48,6 +50,7 @@ impl Record {
             Self::Disk(disk) => Key::Disk(disk.id.clone()),
             Self::Allocator(disk, _) => Key::Allocator(disk.clone()),
             Self::Free(disk, extent) => Key::Free(disk.clone(), extent.offset),
+            Self::Event(event) => Key::Event(event.sequence),
         }
     }
 }
@@ -56,6 +59,96 @@ impl Record {
 pub(super) struct RecordIndex {
     ids: OrdMap<Key, u64>,
     next: u64,
+    events: OrdMap<u64, PagedAuditEvent>,
+    event_bytes: usize,
+}
+
+const EVENT_LIMIT: usize = 512;
+const MAX_EVENT_DETAILS: usize = 16 * 1024;
+const EVENT_BYTES_LIMIT: usize = 256 * 1024;
+
+impl RecordIndex {
+    pub(super) fn events(&self) -> Vec<PagedAuditEvent> {
+        self.events.values().cloned().collect()
+    }
+}
+
+pub(super) fn append_event(
+    changes: Changes,
+    index: RecordIndex,
+    txid: u64,
+    action: &str,
+    mut details: serde_json::Value,
+    advisory: bool,
+) -> Result<(Changes, RecordIndex)> {
+    let mut plan = Plan { changes, index };
+    let sequence = plan
+        .index
+        .events
+        .iter()
+        .next_back()
+        .map_or(Some(1), |(key, _)| key.checked_add(1))
+        .ok_or_else(|| ArgosError::Invalid("paged event sequence exhausted".into()))?;
+    let bytes = serde_json::to_vec(&details)?;
+    if bytes.len() > MAX_EVENT_DETAILS {
+        use sha2::{Digest, Sha256};
+        details = serde_json::json!({"omitted_bytes":bytes.len(),"sha256":hex::encode(Sha256::digest(&bytes))});
+    }
+    if action.len() > 1024 {
+        return Err(ArgosError::Invalid("paged event action too long".into()));
+    }
+    let event = PagedAuditEvent {
+        sequence,
+        txid,
+        time: crate::util::now_f64(),
+        action: action.into(),
+        details,
+        advisory,
+    };
+    plan.put(Record::Event(Box::new(event.clone())))?;
+    plan.index.event_bytes += serde_json::to_vec(&event)?.len();
+    plan.index.events.insert(sequence, event);
+    while plan.index.events.len() > EVENT_LIMIT || plan.index.event_bytes > EVENT_BYTES_LIMIT {
+        let oldest = *plan.index.events.keys().next().unwrap();
+        plan.remove(Key::Event(oldest))?;
+        let removed = plan.index.events.remove(&oldest).unwrap();
+        plan.index.event_bytes = plan
+            .index
+            .event_bytes
+            .saturating_sub(serde_json::to_vec(&removed)?.len());
+    }
+    Ok(plan.finish())
+}
+
+pub(super) fn import_events(
+    changes: Changes,
+    index: RecordIndex,
+    events: &[PagedAuditEvent],
+) -> Result<(Changes, RecordIndex)> {
+    let mut plan = Plan { changes, index };
+    for event in events.iter().rev().take(EVENT_LIMIT).rev() {
+        if event.sequence == 0
+            || plan
+                .index
+                .events
+                .insert(event.sequence, event.clone())
+                .is_some()
+        {
+            return Err(corrupt("invalid imported paged event sequence"));
+        }
+        plan.index.event_bytes += serde_json::to_vec(event)?.len();
+        plan.put(Record::Event(Box::new(event.clone())))?;
+    }
+    while plan.index.event_bytes > EVENT_BYTES_LIMIT {
+        let oldest = *plan.index.events.keys().next().unwrap();
+        plan.remove(Key::Event(oldest))?;
+        let removed = plan.index.events.remove(&oldest).unwrap();
+        plan.index.event_bytes = plan
+            .index
+            .event_bytes
+            .saturating_sub(serde_json::to_vec(&removed)?.len());
+    }
+    Ok(plan.finish())
 }
 
 struct Plan {
@@ -205,29 +298,31 @@ fn inode_records(
             None => plan.remove(Key::Xattr(key, name.clone())),
         },
     )?;
-    for inode in old.into_iter().chain(new) {
-        if !inode
+    let empty = OrdMap::new();
+    let old_index = match old {
+        Some(inode) => inode
             .blocks
-            .windows(2)
-            .all(|pair| pair[0].raw_offset < pair[1].raw_offset)
-        {
-            return Err(corrupt(
-                "file block mappings must be strictly ordered by offset",
-            ));
+            .offset_index()
+            .ok_or_else(|| corrupt("file block mappings must be strictly ordered by offset"))?,
+        None => &empty,
+    };
+    let new_index = match new {
+        Some(inode) => inode
+            .blocks
+            .offset_index()
+            .ok_or_else(|| corrupt("file block mappings must be strictly ordered by offset"))?,
+        None => &empty,
+    };
+    for change in old_index.diff(new_index) {
+        match change {
+            DiffItem::Add(_, block)
+            | DiffItem::Update {
+                new: (_, block), ..
+            } => plan.put(Record::Block(key, Box::new(block.clone())))?,
+            DiffItem::Remove(offset, _) => plan.remove(Key::Block(key, *offset))?,
         }
     }
-    diff(
-        old.into_iter()
-            .flat_map(|i| i.blocks.iter())
-            .map(|b| (b.raw_offset, b)),
-        new.into_iter()
-            .flat_map(|i| i.blocks.iter())
-            .map(|b| (b.raw_offset, b)),
-        |offset, value| match value {
-            Some(block) => plan.put(Record::Block(key, Box::new(block.clone()))),
-            None => plan.remove(Key::Block(key, offset)),
-        },
-    )
+    Ok(())
 }
 
 fn allocator_records(
@@ -246,30 +341,32 @@ fn allocator_records(
     {
         return Ok(());
     }
-    for alloc in old.into_iter().chain(new) {
-        if !alloc
+    let empty = OrdMap::new();
+    let old_index = match old {
+        Some(state) => state
             .free_extents
-            .iter()
-            .zip(alloc.free_extents.iter().skip(1))
-            .all(|(a, b)| a.offset < b.offset)
-        {
-            return Err(corrupt(
-                "allocator free extents must be strictly ordered by offset",
-            ));
+            .offset_index()
+            .ok_or_else(|| corrupt("allocator free extents must be strictly ordered by offset"))?,
+        None => &empty,
+    };
+    let new_index = match new {
+        Some(state) => state
+            .free_extents
+            .offset_index()
+            .ok_or_else(|| corrupt("allocator free extents must be strictly ordered by offset"))?,
+        None => &empty,
+    };
+    for change in old_index.diff(new_index) {
+        use imbl::ordmap::DiffItem;
+        match change {
+            DiffItem::Add(_, extent)
+            | DiffItem::Update {
+                new: (_, extent), ..
+            } => plan.put(Record::Free(disk.into(), extent.clone()))?,
+            DiffItem::Remove(offset, _) => plan.remove(Key::Free(disk.into(), *offset))?,
         }
     }
-    diff(
-        old.into_iter()
-            .flat_map(|a| a.free_extents.iter())
-            .map(|e| (e.offset, e)),
-        new.into_iter()
-            .flat_map(|a| a.free_extents.iter())
-            .map(|e| (e.offset, e)),
-        |offset, value| match value {
-            Some(extent) => plan.put(Record::Free(disk.into(), extent.clone())),
-            None => plan.remove(Key::Free(disk.into(), offset)),
-        },
-    )
+    Ok(())
 }
 
 pub(super) fn initial_records(meta: &Metadata) -> Result<(Changes, RecordIndex)> {
@@ -384,6 +481,16 @@ pub(super) fn decode_image(
             Record::Free(id, extent) => {
                 free.entry(id).or_default().insert(extent.offset, extent);
             }
+            Record::Event(event) => {
+                index.event_bytes += serde_json::to_vec(&event)?.len();
+                if index.event_bytes > EVENT_BYTES_LIMIT
+                    || event.sequence == 0
+                    || index.events.insert(event.sequence, *event).is_some()
+                    || index.events.len() > EVENT_LIMIT
+                {
+                    return Err(corrupt("invalid paged event history"));
+                }
+            }
         }
     }
     let mut meta = header.ok_or_else(|| corrupt("missing metadata image header"))?;
@@ -398,18 +505,20 @@ pub(super) fn decode_image(
         if ino == 0 {
             return Err(corrupt("invalid inode zero"));
         }
-        meta.inodes.insert(
-            ino,
-            core.into_inode(
-                entries.remove(&ino).unwrap_or_default(),
-                xattrs.remove(&ino).unwrap_or_default(),
-                blocks
-                    .remove(&ino)
-                    .unwrap_or_default()
-                    .into_values()
-                    .collect(),
-            ),
+        let inode = core.into_inode(
+            entries.remove(&ino).unwrap_or_default(),
+            xattrs.remove(&ino).unwrap_or_default(),
+            blocks
+                .remove(&ino)
+                .unwrap_or_default()
+                .into_values()
+                .collect(),
         );
+        inode
+            .blocks
+            .offset_index()
+            .ok_or_else(|| corrupt("invalid recovered file block index"))?;
+        meta.inodes.insert(ino, inode);
     }
     if !entries.is_empty() || !xattrs.is_empty() || !blocks.is_empty() {
         return Err(corrupt("orphaned inode record"));
@@ -420,6 +529,10 @@ pub(super) fn decode_image(
             .unwrap_or_default()
             .into_values()
             .collect();
+        alloc
+            .free_extents
+            .offset_index()
+            .ok_or_else(|| corrupt("invalid recovered allocator offset index"))?;
     }
     if !free.is_empty() {
         return Err(corrupt("orphaned allocator extent record"));
@@ -431,6 +544,9 @@ pub(super) fn decode_image(
             return Err(corrupt("invalid paged integrity header"));
         }
         meta.integrity.meta_hash = hex::encode(root_hash);
+    }
+    if index.events.values().any(|event| event.txid > meta.txid) {
+        return Err(corrupt("paged event references a future transaction"));
     }
     meta.inodes.mark_committed();
     Ok((meta, index))

@@ -3,6 +3,7 @@
 use super::*;
 use crate::raw_format::{
     REQUIRED_FEATURE_PAGED_METADATA as ACTIVE, REQUIRED_FEATURE_PAGED_MIGRATION as PENDING,
+    REQUIRED_FEATURE_PAGED_TOPOLOGY as TOPOLOGY,
 };
 use crate::storage::raw::paged_metadata::{Arena, ImageStore, PAGED_INTEGRITY_SCHEME};
 
@@ -12,6 +13,8 @@ const MAX_MANIFEST: usize = 1024 * 1024;
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct Manifest {
     pool: Uuid,
+    #[serde(default)]
+    epoch: u64,
     members: Vec<ManifestMember>,
 }
 
@@ -59,6 +62,7 @@ impl Manifest {
         members.sort_by(|a, b| a.arena.disk_id.cmp(&b.arena.disk_id));
         let manifest = Self {
             pool: first.pool_uuid,
+            epoch: 0,
             members,
         };
         manifest.validate(superblocks)?;
@@ -92,10 +96,10 @@ impl Manifest {
                     m.device_uuid == sb.device_uuid
                         && m.arena.disk_id == sb.disk_id
                         && m.data_offset == sb.data.offset
-                        && m.data_length == sb.data.length
+                        && m.data_length <= sb.data.length
                         && ((m.arena.offset == sb.metadata.offset
                             && m.arena.length == sb.metadata.length)
-                            || (sb.data.offset.checked_add(sb.data.length) == Some(m.arena.offset)
+                            || (m.data_offset.checked_add(m.data_length) == Some(m.arena.offset)
                                 && m.arena
                                     .offset
                                     .checked_add(m.arena.length)
@@ -167,39 +171,10 @@ fn read_manifest(backend: &dyn StorageBackend, sb: &RawSuperblock) -> Result<Man
     Ok(manifest)
 }
 
-fn select_manifest(
-    backend: &dyn StorageBackend,
-    superblocks: &[RawSuperblock],
-) -> Result<Manifest> {
-    if !superblocks
-        .iter()
-        .any(|sb| sb.required_feature_flags & ACTIVE != 0)
-    {
-        return Err(ArgosError::IncompatibleFormat("paged metadata upgrade interrupted; rerun upgrade-paged-metadata with all members offline".into()));
-    }
-    let mut chosen = None;
-    let mut valid = 0;
-    for sb in superblocks {
-        if let Ok(manifest) = read_manifest(backend, sb) {
-            if chosen.as_ref().is_some_and(|old| old != &manifest) {
-                return Err(ArgosError::Conflict(
-                    "divergent paged membership manifests".into(),
-                ));
-            }
-            chosen = Some(manifest);
-            valid += 1;
-        }
-    }
-    let manifest = chosen.ok_or_else(|| {
-        ArgosError::CorruptedMetadata("no valid paged membership manifest".into())
-    })?;
-    manifest.validate(superblocks)?;
-    let need = manifest.members.len() / 2 + 1;
-    if valid < need {
-        return Err(quorum_unavailable("paged membership manifest", need, valid));
-    }
-    Ok(manifest)
-}
+mod topology;
+pub(crate) use topology::clear_transition_slots as clear_paged_manifest;
+pub(crate) use topology::reconfigure;
+use topology::select_manifest;
 
 fn validate_image(meta: &Metadata, manifest: &Manifest) -> Result<()> {
     if meta.integrity.hash_scheme != Some(PAGED_INTEGRITY_SCHEME)
@@ -275,6 +250,7 @@ fn stage(
         )
     }) {
         backend.write_at(&sb.disk_id, member.arena.offset, &[0; RAW_HEADER_SIZE * 4])?;
+        topology::clear_transition_slots(&*backend, sb)?;
         backend.write_at(&sb.disk_id, sb.allocator.offset, &bytes)?;
         backend.flush_device(&sb.disk_id)?;
     }
@@ -288,7 +264,7 @@ pub(super) fn open(
     superblocks: &[RawSuperblock],
     write: bool,
 ) -> Result<ImageStore> {
-    let manifest = select_manifest(&*backend, superblocks)?;
+    let manifest = select_manifest(&*backend, superblocks, write)?;
     let mut store = ImageStore::open(backend, manifest.pool, manifest.arenas())?;
     validate_image(&store.snapshot(), &manifest)?;
     if write {
@@ -303,16 +279,22 @@ pub(super) fn recover(
     backend: &dyn StorageBackend,
     superblocks: &[RawSuperblock],
 ) -> Result<(Metadata, TransactionReport)> {
-    let manifest = select_manifest(backend, superblocks)?;
-    let metadata = ImageStore::recover(backend, manifest.pool, manifest.arenas())?;
+    let manifest = select_manifest(backend, superblocks, false)?;
+    let (metadata, events) =
+        ImageStore::recover_with_events(backend, manifest.pool, manifest.arenas())?;
     validate_image(&metadata, &manifest)?;
-    let report = report(&metadata);
+    let report = report(&metadata, events);
     Ok((metadata, report))
 }
 
-pub(super) fn report(metadata: &Metadata) -> TransactionReport {
+pub(super) fn report(
+    metadata: &Metadata,
+    events: Vec<crate::types::PagedAuditEvent>,
+) -> TransactionReport {
     TransactionReport {
         selected_metadata_source: "raw-paged-metadata".into(),
+        valid_entries: events.len() as u64,
+        paged_events: events,
         last_valid_txid: metadata.txid,
         last_valid_generation: metadata.integrity.generation,
         last_valid_record_hash: metadata.integrity.meta_hash.clone(),
@@ -327,6 +309,7 @@ pub(crate) fn commit(
     meta: &mut Metadata,
     superblocks: &[RawSuperblock],
     metrics: &CommitMetrics,
+    event: (&str, serde_json::Value),
 ) -> Result<QuorumWriteReport> {
     let base = store.snapshot();
     let active = |m: &Metadata| {
@@ -349,13 +332,36 @@ pub(crate) fn commit(
     meta.integrity.generation = meta.txid;
     meta.integrity.previous_meta_hash = base.integrity.meta_hash;
     meta.integrity.hash_scheme = Some(PAGED_INTEGRITY_SCHEME);
-    let report = match store.commit_allowed(meta, Some(&allowed)) {
+    let report = match store.commit_allowed(meta, Some(&allowed), Some(event)) {
         Ok(report) => report,
         Err(err) => {
             meta.integrity = before;
             return Err(err);
         }
     };
+    Ok(write_report(report, allowed, metrics))
+}
+
+pub(crate) fn commit_event(
+    store: &mut ImageStore,
+    superblocks: &[RawSuperblock],
+    metrics: &CommitMetrics,
+    action: &str,
+    details: serde_json::Value,
+) -> Result<QuorumWriteReport> {
+    let allowed = superblocks
+        .iter()
+        .map(|sb| sb.disk_id.clone())
+        .collect::<BTreeSet<_>>();
+    let report = store.commit_event(&allowed, action, details)?;
+    Ok(write_report(report, allowed, metrics))
+}
+
+fn write_report(
+    report: crate::storage::raw::paged_metadata::CommitReport,
+    allowed: BTreeSet<String>,
+    metrics: &CommitMetrics,
+) -> QuorumWriteReport {
     let mut result = QuorumWriteReport::default();
     for io in report.members.values() {
         metrics.add_raw_write_bytes(RawWriteKind::Checkpoint, io.pages_written * RAW_HEADER_SIZE);
@@ -373,7 +379,7 @@ pub(crate) fn commit(
             result.unavailable_devices.insert(disk);
         }
     }
-    Ok(result)
+    result
 }
 
 /// One-way offline conversion. Stage the new tree in never-allocated data
@@ -450,11 +456,11 @@ pub(super) fn upgrade(
     if active {
         // An ACTIVE copy is irreversible. Recover the new authority, never
         // rebuild from the older legacy image even if some flags are pending.
-        let first = read_manifest(&*backend, &superblocks[0])?;
-        for sb in superblocks {
-            if read_manifest(&*backend, sb)? != first {
-                return Err(ArgosError::Conflict("upgrade manifests disagree".into()));
-            }
+        let first = select_manifest(&*backend, superblocks, true)?;
+        if first.epoch != 0 {
+            let metadata = ImageStore::recover(&*backend, pool, first.arenas())?;
+            validate_name(&metadata)?;
+            return Ok(metadata);
         }
         let mut target = superblocks.to_vec();
         apply_manifest(&first, &mut target)?;
@@ -464,7 +470,7 @@ pub(super) fn upgrade(
         validate_image(&metadata, &first)?;
         store.repair_stale()?;
         store.confirm_all(target.len())?;
-        publish_flags(&*backend, &target, ACTIVE | PENDING)?;
+        publish_flags(&*backend, &target, ACTIVE | PENDING | TOPOLOGY)?;
         return Ok(metadata);
     }
 
@@ -474,7 +480,7 @@ pub(super) fn upgrade(
         .iter()
         .cloned()
         .map(|mut sb| {
-            sb.required_feature_flags &= !(ACTIVE | PENDING);
+            sb.required_feature_flags &= !(ACTIVE | PENDING | TOPOLOGY);
             sb
         })
         .collect::<Vec<_>>();
@@ -588,8 +594,8 @@ pub(super) fn upgrade(
     let _store = stage(backend.clone(), &target, &manifest, &mut metadata)?;
     // All new roots exist, but no new-format writer may yet mount. Fence
     // every old primary and backup copy before enabling the new authority.
-    publish_flags(&*backend, &target, PENDING)?;
-    publish_flags(&*backend, &target, PENDING | ACTIVE)?;
+    publish_flags(&*backend, &target, PENDING | TOPOLOGY)?;
+    publish_flags(&*backend, &target, PENDING | ACTIVE | TOPOLOGY)?;
     Ok(metadata)
 }
 

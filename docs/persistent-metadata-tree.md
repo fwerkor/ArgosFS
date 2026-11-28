@@ -92,9 +92,8 @@ few members to make new writes, `repair_stale` copies its exact authenticated
 tree shape to stale accessible members, using their own allocators. It
 preserves logical digests and certifies repaired copies; normal commits
 resume only after the selected base is again on a certified majority.
-Repairing missing devices requires reopening with the same full configured
-membership after the devices return. Changing that membership is not yet
-supported by this engine.
+Repairing returning devices requires reopening with the selected configured
+membership. Membership changes use the separate joint-quorum protocol below.
 
 ## Metadata records and mounted transaction path
 
@@ -112,24 +111,26 @@ baseline exactly once after a successful commit. Directory entries use an
 ordered persistent map with structural diff, retaining the existing sorted
 JSON representation. File block and free-extent differences are compared by
 logical offset; only changed records reach the page tree. An unrelated inode
-snapshot takes the exhaustive fallback. Block vectors and a changed allocator
-extent sequence still need a local linear comparison; this is not yet strict
-O(changed records) CPU work for very large individual files/fragmented disks.
+snapshot takes the exhaustive fallback. File blocks and allocator free extents maintain persistent offset indexes.
+Normal range edits preserve shared subtrees and use structural differences.
+Legacy mutable access, unrelated snapshots, and malformed/unordered data can
+require rebuilding indexes or exhaustive comparison.
 
 The mounted volume shares one page-store handle across cloned filesystem
 handles. Both immediate and deferred transactions pass the existing data
 durability checks and data flush barrier, then commit the authenticated root.
-The legacy journal is no longer an independent recovery authority. Advisory
-event-only records are not persisted in this format; transaction inspection
-reports the latest selected root and logical transaction instead of legacy
-journal history.
+The legacy journal is no longer an independent recovery authority. Transaction and advisory events are authenticated records in the same tree.
+Event-only commits preserve the last durable logical metadata state; they do
+not publish unrelated pending mutations. Inspection exposes the retained
+events. Retention is bounded to 512 events and 256 KiB; details exceeding
+16 KiB are represented by their length and digest.
 
 ## Offline migration protocol
 
 Fresh pools use the original metadata region as a page arena. Conversion of
 an existing pool stages a new arena in the never-allocated tail of each
 member's data region; both legacy checkpoint slots and journal remain
-untouched. The immutable full membership/geometry manifest is stored in the
+untouched. The initial full membership/geometry manifest is stored in the
 previously unused allocator region and independently checksummed. Every
 configured member identity and arena boundary is checked against the
 superblocks and recovered allocation state.
@@ -153,6 +154,24 @@ publication. Do not use older binaries or run unrelated writers during an
 interrupted upgrade. An upgrade can fail for insufficient free tail space
 without changing the legacy recovery authority.
 
+## Online membership changes
+
+Configuration epochs alternate between two checksummed descriptor/certificate
+slots in the reserved allocator region. Stage a separately authenticated tree
+for the new configuration in a disjoint arena, then durably prepare and certify
+the transition using majorities of both the previous and new memberships.
+The prior arena remains intact until the new configuration is certified. A
+missing retained device cannot vote until repaired; a missing old device can
+be replaced when both majority requirements hold. Allocation geometry is part
+of the authenticated configuration. Reconfiguration requires sufficient space
+for the staging arena; it is not a steady-state localized metadata edit.
+
+Recovery selects the highest supported epoch, repairs interrupted publication
+where the evidence is sufficient, and refuses ambiguous or conflicting states
+rather than silently rolling back. A partial prepare with an advanced old
+root requires operator intervention. The required topology feature bit fences
+readers that cannot interpret configuration transitions.
+
 ## Complexity and measurements
 
 For a fixed-size changed record, steady state touches the affected leaf and
@@ -166,10 +185,11 @@ Local loop-file regression using 128-byte records, one member:
 
 | Records | Initial pages written | Reads for one edit | Writes for one edit |
 | --- | ---: | ---: | ---: |
-| 50,000 | 1,811 | 4 | 5 |
-| 294,000 | 10,630 | 5 | 6 |
+| 50,000 | 1,811 | 9 | 5 |
+| 294,000 | 10,630 | 11 | 6 |
 
-The write counts include the new root and certificate. The 294k test is
+The write counts include the new root and certificate. Read counts include
+readback verification of changed pages, root and certificate after flushing. The 294k test is
 opt-in for routine CI; run it with:
 
 ```sh
@@ -179,18 +199,17 @@ cargo test --lib two_hundred_ninety_four_thousand_records_stay_path_bounded -- -
 These are page-engine microbenchmarks, not a Borg backup benchmark or a
 measurement of an existing nine-member physical ArgosFS pool.
 
-## Remaining production work
+## Remaining production qualification
 
-- The current format has fixed configured membership. Add/remove/replace
-  operations requiring a membership change fail explicitly before mutating
-  the pool. Online membership changes need a durable old/new configuration
-  transition with joint quorum evidence, not a change to the existing
-  manifest in place. Repair of returning configured members is supported.
-- Finish precise mutation tracking for file block vectors and free extent
-  sequences, so even the comparison work is local to a changed range.
-- Add production-grade event history and detailed paged-member audit
-  diagnostics; legacy journal event records are not used for this format.
-- Validate arena capacity on large real inode populations, run multi-device
-  raw/loop lifecycle and ztest, and benchmark end-to-end Borg performance on
-  physical storage. The current 294k test is a fixed-size page-engine
-  microbenchmark, not a full physical-pool performance result.
+- The normal incremental path uses shared ordered indexes. Cold recovery,
+  incompatible snapshots, legacy arbitrary mutations, and full member rebuilds
+  can still require scans; extended attributes are compared within an inode.
+- Membership staging requires extra arena capacity. Ambiguous interrupted
+  transitions are rejected rather than automatically resolved without evidence.
+- Run prolonged power-cut and fault-injection workloads and end-to-end Borg
+  benchmarks on real multi-device storage. Loop-file results are not physical
+  disk throughput or latency measurements.
+
+Run the paged-format ztest workload with `ztest --paged-metadata` (in addition
+to the usual workload options). The retained event history is intentionally
+bounded, not an unlimited audit archive.

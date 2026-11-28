@@ -324,7 +324,8 @@ impl ArgosFs {
                 pool_name,
             )?;
             if paged {
-                sb.required_feature_flags |= raw_format::REQUIRED_FEATURE_PAGED_METADATA;
+                sb.required_feature_flags |= raw_format::REQUIRED_FEATURE_PAGED_METADATA
+                    | raw_format::REQUIRED_FEATURE_PAGED_TOPOLOGY;
             }
             let allocator = allocator::init_allocator(
                 sb.data.offset,

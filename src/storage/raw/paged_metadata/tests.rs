@@ -53,7 +53,7 @@ fn packed_tree_large_namespace_changes_only_one_path() {
         "50k records: initial {initial_pages} pages, edit {} reads, {} writes",
         io.pages_read, io.pages_written
     );
-    assert!(io.pages_read <= 10 && io.pages_written <= 8);
+    assert!(io.pages_read <= 18 && io.pages_written <= 8);
     expected.insert(25_000, updated);
     drop(tree);
     let mut tree = PagedMetadata::open(backend, POOL, arenas).unwrap();
@@ -398,7 +398,7 @@ fn two_hundred_ninety_four_thousand_records_stay_path_bounded() {
         "294k records: initial {} pages ({build:?}), edit {} reads, {} writes ({elapsed:?})",
         initial.members["disk-0000"].pages_written, io.pages_read, io.pages_written
     );
-    assert!(io.pages_read <= 10 && io.pages_written <= 8);
+    assert!(io.pages_read <= 18 && io.pages_written <= 8);
     drop(tree);
     let recovered = PagedMetadata::open(backend, POOL, arenas).unwrap();
     assert_eq!(recovered.txid(), 2);
@@ -449,4 +449,70 @@ fn copied_member_bytes_do_not_vote_as_a_second_device() {
         PagedMetadata::open(faults, POOL, arenas),
         Err(ArgosError::QuorumUnavailable { .. })
     ));
+}
+
+#[test]
+#[ignore = "large real-inode metadata arena performance regression"]
+fn paged_real_inode_population_294k_incremental_commit() {
+    let root = tempfile::tempdir().unwrap();
+    let fs = crate::ArgosFs::create(
+        root.path(),
+        crate::VolumeConfig {
+            k: 1,
+            m: 0,
+            ..Default::default()
+        },
+        1,
+        false,
+    )
+    .unwrap();
+    fs.write_file("/file", b"small", 0o600).unwrap();
+    let mut meta = fs.metadata_snapshot();
+    let template = meta
+        .inodes
+        .values()
+        .find(|inode| inode.kind == crate::types::NodeKind::File)
+        .unwrap()
+        .clone();
+    for ino in 3..=294000 {
+        let mut inode = template.clone();
+        inode.id = ino;
+        meta.inodes.insert(ino, inode);
+        meta.inodes
+            .get_mut(&1)
+            .unwrap()
+            .entries
+            .insert(format!("file-{ino:06}"), ino);
+    }
+    meta.next_inode = 294001;
+    let pool = uuid::Uuid::parse_str(&meta.uuid).unwrap();
+    let (_dir, backend, arenas) = fixture(1, 65536);
+    let start = std::time::Instant::now();
+    let mut store = ImageStore::format(backend.clone(), arenas.clone(), &mut meta).unwrap();
+    let build = start.elapsed();
+    let mut next = store.snapshot();
+    next.txid += 1;
+    next.inodes.get_mut(&147000).unwrap().uid = 123;
+    next.inodes
+        .get_mut(&1)
+        .unwrap()
+        .entries
+        .remove("file-147000");
+    next.inodes
+        .get_mut(&1)
+        .unwrap()
+        .entries
+        .insert("renamed-file".into(), 147000);
+    let start = std::time::Instant::now();
+    let report = store.commit(&mut next).unwrap();
+    let elapsed = start.elapsed();
+    let io = report.members["disk-0000"];
+    eprintln!("294k inode-shaped records and directory entries: build {build:?}, edit {} reads, {} writes ({elapsed:?})",io.pages_read,io.pages_written);
+    assert!(io.pages_read < 80 && io.pages_written < 40);
+    drop(store);
+    let recovered = ImageStore::open(backend, pool, arenas).unwrap().snapshot();
+    assert_eq!(recovered.inodes.len(), 294000);
+    assert_eq!(recovered.inodes[&147000].uid, 123);
+    assert_eq!(recovered.inodes[&1].entries["renamed-file"], 147000);
+    assert!(!recovered.inodes[&1].entries.contains_key("file-147000"));
 }

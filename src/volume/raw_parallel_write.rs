@@ -124,8 +124,7 @@ impl ArgosFs {
         }
         let now = write_time.map_or_else(now_f64, |time| time.at);
         let inode = meta.inodes.get_mut(&ino).expect("validated append inode");
-        inode.blocks.extend(plan.blocks.iter().cloned());
-        inode.blocks.sort_by_key(|block| block.raw_offset);
+        inode.blocks.insert_sorted(plan.blocks.iter().cloned());
         set_inline_payload(inode, None);
         inode.size = target;
         inode.write_count = inode.write_count.saturating_add(1);

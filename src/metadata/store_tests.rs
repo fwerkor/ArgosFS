@@ -158,7 +158,7 @@ fn sample_metadata() -> Metadata {
         target: None,
         inline_data: None,
         inline_sha256: String::new(),
-        blocks: Vec::new(),
+        blocks: Default::default(),
         xattrs: BTreeMap::new(),
         quota_bytes: Some(4096),
         posix_acl_access: None,
@@ -201,7 +201,8 @@ fn sample_metadata() -> Metadata {
                 raw_offset: 5,
                 ..block
             },
-        ],
+        ]
+        .into(),
         xattrs,
         quota_bytes: None,
         posix_acl_access: Some(PosixAcl::default()),
@@ -233,7 +234,7 @@ fn sample_metadata() -> Metadata {
         target: Some("alpha".to_string()),
         inline_data: None,
         inline_sha256: String::new(),
-        blocks: Vec::new(),
+        blocks: Default::default(),
         xattrs: BTreeMap::new(),
         quota_bytes: None,
         posix_acl_access: None,

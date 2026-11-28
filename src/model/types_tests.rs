@@ -146,7 +146,7 @@ fn inline_inode_data_serializes_as_base64_and_rejects_invalid_text() {
         target: None,
         inline_data: Some(vec![0, 1, 2, 255]),
         inline_sha256: String::new(),
-        blocks: Vec::new(),
+        blocks: Default::default(),
         xattrs: BTreeMap::new(),
         quota_bytes: None,
         posix_acl_access: None,

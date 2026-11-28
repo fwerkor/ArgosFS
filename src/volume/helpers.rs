@@ -160,7 +160,7 @@ pub(super) fn root_inode(created_at: f64) -> Inode {
         target: None,
         inline_data: None,
         inline_sha256: String::new(),
-        blocks: Vec::new(),
+        blocks: Default::default(),
         xattrs: BTreeMap::new(),
         quota_bytes: None,
         posix_acl_access: None,

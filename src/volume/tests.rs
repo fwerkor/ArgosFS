@@ -631,9 +631,13 @@ fn raw_journal_events_refresh_stale_read_telemetry_integrity() {
     assert!(!fs.deferred_commit.lock().raw_uncommitted_metadata_dirty);
 
     {
-        let meta = fs.meta.read();
-        fs.journal_locked(&meta, "self-heal-deferred", json!({"reason": "test-event"}))
-            .unwrap();
+        let mut meta = fs.meta.write();
+        fs.journal_locked(
+            &mut meta,
+            "self-heal-deferred",
+            json!({"reason": "test-event"}),
+        )
+        .unwrap();
     }
 
     let report = fs.transaction_report().unwrap();
@@ -1907,9 +1911,9 @@ fn v2_event_rollover_reanchors_deferred_hash_before_next_commit() {
     // >2 MiB entry forces raw journal rollover/checkpoint. The same-txid
     // event checkpoint has a canonical digest rather than the old v2 digest.
     {
-        let meta = fs.meta.read();
+        let mut meta = fs.meta.write();
         fs.journal_locked(
-            &meta,
+            &mut meta,
             "autopilot",
             json!({"audit": "x".repeat(3 * 1024 * 1024)}),
         )
@@ -2026,9 +2030,9 @@ fn upgraded_legacy_event_rollover_with_read_telemetry_reanchors_before_first_v2_
     assert!(fs.runtime.read_advisory.pending_entries().0 > 0);
     assert!(!fs.deferred_commit.lock().raw_uncommitted_metadata_dirty);
     {
-        let meta = fs.meta.read();
+        let mut meta = fs.meta.write();
         fs.journal_locked(
-            &meta,
+            &mut meta,
             "snapshot",
             json!({"audit": "x".repeat(3 * 1024 * 1024)}),
         )

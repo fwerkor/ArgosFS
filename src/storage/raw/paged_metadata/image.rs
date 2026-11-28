@@ -4,7 +4,7 @@
 use super::{Arena, Changes, CommitIo, CommitReport, PagedMetadata};
 use crate::backend::StorageBackend;
 use crate::error::{ArgosError, Result};
-use crate::types::Metadata;
+use crate::types::{Metadata, PagedAuditEvent};
 use serde::{de::DeserializeOwned, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -61,7 +61,9 @@ fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
 }
 
 mod records;
-use records::{decode_image, initial_records, plan_records, RecordIndex};
+use records::{
+    append_event, decode_image, import_events, initial_records, plan_records, RecordIndex,
+};
 
 /// Typed metadata image on dedicated authenticated page arenas. Each
 /// directory entry, block mapping and free extent has an independent record.
@@ -78,11 +80,22 @@ impl ImageStore {
         arenas: Vec<Arena>,
         metadata: &mut Metadata,
     ) -> Result<Self> {
+        Self::format_with_events(backend, arenas, metadata, &[], None)
+    }
+
+    pub(crate) fn format_with_events(
+        backend: Arc<dyn StorageBackend>,
+        arenas: Vec<Arena>,
+        metadata: &mut Metadata,
+        events: &[PagedAuditEvent],
+        selected: Option<&BTreeSet<String>>,
+    ) -> Result<Self> {
         let pool = Uuid::parse_str(&metadata.uuid)
             .map_err(|err| ArgosError::Invalid(format!("invalid metadata pool UUID: {err}")))?;
         // Validate and serialize all records before initializing any region.
         let (records, index) = initial_records(metadata)?;
-        let mut tree = PagedMetadata::format(backend, *pool.as_bytes(), arenas)?;
+        let (records, index) = import_events(records, index, events)?;
+        let mut tree = PagedMetadata::format_selected(backend, *pool.as_bytes(), arenas, selected)?;
         let report = tree.commit(&records)?;
         if metadata.integrity.hash_scheme == Some(PAGED_INTEGRITY_SCHEME) {
             metadata.integrity.meta_hash = hex::encode(report.root_hash);
@@ -118,13 +131,14 @@ impl ImageStore {
     /// Commit only candidate changed inode records and the metadata header.
     /// The caller's baseline advances only after a certified root commit.
     pub fn commit(&mut self, next: &mut Metadata) -> Result<CommitReport> {
-        self.commit_allowed(next, None)
+        self.commit_allowed(next, None, None)
     }
 
     pub(crate) fn commit_allowed(
         &mut self,
         next: &mut Metadata,
         allowed: Option<&BTreeSet<String>>,
+        event: Option<(&str, serde_json::Value)>,
     ) -> Result<CommitReport> {
         if Uuid::parse_str(&next.uuid).ok() != Some(self.pool) || next.txid <= self.base.txid {
             return Err(ArgosError::Invalid(
@@ -132,6 +146,11 @@ impl ImageStore {
             ));
         }
         let (changes, index) = plan_records(&self.base, next, self.index.clone())?;
+        let (changes, index) = if let Some((action, details)) = event {
+            append_event(changes, index, next.txid, action, details, false)?
+        } else {
+            (changes, index)
+        };
         let report = self.tree.commit_allowed(&changes, allowed)?;
         if next.integrity.hash_scheme == Some(PAGED_INTEGRITY_SCHEME) {
             next.integrity.meta_hash = hex::encode(report.root_hash);
@@ -140,6 +159,47 @@ impl ImageStore {
         self.base = next.clone();
         self.index = index;
         Ok(report)
+    }
+
+    /// Append an advisory event to the certified tree without committing
+    /// any dirty live namespace or advancing the logical metadata txid.
+    pub(crate) fn commit_event(
+        &mut self,
+        allowed: &BTreeSet<String>,
+        action: &str,
+        details: serde_json::Value,
+    ) -> Result<CommitReport> {
+        if self.base.integrity.hash_scheme != Some(PAGED_INTEGRITY_SCHEME) {
+            return Err(ArgosError::Invalid(
+                "paged event requires Merkle integrity".into(),
+            ));
+        }
+        let (changes, index) = append_event(
+            Changes::new(),
+            self.index.clone(),
+            self.base.txid,
+            action,
+            details,
+            true,
+        )?;
+        let report = self.tree.commit_allowed(&changes, Some(allowed))?;
+        self.base.integrity.meta_hash = hex::encode(report.root_hash);
+        self.index = index;
+        Ok(report)
+    }
+
+    pub(crate) fn events(&self) -> Vec<PagedAuditEvent> {
+        self.index.events()
+    }
+
+    pub(crate) fn recover_with_events(
+        backend: &dyn StorageBackend,
+        pool: Uuid,
+        arenas: Vec<Arena>,
+    ) -> Result<(Metadata, Vec<PagedAuditEvent>)> {
+        let (records, hash) = super::recover_records(backend, *pool.as_bytes(), arenas)?;
+        let (meta, index) = decode_image(records, pool, hash)?;
+        Ok((meta, index.events()))
     }
 
     pub(crate) fn recover(

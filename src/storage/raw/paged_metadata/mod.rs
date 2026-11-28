@@ -202,9 +202,26 @@ impl PagedMetadata {
         pool: [u8; 16],
         arenas: Vec<Arena>,
     ) -> Result<Self> {
-        validate_members(&arenas)?;
+        Self::format_selected(backend, pool, arenas, None)
+    }
+
+    pub(super) fn format_selected(
+        backend: Arc<dyn StorageBackend>,
+        pool: [u8; 16],
+        arenas: Vec<Arena>,
+        selected: Option<&BTreeSet<String>>,
+    ) -> Result<Self> {
+        let quorum = validate_members(&arenas)?;
+        let chosen = arenas
+            .iter()
+            .filter(|arena| selected.is_none_or(|ids| ids.contains(&arena.disk_id)))
+            .collect::<Vec<_>>();
+        if chosen.len() < quorum {
+            return Err(unavailable(quorum, chosen.len()));
+        }
+
         let namespace = namespace_identity(pool, &arenas);
-        for arena in &arenas {
+        for arena in &chosen {
             arena.validate(&*backend)?;
             for slot in 0..RESERVED_PAGES {
                 if arena.read(&*backend, slot)?.iter().any(|byte| *byte != 0) {
@@ -219,7 +236,7 @@ impl PagedMetadata {
             txid: 0,
             tree: None,
         };
-        for arena in &arenas {
+        for arena in &chosen {
             for slot in 0..2 {
                 arena.write(
                     &*backend,
@@ -233,7 +250,7 @@ impl PagedMetadata {
             }
             backend.flush_device(&arena.disk_id)?;
         }
-        for arena in &arenas {
+        for arena in &chosen {
             for slot in 2..4 {
                 arena.write(
                     &*backend,
@@ -449,7 +466,9 @@ impl PagedMetadata {
             match result {
                 Ok(()) => {
                     certified += 1;
-                    committed.get_mut(&disk).unwrap().pages_written += 1;
+                    let io = committed.get_mut(&disk).unwrap();
+                    io.pages_written += 1;
+                    io.pages_read += 1;
                 }
                 Err(err) => {
                     failures.insert(disk, err.to_string());
@@ -585,6 +604,7 @@ impl PagedMetadata {
                     {
                         Ok(()) => {
                             io.pages_written += 1;
+                            io.pages_read += 1;
                             report.insert(disk, Ok(io));
                         }
                         Err(err) => {

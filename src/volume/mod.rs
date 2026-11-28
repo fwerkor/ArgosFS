@@ -656,7 +656,7 @@ impl ArgosFs {
     }
 
     pub fn snapshot(&self, name: &str) -> Result<PathBuf> {
-        let meta = self.meta.read();
+        let mut meta = self.meta.write();
         let trimmed = name.trim();
         if trimmed.is_empty() {
             return Err(ArgosError::Invalid(
@@ -689,7 +689,11 @@ impl ArgosFs {
             )));
         }
         atomic_write(&path, serde_json::to_vec_pretty(&*meta)?.as_slice())?;
-        self.journal_locked(&meta, "snapshot", json!({"name": trimmed, "path": path}))?;
+        self.journal_locked(
+            &mut meta,
+            "snapshot",
+            json!({"name": trimmed, "path": path}),
+        )?;
         Ok(path)
     }
 

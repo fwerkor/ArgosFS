@@ -1,6 +1,6 @@
 use super::wire::{self, put_u32, put_u64};
 mod paged;
-pub(crate) use paged::commit as commit_paged_metadata;
+pub(crate) use paged::{commit as commit_paged_metadata, commit_event as commit_paged_event};
 mod checkpoint;
 use checkpoint::*;
 mod journal_io;
@@ -181,23 +181,7 @@ pub(crate) fn initialize_pool_with_store(
     force: bool,
 ) -> Result<Option<crate::storage::raw::paged_metadata::ImageStore>> {
     preflight_empty(&*backend, superblocks, force)?;
-    for sb in superblocks {
-        let device_id = sb.disk_id.clone();
-        let mut header = [0u8; 4096];
-        header[..16].copy_from_slice(PROTECTIVE_MAGIC);
-        backend.write_at(&device_id, PROTECTIVE_HEADER_OFFSET, &header)?;
-        backend.write_at(&device_id, PRIMARY_SUPERBLOCK_OFFSET, &sb.encode())?;
-        backend.write_at(&device_id, DEVICE_LABEL_OFFSET, &sb.device_label().encode())?;
-        backend.write_at(&device_id, sb.backup_superblock_offset, &sb.encode())?;
-        backend.write_at(
-            &device_id,
-            sb.backup_superblock_offset + SUPERBLOCK_SIZE as u64,
-            &sb.device_label().encode(),
-        )?;
-        if !paged::uses_paged(superblocks) {
-            initialize_journal_region(&*backend, &device_id, sb)?;
-        }
-    }
+    initialize_member_headers(&*backend, superblocks)?;
     if paged::uses_paged(superblocks) {
         return paged::initialize(backend, superblocks, metadata).map(Some);
     }
@@ -213,6 +197,32 @@ pub(crate) fn initialize_pool_with_store(
     backend.flush_all()?;
     Ok(None)
 }
+
+pub(crate) fn initialize_member_headers(
+    backend: &dyn StorageBackend,
+    superblocks: &[RawSuperblock],
+) -> Result<()> {
+    for sb in superblocks {
+        let device_id = sb.disk_id.clone();
+        let mut header = [0u8; 4096];
+        header[..16].copy_from_slice(PROTECTIVE_MAGIC);
+        backend.write_at(&device_id, PROTECTIVE_HEADER_OFFSET, &header)?;
+        backend.write_at(&device_id, PRIMARY_SUPERBLOCK_OFFSET, &sb.encode())?;
+        backend.write_at(&device_id, DEVICE_LABEL_OFFSET, &sb.device_label().encode())?;
+        backend.write_at(&device_id, sb.backup_superblock_offset, &sb.encode())?;
+        backend.write_at(
+            &device_id,
+            sb.backup_superblock_offset + SUPERBLOCK_SIZE as u64,
+            &sb.device_label().encode(),
+        )?;
+        if !paged::uses_paged(superblocks) {
+            initialize_journal_region(backend, &device_id, sb)?;
+        }
+    }
+    backend.flush_all()
+}
+
+pub(crate) use paged::{clear_paged_manifest, reconfigure as reconfigure_paged_metadata};
 
 pub fn preflight_devices_empty(
     backend: &dyn StorageBackend,
@@ -332,7 +342,7 @@ where
     };
     let (mut metadata, mut report) = if let Some(store) = &paged_metadata {
         let metadata = store.lock().snapshot();
-        let report = paged::report(&metadata);
+        let report = paged::report(&metadata, store.lock().events());
         (metadata, report)
     } else {
         load_or_recover(&*backend, &superblocks, write)?
