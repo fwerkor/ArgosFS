@@ -2004,3 +2004,45 @@ fn raw_reshape_replay_uses_only_durable_delta_bases() {
     assert_eq!(reopened.read_file("/a", false).unwrap(), a_payload);
     assert_eq!(reopened.read_file("/b", false).unwrap(), b_payload);
 }
+
+#[test]
+fn mixed_layout_range_writes_and_truncates_preserve_unmodified_bytes() {
+    for paged in [false, true] {
+        let tmp = TempDir::new().unwrap();
+        let images = loop_images(&tmp, 5);
+        let mut cfg = config(3, 2);
+        cfg.chunk_size = 16 * 1024;
+        let create = if paged {
+            ArgosFs::create_loop_paged
+        } else {
+            ArgosFs::create_loop_legacy
+        };
+        let fs = create(&images, cfg, 32 * 1024 * 1024, "mixed-layout-range", false).unwrap();
+        let mut expected: Vec<u8> = (0..180_000).map(|i| (i % 251) as u8).collect();
+        fs.write_file("/file", &expected, 0o600).unwrap();
+        fs.write_file("/truncate", &expected, 0o600).unwrap();
+        assert!(!fs.reshape_layout(2, 2, Some(0)).unwrap().complete);
+        let ino = fs.resolve_path("/file", true).unwrap();
+        let patch = vec![0x91; 513];
+        for offset in [8191, 32 * 1024 + 33, 64 * 1024 + 5, 120_001] {
+            assert_eq!(
+                fs.write_inode_range(ino, offset as u64, &patch).unwrap(),
+                patch.len()
+            );
+            expected[offset..offset + patch.len()].copy_from_slice(&patch);
+            assert_eq!(fs.read_file("/file", false).unwrap(), expected);
+        }
+        fs.truncate_path("/truncate", 64 * 1024).unwrap();
+        let truncated: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+        assert_eq!(fs.read_file("/truncate", false).unwrap(), truncated);
+        fs.sync().unwrap();
+        drop(fs);
+        let fs = ArgosFs::open_loop(&images, true).unwrap();
+        assert!(fs.reshape_layout(2, 2, None).unwrap().complete);
+        assert_eq!(fs.read_file("/file", false).unwrap(), expected);
+        assert_eq!(fs.read_file("/truncate", false).unwrap(), truncated);
+        let report = fs.fsck(false, false).unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.damaged_files, 0);
+    }
+}

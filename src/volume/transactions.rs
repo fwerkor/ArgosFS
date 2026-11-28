@@ -580,11 +580,27 @@ impl ArgosFs {
                 }
                 return Err(precommit_err);
             }
-            let replay_previous = if raw_uncommitted_metadata_dirty {
+            // A rollback snapshot may already contain uncommitted maintenance
+            // changes (for example tier classification before a rewrite). It
+            // is never a reliable journal base, even if its stored hash still
+            // names the previous transaction. Use the committed image only.
+            let replay_previous = if raw_uncommitted_metadata_dirty
+                || self.paged_metadata.is_some()
+                || v2_base.is_some()
+            {
                 None
             } else {
-                previous_metadata
-                    .filter(|previous| previous.integrity.meta_hash == previous_meta_hash)
+                let base = self.deferred_commit.lock().durable_metadata.clone();
+                match base {
+                    Some(base)
+                        if base.txid == previous_txid
+                            && base.integrity.meta_hash == previous_meta_hash
+                            && journal::canonical_metadata_hash(&base)? == previous_meta_hash =>
+                    {
+                        Some(base)
+                    }
+                    _ => None,
+                }
             };
             let details = json!({"txid": meta.txid, "previous_meta_hash": previous_meta_hash, "details": details});
             let commit_backend = if self.open_backend_covers_superblocks(&superblocks) {
@@ -617,12 +633,14 @@ impl ArgosFs {
                         details.clone(),
                     );
                 }
-                match replay_previous {
-                    Some(previous) => raw_store::append_transaction_with_trusted_integrity_quorum(
+                // The legacy base was revalidated above. If discovery or
+                // normalization changed it, emit a full snapshot instead.
+                match replay_previous.as_deref() {
+                    Some(base) => raw_store::append_transaction_with_trusted_integrity_quorum(
                         backend,
                         &superblocks,
                         meta,
-                        Some(previous),
+                        Some(base),
                         action,
                         details.clone(),
                     ),

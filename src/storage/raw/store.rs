@@ -886,7 +886,7 @@ fn load_or_recover(
         .collect();
     let expected_pool = superblocks.first().map(|sb| sb.pool_uuid);
     let mut best = select_quorum_metadata_candidate_for_pool(&candidates, expected_pool)?;
-    let journal_best = read_latest_journal_metadata(
+    let (journal_best, stable_membership) = read_latest_journal_metadata_with_membership(
         backend,
         superblocks,
         &mut report,
@@ -939,10 +939,35 @@ fn load_or_recover(
         }
     }
     report.selected_metadata_source = "raw-metadata-or-journal".to_string();
-    if checkpoint_replay && report.replayed {
+    // A crash can leave a valid but uncommitted suffix on a minority while
+    // the selected durable state is already a checkpoint. With all active
+    // members present and every journal verified, the replay decision also
+    // proves that this newer suffix did not reach quorum. Leaving it in place
+    // can block the next transaction at the very same txid (e.g. a 3/3 split
+    // on six members). Re-anchor before returning a writable mount, just as
+    // when the winner came from journal replay. Never use this shortcut for
+    // an incomplete membership or corrupt/unverified journal.
+    let complete_membership = metadata_member_superblocks(superblocks, &metadata).len()
+        == metadata
+            .disks
+            .values()
+            .filter(|d| d.status != DiskStatus::Removed)
+            .count();
+    let uncommitted_suffix = complete_membership
+        && stable_membership
+        && report.errors.is_empty()
+        && report.invalid_entries == 0
+        && report
+            .raw_journal_members
+            .iter()
+            .all(|m| m.readable && m.error.is_none())
+        && report.last_valid_txid > metadata.txid;
+    if checkpoint_replay && (report.replayed || uncommitted_suffix) {
         journal::inject_crash(FaultPoint::DuringReplay.as_str())?;
         let member_superblocks = metadata_member_superblocks(superblocks, &metadata);
-        if can_retain_replayed_journal(&metadata, &member_superblocks, &report) {
+        if !uncommitted_suffix
+            && can_retain_replayed_journal(&metadata, &member_superblocks, &report)
+        {
             return Ok((metadata, report));
         }
         let checkpoint_report =

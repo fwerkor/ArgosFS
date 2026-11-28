@@ -753,6 +753,13 @@ impl ArgosFs {
             .div_ceil(stripe_size)
             .saturating_mul(stripe_size)
             .min(new_size);
+        let (affected_start, affected_end) = self.cover_inode_rewrite_window_locked(
+            &meta,
+            ino,
+            affected_start,
+            affected_end,
+            new_size,
+        )?;
         let mut window = zeroed_io_buffer(
             affected_end - affected_start,
             "disjoint stripe rewrite window",
@@ -873,6 +880,14 @@ impl ArgosFs {
             .div_ceil(stripe_raw_size)
             .saturating_mul(stripe_raw_size)
             .min(new_size);
+
+        let (affected_start, affected_end) = self.cover_inode_rewrite_window_locked(
+            &meta,
+            ino,
+            affected_start,
+            affected_end,
+            new_size,
+        )?;
 
         if end > affected_end {
             return Err(ArgosError::Invalid(
@@ -1104,6 +1119,13 @@ impl ArgosFs {
 
         let affected_start = (new_size / stripe_raw_size) * stripe_raw_size;
         let affected_end = new_size;
+        let (affected_start, affected_end) = self.cover_inode_rewrite_window_locked(
+            &meta,
+            ino,
+            affected_start,
+            affected_end,
+            new_size,
+        )?;
         let window = if affected_start < affected_end {
             self.decode_inode_window_locked(&mut meta, ino, affected_start, affected_end)?
         } else {

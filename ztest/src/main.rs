@@ -157,6 +157,17 @@ struct ModelArgs {
     legacy_metadata: bool,
     #[arg(long)]
     topology: bool,
+    /// Combine feature checks with a varied pool configuration and repeated topology rounds.
+    #[arg(long, value_enum, conflicts_with = "replay")]
+    profile: Option<argosfs_ztest::combinations::Profile>,
+    /// Additional files in the quota subtree (0–4096), retained across maintenance.
+    #[arg(
+        long,
+        default_value_t = 0,
+        requires = "profile",
+        conflicts_with = "replay"
+    )]
+    directory_entries: usize,
     #[arg(long)]
     replay: Option<PathBuf>,
     #[arg(long)]
@@ -187,13 +198,28 @@ fn dispatch() -> Result<()> {
             let trace = if let Some(path) = args.replay {
                 serde_json::from_slice(&std::fs::read(path)?)?
             } else {
-                argosfs_ztest::model::Trace::generate(
+                let trace = argosfs_ztest::model::Trace::generate(
                     args.seed,
                     !args.legacy_metadata,
                     args.operations,
                     args.topology,
-                )
+                );
+                if let Some(profile) = args.profile {
+                    let mut trace = trace.with_profile(profile, args.topology);
+                    trace.directory_entries = args.directory_entries;
+                    trace
+                } else {
+                    trace
+                }
             };
+            if trace
+                .profile
+                .is_some_and(argosfs_ztest::combinations::Profile::encrypted)
+            {
+                // Only this CLI process and its disposable test children use the fixture key.
+                std::env::remove_var("ARGOSFS_KEY_FILE");
+                std::env::set_var("ARGOSFS_KEY", argosfs_ztest::combinations::TEST_KEY);
+            }
             argosfs_ztest::model::run(trace, &args.work_dir, args.minimize)
         }
         Command::MutationWorker(args) => {
