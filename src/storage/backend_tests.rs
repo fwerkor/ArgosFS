@@ -246,3 +246,30 @@ fn batched_writes_handle_many_adjacent_ranges() {
         expected
     );
 }
+
+#[test]
+fn owned_uring_batch_preserves_fragmented_ranges_and_ordered_fallback() {
+    let file = image(8192);
+    let backend = FileBlockBackend::open_loop(&[file.path().to_path_buf()], true).unwrap();
+    let id = "disk-0000".to_string();
+    let backend = crate::storage::guard::GuardedBackend::new(Arc::new(backend));
+    backend
+        .write_owned_batch(
+            &id,
+            vec![(0, b"abc".to_vec()), (8, b"def".to_vec())],
+            IoMode::IoUring,
+        )
+        .unwrap();
+    backend
+        .write_owned_batch(
+            &id,
+            vec![(1, b"xyz".to_vec()), (2, b"AB".to_vec())],
+            IoMode::IoUring,
+        )
+        .unwrap();
+    backend.flush_device(&id).unwrap();
+    let out = backend.read_shard_owned(&id, 0, vec![0; 11]).unwrap();
+    assert_eq!(&out[..4], b"axAB");
+    assert_eq!(&out[4..8], &[0; 4]);
+    assert_eq!(&out[8..], b"def");
+}

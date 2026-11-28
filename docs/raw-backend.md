@@ -342,3 +342,13 @@ a timed-out operation to retain a borrowed caller buffer.
 
 These changes apply to the existing raw/loop backend, require no new on-disk
 features, and do not depend on FUSE-over-io_uring.
+
+With the existing `io-uring` I/O policy selected, fragmented, ordered and
+nonoverlapping raw append batches can use up to 64 simultaneous positioned
+writes on a ring reused by the member's deadline worker. Contiguous runs
+retain the cheaper vectored write path; overlapping, oversized, unsupported
+or out-of-order batches retain the ordered fallback. Ring initialization
+failure falls back before any writes are issued. Completion failures are
+reported, and ambiguous submission failures fence the member rather than
+replaying potentially outstanding operations. All completions must be
+observed before the existing member flush and metadata publication.

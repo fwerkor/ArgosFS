@@ -8,7 +8,7 @@
 
 use crate::backend::{BackendCapabilities, BackendDeviceInfo, StorageBackend};
 use crate::error::{ArgosError, Result};
-use crate::types::{BackendKind, DiskStatus};
+use crate::types::{BackendKind, DiskStatus, IoMode};
 use crate::util::usb_mode;
 use parking_lot::Mutex;
 use std::collections::BTreeMap;
@@ -316,6 +316,19 @@ impl StorageBackend for GuardedBackend {
                 .map(|(offset, data)| (*offset, data.as_slice()))
                 .collect();
             inner.write_batch(&id, &ranges)
+        })
+    }
+
+    fn write_owned_batch(
+        &self,
+        device_id: &String,
+        writes: Vec<(u64, Vec<u8>)>,
+        mode: IoMode,
+    ) -> Result<()> {
+        let inner = self.inner.clone();
+        let id = device_id.clone();
+        self.run(device_id, "write batch", move || {
+            inner.write_owned_batch(&id, writes, mode)
         })
     }
 

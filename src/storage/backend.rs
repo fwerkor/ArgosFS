@@ -1,5 +1,5 @@
 use crate::error::{ArgosError, Result};
-use crate::types::{BackendKind, DiskStatus};
+use crate::types::{BackendKind, DiskStatus, IoMode};
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom};
@@ -58,6 +58,20 @@ pub trait StorageBackend: Send + Sync {
             self.write_at(device_id, *offset, data)?;
         }
         Ok(())
+    }
+    /// Owned batches allow a deadline worker to transfer its payloads into
+    /// the optional asynchronous backend without another copy.
+    fn write_owned_batch(
+        &self,
+        device_id: &DeviceId,
+        writes: Vec<(u64, Vec<u8>)>,
+        _mode: IoMode,
+    ) -> Result<()> {
+        let ranges: Vec<_> = writes
+            .iter()
+            .map(|(offset, data)| (*offset, data.as_slice()))
+            .collect();
+        self.write_batch(device_id, &ranges)
     }
     fn flush_device(&self, device_id: &DeviceId) -> Result<()>;
     fn flush_all(&self) -> Result<()>;
@@ -314,6 +328,31 @@ impl StorageBackend for FileBlockBackend {
             self.write_at(device_id, *offset, data)?;
         }
         Ok(())
+    }
+
+    fn write_owned_batch(
+        &self,
+        device_id: &DeviceId,
+        mut writes: Vec<(u64, Vec<u8>)>,
+        mode: IoMode,
+    ) -> Result<()> {
+        let device = self.device(device_id)?;
+        #[cfg(target_os = "linux")]
+        if mode == IoMode::IoUring {
+            // Asynchronous submission is limited to disjoint, bounded
+            // ranges. Contiguous ranges already benefit from pwritev.
+            if super::raw_uring::eligible(&writes, device.capacity)
+                && super::raw_uring::write(&device.file, &mut writes)?
+            {
+                return Ok(());
+            }
+        }
+        let _ = (&device, mode);
+        let ranges: Vec<_> = writes
+            .iter()
+            .map(|(offset, data)| (*offset, data.as_slice()))
+            .collect();
+        self.write_batch(device_id, &ranges)
     }
 
     fn flush_device(&self, device_id: &DeviceId) -> Result<()> {

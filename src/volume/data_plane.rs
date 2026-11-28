@@ -2275,10 +2275,23 @@ impl ArgosFs {
         if self.is_device_quarantined(disk_id) {
             return Err(ArgosError::MissingDevice(disk_id.to_string()));
         }
-        let result = match self.backend.write_batch(&disk_id.to_string(), writes) {
+        let owned = || {
+            writes
+                .iter()
+                .map(|(offset, data)| (*offset, data.to_vec()))
+                .collect()
+        };
+        let submit = |backend: &dyn StorageBackend| {
+            if meta.config.io_mode == IoMode::IoUring {
+                backend.write_owned_batch(&disk_id.to_string(), owned(), meta.config.io_mode)
+            } else {
+                backend.write_batch(&disk_id.to_string(), writes)
+            }
+        };
+        let result = match submit(self.backend.as_ref()) {
             Err(ArgosError::MissingDevice(_)) if meta.backend != BackendKind::Host => {
                 let backend = self.single_device_backend_locked(meta, disk_id, true)?;
-                backend.write_batch(&disk_id.to_string(), writes)
+                submit(backend.as_ref())
             }
             other => other,
         };
