@@ -170,7 +170,7 @@ fn raw_loop_stripe_prefix_and_tail_survive_sync_and_reopen() {
     let images = (0..3)
         .map(|i| dir.path().join(format!("staged-{i}.img")))
         .collect::<Vec<_>>();
-    let volume = ArgosFs::create_loop(
+    let volume = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,
@@ -426,7 +426,7 @@ fn raw_disjoint_writeback_survives_sync_reopen_and_journal_verification() {
     let images = (0..3)
         .map(|i| dir.path().join(format!("disjoint-{i}.img")))
         .collect::<Vec<_>>();
-    let volume = ArgosFs::create_loop(
+    let volume = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,

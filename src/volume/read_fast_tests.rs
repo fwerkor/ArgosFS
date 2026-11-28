@@ -149,7 +149,7 @@ fn healthy_stripe_reads_data_shards_concurrently() {
     let images = (0..3)
         .map(|index| dir.path().join(format!("member-{index}.img")))
         .collect::<Vec<_>>();
-    let mut fs = ArgosFs::create_loop(
+    let mut fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,
@@ -196,7 +196,7 @@ fn cold_multistripe_range_overlaps_independent_stripe_reads() {
     let images = (0..3)
         .map(|i| dir.path().join(format!("range-{i}.img")))
         .collect::<Vec<_>>();
-    let mut fs = ArgosFs::create_loop(
+    let mut fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,

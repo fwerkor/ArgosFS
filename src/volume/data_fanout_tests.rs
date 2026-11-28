@@ -70,7 +70,7 @@ fn fixture() -> (tempfile::TempDir, Vec<PathBuf>, ArgosFs) {
     let paths = (0..3)
         .map(|i| dir.path().join(format!("fanout-{i}.img")))
         .collect::<Vec<_>>();
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &paths,
         VolumeConfig {
             k: 2,

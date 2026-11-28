@@ -10,7 +10,7 @@ fn raw_fixture() -> (tempfile::TempDir, Vec<PathBuf>, ArgosFs, InodeId) {
     let images = (0..3)
         .map(|i| dir.path().join(format!("advisory-read-{i}.img")))
         .collect::<Vec<_>>();
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,
@@ -211,7 +211,7 @@ fn immediate_metadata_commit_after_advisory_reads_reanchors_trusted_hash() {
     let images = (0..3)
         .map(|i| dir.path().join(format!("immediate-{i}.img")))
         .collect::<Vec<_>>();
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,
@@ -335,7 +335,7 @@ fn nine_member_clean_read_cycle_only_writes_small_superblock_flags() {
     let images = (0..9)
         .map(|i| dir.path().join(format!("nine-member-{i}.img")))
         .collect::<Vec<_>>();
-    let mut fs = ArgosFs::create_loop(
+    let mut fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 4,
@@ -427,7 +427,7 @@ fn immediate_raw_reads_and_clean_unmount_do_not_checkpoint() {
     let images = (0..3)
         .map(|i| dir.path().join(format!("immediate-read-{i}.img")))
         .collect::<Vec<_>>();
-    let mut fs = ArgosFs::create_loop(
+    let mut fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,
@@ -471,7 +471,7 @@ fn clean_reopened_v2_pool_uses_exact_durable_delta_base() {
     let images = (0..3)
         .map(|i| dir.path().join(format!("v2-reopen-{i}.img")))
         .collect::<Vec<_>>();
-    let mut fs = ArgosFs::create_loop(
+    let mut fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,
@@ -565,7 +565,7 @@ fn verified_unclean_reopen_reuses_durable_delta_base() {
     let images = (0..3)
         .map(|i| dir.path().join(format!("unclean-{i}.img")))
         .collect::<Vec<_>>();
-    let mut fs = ArgosFs::create_loop(
+    let mut fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,

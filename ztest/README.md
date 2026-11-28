@@ -9,6 +9,10 @@ It is intentionally a separate, workspace-excluded package. Nothing outside the
 small `#[doc(hidden)]` backend-open hook in ArgosFS needs to know it exists, so
 the harness can move to its own repository or distribution package later.
 
+Fresh test pools use paged metadata by default. Pass `run --legacy-metadata`
+to exercise the original checkpoint/journal format; `--paged-metadata`
+remains an explicit selection of the default.
+
 ## What it injects
 
 The fault backend wraps the normal loop/raw backend:

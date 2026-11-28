@@ -263,7 +263,7 @@ fn raw_buffered_tail_reads_are_advisory_and_never_force_periodic_checkpoint() {
     let images = (0..3)
         .map(|n| dir.path().join(format!("raw-buffer-read-{n}.img")))
         .collect::<Vec<_>>();
-    let volume = ArgosFs::create_loop(
+    let volume = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,

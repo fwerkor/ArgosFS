@@ -94,7 +94,7 @@ mod tests {
         let images = (0..3)
             .map(|index| dir.path().join(format!("member-{index}.img")))
             .collect::<Vec<_>>();
-        let mut fs = ArgosFs::create_loop(
+        let mut fs = ArgosFs::create_loop_legacy(
             &images,
             VolumeConfig {
                 k: 2,

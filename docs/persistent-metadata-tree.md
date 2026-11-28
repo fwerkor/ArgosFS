@@ -1,15 +1,15 @@
-# Persistent metadata page engine (opt-in raw format)
+# Persistent metadata page engine (default raw/loop format)
 
-ArgosFS supports an explicit paged metadata raw/loop format. The normal
-legacy format remains the default. Paged pools use certified COW roots for
-immediate transactions, deferred group commits, sync, replay selection, and
-clean unmount; legacy checkpoint and journal writers reject the new required
-feature. The code remains a draft until topology changes and broader
-production testing are complete.
+New raw/loop pools use paged metadata by default. Paged pools use certified
+COW roots for immediate transactions, deferred group commits, sync, replay
+selection, and clean unmount; legacy checkpoint and journal writers reject the
+new required feature. Use `mkfs --legacy-metadata` for the original format,
+or `--paged-metadata` to explicitly select the default. Existing pools retain
+their on-disk format. Broader real-device qualification is still needed.
 
 ```sh
 argosfs mkfs --backend loop --images a.img,b.img,c.img \
-  --image-size 512MiB --k 2 --m 1 --paged-metadata
+  --image-size 512MiB --k 2 --m 1
 argosfs upgrade-paged-metadata --pool-config pool.json --offline-confirmed
 ```
 
@@ -210,6 +210,6 @@ measurement of an existing nine-member physical ArgosFS pool.
   benchmarks on real multi-device storage. Loop-file results are not physical
   disk throughput or latency measurements.
 
-Run the paged-format ztest workload with `ztest --paged-metadata` (in addition
-to the usual workload options). The retained event history is intentionally
+The ztest harness uses paged metadata by default; run it with
+`run --legacy-metadata` to exercise the original checkpoint/journal format. The retained event history is intentionally
 bounded, not an unlimited audit archive.

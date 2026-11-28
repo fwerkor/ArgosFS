@@ -34,9 +34,12 @@ struct RunArgs {
     work_dir: Option<PathBuf>,
     #[arg(long)]
     keep_work_dir: bool,
-    /// Create the test pool using authenticated paged metadata.
-    #[arg(long)]
+    /// Explicitly select authenticated paged metadata (the default).
+    #[arg(long, conflicts_with = "legacy_metadata")]
     paged_metadata: bool,
+    /// Exercise the original checkpoint/journal format instead.
+    #[arg(long)]
+    legacy_metadata: bool,
     /// Number of crash/recover cycles.
     #[arg(long, default_value_t = 5)]
     cycles: usize,
@@ -209,7 +212,7 @@ fn run_config(args: RunArgs) -> Result<RunConfig> {
     Ok(RunConfig {
         work_dir: args.work_dir,
         keep_work_dir: args.keep_work_dir,
-        paged_metadata: args.paged_metadata,
+        paged_metadata: !args.legacy_metadata,
         cycles: args.cycles,
         seed: args.seed,
         devices: args.devices,

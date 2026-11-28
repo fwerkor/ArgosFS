@@ -163,7 +163,29 @@ impl ArgosFs {
         })
     }
 
+    /// Create a loop pool using the default authenticated paged metadata format.
     pub fn create_loop(
+        images: &[PathBuf],
+        config: VolumeConfig,
+        image_size: u64,
+        pool_name: &str,
+        force: bool,
+    ) -> Result<Self> {
+        Self::create_loop_paged(images, config, image_size, pool_name, force)
+    }
+
+    /// Create a raw pool using the default authenticated paged metadata format.
+    pub fn create_raw(
+        devices: &[PathBuf],
+        config: VolumeConfig,
+        pool_name: &str,
+        force: bool,
+    ) -> Result<Self> {
+        Self::create_raw_paged(devices, config, pool_name, force)
+    }
+
+    /// Explicitly create a loop pool in the original checkpoint/journal format.
+    pub fn create_loop_legacy(
         images: &[PathBuf],
         config: VolumeConfig,
         image_size: u64,
@@ -177,7 +199,8 @@ impl ArgosFs {
         Self::create_block_backend(BackendKind::LoopBlock, images, config, pool_name, force)
     }
 
-    pub fn create_raw(
+    /// Explicitly create a raw pool in the original checkpoint/journal format.
+    pub fn create_raw_legacy(
         devices: &[PathBuf],
         config: VolumeConfig,
         pool_name: &str,
@@ -189,7 +212,7 @@ impl ArgosFs {
         Self::create_block_backend(BackendKind::RawBlock, devices, config, pool_name, force)
     }
 
-    /// Create a new loop pool using the opt-in paged metadata disk format.
+    /// Create a new loop pool using the authenticated paged metadata disk format.
     pub fn create_loop_paged(
         images: &[PathBuf],
         config: VolumeConfig,
@@ -211,7 +234,7 @@ impl ArgosFs {
         )
     }
 
-    /// Create a new raw pool using the opt-in paged metadata disk format.
+    /// Create a new raw pool using the authenticated paged metadata disk format.
     pub fn create_raw_paged(
         devices: &[PathBuf],
         config: VolumeConfig,

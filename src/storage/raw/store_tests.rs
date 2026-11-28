@@ -349,7 +349,7 @@ fn loop_image(dir: &Path, name: &str) -> PathBuf {
 
 fn create_loop_pool(dir: &Path, name: &str) -> (PathBuf, ArgosFs) {
     let image = dir.join(format!("{name}.img"));
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         std::slice::from_ref(&image),
         VolumeConfig {
             k: 1,
@@ -375,7 +375,7 @@ fn quorum_fixture() -> (
     let images = (0..3)
         .map(|index| dir.path().join(format!("quorum-{index}.img")))
         .collect::<Vec<_>>();
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,
@@ -1010,7 +1010,7 @@ fn manually_offline_member_stays_offline_after_reopen() {
     let images = (0..3)
         .map(|index| dir.path().join(format!("manual-offline-{index}.img")))
         .collect::<Vec<_>>();
-    let fs = crate::volume::ArgosFs::create_loop(
+    let fs = crate::volume::ArgosFs::create_loop_legacy(
         &images,
         crate::types::VolumeConfig {
             k: 2,
@@ -2539,7 +2539,7 @@ fn torn_primary_label_falls_back_to_the_backup_label() {
     let images = (0..2)
         .map(|index| dir.path().join(format!("backup-label-{index}.img")))
         .collect::<Vec<_>>();
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 1,

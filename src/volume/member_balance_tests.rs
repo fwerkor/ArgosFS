@@ -6,7 +6,7 @@ fn returning_member_receives_verified_shards_without_rewriting_files() {
     let paths = (0..4)
         .map(|i| dir.path().join(format!("member-{i}.img")))
         .collect::<Vec<_>>();
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &paths,
         VolumeConfig {
             k: 2,
