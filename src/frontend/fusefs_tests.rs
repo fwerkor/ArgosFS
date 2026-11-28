@@ -1098,6 +1098,9 @@ fn open_reply_flags_follow_direct_io_and_writeback_policy() {
     let fuse = ArgosFuse::new(volume.clone());
     assert_eq!(fuse.open_reply_flags(false), FopenFlags::FOPEN_KEEP_CACHE);
     assert_eq!(fuse.open_reply_flags(true), FopenFlags::FOPEN_NOFLUSH);
+    fuse.kernel_writeback.store(true, Ordering::Release);
+    assert_eq!(fuse.open_reply_flags(true), FopenFlags::empty());
+    fuse.kernel_writeback.store(false, Ordering::Release);
 
     volume
         .set_io_policy(crate::types::IoMode::Direct, true, true, true)

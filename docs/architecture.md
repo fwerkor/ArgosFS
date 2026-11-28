@@ -248,3 +248,14 @@ errors are propagated rather than silently replaying an uncertain write.
 Each successful host-file shard write still crosses its existing sync barrier.
 This is not FUSE-over-io_uring: that requires a separate transport in the
 FUSE library. Raw block backends do not yet use this host-path ring pool.
+
+Linux kernel writeback caching is an opt-in mount policy:
+`argosfs mount ROOT MOUNTPOINT -o default_permissions -o kernel_writeback`.
+It requires buffered FUSE I/O, an exclusive authoritative mount, and kernel
+support; unsupported kernels retain userspace writeback. The kernel may
+perform partial-page reads on writable-only handles, so the VFS permission
+check is mandatory. Kernel writeback retains the existing bounded ArgosFS
+write staging and fsync durability barrier; repeated FLUSH requests report
+errors without releasing handles. The option is not enabled by default.
+Run `python3 tests/fuse_kernel_writeback.py --binary target/release/argosfs`
+on a Linux FUSE-capable host for mounted cache and permission regressions.
