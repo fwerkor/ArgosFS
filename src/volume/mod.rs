@@ -279,6 +279,8 @@ impl QuotaRuntime {
     }
 }
 
+type DirectoryParentIndex = BTreeMap<InodeId, (InodeId, String)>;
+
 /// Mount-local state shared by every handle, independent of backend configuration.
 struct MountRuntime {
     read_advisory: read_advisory::ReadAdvisory,
@@ -291,11 +293,9 @@ struct MountRuntime {
     repair_counters: RepairCounters,
     mount_owners: AtomicUsize,
     read_retries: usize,
-    /// Child -> parent, built on the first parent lookup and then kept current
-    /// by namespace mutations. Readdir only needs it for directories, but
-    /// indexing every child preserves the helper's previous behavior for
-    /// files and hard links too.
-    parent_index: RwLock<Option<BTreeMap<InodeId, InodeId>>>,
+    /// Directory child -> (parent, encoded entry name). Validate by exact
+    /// lookup rather than scanning a potentially very wide parent.
+    parent_index: RwLock<Option<DirectoryParentIndex>>,
 }
 
 impl MountRuntime {

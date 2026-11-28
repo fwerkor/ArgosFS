@@ -1350,7 +1350,6 @@ impl ArgosFs {
             "symlink",
             json!({"parent": parent, "name": name, "target": target_string, "inode": ino}),
         )?;
-        self.remember_parent_link(parent, ino);
         Ok(Self::attr_from_inode(
             meta.inodes.get(&ino).unwrap(),
             meta.config.chunk_size,
@@ -1427,7 +1426,6 @@ impl ArgosFs {
             "link",
             json!({"inode": ino, "new_parent": new_parent, "name": name}),
         )?;
-        self.remember_parent_link(new_parent, ino);
         self.refresh_quota_runtime_if_active_locked(&meta)?;
         Ok(Self::attr_from_inode(
             meta.inodes
