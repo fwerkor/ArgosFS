@@ -241,8 +241,12 @@ fn ordered_file_windows_track_dirty_edits_and_snapshot_rollback() {
     let serialized = serde_json::to_vec(&inodes).unwrap();
     let recovered: crate::model::inodes::TrackedInodes =
         serde_json::from_slice(&serialized).unwrap();
+    // Compare the same recovered snapshot before and after populating the
+    // derived index. JSON floating-point timestamps need not round-trip to
+    // identical bytes across serialization and parsing.
+    let recovered_bytes = serde_json::to_vec(&recovered).unwrap();
     assert_eq!(recovered.file_window_ids(Some(c), 10), vec![d, c]);
-    assert_eq!(serde_json::to_vec(&recovered).unwrap(), serialized);
+    assert_eq!(serde_json::to_vec(&recovered).unwrap(), recovered_bytes);
 }
 
 #[test]
