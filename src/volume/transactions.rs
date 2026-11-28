@@ -580,11 +580,21 @@ impl ArgosFs {
                 }
                 return Err(precommit_err);
             }
-            let replay_previous = if raw_uncommitted_metadata_dirty {
-                None
-            } else {
-                previous_metadata
-                    .filter(|previous| previous.integrity.meta_hash == previous_meta_hash)
+            // A rollback snapshot can already include live, uncommitted
+            // changes (e.g. tier classification before a rebalance rewrite).
+            // Its stored hash alone does not certify it as a replay base.
+            // Legacy deltas must also start from the journal-durable image.
+            let replay_previous = {
+                let state = self.deferred_commit.lock();
+                (!state.raw_checkpoint_required && !state.raw_uncommitted_metadata_dirty)
+                    .then(|| state.durable_metadata.clone())
+                    .flatten()
+                    .filter(|base| {
+                        base.txid == previous_txid
+                            && base.integrity.meta_hash == previous_meta_hash
+                            && base.integrity.hash_scheme.is_none()
+                            && previous_meta_hash.len() == 64
+                    })
             };
             let details = json!({"txid": meta.txid, "previous_meta_hash": previous_meta_hash, "details": details});
             let commit_backend = if self.open_backend_covers_superblocks(&superblocks) {
@@ -617,7 +627,7 @@ impl ArgosFs {
                         details.clone(),
                     );
                 }
-                match replay_previous {
+                match replay_previous.as_deref() {
                     Some(previous) => raw_store::append_transaction_with_trusted_integrity_quorum(
                         backend,
                         &superblocks,

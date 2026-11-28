@@ -589,9 +589,20 @@ impl ArgosFs {
         for ino in targets {
             let inode_lock = self.inode_lock(ino);
             let _inode_guard = inode_lock.lock();
-            let data = self.read_inode(ino, 0, u64::MAX as usize, false)?;
+            let data = match self.read_inode(ino, 0, u64::MAX as usize, false) {
+                Ok(data) => data,
+                Err(ArgosError::NotFound(_)) if !self.meta.read().inodes.contains_key(&ino) => {
+                    continue
+                }
+                Err(err) => return Err(err),
+            };
             maintenance_after_read_delay();
             let mut meta = self.meta.write();
+            // Unlink/rename replacement may remove the inode even while
+            // the data mutex is held. Never recreate or rewrite a dead file.
+            if !meta.inodes.contains_key(&ino) {
+                continue;
+            }
             self.replace_inode_data_locked(
                 &mut meta,
                 ino,
@@ -786,9 +797,20 @@ impl ArgosFs {
             };
             let inode_lock = self.inode_lock(ino);
             let _inode_guard = inode_lock.lock();
-            let data = self.read_inode(ino, 0, u64::MAX as usize, true)?;
+            let data = match self.read_inode(ino, 0, u64::MAX as usize, true) {
+                Ok(data) => data,
+                Err(ArgosError::NotFound(_)) if !self.meta.read().inodes.contains_key(&ino) => {
+                    continue
+                }
+                Err(err) => return Err(err),
+            };
             maintenance_after_read_delay();
             let mut meta = self.meta.write();
+            // Unlink/rename replacement may remove the inode even while
+            // the data mutex is held. Never recreate or rewrite a dead file.
+            if !meta.inodes.contains_key(&ino) {
+                continue;
+            }
             self.replace_inode_data_locked(
                 &mut meta,
                 ino,
@@ -906,9 +928,21 @@ impl ArgosFs {
         for ino in targets {
             let inode_lock = self.inode_lock(ino);
             let _inode_guard = inode_lock.lock();
-            let data = self.read_inode(ino, 0, u64::MAX as usize, true)?;
+            next_cursor = Some(ino);
+            let data = match self.read_inode(ino, 0, u64::MAX as usize, true) {
+                Ok(data) => data,
+                Err(ArgosError::NotFound(_)) if !self.meta.read().inodes.contains_key(&ino) => {
+                    continue
+                }
+                Err(err) => return Err(err),
+            };
             maintenance_after_read_delay();
             let mut meta = self.meta.write();
+            // Unlink/rename replacement may remove the inode even while
+            // the data mutex is held. Never recreate or rewrite a dead file.
+            if !meta.inodes.contains_key(&ino) {
+                continue;
+            }
             // Fold queued read traffic into the inode before hot/cold tier
             // classification. Common reads retain their shared guard.
             self.drain_read_advisory_locked(&mut meta);
@@ -925,7 +959,6 @@ impl ArgosFs {
                 &BTreeSet::new(),
             )?;
             rewritten += 1;
-            next_cursor = Some(ino);
         }
         let mut meta = self.meta.write();
         self.commit_locked(
@@ -958,6 +991,10 @@ impl ArgosFs {
         for ino in self.file_window(cursor, max_files) {
             let inode_lock = self.inode_lock(ino);
             let _inode_guard = inode_lock.lock();
+            next_cursor = Some(ino);
+            if !self.meta.read().inodes.contains_key(&ino) {
+                continue;
+            }
             report.files_checked += 1;
             match self.read_inode_with_damage_report_for_scrub(ino, 0, u64::MAX as usize, true) {
                 Ok((_, damaged, repaired)) => {
@@ -994,12 +1031,14 @@ impl ArgosFs {
                         report.repaired_files += 1;
                     }
                 }
+                Err(ArgosError::NotFound(_)) if !self.meta.read().inodes.contains_key(&ino) => {
+                    report.files_checked -= 1;
+                }
                 Err(err) => {
                     report.unrecoverable_files += 1;
                     report.errors.push(format!("inode {ino}: {err}"));
                 }
             }
-            next_cursor = Some(ino);
         }
         report.shard_read_retries = self
             .runtime
@@ -1174,6 +1213,10 @@ impl ArgosFs {
                     let mut damaged_blocks = Vec::new();
                     let mut unrecoverable_blocks = Vec::new();
                     let mut meta = self.meta.write();
+                    if !meta.inodes.contains_key(&ino) {
+                        report.files_checked -= 1;
+                        continue;
+                    }
                     for block in &inode.blocks {
                         let mut block_damaged = false;
                         let mut available_slots = BTreeSet::new();
@@ -1304,6 +1347,9 @@ impl ArgosFs {
                                 .collect::<BTreeSet<_>>();
                             maintenance_after_read_delay();
                             let mut meta = self.meta.write();
+                            if !meta.inodes.contains_key(&ino) {
+                                continue;
+                            }
                             match self.repair_inode_shards_locked(
                                 &mut meta,
                                 ino,

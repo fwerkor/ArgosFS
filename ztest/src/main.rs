@@ -24,6 +24,10 @@ enum Command {
     Run(RunArgs),
     /// Run or replay an exact-state model trace on clean storage.
     Model(ModelArgs),
+    /// Race foreground operations against topology and maintenance.
+    Mixed(MixedArgs),
+    /// Enumerate every mutating I/O boundary of key transactions.
+    Sweep(SweepArgs),
     /// Internal workload process. The run supervisor starts this.
     #[command(hide = true)]
     Worker(WorkerArgs),
@@ -164,6 +168,31 @@ struct ModelArgs {
 }
 
 #[derive(Parser)]
+struct MixedArgs {
+    #[arg(long)]
+    work_dir: PathBuf,
+    #[arg(long, default_value_t = 1)]
+    seed: u64,
+    #[arg(long, default_value_t = 2)]
+    rounds: usize,
+    #[arg(long)]
+    legacy_metadata: bool,
+}
+
+#[derive(Parser)]
+struct SweepArgs {
+    #[arg(long)]
+    work_dir: PathBuf,
+    #[arg(long)]
+    legacy_metadata: bool,
+    #[arg(long, default_value_t = 512)]
+    max_boundaries: u64,
+    /// Optional comma-separated subset: rename,delete,overwrite,range,truncate,link,quota,xattr.
+    #[arg(long, value_delimiter = ',')]
+    operations: Vec<String>,
+}
+
+#[derive(Parser)]
 struct WorkerArgs {
     #[arg(long)]
     config: PathBuf,
@@ -182,6 +211,34 @@ fn dispatch() -> Result<()> {
             let outcome = run(run_config(args)?)?;
             println!("{}", serde_json::to_string_pretty(&outcome)?);
             Ok(())
+        }
+        Command::Mixed(args) => argosfs_ztest::mixed::run(
+            &args.work_dir,
+            !args.legacy_metadata,
+            args.seed,
+            args.rounds,
+        ),
+        Command::Sweep(args) => {
+            use argosfs_ztest::atomic::Mutation;
+            let ops = if args.operations.is_empty() {
+                Mutation::ALL.to_vec()
+            } else {
+                args.operations
+                    .iter()
+                    .map(|name| {
+                        Mutation::ALL
+                            .into_iter()
+                            .find(|op| format!("{op:?}").eq_ignore_ascii_case(name))
+                            .with_context(|| format!("unknown sweep operation {name}"))
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            };
+            argosfs_ztest::atomic::sweep(
+                &args.work_dir,
+                !args.legacy_metadata,
+                args.max_boundaries,
+                &ops,
+            )
         }
         Command::Model(args) => {
             let trace = if let Some(path) = args.replay {
