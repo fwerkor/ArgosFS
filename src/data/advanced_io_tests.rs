@@ -116,7 +116,7 @@ fn io_uring_mode_always_has_a_buffered_fallback() {
 fn direct_helpers_cover_empty_missing_directory_and_short_file_paths() {
     let dir = tempdir().unwrap();
     let empty = dir.path().join("empty-direct.bin");
-    assert!(write_iouring(&empty, b"").is_ok() || empty.exists());
+    write_all(&empty, b"", IoMode::IoUring).unwrap();
     if empty.exists() {
         assert!(read_iouring(&empty, 0).unwrap_or_default().is_empty());
     }
@@ -146,4 +146,69 @@ fn aligned_buffer_supports_zero_length_and_cpu_lists_ignore_whitespace() {
     assert!(cpu_list_contains(" 0-2, 4 ", 1));
     assert!(cpu_list_contains(" 0-2, 4 ", 4));
     assert!(!cpu_list_contains(" 0-2, 4 ", 3));
+}
+
+#[test]
+fn ring_pool_reuses_drained_rings_across_threads() {
+    let pool = RingPool::new();
+    let Ok(lease) = pool.acquire() else {
+        // Restricted CI and old kernels exercise the buffered fallback.
+        return;
+    };
+    let fd = lease.ring.as_ref().unwrap().as_raw_fd();
+    drop(lease);
+    std::thread::scope(|scope| {
+        scope
+            .spawn(|| {
+                let lease = pool.acquire().unwrap();
+                assert_eq!(lease.ring.as_ref().unwrap().as_raw_fd(), fd);
+            })
+            .join()
+            .unwrap();
+    });
+    pool.disable();
+    assert!(pool.idle.lock().is_empty());
+    assert!(matches!(pool.acquire(), Err(ArgosError::Unsupported(_))));
+}
+
+#[test]
+fn io_uring_repeated_writes_preserve_truncation_and_short_reads() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("reused.bin");
+    for size in [4096, 131_073, 5, 0, 65_536] {
+        let payload = vec![0x6b; size];
+        write_all(&path, &payload, IoMode::IoUring).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().len(), size as u64);
+        assert_eq!(
+            read_all(&path, size + 7, IoMode::IoUring, false).unwrap(),
+            payload
+        );
+    }
+}
+
+#[test]
+fn buffered_policy_round_trips_at_automatic_uring_threshold() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("automatic.bin");
+    for size in [
+        AUTO_URING_MIN_BYTES - 1,
+        AUTO_URING_MIN_BYTES,
+        AUTO_URING_MIN_BYTES + 1,
+    ] {
+        let data = (0..size).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+        write_all(&path, &data, IoMode::Buffered).unwrap();
+        assert_eq!(
+            read_all(&path, size, IoMode::Buffered, false).unwrap(),
+            data
+        );
+    }
+    assert!(!prefer_uring(IoMode::Direct, AUTO_URING_MIN_BYTES));
+    assert!(!prefer_uring(IoMode::Buffered, AUTO_URING_MIN_BYTES - 1));
+    assert_eq!(
+        prefer_uring(IoMode::Buffered, AUTO_URING_MIN_BYTES),
+        !uring_disabled_by_operator()
+    );
+    if uring_disabled_by_operator() {
+        assert!(!io_uring_available());
+    }
 }

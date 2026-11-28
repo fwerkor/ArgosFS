@@ -6,7 +6,7 @@ use handles::*;
 use writeback::*;
 
 use super::fuse_directory_cache::{DirectoryListingCache, DirectoryRevision};
-use super::fuse_queue::FuseRequestExecutor;
+use super::fuse_queue::{FuseRequestExecutor, RequestKind};
 use super::metrics;
 use crate::acl;
 use crate::commit_metrics::{ReadPhase, WritebackFlushReason};
@@ -28,6 +28,7 @@ use std::io::Read;
 use std::ops::Deref;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
@@ -58,10 +59,33 @@ fn fuse_thread_count(variable: &str, min: usize, max: usize) -> usize {
         })
 }
 
+// Bound request memory and keep the existing defaults unless the operator
+// deliberately tunes the mount for a different storage workload.
+fn fuse_io_setting(value: Option<&str>, min: u32, max: u32, default: u32) -> u32 {
+    value
+        .and_then(|value| value.parse().ok())
+        .filter(|value| (min..=max).contains(value))
+        .unwrap_or(default)
+}
+
+fn fuse_io_env(name: &str, min: u32, max: u32, default: u32) -> u32 {
+    fuse_io_setting(std::env::var(name).ok().as_deref(), min, max, default)
+}
+
+fn fuse_optional_capabilities(supported: InitFlags) -> InitFlags {
+    // READDIRPLUS must not expose child lookup results when a caller can
+    // read directory names but cannot search the directory. fuser 0.18
+    // couples entry_out.nodeid with dirent.ino, so it cannot encode a
+    // names-only plus entry with the original inode number and nodeid 0.
+    // Keep ordinary READDIR semantics until that representation is available.
+    supported & InitFlags::FUSE_PARALLEL_DIROPS
+}
+
 pub struct ArgosFuse {
     shared: Arc<ArgosFuseShared>,
     commit_worker: Option<DeferredCommitWorker>,
     io_tasks: OnceLock<std::result::Result<FuseRequestExecutor, String>>,
+    request_kernel_writeback: bool,
 }
 
 /// Shared state held by in-flight requests until their asynchronous replies
@@ -69,6 +93,8 @@ pub struct ArgosFuse {
 #[doc(hidden)]
 pub struct ArgosFuseShared {
     volume: ArgosFs,
+    kernel_writeback: AtomicBool,
+    direct_io_at_mount: bool,
     writeback: Mutex<FuseWriteback>,
     writeback_locks: [RwLock<()>; WRITEBACK_LOCK_STRIPES],
     handles: Mutex<FuseHandles>,
@@ -132,10 +158,10 @@ impl Drop for DeferredCommitWorker {
 
 impl ArgosFuse {
     pub fn new(volume: ArgosFs) -> Self {
-        Self::try_new(volume).expect("start ArgosFS deferred commit worker")
+        Self::try_new(volume, false).expect("start ArgosFS deferred commit worker")
     }
 
-    fn try_new(volume: ArgosFs) -> Result<Self> {
+    fn try_new(volume: ArgosFs, force_direct_io: bool) -> Result<Self> {
         // Seed the snapshot before the first FUSE request, so statfs never
         // needs to block on a metadata write lock even during the first commit.
         let unavailable = volume.runtime_unavailable_devices();
@@ -145,9 +171,12 @@ impl ArgosFuse {
             unavailable,
         );
         let commit_worker = DeferredCommitWorker::start(&volume)?;
+        let direct_io_at_mount = force_direct_io || volume.io_policy().direct_io;
         Ok(Self {
             shared: Arc::new(ArgosFuseShared {
                 volume,
+                kernel_writeback: AtomicBool::new(false),
+                direct_io_at_mount,
                 writeback: Mutex::new(FuseWriteback::default()),
                 writeback_locks: std::array::from_fn(|_| RwLock::new(())),
                 handles: Mutex::new(FuseHandles::default()),
@@ -156,6 +185,7 @@ impl ArgosFuse {
             }),
             commit_worker,
             io_tasks: OnceLock::new(),
+            request_kernel_writeback: false,
         })
     }
 
@@ -169,6 +199,23 @@ impl ArgosFuse {
         shared_read: bool,
         job: impl FnOnce(Arc<ArgosFuseShared>) + Send + 'static,
     ) {
+        self.submit_request(
+            ino,
+            if shared_read {
+                RequestKind::Read
+            } else {
+                RequestKind::Exclusive
+            },
+            job,
+        );
+    }
+
+    fn submit_request(
+        &self,
+        ino: InodeId,
+        kind: RequestKind,
+        job: impl FnOnce(Arc<ArgosFuseShared>) + Send + 'static,
+    ) {
         let shared = Arc::clone(&self.shared);
         let executor = self.io_tasks.get_or_init(|| {
             FuseRequestExecutor::start(fuse_thread_count("ARGOSFS_FUSE_IO_WORKERS", 2, 16))
@@ -176,10 +223,10 @@ impl ArgosFuse {
         });
         match executor {
             Ok(executor) => {
-                let accepted = if shared_read {
-                    executor.submit_read(ino, move || job(shared))
-                } else {
-                    executor.submit(ino, move || job(shared))
+                let accepted = match kind {
+                    RequestKind::Read => executor.submit_read(ino, move || job(shared)),
+                    RequestKind::Exclusive => executor.submit(ino, move || job(shared)),
+                    range => executor.submit_kind(ino, range, move || job(shared)),
                 };
                 if !accepted {
                     eprintln!("argosfs: rejecting FUSE request during shutdown");
@@ -250,12 +297,18 @@ impl ArgosFuseShared {
 
     fn open_reply_flags(&self, write_open: bool) -> FopenFlags {
         let mut flags = FopenFlags::empty();
-        if self.volume.io_policy().direct_io {
+        let direct = self.direct_io_at_mount || self.volume.io_policy().direct_io;
+        if direct {
             flags |= FopenFlags::FOPEN_DIRECT_IO;
+            if write_open && self.direct_io_at_mount && cfg!(target_os = "linux") {
+                flags |= FopenFlags::FOPEN_PARALLEL_DIRECT_WRITES;
+            }
         }
         if write_open {
-            flags |= FopenFlags::FOPEN_NOFLUSH;
-        } else if !self.volume.io_policy().direct_io {
+            if !self.kernel_writeback.load(Ordering::Acquire) {
+                flags |= FopenFlags::FOPEN_NOFLUSH;
+            }
+        } else if !direct {
             flags |= FopenFlags::FOPEN_KEEP_CACHE;
         }
         flags
@@ -412,8 +465,18 @@ pub fn mount_volume_with_metrics(
         MountOption::FSName("argosfs".to_string()),
         MountOption::Subtype("argosfs".to_string()),
     ];
+    let mut writeback_override = None;
+    let mut force_direct_io = false;
     for option in options {
-        mount_options.push(MountOption::CUSTOM(option));
+        if option == "kernel_writeback" {
+            writeback_override = Some(true);
+        } else if option == "no_kernel_writeback" {
+            writeback_override = Some(false);
+        } else if option == "direct_io" {
+            force_direct_io = true;
+        } else {
+            mount_options.push(MountOption::CUSTOM(option));
+        }
     }
     if !foreground {
         eprintln!(
@@ -421,13 +484,33 @@ pub fn mount_volume_with_metrics(
         );
     }
     let config = mount_config(mount_options);
+    let eligible = cfg!(target_os = "linux")
+        && config
+            .mount_options
+            .contains(&MountOption::DefaultPermissions)
+        && !config.mount_options.contains(&MountOption::RO)
+        && !force_direct_io
+        && !volume.io_policy().direct_io;
+    if writeback_override == Some(true) && !eligible {
+        return Err(ArgosError::Invalid(
+            "kernel_writeback requires Linux, default_permissions, and writable buffered FUSE I/O"
+                .into(),
+        ));
+    }
+    let request_kernel_writeback = eligible && writeback_override != Some(false);
+    let policy = volume.io_policy();
+    let uring = policy.io_mode != crate::types::IoMode::Direct
+        && crate::data::advanced_io::io_uring_available();
+    eprintln!("argosfs: io_uring READ/WRITE available={uring}; policy={:?}; direct_io={}; kernel_writeback requested={request_kernel_writeback}", policy.io_mode, force_direct_io || policy.direct_io);
     // This server sees the same atomic counters as FUSE and the commit worker.
     // Keep it scoped to the blocking mount so it cannot keep the volume alive
     // after the FUSE filesystem performs its final sync.
     let _metrics_server = metrics_listen
         .map(|address| metrics::MountedMetricsServer::start(&volume, address))
         .transpose()?;
-    fuser::mount2(ArgosFuse::try_new(volume)?, mountpoint, &config).map_err(ArgosError::Io)
+    let mut fs = ArgosFuse::try_new(volume, force_direct_io)?;
+    fs.request_kernel_writeback = request_kernel_writeback;
+    fuser::mount2(fs, mountpoint, &config).map_err(ArgosError::Io)
 }
 
 fn mount_config(options: Vec<MountOption>) -> Config {
@@ -488,12 +571,35 @@ impl Filesystem for ArgosFuse {
         _req: &Request,
         config: &mut KernelConfig,
     ) -> std::result::Result<(), std::io::Error> {
-        let _ = config.set_max_write(1024 * 1024);
-        let _ = config.set_max_readahead(1024 * 1024);
-        let _ = config.set_max_background(64);
-        let _ = config.set_congestion_threshold(48);
-        let _ = config
-            .add_capabilities(InitFlags::FUSE_PARALLEL_DIROPS | InitFlags::FUSE_READDIRPLUS_AUTO);
+        let max_write = fuse_io_env("ARGOSFS_FUSE_MAX_WRITE", 4096, 1024 * 1024, 1024 * 1024);
+        let max_readahead =
+            fuse_io_env("ARGOSFS_FUSE_MAX_READAHEAD", 4096, 1024 * 1024, 1024 * 1024);
+        let background = fuse_io_env("ARGOSFS_FUSE_MAX_BACKGROUND", 8, 256, 64) as u16;
+        if let Err(limit) = config.set_max_write(max_write) {
+            let _ = config.set_max_write(limit);
+        }
+        if let Err(limit) = config.set_max_readahead(max_readahead) {
+            if limit != 0 {
+                let _ = config.set_max_readahead(limit);
+            }
+        }
+        let _ = config.set_max_background(background);
+        let _ = config.set_congestion_threshold(background * 3 / 4);
+        // Request only supported capabilities with permission-safe handlers.
+        let optional = fuse_optional_capabilities(config.capabilities());
+        let _ = config.add_capabilities(optional);
+        eprintln!("argosfs: FUSE optional capabilities={optional:?}");
+        if self.request_kernel_writeback {
+            let enabled = config
+                .add_capabilities(InitFlags::FUSE_WRITEBACK_CACHE)
+                .is_ok();
+            self.kernel_writeback.store(enabled, Ordering::Release);
+            if enabled {
+                eprintln!("argosfs: kernel writeback enabled");
+            } else {
+                eprintln!("argosfs: kernel writeback unsupported; using userspace writeback");
+            }
+        }
         Ok(())
     }
 
@@ -591,12 +697,30 @@ impl Filesystem for ArgosFuse {
                 }
                 if atime.is_some() || mtime.is_some() {
                     let owner_or_root = req.uid() == 0 || req.uid() == current.uid;
-                    if !owner_or_root && (is_specific_time(&atime) || is_specific_time(&mtime)) {
+                    // Linux sends an explicit mtime with the writable file
+                    // handle during writeback fsync, including for a writer
+                    // who is not the inode owner. This mode is only
+                    // negotiated with default_permissions, so the VFS has
+                    // already authorized any application-initiated setattr.
+                    let kernel_mtime = shared.kernel_writeback.load(Ordering::Acquire)
+                        && mode.is_none()
+                        && uid.is_none()
+                        && gid.is_none()
+                        && size.is_none()
+                        && atime.is_none()
+                        && is_specific_time(&mtime)
+                        && fh.is_some_and(|handle| {
+                            shared.require_writable_handle(ino, handle).is_ok()
+                        });
+                    if !owner_or_root
+                        && !kernel_mtime
+                        && (is_specific_time(&atime) || is_specific_time(&mtime))
+                    {
                         return Err(ArgosError::PermissionDenied(
                             "setting explicit timestamps requires ownership or root".to_string(),
                         ));
                     }
-                    if !owner_or_root {
+                    if !owner_or_root && !kernel_mtime {
                         shared.require_access(req, ino, libc::W_OK)?;
                     }
                 }
@@ -961,7 +1085,12 @@ impl Filesystem for ArgosFuse {
                             "FUSE file handle inode mismatch".to_string(),
                         ));
                     }
-                    if !file.can_read() {
+                    // The kernel may issue a read to fill an incomplete page
+                    // before a partial write on an O_WRONLY descriptor. The
+                    // VFS still enforces the application's access mode.
+                    if !(file.can_read()
+                        || (shared.kernel_writeback.load(Ordering::Acquire) && file.can_write()))
+                    {
                         return Err(ArgosError::PermissionDenied(
                             "FUSE file handle is not open for reading".to_string(),
                         ));
@@ -984,7 +1113,7 @@ impl Filesystem for ArgosFuse {
         offset: u64,
         data: &[u8],
         _write_flags: WriteFlags,
-        _flags: OpenFlags,
+        flags: OpenFlags,
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
@@ -992,8 +1121,21 @@ impl Filesystem for ArgosFuse {
             reply.written(0);
             return;
         }
+        let kind = if self.direct_io_at_mount
+            && cfg!(target_os = "linux")
+            && flags.0 & (libc::O_APPEND | libc::O_SYNC | libc::O_DSYNC) == 0
+        {
+            offset
+                .checked_add(data.len() as u64)
+                .map_or(RequestKind::Exclusive, |end| RequestKind::WriteRange {
+                    start: offset,
+                    end,
+                })
+        } else {
+            RequestKind::Exclusive
+        };
         let data = data.to_vec();
-        self.submit_io(ino.0, move |shared| {
+        self.submit_request(ino.0, kind, move |shared| {
             let data = data.as_slice();
             let file = shared.handles.lock().get(fh).cloned();
             let result = file
@@ -1010,7 +1152,8 @@ impl Filesystem for ArgosFuse {
                         ));
                     }
                     let sync_write = file.flags & (libc::O_SYNC | libc::O_DSYNC) != 0;
-                    let direct = shared.volume.io_policy().direct_io
+                    let direct = shared.direct_io_at_mount
+                        || shared.volume.io_policy().direct_io
                         || data.len() > FUSE_WRITEBACK_MAX_BYTES
                         || sync_write;
                     let written = if direct {
@@ -1201,6 +1344,38 @@ impl Filesystem for ArgosFuse {
             255,
             block as u32,
         );
+    }
+
+    fn flush(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        _lock_owner: LockOwner,
+        reply: ReplyEmpty,
+    ) {
+        if !self.kernel_writeback.load(Ordering::Acquire) {
+            reply.error(Errno::ENOSYS);
+            return;
+        }
+        // Kernel writeback must surface errors on close; release replies
+        // cannot report them to the closing application. Flush is repeatable
+        // for dup/fork descriptors and must not close the handle.
+        self.submit_io(ino.0, move |shared| {
+            let valid = shared
+                .handles
+                .lock()
+                .get(fh)
+                .is_some_and(|file| file.ino == ino.0);
+            if !valid {
+                reply.error(Errno::EBADF);
+                return;
+            }
+            match shared.flush_inode_writeback_reason(ino.0, WritebackFlushReason::Release) {
+                Ok(()) => reply.ok(),
+                Err(err) => reply.error(errno(&err)),
+            }
+        });
     }
 
     fn release(

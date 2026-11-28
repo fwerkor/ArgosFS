@@ -1,25 +1,209 @@
 use crate::error::{ArgosError, Result};
 use crate::types::IoMode;
 use crate::util::{ensure_private_dir, read_to_vec};
-use io_uring::{opcode, types, IoUring};
+use io_uring::{opcode, squeue, types, IoUring, Probe};
 use memmap2::MmapOptions;
+use parking_lot::Mutex;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const ALIGN: usize = 4096;
 const MAX_SHARD_IO_BYTES: usize = 256 * 1024 * 1024;
+const MAX_IDLE_RINGS: usize = 16;
+const AUTO_URING_MIN_BYTES: usize = 128 * 1024;
+
+fn uring_disabled_by_operator() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("ARGOSFS_DISABLE_IO_URING").is_some_and(|v| v == "1"))
+}
+
+fn prefer_uring(mode: IoMode, bytes: usize) -> bool {
+    !uring_disabled_by_operator()
+        && (mode == IoMode::IoUring || (mode == IoMode::Buffered && bytes >= AUTO_URING_MIN_BYTES))
+}
+
+fn probe_ring(ring: &IoUring) -> std::io::Result<()> {
+    let mut probe = Probe::new();
+    ring.submitter().register_probe(&mut probe)?;
+    if !probe.is_supported(opcode::Read::CODE) || !probe.is_supported(opcode::Write::CODE) {
+        return Err(std::io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+    }
+    Ok(())
+}
+
+// Shard reads can run on short-lived scoped threads. A shared idle pool,
+// rather than thread-local rings, also amortizes setup across those threads.
+// Each checkout has exactly one owner and returns only a fully drained ring.
+struct RingPool {
+    idle: Mutex<Vec<IoUring>>,
+    disabled: AtomicBool,
+}
+
+impl RingPool {
+    const fn new() -> Self {
+        Self {
+            idle: Mutex::new(Vec::new()),
+            disabled: AtomicBool::new(false),
+        }
+    }
+
+    fn acquire(&self) -> Result<RingLease<'_>> {
+        if uring_disabled_by_operator() || self.disabled.load(Ordering::Acquire) {
+            return Err(ArgosError::Unsupported("io_uring unavailable".into()));
+        }
+        let idle = self.idle.lock().pop();
+        let ring = match idle {
+            Some(ring) => ring,
+            None => {
+                let ring = IoUring::new(8).map_err(|err| {
+                    if matches!(
+                        err.raw_os_error(),
+                        Some(
+                            libc::ENOSYS
+                                | libc::EPERM
+                                | libc::EACCES
+                                | libc::EOPNOTSUPP
+                                | libc::EINVAL
+                        )
+                    ) {
+                        self.disable();
+                    }
+                    ArgosError::Unsupported(format!("io_uring setup: {err}"))
+                })?;
+                if let Err(err) = probe_ring(&ring) {
+                    // Old kernels can create a ring without supporting the
+                    // non-vectored READ/WRITE commands. Never submit on it.
+                    self.disable();
+                    return Err(ArgosError::Unsupported(format!(
+                        "io_uring opcode probe: {err}"
+                    )));
+                }
+                ring
+            }
+        };
+        Ok(RingLease {
+            pool: self,
+            ring: Some(ring),
+            reusable: true,
+        })
+    }
+
+    fn disable(&self) {
+        self.disabled.store(true, Ordering::Release);
+        self.idle.lock().clear();
+    }
+}
+
+static RINGS: RingPool = RingPool::new();
+
+struct RingLease<'a> {
+    pool: &'a RingPool,
+    ring: Option<IoUring>,
+    reusable: bool,
+}
+
+impl Drop for RingLease<'_> {
+    fn drop(&mut self) {
+        if !self.reusable {
+            return;
+        }
+        let mut idle = self.pool.idle.lock();
+        if !self.pool.disabled.load(Ordering::Acquire) && idle.len() < MAX_IDLE_RINGS {
+            if let Some(ring) = self.ring.take() {
+                idle.push(ring);
+            }
+        }
+    }
+}
+
+// An SQE contains a raw userspace pointer. Never release or reuse its
+// allocation before observing the completion, even if io_uring_enter fails.
+// A fatal enter error disables the acceleration path. Try synchronous
+// cancellation before dropping the ring; if the kernel cannot confirm that
+// the request has stopped, retain the affected allocation for process lifetime.
+struct PendingBuffer<'a> {
+    buffer: &'a mut Vec<u8>,
+    pending: bool,
+}
+
+impl Drop for PendingBuffer<'_> {
+    fn drop(&mut self) {
+        if self.pending {
+            std::mem::forget(std::mem::take(self.buffer));
+        }
+    }
+}
+
+impl RingLease<'_> {
+    fn complete(&mut self, entry: squeue::Entry, buffer: &mut Vec<u8>) -> Result<usize> {
+        let ring = self.ring.as_mut().expect("checked out ring");
+        let mut guard = PendingBuffer {
+            buffer,
+            pending: false,
+        };
+        // SAFETY: the caller builds the SQE from this owned allocation. The
+        // guard preserves it until CQE observation (including unwind/error).
+        unsafe {
+            ring.submission()
+                .push(&entry)
+                .map_err(|_| ArgosError::Invalid("io_uring submission queue is full".into()))?;
+        }
+        self.reusable = false;
+        guard.pending = true;
+        loop {
+            if let Some(cqe) = ring.completion().next() {
+                guard.pending = false;
+                self.reusable = true;
+                let result = cqe.result();
+                return if result < 0 {
+                    Err(ArgosError::Io(std::io::Error::from_raw_os_error(-result)))
+                } else {
+                    Ok(result as usize)
+                };
+            }
+            match ring.submit_and_wait(1) {
+                Ok(_) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(err) => {
+                    // The kernel may still own the pointer. Do not replay
+                    // this write via the buffered path or recycle this ring.
+                    self.pool.disable();
+                    let cancelled = ring.submitter().register_sync_cancel(
+                        Some(types::Timespec::new().sec(1)),
+                        types::CancelBuilder::any(),
+                    );
+                    // A non-SQPOLL ring will never submit its unconsumed SQEs
+                    // again after this branch. Successful synchronous cancel
+                    // (or no in-flight request) makes the buffer safe to free.
+                    if cancelled.is_ok()
+                        || cancelled.is_err_and(|error| error.raw_os_error() == Some(libc::ENOENT))
+                    {
+                        guard.pending = false;
+                    }
+                    return Err(ArgosError::Io(err));
+                }
+            }
+        }
+    }
+}
 
 pub fn write_all(path: &Path, data: &[u8], mode: IoMode) -> Result<()> {
     if let Some(parent) = path.parent() {
         ensure_private_dir(parent)?;
     }
+    if prefer_uring(mode, data.len()) {
+        return match write_iouring(path, data) {
+            Err(ArgosError::Unsupported(_)) => write_buffered(path, data),
+            result => result,
+        };
+    }
     match mode {
-        IoMode::Buffered => write_buffered(path, data),
         IoMode::Direct => write_direct(path, data).or_else(|_| write_buffered(path, data)),
-        IoMode::IoUring => write_iouring(path, data).or_else(|_| write_buffered(path, data)),
+        IoMode::Buffered | IoMode::IoUring => write_buffered(path, data),
     }
 }
 
@@ -29,19 +213,22 @@ pub fn read_all(
     mode: IoMode,
     zero_copy: bool,
 ) -> Result<Vec<u8>> {
+    if prefer_uring(mode, expected_size) {
+        return match read_iouring(path, expected_size) {
+            Err(ArgosError::Unsupported(_)) => read_mmap_or_buffered(path, zero_copy),
+            result => result,
+        };
+    }
     match mode {
-        IoMode::IoUring => {
-            read_iouring(path, expected_size).or_else(|_| read_mmap_or_buffered(path, zero_copy))
-        }
         IoMode::Direct => {
             read_direct(path, expected_size).or_else(|_| read_mmap_or_buffered(path, zero_copy))
         }
-        IoMode::Buffered => read_mmap_or_buffered(path, zero_copy),
+        IoMode::Buffered | IoMode::IoUring => read_mmap_or_buffered(path, zero_copy),
     }
 }
 
 pub fn io_uring_available() -> bool {
-    IoUring::new(2).is_ok()
+    RINGS.acquire().is_ok()
 }
 
 pub fn current_numa_node() -> Option<i32> {
@@ -96,6 +283,7 @@ fn read_mmap_or_buffered(path: &Path, zero_copy: bool) -> Result<Vec<u8>> {
 }
 
 fn write_iouring(path: &Path, data: &[u8]) -> Result<()> {
+    let mut ring = RINGS.acquire()?;
     let file = OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -103,38 +291,32 @@ fn write_iouring(path: &Path, data: &[u8]) -> Result<()> {
         .mode(0o600)
         .open(path)?;
     let fd = file.as_raw_fd();
-    let mut ring = IoUring::new(2).map_err(ArgosError::Io)?;
+    // Own the submitted memory so an indeterminate kernel error cannot
+    // leave the kernel referencing a caller-owned slice.
+    let mut owned = Vec::new();
+    owned
+        .try_reserve_exact(data.len())
+        .map_err(|_| ArgosError::Io(std::io::Error::from_raw_os_error(libc::ENOMEM)))?;
+    owned.extend_from_slice(data);
+    let mut data = owned;
     let mut written = 0usize;
     while written < data.len() {
         let entry = opcode::Write::new(
             types::Fd(fd),
             data[written..].as_ptr(),
-            (data.len() - written) as _,
+            (data.len() - written).min(i32::MAX as usize) as u32,
         )
         .offset(written as u64)
         .build()
         .user_data(1);
-        unsafe {
-            ring.submission().push(&entry).map_err(|_| {
-                ArgosError::Invalid("io_uring submission queue is full".to_string())
-            })?;
-        }
-        ring.submit_and_wait(1).map_err(ArgosError::Io)?;
-        let cqe = ring.completion().next().ok_or_else(|| {
-            ArgosError::Invalid("io_uring write produced no completion".to_string())
-        })?;
-        if cqe.result() < 0 {
-            return Err(ArgosError::Io(std::io::Error::from_raw_os_error(
-                -cqe.result(),
-            )));
-        }
-        if cqe.result() == 0 {
+        let count = ring.complete(entry, &mut data)?;
+        if count == 0 {
             return Err(ArgosError::Io(std::io::Error::new(
                 std::io::ErrorKind::WriteZero,
                 "short io_uring write",
             )));
         }
-        written = written.saturating_add(cqe.result() as usize);
+        written += count;
     }
     file.sync_all()?;
     Ok(())
@@ -150,43 +332,30 @@ fn read_iouring(path: &Path, expected_size: usize) -> Result<Vec<u8>> {
             "io_uring shard read requires {size} bytes, limit is {MAX_SHARD_IO_BYTES}"
         )));
     }
+    if size == 0 {
+        return Ok(Vec::new());
+    }
+    let mut ring = RINGS.acquire()?;
     let mut data = Vec::new();
     data.try_reserve_exact(size)
         .map_err(|_| ArgosError::Io(std::io::Error::from_raw_os_error(libc::ENOMEM)))?;
     data.resize(size, 0);
-    if size == 0 {
-        return Ok(data);
-    }
     let fd = file.as_raw_fd();
-    let mut ring = IoUring::new(2).map_err(ArgosError::Io)?;
     let mut read_total = 0usize;
     while read_total < size {
         let entry = opcode::Read::new(
             types::Fd(fd),
             data[read_total..].as_mut_ptr(),
-            (size - read_total) as _,
+            (size - read_total) as u32,
         )
         .offset(read_total as u64)
         .build()
         .user_data(1);
-        unsafe {
-            ring.submission().push(&entry).map_err(|_| {
-                ArgosError::Invalid("io_uring submission queue is full".to_string())
-            })?;
-        }
-        ring.submit_and_wait(1).map_err(ArgosError::Io)?;
-        let cqe = ring.completion().next().ok_or_else(|| {
-            ArgosError::Invalid("io_uring read produced no completion".to_string())
-        })?;
-        if cqe.result() < 0 {
-            return Err(ArgosError::Io(std::io::Error::from_raw_os_error(
-                -cqe.result(),
-            )));
-        }
-        if cqe.result() == 0 {
+        let count = ring.complete(entry, &mut data)?;
+        if count == 0 {
             break;
         }
-        read_total = read_total.saturating_add(cqe.result() as usize);
+        read_total += count;
     }
     data.truncate(read_total);
     Ok(data)

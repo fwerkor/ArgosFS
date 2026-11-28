@@ -1098,6 +1098,9 @@ fn open_reply_flags_follow_direct_io_and_writeback_policy() {
     let fuse = ArgosFuse::new(volume.clone());
     assert_eq!(fuse.open_reply_flags(false), FopenFlags::FOPEN_KEEP_CACHE);
     assert_eq!(fuse.open_reply_flags(true), FopenFlags::FOPEN_NOFLUSH);
+    fuse.kernel_writeback.store(true, Ordering::Release);
+    assert_eq!(fuse.open_reply_flags(true), FopenFlags::empty());
+    fuse.kernel_writeback.store(false, Ordering::Release);
 
     volume
         .set_io_policy(crate::types::IoMode::Direct, true, true, true)
@@ -1316,4 +1319,31 @@ fn blocked_inode_flush_does_not_hold_mount_writeback_map() {
     });
     assert_eq!(volume.read_file("/a", false).unwrap(), b"pending-a");
     assert!(fuse.writeback.lock().dirty.is_empty());
+}
+
+#[test]
+fn optional_fuse_capabilities_preserve_read_only_directory_listing() {
+    use InitFlags as F;
+    assert_eq!(
+        fuse_optional_capabilities(F::FUSE_PARALLEL_DIROPS),
+        F::FUSE_PARALLEL_DIROPS
+    );
+    assert_eq!(
+        fuse_optional_capabilities(F::FUSE_DO_READDIRPLUS | F::FUSE_READDIRPLUS_AUTO),
+        F::empty()
+    );
+    let supported = F::FUSE_DO_READDIRPLUS | F::FUSE_READDIRPLUS_AUTO | F::FUSE_PARALLEL_DIROPS;
+    assert_eq!(
+        fuse_optional_capabilities(supported | F::FUSE_WRITEBACK_CACHE),
+        F::FUSE_PARALLEL_DIROPS
+    );
+}
+
+#[test]
+fn fuse_io_setting_rejects_invalid_and_unbounded_values() {
+    for value in [None, Some(""), Some("abc"), Some("0"), Some("257")] {
+        assert_eq!(fuse_io_setting(value, 8, 256, 64), 64);
+    }
+    assert_eq!(fuse_io_setting(Some("8"), 8, 256, 64), 8);
+    assert_eq!(fuse_io_setting(Some("256"), 8, 256, 64), 256);
 }

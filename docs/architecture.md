@@ -235,3 +235,50 @@ reclaimed only by the durable metadata transaction. It balances by capacity
 within a storage tier and does not reduce failure-domain diversity. A pass may
 stop short of the average if no safe placement is available; scrub separately
 to repair actual damage. The operation is deliberately not a mount side effect.
+
+
+### Linux FUSE request negotiation
+
+The mount requests parallel directory operations when advertised by the kernel.
+READDIRPLUS is deliberately not negotiated: ordinary directory enumeration
+requires read permission alone, and the current fuser reply API cannot
+represent a names-only plus entry with a separate zero lookup node ID.
+The request limits retain the default 1 MiB write and readahead
+targets, 64 background requests and a 75% congestion threshold. Operators may
+override the targets with `ARGOSFS_FUSE_MAX_WRITE` and
+`ARGOSFS_FUSE_MAX_READAHEAD` (4096–1048576 bytes), or
+`ARGOSFS_FUSE_MAX_BACKGROUND` (8–256). The negotiated limits remain bounded
+by the kernel/library; invalid values use the defaults. These are mount-time
+settings and do not affect the persistent format.
+
+Buffered host shard I/O automatically tries io_uring for requests of at least
+128 KiB; explicit `io-uring` also tries smaller requests. Both reuse a bounded
+pool of drained rings across worker threads. Ring setup and READ/WRITE opcode
+probing must succeed before submission. Set `ARGOSFS_DISABLE_IO_URING=1` at
+process startup to use the ordinary buffered path instead. Completed I/O
+errors are propagated rather than silently replaying an uncertain write.
+Each successful host-file shard write still crosses its existing sync barrier.
+This is not FUSE-over-io_uring: that requires a separate transport in the
+FUSE library. Raw block backends do not yet use this host-path ring pool.
+
+Linux kernel writeback caching is automatically negotiated for writable
+buffered mounts that already select `default_permissions`. It requires an
+exclusive authoritative mount and kernel support; unsupported kernels retain
+userspace writeback. Mounts using daemon-only permission checks keep their
+existing ACL semantics and userspace writeback; ArgosFS does not silently add
+`default_permissions`. Use `-o no_kernel_writeback` to opt out or
+`-o kernel_writeback` to explicitly request it on an eligible mount. The kernel may
+perform partial-page reads on writable-only handles, so the VFS permission
+check is mandatory. Kernel writeback retains the existing bounded ArgosFS
+write staging and fsync durability barrier; repeated FLUSH requests report
+errors without releasing handles.
+Run `python3 tests/fuse_kernel_writeback.py --binary target/release/argosfs`
+on a Linux FUSE-capable host for mounted cache and permission regressions.
+
+For direct FUSE I/O, disjoint write ranges may run concurrently in the
+mount request executor. Overlapping writes, reads, and metadata operations
+retain ordered inode barriers; append and synchronous writes use the
+exclusive path. Linux direct handles advertise parallel direct writes.
+Use the existing persisted direct-I/O policy or the mount-only
+`-o direct_io` option (also available for raw/loop mounts). Direct I/O
+and kernel writeback are mutually exclusive mount modes.
