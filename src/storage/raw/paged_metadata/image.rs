@@ -93,6 +93,11 @@ impl NumericImageStore {
         events: &[PagedAuditEvent],
         selected: Option<&BTreeSet<String>>,
     ) -> Result<Self> {
+        if metadata.raw_pool.snapshot_state.is_some() {
+            return Err(ArgosError::IncompatibleFormat(
+                "numeric metadata cannot represent native snapshots".into(),
+            ));
+        }
         let pool = Uuid::parse_str(&metadata.uuid)
             .map_err(|err| ArgosError::Invalid(format!("invalid metadata pool UUID: {err}")))?;
         // Validate and serialize all records before initializing any region.
@@ -139,6 +144,11 @@ impl NumericImageStore {
         allowed: Option<&BTreeSet<String>>,
         event: Option<(&str, serde_json::Value)>,
     ) -> Result<CommitReport> {
+        if next.raw_pool.snapshot_state.is_some() {
+            return Err(ArgosError::IncompatibleFormat(
+                "numeric metadata cannot represent native snapshots".into(),
+            ));
+        }
         if Uuid::parse_str(&next.uuid).ok() != Some(self.pool) || next.txid <= self.base.txid {
             return Err(ArgosError::Invalid(
                 "metadata image must advance its pool transaction".into(),
@@ -266,6 +276,23 @@ impl ImageStore {
             )
         }
     }
+    pub(crate) fn transfer_v3(
+        backend: Arc<dyn StorageBackend>,
+        old_arenas: Vec<Arena>,
+        new_arenas: Vec<Arena>,
+        base: &Metadata,
+        next: &mut Metadata,
+        events: &[PagedAuditEvent],
+        selected: &BTreeSet<String>,
+    ) -> Result<Self> {
+        V3ImageStore::transfer_with_events(
+            backend, old_arenas, new_arenas, base, next, events, selected,
+        )
+        .map(|store| Self {
+            inner: ImageStoreKind::V3(store),
+        })
+    }
+
     pub(crate) fn format_v3(
         backend: Arc<dyn StorageBackend>,
         arenas: Vec<Arena>,
@@ -328,6 +355,28 @@ impl ImageStore {
         match &mut self.inner {
             ImageStoreKind::Numeric(store) => store.commit_allowed(next, allowed, event),
             ImageStoreKind::V3(store) => store.commit_allowed(next, allowed, event),
+        }
+    }
+    pub(crate) fn snapshot_image(&self, name: &str) -> Result<Metadata> {
+        match &self.inner {
+            ImageStoreKind::V3(store) => store.snapshot_image(name),
+            _ => Err(ArgosError::Unsupported(
+                "filesystem snapshots require experimental V3".into(),
+            )),
+        }
+    }
+    pub(crate) fn commit_snapshot(
+        &mut self,
+        next: &mut Metadata,
+        allowed: &BTreeSet<String>,
+        name: &str,
+        create: bool,
+    ) -> Result<CommitReport> {
+        match &mut self.inner {
+            ImageStoreKind::V3(store) => store.commit_snapshot(next, allowed, name, create),
+            _ => Err(ArgosError::Unsupported(
+                "filesystem snapshots require experimental V3".into(),
+            )),
         }
     }
     pub(crate) fn commit_event(

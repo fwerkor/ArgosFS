@@ -32,6 +32,7 @@ pub enum Domain {
     Snapshot = 14,
     QuotaMembership = 15,
     Statistics = 16,
+    SnapshotPin = super::SNAPSHOT_PIN_DOMAIN,
 }
 
 impl Domain {
@@ -189,6 +190,7 @@ pub fn import_image_with_events(
     header.inodes = Default::default();
     header.disks.clear();
     header.raw_pool.allocators.clear();
+    header.raw_pool.snapshot_state = None;
     header.integrity.meta_hash.clear();
     header.checkpoint_member_catalog = None;
     put(&mut changes, Domain::Header.prefix(), &header)?;
@@ -205,6 +207,22 @@ pub fn import_image_with_events(
                 Domain::DataFree.disk(id, Some(extent.offset))?,
                 extent,
             )?;
+        }
+    }
+    if let Some(state) = &meta.raw_pool.snapshot_state {
+        for (id, pins) in &state.pins {
+            for (&offset, pin) in pins {
+                if pin.extent.disk_id != *id || pin.extent.offset != offset || pin.references == 0 {
+                    return Err(ArgosError::CorruptedMetadata(
+                        "invalid snapshot pin identity".into(),
+                    ));
+                }
+                put(
+                    &mut changes,
+                    Domain::SnapshotPin.disk(id, Some(offset))?,
+                    pin,
+                )?;
+            }
         }
     }
     for (&ino, inode) in meta.inodes.iter() {

@@ -42,6 +42,11 @@ impl MigrationSource {
     /// The caller must supply a fully verified, offline source image and
     /// audit events. No attempt is made to recover a live source here.
     pub fn from_image(meta: &Metadata, events: &[PagedAuditEvent]) -> Result<Self> {
+        if meta.raw_pool.snapshot_state.is_some() {
+            return Err(ArgosError::Unsupported(
+                "source snapshot DAG requires native graph transfer, not image migration".into(),
+            ));
+        }
         let pool = uuid::Uuid::parse_str(&meta.uuid)
             .map_err(|_| ArgosError::Invalid("invalid source pool UUID".into()))?;
         let records = import_image_with_events(meta, events)?;

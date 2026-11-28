@@ -129,6 +129,7 @@ mod shard_read_batch;
 mod shard_repair;
 #[cfg(test)]
 mod shard_repair_tests;
+mod snapshots;
 use shard_repair::RepairCounters;
 #[cfg(test)]
 mod paged_metadata_tests;
@@ -658,6 +659,11 @@ impl ArgosFs {
 
     pub fn snapshot(&self, name: &str) -> Result<PathBuf> {
         let mut meta = self.meta.write();
+        if meta.integrity.hash_scheme
+            == Some(crate::storage::raw::paged_metadata::V3_INTEGRITY_SCHEME)
+        {
+            return Err(ArgosError::Unsupported("legacy JSON export is not a V3 filesystem snapshot; use create_filesystem_snapshot".into()));
+        }
         let trimmed = name.trim();
         if trimmed.is_empty() {
             return Err(ArgosError::Invalid(

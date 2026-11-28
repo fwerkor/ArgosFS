@@ -540,6 +540,16 @@ impl ArgosFs {
         {
             let mut meta = self.meta.write();
             self.ensure_block_backend_writable_locked(&meta)?;
+            if meta
+                .raw_pool
+                .snapshot_state
+                .as_ref()
+                .is_some_and(|state| state.pins.contains_key(disk_id))
+            {
+                return Err(ArgosError::Unsupported(
+                    "historical data relocation is required before member evacuation".into(),
+                ));
+            }
             if !meta.disks.contains_key(disk_id) {
                 return Err(ArgosError::NotFound(disk_id.to_string()));
             }
@@ -613,6 +623,18 @@ impl ArgosFs {
     }
 
     pub fn remove_disk(&self, disk_id: &str) -> Result<u64> {
+        if self
+            .meta
+            .read()
+            .raw_pool
+            .snapshot_state
+            .as_ref()
+            .is_some_and(|state| state.pins.contains_key(disk_id))
+        {
+            return Err(ArgosError::Unsupported(
+                "historical data relocation is required before member evacuation".into(),
+            ));
+        }
         let rewritten = self.drain_disk(disk_id)?;
         if self.paged_metadata.is_some() {
             self.sync()?;
@@ -1119,6 +1141,7 @@ impl ArgosFs {
         mut progress: Option<&mut FsckProgress<'_>>,
     ) -> Result<FsckReport> {
         let mut report = FsckReport::default();
+        self.audit_snapshot_data(&mut report)?;
         // The filesystem encryption configuration is stable during a scrub.
         // Argon2id derivation is intentionally amortized over encrypted files,
         // while every stripe still validates its own authenticated contents.
@@ -1456,16 +1479,7 @@ impl ArgosFs {
                     Err(err) => report.errors.push(err.to_string()),
                 }
             }
-            let mut referenced_usage = BTreeMap::<String, u64>::new();
-            for shard in meta
-                .inodes
-                .values()
-                .flat_map(|inode| inode.blocks.iter())
-                .flat_map(|block| block.shards.iter())
-            {
-                let current = referenced_usage.entry(shard.disk_id.clone()).or_default();
-                *current = current.saturating_add(shard_accounted_size(shard));
-            }
+            let referenced_usage = referenced_disk_usage(&meta);
             for (disk_id, disk) in meta.disks.iter_mut() {
                 let used_bytes = referenced_usage.get(disk_id).copied().unwrap_or(0);
                 if disk.used_bytes != used_bytes {
@@ -1533,6 +1547,14 @@ impl ArgosFs {
         let targets = {
             let meta = self.meta.read();
             self.ensure_block_backend_writable_locked(&meta)?;
+            if meta
+                .raw_pool
+                .snapshot_state
+                .as_ref()
+                .is_some_and(|state| state.pins.contains_key(disk_id))
+            {
+                return Err(ArgosError::Unsupported("historical object relocation is required before claiming member repair complete".into()));
+            }
             let member = meta
                 .disks
                 .get(disk_id)
@@ -1705,6 +1727,33 @@ fn raw_orphan_plans(meta: &Metadata, pending: &[FileBlock]) -> Result<Vec<RawOrp
                     shard.disk_id, shard.slot
                 )))
             }
+        }
+    }
+    if let Some(state) = &meta.raw_pool.snapshot_state {
+        for (id, pins) in &state.pins {
+            if !meta.raw_pool.allocators.contains_key(id) {
+                return Err(ArgosError::CorruptedMetadata(
+                    "missing snapshot pin allocator".into(),
+                ));
+            }
+            let allocated = extents.entry(id.clone()).or_default();
+            let live = allocated
+                .iter()
+                .map(|extent| (extent.offset, extent))
+                .collect::<BTreeMap<_, _>>();
+            let mut historical = Vec::new();
+            for (&offset, pin) in pins {
+                match live.get(&offset) {
+                    Some(extent) if **extent != pin.extent => {
+                        return Err(ArgosError::CorruptedMetadata(
+                            "snapshot pin aliases live allocation".into(),
+                        ))
+                    }
+                    Some(_) => {}
+                    None => historical.push(pin.extent.clone()),
+                }
+            }
+            allocated.extend(historical);
         }
     }
     let mut plans = Vec::new();

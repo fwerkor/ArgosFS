@@ -2184,6 +2184,19 @@ impl ArgosFs {
     pub(super) fn delete_shard_locked(&self, meta: &mut Metadata, shard: &Shard) -> Result<()> {
         match shard.location.as_ref() {
             Some(ShardLocation::RawExtent(extent)) => {
+                if let Some(pin) = meta
+                    .raw_pool
+                    .snapshot_state
+                    .as_ref()
+                    .and_then(|state| state.pin(extent))
+                {
+                    if pin.extent != *extent || pin.references == 0 {
+                        return Err(ArgosError::CorruptedMetadata(
+                            "snapshot pin generation mismatch during reclaim".into(),
+                        ));
+                    }
+                    return Ok(());
+                }
                 if let Some(verify) = &self.verify_written {
                     verify.invalidate(&extent.disk_id, extent.offset);
                 }
@@ -2306,6 +2319,12 @@ impl ArgosFs {
         add: bool,
     ) {
         for shard in blocks.into_iter().flat_map(|block| block.shards.iter()) {
+            if !add
+                && matches!(&shard.location,Some(ShardLocation::RawExtent(extent)) if meta.raw_pool.snapshot_state.as_ref().and_then(|state|state.pin(extent)).is_some())
+            {
+                // The allocation remains owned by a historical generation.
+                continue;
+            }
             if let Some(disk) = meta.disks.get_mut(&shard.disk_id) {
                 let accounted = shard_accounted_size(shard);
                 if add {

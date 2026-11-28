@@ -142,6 +142,7 @@ pub(super) struct Ptr {
 pub(super) enum Value {
     Inline(Vec<u8>),
     Blob { len: usize, first: Ptr },
+    Snapshot { txid: u64, root: Ptr },
 }
 
 #[derive(Clone, Debug)]
@@ -207,6 +208,7 @@ impl Value {
         4 + match self {
             Self::Inline(bytes) => bytes.len(),
             Self::Blob { .. } => 40,
+            Self::Snapshot { .. } => 48,
         }
     }
 }
@@ -233,6 +235,7 @@ impl<K: TreeKey> Node<K> {
                 .filter_map(|(_, value)| match value {
                     Value::Blob { first, .. } => Some(*first),
                     Value::Inline(_) => None,
+                    Value::Snapshot { root, .. } => Some(*root),
                 })
                 .collect(),
             Self::Branch { children, .. } => children.iter().map(|(_, ptr)| *ptr).collect(),
@@ -344,7 +347,17 @@ impl<K: TreeKey> Node<K> {
                 }
                 for (key, value) in entries {
                     key.encode_key(&mut payload);
+                    if (key.domain_id() == Some(super::SNAPSHOT_DOMAIN))
+                        != matches!(value, Value::Snapshot { .. })
+                    {
+                        return Err(corrupt("snapshot value outside reserved snapshot domain"));
+                    }
                     match value {
+                        Value::Snapshot { txid, root } => {
+                            payload.extend_from_slice(&u32::MAX.to_le_bytes());
+                            payload.extend_from_slice(&txid.to_le_bytes());
+                            write_ptr(&mut payload, Some(*root), logical);
+                        }
                         Value::Inline(bytes) => {
                             if bytes.len() > INLINE_MAX {
                                 return Err(corrupt("oversized inline metadata value"));
@@ -434,7 +447,12 @@ impl<K: TreeKey> Node<K> {
                 for _ in 0..count {
                     let key = K::decode_key(&mut input.0)?;
                     let size = input.u32()?;
-                    let value = if size & (1 << 31) != 0 {
+                    let value = if size == u32::MAX && K::PERSISTENT_ALLOCATOR {
+                        Value::Snapshot {
+                            txid: input.u64()?,
+                            root: input.required_ptr()?,
+                        }
+                    } else if size & (1 << 31) != 0 {
                         let len = (size & !(1 << 31)) as usize;
                         Value::Blob {
                             len,
@@ -503,7 +521,9 @@ impl Default for V3Features {
 }
 
 impl V3Features {
-    const REQUIRED: u64 = (1 << 0) | (1 << 1) | (1 << 2);
+    // Bit 3 is reserved for the final logical object/ownership format.
+    // Bit 63 marks this incompatible, unshipped extent-pin prototype.
+    const REQUIRED: u64 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 63);
 
     pub fn validate(self, writable: bool) -> Result<()> {
         if self.incompat != Self::REQUIRED {

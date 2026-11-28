@@ -466,3 +466,278 @@ fn v3_experimental_metadata_growth_reuses_alternate_region_on_topology_changes()
     assert_eq!(fs.read_file("/before", false).unwrap(), data);
     assert_eq!(fs.read_file("/after", false).unwrap(), data);
 }
+
+#[test]
+fn v3_native_snapshot_preserves_data_across_overwrite_unlink_and_reopen() {
+    for deferred in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = images(&dir);
+        let fs = ArgosFs::create_loop_v3_experimental(
+            &paths,
+            config(deferred),
+            128 * 1024 * 1024,
+            "v3-snapshots",
+        )
+        .unwrap();
+        let parent = fs.mkdir("/dir", 0o755).unwrap();
+        let first = (0..64 * 1024).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+        let second = (0..64 * 1024)
+            .map(|i| ((i + 31) % 251) as u8)
+            .collect::<Vec<_>>();
+        fs.write_file("/dir/file", &first, 0o600).unwrap();
+        fs.write_file("/inline", b"first inline", 0o600).unwrap();
+        let ino = fs.resolve_path("/dir/file", true).unwrap();
+        fs.link_at(ino, parent, std::ffi::OsStr::new("alias"))
+            .unwrap();
+        fs.create_filesystem_snapshot("first").unwrap();
+        assert!(fs.create_filesystem_snapshot("first").is_err());
+        let first_pins = fs.metadata_snapshot().raw_pool.snapshot_state.unwrap().pins;
+        assert!(!first_pins.is_empty());
+        assert!(first_pins
+            .values()
+            .flat_map(|pins| pins.values())
+            .all(|pin| pin.references == 1));
+        fs.create_filesystem_snapshot("same-data").unwrap();
+        let meta = fs.metadata_snapshot();
+        assert!(meta
+            .raw_pool
+            .snapshot_state
+            .as_ref()
+            .unwrap()
+            .pins
+            .values()
+            .flat_map(|pins| pins.values())
+            .all(|pin| pin.references == 2));
+        fs.write_file("/dir/file", &second, 0o600).unwrap();
+        fs.write_file("/inline", b"second inline", 0o600).unwrap();
+        fs.rename_path("/dir/file", "/dir/renamed").unwrap();
+        fs.create_filesystem_snapshot("second").unwrap();
+        fs.truncate_path("/dir/renamed", 8192).unwrap();
+        fs.unlink_path("/dir/alias").unwrap();
+        fs.unlink_path("/dir/renamed").unwrap();
+        fs.unlink_path("/inline").unwrap();
+        fs.sync().unwrap();
+        for i in 0..8 {
+            fs.write_file(&format!("/reused-{i}"), &vec![i; 64 * 1024], 0o600)
+                .unwrap();
+        }
+        fs.sync().unwrap();
+        assert_eq!(
+            fs.read_snapshot_range("first", "/dir/file", 4096, 16384)
+                .unwrap(),
+            first[4096..20480]
+        );
+        assert_eq!(
+            fs.read_snapshot_range("same-data", "/dir/alias", 0, usize::MAX)
+                .unwrap(),
+            first
+        );
+        assert_eq!(
+            fs.read_snapshot_range("second", "/dir/renamed", 0, usize::MAX)
+                .unwrap(),
+            second
+        );
+        assert_eq!(
+            fs.read_snapshot_range("first", "/inline", 0, 64).unwrap(),
+            b"first inline"
+        );
+        assert_eq!(
+            fs.read_snapshot_range("second", "/inline", 0, 64).unwrap(),
+            b"second inline"
+        );
+        assert!(fs.remove_disk(first_pins.keys().next().unwrap()).is_err());
+        let usage = fs
+            .metadata_snapshot()
+            .disks
+            .values()
+            .map(|disk| disk.used_bytes)
+            .sum::<u64>();
+        let audit = fs.fsck(false, true).unwrap();
+        assert_eq!(audit.orphan_shards, 0);
+        assert_eq!(audit.orphan_extent_bytes, 0);
+        assert!(audit.snapshot_shards_checked > 0);
+        assert_eq!(audit.snapshot_shards_damaged, 0);
+        assert_eq!(
+            usage,
+            fs.metadata_snapshot()
+                .disks
+                .values()
+                .map(|disk| disk.used_bytes)
+                .sum::<u64>()
+        );
+        fs.mark_clean_unmount().unwrap();
+        drop(fs);
+        let fs = ArgosFs::open_loop(&paths, true).unwrap();
+        assert_eq!(
+            fs.list_filesystem_snapshots().unwrap(),
+            vec!["first", "same-data", "second"]
+        );
+        assert_eq!(
+            fs.read_snapshot_range("first", "/dir/file", 0, usize::MAX)
+                .unwrap(),
+            first
+        );
+        let before = fs.metadata_snapshot();
+        fs.delete_filesystem_snapshot("first").unwrap();
+        let after = fs.metadata_snapshot();
+        assert_eq!(
+            before.raw_pool.allocators.keys().collect::<Vec<_>>(),
+            after.raw_pool.allocators.keys().collect::<Vec<_>>()
+        );
+        for (id, pins) in &first_pins {
+            for (offset, pin) in pins {
+                assert_eq!(
+                    after.raw_pool.snapshot_state.as_ref().unwrap().pins[id][offset].extent,
+                    pin.extent
+                );
+                assert_eq!(
+                    after.raw_pool.snapshot_state.as_ref().unwrap().pins[id][offset].references,
+                    1
+                );
+            }
+        }
+        assert!(fs.read_snapshot_range("first", "/dir/file", 0, 32).is_err());
+        assert_eq!(
+            fs.read_snapshot_range("same-data", "/dir/file", 0, usize::MAX)
+                .unwrap(),
+            first
+        );
+        fs.delete_filesystem_snapshot("same-data").unwrap();
+        fs.delete_filesystem_snapshot("second").unwrap();
+        assert!(fs.list_filesystem_snapshots().unwrap().is_empty());
+        let released = fs.metadata_snapshot();
+        assert!(released.raw_pool.snapshot_state.is_none());
+        for (id, pins) in &first_pins {
+            let alloc = &released.raw_pool.allocators[id];
+            for pin in pins.values() {
+                let end = pin.extent.offset + pin.extent.length;
+                assert!(
+                    pin.extent.offset >= alloc.next_offset
+                        || alloc
+                            .free_extents
+                            .iter()
+                            .any(|free| free.offset <= pin.extent.offset
+                                && free.offset + free.length >= end)
+                );
+            }
+        }
+        assert!(fs.delete_filesystem_snapshot("second").is_err());
+        fs.mark_clean_unmount().unwrap();
+        drop(fs);
+        let fs = ArgosFs::open_loop(&paths, false).unwrap();
+        assert!(fs.list_filesystem_snapshots().unwrap().is_empty());
+        assert_eq!(
+            fs.read_file("/reused-7", false).unwrap(),
+            vec![7; 64 * 1024]
+        );
+    }
+}
+
+#[test]
+fn v3_snapshot_only_corruption_is_detected_and_never_reclaimed_as_orphan() {
+    use std::os::unix::fs::FileExt;
+    let dir = tempfile::tempdir().unwrap();
+    let paths = images(&dir);
+    let fs = ArgosFs::create_loop_v3_experimental(
+        &paths,
+        config(false),
+        128 * 1024 * 1024,
+        "snapshot-only-damage",
+    )
+    .unwrap();
+    let data = vec![31; 64 * 1024];
+    fs.write_file("/file", &data, 0o600).unwrap();
+    fs.create_filesystem_snapshot("old").unwrap();
+    let meta = fs.metadata_snapshot();
+    let ino = fs.resolve_path("/file", true).unwrap();
+    let shard = meta.inodes[&ino].blocks[0].shards[0].clone();
+    let Some(ShardLocation::RawExtent(extent)) = shard.location else {
+        panic!("expected raw extent");
+    };
+    fs.unlink_path("/file").unwrap();
+    fs.sync().unwrap();
+    fs.mark_clean_unmount().unwrap();
+    drop(fs);
+    let path = &meta.disks[&extent.disk_id].path;
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    file.write_all_at(&[0xff], extent.offset).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    let fs = ArgosFs::open_loop(&paths, true).unwrap();
+    let report = fs.fsck(false, true).unwrap();
+    assert!(report.snapshot_shards_checked > 0);
+    assert_eq!(report.snapshot_shards_damaged, 1);
+    assert!(!report.errors.is_empty());
+    assert_eq!(report.reclaimed_extent_bytes, 0);
+    assert_eq!(
+        fs.read_snapshot_range("old", "/file", 0, usize::MAX)
+            .unwrap(),
+        data
+    );
+}
+
+#[test]
+fn v3_snapshot_dag_survives_member_add_arena_growth_and_unpinned_removal() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut paths = images(&dir);
+    let fs = ArgosFs::create_loop_v3_experimental(
+        &paths,
+        config(false),
+        512 * 1024 * 1024,
+        "snapshot-transfer",
+    )
+    .unwrap();
+    let historical = vec![71; 64 * 1024];
+    let current = vec![91; 64 * 1024];
+    fs.write_file("/file", &historical, 0o600).unwrap();
+    fs.create_filesystem_snapshot("before").unwrap();
+    fs.write_file("/file", &current, 0o600).unwrap();
+    fs.create_filesystem_snapshot("after").unwrap();
+    let added = dir.path().join("added.img");
+    let id = fs
+        .add_block_device(added.clone(), 512 * 1024 * 1024, false)
+        .unwrap();
+    paths.push(added);
+    assert_eq!(
+        fs.read_snapshot_range("before", "/file", 0, usize::MAX)
+            .unwrap(),
+        historical
+    );
+    fs.mark_clean_unmount().unwrap();
+    drop(fs);
+    let fs = ArgosFs::open_loop(&paths, true).unwrap();
+    let size = fs.raw_superblocks[0].metadata.length * 2;
+    fs.grow_v3_metadata_arena(size).unwrap();
+    assert_eq!(
+        fs.read_snapshot_range("after", "/file", 0, usize::MAX)
+            .unwrap(),
+        current
+    );
+    assert!(fs.remove_disk("disk-0000").is_err());
+    fs.remove_disk(&id).unwrap();
+    fs.mark_clean_unmount().unwrap();
+    drop(fs);
+    paths.pop();
+    let fs = ArgosFs::open_loop(&paths, true).unwrap();
+    assert_eq!(
+        fs.list_filesystem_snapshots().unwrap(),
+        vec!["after", "before"]
+    );
+    assert_eq!(
+        fs.read_snapshot_range("before", "/file", 0, usize::MAX)
+            .unwrap(),
+        historical
+    );
+    assert_eq!(
+        fs.read_snapshot_range("after", "/file", 0, usize::MAX)
+            .unwrap(),
+        current
+    );
+    assert_eq!(fs.read_file("/file", false).unwrap(), current);
+    let report = fs.fsck(false, false).unwrap();
+    assert!(report.errors.is_empty(), "{report:?}");
+    assert_eq!(report.snapshot_shards_damaged, 0);
+    fs.delete_filesystem_snapshot("before").unwrap();
+    fs.delete_filesystem_snapshot("after").unwrap();
+    fs.mark_clean_unmount().unwrap();
+}

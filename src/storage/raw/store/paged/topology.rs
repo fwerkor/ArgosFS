@@ -519,6 +519,11 @@ pub(crate) fn reconfigure_with_growth(
     events: &[crate::types::PagedAuditEvent],
     requested_arena: Option<u64>,
 ) -> Result<ImageStore> {
+    if base.raw_pool.snapshot_state != next.raw_pool.snapshot_state {
+        return Err(ArgosError::Conflict(
+            "topology cannot change snapshot ownership".into(),
+        ));
+    }
     let v3 = uses_v3(superblocks)?;
     if v3 != (base.integrity.hash_scheme == Some(V3_INTEGRITY_SCHEME)) {
         return Err(ArgosError::IncompatibleFormat(
@@ -546,6 +551,13 @@ pub(crate) fn reconfigure_with_growth(
         .filter(|disk| disk.status != DiskStatus::Removed)
         .map(|disk| disk.id.clone())
         .collect::<BTreeSet<_>>();
+    if let Some(state) = &next.raw_pool.snapshot_state {
+        if state.pins.keys().any(|id| !wanted.contains(id)) {
+            return Err(ArgosError::Unsupported(
+                "historical data placement relocation is required before member removal".into(),
+            ));
+        }
+    }
     let previous_pair = old
         .members
         .iter()
@@ -767,6 +779,23 @@ pub(crate) fn reconfigure_with_growth(
         .iter()
         .filter(|m| selected.contains(&m.arena.disk_id))
     {
+        if old.members.iter().any(|prior| {
+            let a = &member.arena;
+            let b = &prior.arena;
+            a.disk_id == b.disk_id
+                && a.offset < b.offset.saturating_add(b.length)
+                && b.offset < a.offset.saturating_add(a.length)
+        }) {
+            return Err(ArgosError::Conflict(
+                "staged metadata arena overlaps current authority".into(),
+            ));
+        }
+    }
+    for member in new
+        .members
+        .iter()
+        .filter(|m| selected.contains(&m.arena.disk_id))
+    {
         backend.write_at(
             &member.arena.disk_id,
             member.arena.offset,
@@ -784,13 +813,25 @@ pub(crate) fn reconfigure_with_growth(
         details:serde_json::json!({"epoch":new.epoch,"old_members":member_ids(&old),"new_members":member_ids(&new)}),
         advisory:false,
     });
-    let mut store = ImageStore::format_with_events(
-        backend.clone(),
-        new.arenas(),
-        next,
-        &events,
-        Some(&selected),
-    )?;
+    let mut store = if v3 && base.raw_pool.snapshot_state.is_some() {
+        ImageStore::transfer_v3(
+            backend.clone(),
+            old.arenas(),
+            new.arenas(),
+            base,
+            next,
+            &events,
+            &selected,
+        )?
+    } else {
+        ImageStore::format_with_events(
+            backend.clone(),
+            new.arenas(),
+            next,
+            &events,
+            Some(&selected),
+        )?
+    };
     store.confirm_all(selected.len())?;
     let transition = Transition {
         old,

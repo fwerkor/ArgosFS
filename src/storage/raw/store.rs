@@ -1,6 +1,9 @@
 use super::wire::{self, put_u32, put_u64};
 mod paged;
-pub(crate) use paged::{commit as commit_paged_metadata, commit_event as commit_paged_event};
+pub(crate) use paged::{
+    commit as commit_paged_metadata, commit_event as commit_paged_event,
+    commit_snapshot as commit_paged_snapshot,
+};
 mod checkpoint;
 use checkpoint::*;
 mod journal_io;

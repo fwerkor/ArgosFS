@@ -5,6 +5,14 @@ The experimental V3 format is not frozen. The existing JSON
 `argosfs snapshot ROOT NAME` is a metadata export, not a restorable file
 snapshot. It must not be advertised or silently imported as one.
 
+> Implementation note: the experimental branch now has native typed
+> metadata snapshot edges and an extent-pin compatibility prototype.
+> See [metadata-v3-development.md](metadata-v3-development.md) for verified
+> capabilities and limitations. It deliberately uses temporary required
+> bit 63 and private domain 0xff00, not the final bit/domain reservations.
+> The logical object/placement and retirement design below remains the
+> release contract; prototype behavior must not be mistaken for completion.
+
 ## 1. Scope and contract
 
 The first production implementation supports atomic, pool-wide read-only
@@ -371,5 +379,6 @@ configurations and real raw/loop volume integration):
   changes; standalone engine measurements are not end-to-end qualification.
 
 The final format is gated on correctness of the ownership model and these
-tests, not just availability of a snapshot command. All above mechanisms are
-design requirements; the present experimental engine does not implement them.
+tests, not just availability of a snapshot command. All above mechanisms are design requirements. The prototype implements
+typed snapshot edges and physical pinning only; final-format object
+ownership, retirement and maintenance remain release gates.

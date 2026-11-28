@@ -445,6 +445,7 @@ impl ArgosFs {
                 dirty_since_txid: 0,
                 mount_generation: 1,
                 allocators,
+                snapshot_state: None,
             },
             created_at,
             updated_at: created_at,

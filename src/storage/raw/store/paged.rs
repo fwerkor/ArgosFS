@@ -423,6 +423,22 @@ pub(crate) fn commit(
     Ok(write_report(report, allowed, metrics))
 }
 
+pub(crate) fn commit_snapshot(
+    store: &mut ImageStore,
+    meta: &mut Metadata,
+    superblocks: &[RawSuperblock],
+    metrics: &CommitMetrics,
+    name: &str,
+    create: bool,
+) -> Result<QuorumWriteReport> {
+    let allowed = superblocks
+        .iter()
+        .map(|sb| sb.disk_id.clone())
+        .collect::<BTreeSet<_>>();
+    let report = store.commit_snapshot(meta, &allowed, name, create)?;
+    Ok(write_report(report, allowed, metrics))
+}
+
 pub(crate) fn commit_event(
     store: &mut ImageStore,
     superblocks: &[RawSuperblock],

@@ -265,6 +265,44 @@ pub(super) fn event_changes(
     Ok(changes)
 }
 
+fn pin_changes(base: &Metadata, next: &Metadata, changes: &mut TypedChanges) -> Result<()> {
+    use imbl::ordmap::DiffItem;
+    let empty = imbl::OrdMap::new();
+    let old = base
+        .raw_pool
+        .snapshot_state
+        .as_ref()
+        .map_or(&empty, |state| &state.pins);
+    let new = next
+        .raw_pool
+        .snapshot_state
+        .as_ref()
+        .map_or(&empty, |state| &state.pins);
+    let empty_disk = imbl::OrdMap::new();
+    for diff in old.diff(new) {
+        let (id, before, after) = match diff {
+            DiffItem::Add(id, pins) => (id, &empty_disk, pins),
+            DiffItem::Remove(id, pins) => (id, pins, &empty_disk),
+            DiffItem::Update {
+                old: (id, before),
+                new: (_, after),
+            } => (id, before, after),
+        };
+        for diff in before.diff(after) {
+            match diff {
+                DiffItem::Add(offset, pin)
+                | DiffItem::Update {
+                    new: (offset, pin), ..
+                } => set(changes, Domain::SnapshotPin.disk(id, Some(*offset))?, pin)?,
+                DiffItem::Remove(offset, _) => {
+                    changes.insert(Domain::SnapshotPin.disk(id, Some(*offset))?, None);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn plan(
     base: &Metadata,
     next: &Metadata,
@@ -322,6 +360,7 @@ pub(super) fn plan(
     } else {
         accounting.quotas.clone()
     };
+    pin_changes(base, next, &mut sink.changes)?;
     sink.changes.extend(event_changes(old_events, new_events)?);
     Ok((sink.changes, Accounting { stats, quotas }))
 }

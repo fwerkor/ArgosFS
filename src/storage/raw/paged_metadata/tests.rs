@@ -575,3 +575,6 @@ fn cold_open_reads_shared_cow_pages_only_once_per_member() {
 
 #[path = "v3_tests.rs"]
 mod v3_tests;
+
+#[path = "snapshot_tests.rs"]
+mod snapshot_tests;

@@ -16,8 +16,59 @@ namespace root sets, typed graph edges, stable data object IDs with current
 placement indirection, a replicated logical ownership ledger separate from
 member-local page counts, and certified bounded retirement/GC must be
 implemented together. The legacy JSON snapshot command is only a metadata
-export. The design is not yet implemented; the current experimental wire
-format must not be frozen.
+export. The typed physical DAG and a transitional extent-pin implementation now
+exercise native snapshots. The final logical ownership model is not yet
+implemented; the current experimental wire format must not be frozen.
+
+## Experimental snapshot implementation
+
+The transitional V3 engine implements named historical catalog edges in a
+bounded-fanout snapshot index (domain 14). Values contain an authenticated
+member-local pointer and a creation transaction, not an untrusted serialized
+address. A historical catalog excludes the snapshot registry and pin index.
+Ordinary metadata paths share immutable pages; creation retains existing
+domain trees and allocates only the descriptor/index/catalog path. The
+physical reference-count map and full graph audit now support sharing across
+historical catalogs, and stale-member repair translates each shared physical
+page once. The wire codec rejects fabricated snapshot records through the
+generic transaction interface. Descriptor deletion and reference reclamation
+use the existing certified transaction protocol.
+
+The materialized volume bridge also provides experimental
+`create_filesystem_snapshot`, `list_filesystem_snapshots`,
+`read_snapshot_range` and `delete_filesystem_snapshot` APIs. A snapshot
+barrier flushes the volume's deferred writes. The same transaction publishes
+the named root and increments physical data extent pins. Overwrite, truncate,
+unlink and orphan reclamation cannot release a pinned allocation. Multiple
+snapshots count distinct references; last-reference deletion releases only
+an extent not still reachable from the active namespace. Physical capacity
+includes historical-only extents. Reopen checks the pin index against all
+historical catalogs and allocator geometry. Read holds the live metadata
+guard to prevent concurrent reclamation and uses current disk status with
+the historical file encoding configuration. Fsck verifies historical shards
+and reports damage; snapshot-only repair/relocation is not supported yet.
+
+This is explicitly a **prototype**, not the final format described below:
+- The prototype uses required root feature bit 63 and private pin domain
+  0xff00, leaving the final feature bit 3 and domains 17–23 reserved.
+  Development pools built against earlier experimental layouts are not
+  compatible; no production pool uses this bit.
+- The data pin index records physical extents rather than stable logical
+  object IDs. Creation/deletion and reopen can enumerate all historical
+  extents; deleting a large snapshot can trigger unbounded page retirement.
+  Historical reads materialize a complete view. This deliberately does not
+  claim path-bounded data snapshot creation, lazy mount, or bounded GC.
+- Metadata replica repair and topology restaging preserve the entire
+  snapshot DAG. Staging translates physical pointers into disjoint arenas,
+  verifies the exact source logical root, and commits the new configuration
+  metadata before joint-quorum publication. Member addition, paired-arena
+  growth and removal of an unpinned member are supported and tested across
+  reopen. Drain, removal or targeted rebuild of a historically pinned
+  member is refused until object placement relocation is implemented.
+  Snapshot-only shard verification is not repair.
+- No rollback, writable clones, FUSE view mounting, writeback barrier
+  integration, object-placement migration or production upgrade is exposed.
+  Legacy JSON snapshot exports are not imported as native snapshots.
 
 ## Implemented core
 
@@ -170,3 +221,17 @@ epochs and rejection of an obsolete quorum are tested with the same workload
 as numeric paged pools. Paired-region growth tests verify insufficient-space
 refusal, durable data across reopen and reuse of the reserve on later
 membership changes. These are not FUSE mount or physical power-cut benchmarks.
+
+### Snapshot validation (experimental loop backend)
+
+- Shared historical catalogs, bounded name paging, overwrite and deletion,
+  exact physical allocator counts, certificate failure recovery and stale
+  member graph repair.
+- Immediate and deferred volume writes, hard links, rename, truncate, inline
+  and block data, overwrite/unlink, restart, shared extent pins, capacity
+  accounting, last-reference reclaim, orphan checking and historical-only
+  corruption detection.
+- Full DAG transfer across member addition, paired-arena growth, removal of
+  a member without historical allocations, and reopen. The old historical
+  content and live file remain readable. Removal of a pinned member fails
+  closed. No actual power-cut or production FUSE performance claim.

@@ -108,6 +108,11 @@ impl Arena {
     ) -> Result<Vec<u8>> {
         match value {
             Value::Inline(bytes) => Ok(bytes),
+            Value::Snapshot { txid, root } => {
+                let mut out = txid.to_le_bytes().to_vec();
+                out.extend_from_slice(&root.hash);
+                Ok(out)
+            }
             Value::Blob { len, first } => {
                 // Never allocate more than the arena could physically hold.
                 if len as u64 > self.length {
@@ -303,6 +308,7 @@ impl Arena {
                         let len = match &value {
                             Value::Inline(value) => value.len(),
                             Value::Blob { len, .. } => *len,
+                            Value::Snapshot { .. } => 40,
                         };
                         let cost = key
                             .encoded_len()
@@ -340,6 +346,7 @@ enum ScanNode<K: TreeKey> {
     Leaf {
         range: (K, K),
         blobs: Vec<(Ptr, usize)>,
+        snapshots: Vec<Ptr>,
     },
     Branch {
         level: u8,
@@ -359,14 +366,20 @@ impl<K: TreeKey> ScanNode<K> {
                     entries.first().unwrap().0.clone(),
                     entries.last().unwrap().0.clone(),
                 );
-                let blobs = entries
-                    .into_iter()
-                    .filter_map(|(_, value)| match value {
-                        Value::Blob { first, len } => Some((first, len)),
-                        Value::Inline(_) => None,
-                    })
-                    .collect();
-                Self::Leaf { range, blobs }
+                let mut blobs = Vec::new();
+                let mut snapshots = Vec::new();
+                for (_, value) in entries {
+                    match value {
+                        Value::Blob { first, len } => blobs.push((first, len)),
+                        Value::Snapshot { root, .. } => snapshots.push(root),
+                        Value::Inline(_) => {}
+                    }
+                }
+                Self::Leaf {
+                    range,
+                    blobs,
+                    snapshots,
+                }
             }
             Node::Branch { level, children } => Self::Branch { level, children },
             Node::Catalog(roots) => Self::Catalog(roots),
@@ -379,7 +392,13 @@ impl<K: TreeKey> ScanNode<K> {
 
     fn children(&self) -> Vec<Ptr> {
         match self {
-            Self::Leaf { blobs, .. } => blobs.iter().map(|(ptr, _)| *ptr).collect(),
+            Self::Leaf {
+                blobs, snapshots, ..
+            } => blobs
+                .iter()
+                .map(|(ptr, _)| *ptr)
+                .chain(snapshots.iter().copied())
+                .collect(),
             Self::Branch { children, .. } => children.iter().map(|(_, ptr)| *ptr).collect(),
             Self::Catalog(roots) => roots.iter().map(|(_, ptr)| *ptr).collect(),
             Self::Blob { next, .. } => next.iter().copied().collect(),
@@ -507,12 +526,52 @@ impl<K: TreeKey> Scanner<'_, K> {
             self.tree(ptr, None)?;
             return Ok(());
         }
+        self.catalog(ptr, true)?;
+        // Each historical catalog is independently validated as a tree.
+        // Shared pages across different catalogs form a DAG, not cycles.
+        // Historical catalogs may never contain a snapshot index.
+        let snapshots = self
+            .graph
+            .keys()
+            .filter_map(|id| self.verified.get(id))
+            .flat_map(|(_, node)| match &**node {
+                ScanNode::Leaf { snapshots, .. } => snapshots.clone(),
+                _ => Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        for ptr in snapshots {
+            let mut scan = Scanner {
+                arena: self.arena,
+                backend: self.backend,
+                verified: self.verified,
+                graph: Graph::new(),
+            };
+            scan.catalog(ptr, false)?;
+            for (id, entry) in scan.graph {
+                if let Some(old) = self.graph.get(&id) {
+                    if old.ptr != entry.ptr {
+                        return Err(corrupt("snapshot page identity mismatch"));
+                    }
+                } else {
+                    self.graph.insert(id, entry);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn catalog(&mut self, ptr: Ptr, allow_snapshots: bool) -> Result<()> {
         let node = self.visit(ptr)?;
         let ScanNode::Catalog(roots) = &*node else {
             return Err(corrupt("V3 root is not a catalog"));
         };
         self.prefetch(roots.iter().map(|(_, ptr)| *ptr));
         for (domain, ptr) in roots {
+            if !allow_snapshots
+                && matches!(*domain, super::SNAPSHOT_DOMAIN | super::SNAPSHOT_PIN_DOMAIN)
+            {
+                return Err(corrupt("historical catalog contains snapshot index"));
+            }
             let (min, max) = self.tree(*ptr, None)?;
             if min.domain_id() != Some(*domain) || max.domain_id() != Some(*domain) {
                 return Err(corrupt("metadata tree outside catalog domain"));
@@ -528,7 +587,7 @@ impl<K: TreeKey> Scanner<'_, K> {
             return Err(corrupt("metadata tree height mismatch"));
         }
         match &*node {
-            ScanNode::Leaf { range, blobs } => {
+            ScanNode::Leaf { range, blobs, .. } => {
                 self.prefetch(blobs.iter().map(|(ptr, _)| *ptr));
                 for &(first, len) in blobs {
                     self.blob(first, len)?;
@@ -883,6 +942,7 @@ impl<K: TreeKey> Member<K> {
         slot: usize,
         txid: u64,
         changes: &TreeChanges<K>,
+        snapshot: Option<&super::SnapshotEdit<K>>,
     ) -> Result<Prepared> {
         let root = self.roots[slot].ok_or_else(|| corrupt("missing base root"))?;
         self.prepare_with(
@@ -892,13 +952,17 @@ impl<K: TreeKey> Member<K> {
             root.physical.map(|p| p.features),
             |plan| {
                 if K::PERSISTENT_ALLOCATOR {
-                    plan.update_catalog(root.tree, changes)
+                    plan.update_catalog(root.tree, changes, snapshot, root.txid)
                 } else if root.tree.is_none() {
                     plan.build_empty(changes)
                 } else {
                     let mut tree = root.tree;
                     for (key, value) in changes {
-                        tree = plan.update_root(tree, key.clone(), value.as_deref())?;
+                        tree = plan.update_root(
+                            tree,
+                            key.clone(),
+                            value.as_deref().map(EditValue::Bytes),
+                        )?;
                     }
                     Ok(tree)
                 }
@@ -1082,8 +1146,12 @@ impl<K: TreeKey> Member<K> {
                     .ok_or_else(|| corrupt("physical reference count overflow"))?,
             );
         }
-        if plan.pages.keys().any(|page| counts.get(page) != Some(&1)) {
-            return Err(corrupt("V3 plan has unreachable or shared staged page"));
+        if plan
+            .pages
+            .keys()
+            .any(|page| counts.get(page).copied().unwrap_or(0) == 0)
+        {
+            return Err(corrupt("V3 plan has unreachable staged page"));
         }
         // Release only the overwritten root after adding the new edges.
         // A zero transition is the only reason to read/release descendants.
@@ -1387,6 +1455,83 @@ impl<K: TreeKey> Member<K> {
         self.data.scan_window(backend, root, window)
     }
 
+    pub(super) fn scan_snapshot(
+        &self,
+        backend: &dyn StorageBackend,
+        slot: usize,
+        key: &K,
+        window: &super::ScanWindow<K>,
+    ) -> Result<super::ScanPage<K>> {
+        let current =
+            self.roots[slot].ok_or_else(|| corrupt("missing current snapshot catalog"))?;
+        let Some(ptr) = current.tree else {
+            return Err(ArgosError::NotFound("snapshot".into()));
+        };
+        let Node::Catalog(roots) = self.data.read_node::<K>(backend, ptr)? else {
+            return Err(corrupt("missing V3 catalog"));
+        };
+        let mut next = roots
+            .into_iter()
+            .find(|(domain, _)| *domain == super::SNAPSHOT_DOMAIN)
+            .map(|(_, ptr)| ptr);
+        let mut expected_level = None;
+        let mut upper = None;
+        while let Some(ptr) = next {
+            let node = self.data.read_node::<K>(backend, ptr)?;
+            if expected_level.is_some() && node.level() != expected_level
+                || upper
+                    .as_ref()
+                    .is_some_and(|key| node.max_key().as_ref() != Some(key))
+            {
+                return Err(corrupt("invalid snapshot index path"));
+            }
+            match node {
+                Node::Branch { level, children } => {
+                    if children
+                        .iter()
+                        .any(|(key, _)| key.domain_id() != Some(super::SNAPSHOT_DOMAIN))
+                    {
+                        return Err(corrupt("invalid snapshot index domain"));
+                    }
+                    let child = children.get(children.partition_point(|(max, _)| max < key));
+                    next = child.map(|(_, ptr)| *ptr);
+                    upper = child.map(|(key, _)| key.clone());
+                    expected_level = Some(level - 1);
+                }
+                Node::Leaf(mut entries) => {
+                    let index = entries
+                        .binary_search_by(|(candidate, _)| candidate.cmp(key))
+                        .map_err(|_| ArgosError::NotFound("snapshot".into()))?;
+                    let Value::Snapshot { txid, root } = entries.swap_remove(index).1 else {
+                        return Err(corrupt("invalid snapshot record"));
+                    };
+                    if txid >= current.txid {
+                        return Err(corrupt("snapshot references future generation"));
+                    }
+                    let Node::Catalog(catalog) = self.data.read_node::<K>(backend, root)? else {
+                        return Err(corrupt("missing historical catalog"));
+                    };
+                    if catalog.iter().any(|(domain, _)| {
+                        matches!(*domain, super::SNAPSHOT_DOMAIN | super::SNAPSHOT_PIN_DOMAIN)
+                    }) {
+                        return Err(corrupt("historical catalog contains snapshots"));
+                    }
+                    return self.data.scan_window(
+                        backend,
+                        Root {
+                            txid,
+                            tree: Some(root),
+                            physical: None,
+                        },
+                        window,
+                    );
+                }
+                _ => return Err(corrupt("invalid snapshot index node")),
+            }
+        }
+        Err(ArgosError::NotFound("snapshot".into()))
+    }
+
     pub(super) fn records(
         &self,
         backend: &dyn StorageBackend,
@@ -1455,6 +1600,12 @@ struct Plan<'a, K: TreeKey> {
     reads: usize,
 }
 
+#[derive(Clone, Copy)]
+enum EditValue<'a> {
+    Bytes(&'a [u8]),
+    Snapshot { txid: u64, root: Ptr },
+}
+
 impl<K: TreeKey> Plan<'_, K> {
     fn read(&mut self, ptr: Ptr) -> Result<Node<K>> {
         if let Some(page) = self.pages.get(&ptr.page) {
@@ -1517,7 +1668,11 @@ impl<K: TreeKey> Plan<'_, K> {
         }
     }
 
-    fn value(&mut self, bytes: &[u8]) -> Result<Value> {
+    fn value(&mut self, value: EditValue<'_>) -> Result<Value> {
+        let bytes = match value {
+            EditValue::Bytes(bytes) => bytes,
+            EditValue::Snapshot { txid, root } => return Ok(Value::Snapshot { txid, root }),
+        };
         if bytes.len() <= INLINE_MAX {
             return Ok(Value::Inline(bytes.to_vec()));
         }
@@ -1582,7 +1737,7 @@ impl<K: TreeKey> Plan<'_, K> {
         Ok(())
     }
 
-    fn update(&mut self, ptr: Ptr, key: K, value: Option<&[u8]>) -> Result<Vec<(K, Ptr)>> {
+    fn update(&mut self, ptr: Ptr, key: K, value: Option<EditValue<'_>>) -> Result<Vec<(K, Ptr)>> {
         match self.read(ptr)? {
             Node::Leaf(mut entries) => {
                 match (
@@ -1592,7 +1747,8 @@ impl<K: TreeKey> Plan<'_, K> {
                     (Ok(index), Some(bytes)) => {
                         // Changes are unique per transaction, so no replaced
                         // overflow chain can have been allocated by this plan.
-                        if matches!(&entries[index].1, Value::Inline(old) if old == bytes) {
+                        if matches!((&entries[index].1,bytes), (Value::Inline(old),EditValue::Bytes(bytes)) if old == bytes)
+                        {
                             return Ok(vec![(entries.last().unwrap().0.clone(), ptr)]);
                         }
                         entries[index].1 = self.value(bytes)?;
@@ -1636,6 +1792,12 @@ impl<K: TreeKey> Plan<'_, K> {
         let mut pending = vec![(root, false)];
         let mut translated = BTreeMap::<u64, Ptr>::new();
         while let Some((ptr, expanded)) = pending.pop() {
+            if let Some(existing) = translated.get(&ptr.page) {
+                if existing.hash != ptr.hash {
+                    return Err(corrupt("repair shared page identity mismatch"));
+                }
+                continue;
+            }
             if !expanded {
                 let entry = graph
                     .get(&ptr.page)
@@ -1668,8 +1830,10 @@ impl<K: TreeKey> Plan<'_, K> {
                 }
                 Node::Leaf(entries) => {
                     for (_, value) in entries {
-                        if let Value::Blob { first, .. } = value {
-                            replace(first)?;
+                        match value {
+                            Value::Blob { first, .. } => replace(first)?,
+                            Value::Snapshot { root, .. } => replace(root)?,
+                            Value::Inline(_) => {}
                         }
                     }
                 }
@@ -1695,6 +1859,8 @@ impl<K: TreeKey> Plan<'_, K> {
         &mut self,
         root: Option<Ptr>,
         changes: &TreeChanges<K>,
+        snapshot: Option<&super::SnapshotEdit<K>>,
+        base_txid: u64,
     ) -> Result<Option<Ptr>> {
         let mut roots = match root {
             Some(ptr) => match self.read(ptr)? {
@@ -1717,13 +1883,59 @@ impl<K: TreeKey> Plan<'_, K> {
                 subtree = self.build_empty(changes)?;
             } else {
                 for (key, value) in changes {
-                    subtree = self.update_root(subtree, key.clone(), value.as_deref())?;
+                    subtree = self.update_root(
+                        subtree,
+                        key.clone(),
+                        value.as_deref().map(EditValue::Bytes),
+                    )?;
                 }
             }
             if let Some(ptr) = subtree {
                 roots.insert(domain, ptr);
             } else {
                 roots.remove(&domain);
+            }
+        }
+        if let Some(edit) = snapshot {
+            let (key, value) = match edit {
+                super::SnapshotEdit::Create(key) => {
+                    let captured = before
+                        .iter()
+                        .filter(|(domain, _)| {
+                            !matches!(
+                                **domain,
+                                super::SNAPSHOT_DOMAIN | super::SNAPSHOT_PIN_DOMAIN
+                            )
+                        })
+                        .map(|(&domain, &ptr)| (domain, ptr))
+                        .collect::<Vec<_>>();
+                    if captured.is_empty() {
+                        return Err(ArgosError::Invalid(
+                            "cannot snapshot an empty metadata catalog".into(),
+                        ));
+                    }
+                    let historical = if !before.contains_key(&super::SNAPSHOT_DOMAIN)
+                        && !before.contains_key(&super::SNAPSHOT_PIN_DOMAIN)
+                    {
+                        root.ok_or_else(|| corrupt("snapshot base missing"))?
+                    } else {
+                        self.store(Node::Catalog(captured), None)?
+                    };
+                    (
+                        key,
+                        Some(EditValue::Snapshot {
+                            txid: base_txid,
+                            root: historical,
+                        }),
+                    )
+                }
+                super::SnapshotEdit::Delete(key) => (key, None),
+            };
+            let snapshot_root = roots.get(&super::SNAPSHOT_DOMAIN).copied();
+            if let Some(ptr) = self.update_root(snapshot_root, key.clone(), value)? {
+                roots.insert(super::SNAPSHOT_DOMAIN, ptr);
+            } else {
+                roots.remove(&super::SNAPSHOT_DOMAIN);
             }
         }
         if roots == before {
@@ -1753,7 +1965,7 @@ impl<K: TreeKey> Plan<'_, K> {
         let mut used = 0;
         for (key, value) in changes {
             let Some(bytes) = value else { continue };
-            let value = self.value(bytes)?;
+            let value = self.value(EditValue::Bytes(bytes))?;
             let len = key.encoded_len() + value.encoded_len();
             if used + len > NODE_CAPACITY {
                 leaves.extend(self.store_tree(Node::Leaf(std::mem::take(&mut entries)), None)?);
@@ -1798,7 +2010,7 @@ impl<K: TreeKey> Plan<'_, K> {
         &mut self,
         root: Option<Ptr>,
         key: K,
-        value: Option<&[u8]>,
+        value: Option<EditValue<'_>>,
     ) -> Result<Option<Ptr>> {
         let Some(root) = root else {
             return match value {

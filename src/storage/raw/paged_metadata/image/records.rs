@@ -226,6 +226,7 @@ fn header(meta: &Metadata) -> Record {
     header.inodes = Default::default();
     header.disks.clear();
     header.raw_pool.allocators.clear();
+    header.raw_pool.snapshot_state = None;
     header.checkpoint_member_catalog = None;
     if matches!(
         header.integrity.hash_scheme,
