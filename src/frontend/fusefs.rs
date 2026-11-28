@@ -465,11 +465,13 @@ pub fn mount_volume_with_metrics(
         MountOption::FSName("argosfs".to_string()),
         MountOption::Subtype("argosfs".to_string()),
     ];
-    let mut request_kernel_writeback = false;
+    let mut writeback_override = None;
     let mut force_direct_io = false;
     for option in options {
         if option == "kernel_writeback" {
-            request_kernel_writeback = true;
+            writeback_override = Some(true);
+        } else if option == "no_kernel_writeback" {
+            writeback_override = Some(false);
         } else if option == "direct_io" {
             force_direct_io = true;
         } else {
@@ -482,18 +484,24 @@ pub fn mount_volume_with_metrics(
         );
     }
     let config = mount_config(mount_options);
-    if request_kernel_writeback
-        && (!cfg!(target_os = "linux")
-            || !config
-                .mount_options
-                .contains(&MountOption::DefaultPermissions)
-            || force_direct_io
-            || volume.io_policy().direct_io)
-    {
+    let eligible = cfg!(target_os = "linux")
+        && config
+            .mount_options
+            .contains(&MountOption::DefaultPermissions)
+        && !config.mount_options.contains(&MountOption::RO)
+        && !force_direct_io
+        && !volume.io_policy().direct_io;
+    if writeback_override == Some(true) && !eligible {
         return Err(ArgosError::Invalid(
-            "kernel_writeback requires Linux, default_permissions, and buffered FUSE I/O".into(),
+            "kernel_writeback requires Linux, default_permissions, and writable buffered FUSE I/O"
+                .into(),
         ));
     }
+    let request_kernel_writeback = eligible && writeback_override != Some(false);
+    let policy = volume.io_policy();
+    let uring = policy.io_mode != crate::types::IoMode::Direct
+        && crate::data::advanced_io::io_uring_available();
+    eprintln!("argosfs: io_uring READ/WRITE available={uring}; policy={:?}; direct_io={}; kernel_writeback requested={request_kernel_writeback}", policy.io_mode, force_direct_io || policy.direct_io);
     // This server sees the same atomic counters as FUSE and the commit worker.
     // Keep it scoped to the blocking mount so it cannot keep the volume alive
     // after the FUSE filesystem performs its final sync.
@@ -578,7 +586,9 @@ impl Filesystem for ArgosFuse {
         let _ = config.set_max_background(background);
         let _ = config.set_congestion_threshold(background * 3 / 4);
         // Request only supported capabilities with permission-safe handlers.
-        let _ = config.add_capabilities(fuse_optional_capabilities(config.capabilities()));
+        let optional = fuse_optional_capabilities(config.capabilities());
+        let _ = config.add_capabilities(optional);
+        eprintln!("argosfs: FUSE optional capabilities={optional:?}");
         if self.request_kernel_writeback {
             let enabled = config
                 .add_capabilities(InitFlags::FUSE_WRITEBACK_CACHE)

@@ -185,3 +185,30 @@ fn io_uring_repeated_writes_preserve_truncation_and_short_reads() {
         );
     }
 }
+
+#[test]
+fn buffered_policy_round_trips_at_automatic_uring_threshold() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("automatic.bin");
+    for size in [
+        AUTO_URING_MIN_BYTES - 1,
+        AUTO_URING_MIN_BYTES,
+        AUTO_URING_MIN_BYTES + 1,
+    ] {
+        let data = (0..size).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+        write_all(&path, &data, IoMode::Buffered).unwrap();
+        assert_eq!(
+            read_all(&path, size, IoMode::Buffered, false).unwrap(),
+            data
+        );
+    }
+    assert!(!prefer_uring(IoMode::Direct, AUTO_URING_MIN_BYTES));
+    assert!(!prefer_uring(IoMode::Buffered, AUTO_URING_MIN_BYTES - 1));
+    assert_eq!(
+        prefer_uring(IoMode::Buffered, AUTO_URING_MIN_BYTES),
+        !uring_disabled_by_operator()
+    );
+    if uring_disabled_by_operator() {
+        assert!(!io_uring_available());
+    }
+}

@@ -242,21 +242,27 @@ override the targets with `ARGOSFS_FUSE_MAX_WRITE` and
 by the kernel/library; invalid values use the defaults. These are mount-time
 settings and do not affect the persistent format.
 
-The `io-uring` shard I/O policy reuses a bounded pool of drained rings across
-worker threads. Unavailable setup falls back to buffered I/O; completed I/O
+Buffered host shard I/O automatically tries io_uring for requests of at least
+128 KiB; explicit `io-uring` also tries smaller requests. Both reuse a bounded
+pool of drained rings across worker threads. Ring setup and READ/WRITE opcode
+probing must succeed before submission. Set `ARGOSFS_DISABLE_IO_URING=1` at
+process startup to use the ordinary buffered path instead. Completed I/O
 errors are propagated rather than silently replaying an uncertain write.
 Each successful host-file shard write still crosses its existing sync barrier.
 This is not FUSE-over-io_uring: that requires a separate transport in the
 FUSE library. Raw block backends do not yet use this host-path ring pool.
 
-Linux kernel writeback caching is an opt-in mount policy:
-`argosfs mount ROOT MOUNTPOINT -o default_permissions -o kernel_writeback`.
-It requires buffered FUSE I/O, an exclusive authoritative mount, and kernel
-support; unsupported kernels retain userspace writeback. The kernel may
+Linux kernel writeback caching is automatically negotiated for writable
+buffered mounts that already select `default_permissions`. It requires an
+exclusive authoritative mount and kernel support; unsupported kernels retain
+userspace writeback. Mounts using daemon-only permission checks keep their
+existing ACL semantics and userspace writeback; ArgosFS does not silently add
+`default_permissions`. Use `-o no_kernel_writeback` to opt out or
+`-o kernel_writeback` to explicitly request it on an eligible mount. The kernel may
 perform partial-page reads on writable-only handles, so the VFS permission
 check is mandatory. Kernel writeback retains the existing bounded ArgosFS
 write staging and fsync durability barrier; repeated FLUSH requests report
-errors without releasing handles. The option is not enabled by default.
+errors without releasing handles.
 Run `python3 tests/fuse_kernel_writeback.py --binary target/release/argosfs`
 on a Linux FUSE-capable host for mounted cache and permission regressions.
 

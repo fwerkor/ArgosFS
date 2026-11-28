@@ -1,7 +1,7 @@
 use crate::error::{ArgosError, Result};
 use crate::types::IoMode;
 use crate::util::{ensure_private_dir, read_to_vec};
-use io_uring::{opcode, squeue, types, IoUring};
+use io_uring::{opcode, squeue, types, IoUring, Probe};
 use memmap2::MmapOptions;
 use parking_lot::Mutex;
 use std::fs::{self, File, OpenOptions};
@@ -14,6 +14,26 @@ use std::sync::atomic::{AtomicBool, Ordering};
 const ALIGN: usize = 4096;
 const MAX_SHARD_IO_BYTES: usize = 256 * 1024 * 1024;
 const MAX_IDLE_RINGS: usize = 16;
+const AUTO_URING_MIN_BYTES: usize = 128 * 1024;
+
+fn uring_disabled_by_operator() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("ARGOSFS_DISABLE_IO_URING").is_some_and(|v| v == "1"))
+}
+
+fn prefer_uring(mode: IoMode, bytes: usize) -> bool {
+    !uring_disabled_by_operator()
+        && (mode == IoMode::IoUring || (mode == IoMode::Buffered && bytes >= AUTO_URING_MIN_BYTES))
+}
+
+fn probe_ring(ring: &IoUring) -> std::io::Result<()> {
+    let mut probe = Probe::new();
+    ring.submitter().register_probe(&mut probe)?;
+    if !probe.is_supported(opcode::Read::CODE) || !probe.is_supported(opcode::Write::CODE) {
+        return Err(std::io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+    }
+    Ok(())
+}
 
 // Shard reads can run on short-lived scoped threads. A shared idle pool,
 // rather than thread-local rings, also amortizes setup across those threads.
@@ -32,21 +52,38 @@ impl RingPool {
     }
 
     fn acquire(&self) -> Result<RingLease<'_>> {
-        if self.disabled.load(Ordering::Acquire) {
+        if uring_disabled_by_operator() || self.disabled.load(Ordering::Acquire) {
             return Err(ArgosError::Unsupported("io_uring unavailable".into()));
         }
         let idle = self.idle.lock().pop();
         let ring = match idle {
             Some(ring) => ring,
-            None => IoUring::new(8).map_err(|err| {
-                if matches!(
-                    err.raw_os_error(),
-                    Some(libc::ENOSYS | libc::EPERM | libc::EACCES | libc::EOPNOTSUPP)
-                ) {
+            None => {
+                let ring = IoUring::new(8).map_err(|err| {
+                    if matches!(
+                        err.raw_os_error(),
+                        Some(
+                            libc::ENOSYS
+                                | libc::EPERM
+                                | libc::EACCES
+                                | libc::EOPNOTSUPP
+                                | libc::EINVAL
+                        )
+                    ) {
+                        self.disable();
+                    }
+                    ArgosError::Unsupported(format!("io_uring setup: {err}"))
+                })?;
+                if let Err(err) = probe_ring(&ring) {
+                    // Old kernels can create a ring without supporting the
+                    // non-vectored READ/WRITE commands. Never submit on it.
                     self.disable();
+                    return Err(ArgosError::Unsupported(format!(
+                        "io_uring opcode probe: {err}"
+                    )));
                 }
-                ArgosError::Unsupported(format!("io_uring setup: {err}"))
-            })?,
+                ring
+            }
         };
         Ok(RingLease {
             pool: self,
@@ -158,13 +195,15 @@ pub fn write_all(path: &Path, data: &[u8], mode: IoMode) -> Result<()> {
     if let Some(parent) = path.parent() {
         ensure_private_dir(parent)?;
     }
-    match mode {
-        IoMode::Buffered => write_buffered(path, data),
-        IoMode::Direct => write_direct(path, data).or_else(|_| write_buffered(path, data)),
-        IoMode::IoUring => match write_iouring(path, data) {
+    if prefer_uring(mode, data.len()) {
+        return match write_iouring(path, data) {
             Err(ArgosError::Unsupported(_)) => write_buffered(path, data),
             result => result,
-        },
+        };
+    }
+    match mode {
+        IoMode::Direct => write_direct(path, data).or_else(|_| write_buffered(path, data)),
+        IoMode::Buffered | IoMode::IoUring => write_buffered(path, data),
     }
 }
 
@@ -174,15 +213,17 @@ pub fn read_all(
     mode: IoMode,
     zero_copy: bool,
 ) -> Result<Vec<u8>> {
-    match mode {
-        IoMode::IoUring => match read_iouring(path, expected_size) {
+    if prefer_uring(mode, expected_size) {
+        return match read_iouring(path, expected_size) {
             Err(ArgosError::Unsupported(_)) => read_mmap_or_buffered(path, zero_copy),
             result => result,
-        },
+        };
+    }
+    match mode {
         IoMode::Direct => {
             read_direct(path, expected_size).or_else(|_| read_mmap_or_buffered(path, zero_copy))
         }
-        IoMode::Buffered => read_mmap_or_buffered(path, zero_copy),
+        IoMode::Buffered | IoMode::IoUring => read_mmap_or_buffered(path, zero_copy),
     }
 }
 

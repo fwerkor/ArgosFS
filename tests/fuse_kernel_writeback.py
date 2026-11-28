@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mounted regressions for opt-in Linux FUSE writeback caching."""
+"""Mounted regressions for automatic Linux FUSE writeback caching."""
 import argparse
 import mmap
 import os
@@ -25,11 +25,15 @@ def main():
                         "--disks", "1", "--compression", "none"],
                        check=True, stdout=subprocess.DEVNULL, timeout=90)
 
-        def start(writeback):
+        def start(writeback, *, kernel_permissions=True, direct=False):
             command = [binary, "mount", str(volume), str(mount), "--foreground",
-                       "-o", "default_permissions", "-o", "allow_other"]
-            if writeback:
-                command += ["-o", "kernel_writeback"]
+                       "-o", "allow_other"]
+            if kernel_permissions:
+                command += ["-o", "default_permissions"]
+            if direct:
+                command += ["-o", "direct_io"]
+            if not writeback and kernel_permissions and not direct:
+                command += ["-o", "no_kernel_writeback"]
             log_path = root / "mount.log"
             with log_path.open("w") as log:
                 server = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT)
@@ -37,9 +41,10 @@ def main():
                 if server.poll() is not None:
                     raise RuntimeError(log_path.read_text())
                 if subprocess.run(["mountpoint", "-q", str(mount)]).returncode == 0:
-                    if writeback and "kernel writeback enabled" not in log_path.read_text():
+                    enabled = "kernel writeback enabled" in log_path.read_text()
+                    if enabled != writeback:
                         stop(server)
-                        raise RuntimeError("kernel writeback was not negotiated")
+                        raise RuntimeError("unexpected kernel writeback negotiation")
                     return server
                 time.sleep(0.1)
             server.terminate()
@@ -162,6 +167,12 @@ else:
             assert file.read_bytes() == expected
         finally:
             stop(server)
+        for options in ({"kernel_permissions": False}, {"direct": True}):
+            server = start(False, **options)
+            try:
+                assert file.read_bytes() == expected
+            finally:
+                stop(server)
         print("kernel writeback mounted regression passed")
 
 
