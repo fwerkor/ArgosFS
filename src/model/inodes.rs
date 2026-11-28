@@ -181,6 +181,8 @@ pub struct TrackedInodes {
     baseline: Arc<()>,
     member_catalog: OnceLock<MemberCatalog>,
     checkpoint_proof: Option<ReferenceProof>,
+    // Only set on the temporary serialization view for legacy integrity.
+    normalize_legacy_hash: bool,
 }
 
 impl Default for TrackedInodes {
@@ -192,11 +194,19 @@ impl Default for TrackedInodes {
             baseline: Arc::new(()),
             member_catalog: OnceLock::new(),
             checkpoint_proof: None,
+            normalize_legacy_hash: false,
         }
     }
 }
 
 impl TrackedInodes {
+    /// Preserve the historical JSON round-trip of each inode without building
+    /// a second namespace. This view is used only by the legacy hash writer.
+    pub(crate) fn into_legacy_hash_view(mut self) -> Self {
+        self.normalize_legacy_hash = true;
+        self
+    }
+
     pub fn len(&self) -> usize {
         self.map.len()
     }
@@ -433,8 +443,19 @@ impl Serialize for TrackedInodes {
         let mut sorted = self.map.iter().collect::<Vec<_>>();
         sorted.sort_unstable_by_key(|(ino, _)| *ino);
         let mut map = serializer.serialize_map(Some(sorted.len()))?;
-        for (ino, inode) in sorted {
-            map.serialize_entry(ino, inode)?;
+        if self.normalize_legacy_hash {
+            let mut compact = Vec::new();
+            for (ino, inode) in sorted {
+                compact.clear();
+                serde_json::to_writer(&mut compact, inode).map_err(serde::ser::Error::custom)?;
+                let normalized: Inode =
+                    serde_json::from_slice(&compact).map_err(serde::ser::Error::custom)?;
+                map.serialize_entry(ino, &normalized)?;
+            }
+        } else {
+            for (ino, inode) in sorted {
+                map.serialize_entry(ino, inode)?;
+            }
         }
         map.end()
     }
