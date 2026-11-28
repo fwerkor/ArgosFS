@@ -7,9 +7,6 @@ pub(super) const PAGE_SIZE: usize = 4096;
 const TRAILER: usize = PAGE_SIZE - 32;
 const HEADER: usize = 16;
 pub(super) const NODE_CAPACITY: usize = TRAILER - HEADER;
-const MAGIC: &[u8; 8] = b"ARGPG001";
-const ROOT_MAGIC: &[u8; 8] = b"ARGRT001";
-const CERT_MAGIC: &[u8; 8] = b"ARGCT001";
 pub(super) const RESERVED_PAGES: u64 = 4;
 pub(super) const INLINE_MAX: usize = 768;
 pub(super) const BLOB_MAX: usize = TRAILER - HEADER - 40;
@@ -17,6 +14,117 @@ pub(super) const MAX_LEVEL: u8 = 32;
 pub(super) const MAX_VALUE: usize = 1024 * 1024 * 1024;
 pub(super) type Hash = [u8; 32];
 pub(super) type Bytes = [u8; PAGE_SIZE];
+
+/// The legacy numeric codec and the new ordered compound-key codec share
+/// the COW machinery, but deliberately have disjoint wire magics.
+pub trait TreeKey: sealed::Sealed + Clone + Ord + std::fmt::Debug + Send + Sync {
+    const PAGE_MAGIC: &'static [u8; 8];
+    const ROOT_MAGIC: &'static [u8; 8];
+    const CERT_MAGIC: &'static [u8; 8];
+    const MIN_ENCODED_LEN: usize;
+    const PERSISTENT_ALLOCATOR: bool;
+    fn encoded_len(&self) -> usize;
+    fn encode_key(&self, out: &mut Vec<u8>);
+    fn decode_key(input: &mut &[u8]) -> Result<Self>;
+}
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for u64 {}
+    impl Sealed for super::TypedKey {}
+}
+impl TreeKey for u64 {
+    const PAGE_MAGIC: &'static [u8; 8] = b"ARGPG001";
+    const ROOT_MAGIC: &'static [u8; 8] = b"ARGRT001";
+    const CERT_MAGIC: &'static [u8; 8] = b"ARGCT001";
+    const MIN_ENCODED_LEN: usize = 8;
+    const PERSISTENT_ALLOCATOR: bool = false;
+    fn encoded_len(&self) -> usize {
+        8
+    }
+    fn encode_key(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.to_le_bytes());
+    }
+    fn decode_key(input: &mut &[u8]) -> Result<Self> {
+        let mut reader = Reader(input);
+        let key = reader.u64()?;
+        *input = reader.0;
+        Ok(key)
+    }
+}
+
+/// A lexicographic, length-delimited key. The first two bytes are the
+/// big-endian namespace ID. Binary names (including non-UTF8) are lossless.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct TypedKey(Vec<u8>);
+
+impl TypedKey {
+    pub const MAX_LEN: usize = 1024;
+
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
+        if !(2..=Self::MAX_LEN).contains(&bytes.len()) {
+            return Err(ArgosError::Invalid("compound metadata key length".into()));
+        }
+        Ok(Self(bytes.into_boxed_slice().into_vec()))
+    }
+
+    pub fn new(domain: u16, suffix: &[u8]) -> Result<Self> {
+        if suffix.len() > Self::MAX_LEN - 2 {
+            return Err(ArgosError::Invalid("compound metadata key length".into()));
+        }
+        let mut bytes = domain.to_be_bytes().to_vec();
+        bytes.extend_from_slice(suffix);
+        Self::from_bytes(bytes)
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    pub fn domain(&self) -> u16 {
+        u16::from_be_bytes(self.0[..2].try_into().unwrap())
+    }
+
+    /// Exclusive upper bound of a prefix, or None for the maximal prefix.
+    pub fn prefix_end(&self) -> Option<Self> {
+        let mut bytes = self.0.clone();
+        for pos in (0..bytes.len()).rev() {
+            if bytes[pos] != u8::MAX {
+                bytes[pos] += 1;
+                bytes.truncate((pos + 1).max(2));
+                if pos == 0 {
+                    bytes[1] = 0;
+                }
+                return Some(Self(bytes));
+            }
+        }
+        None
+    }
+}
+
+impl TreeKey for TypedKey {
+    const PAGE_MAGIC: &'static [u8; 8] = b"ARGPG003";
+    const ROOT_MAGIC: &'static [u8; 8] = b"ARGRT003";
+    const CERT_MAGIC: &'static [u8; 8] = b"ARGCT003";
+    const MIN_ENCODED_LEN: usize = 4;
+    const PERSISTENT_ALLOCATOR: bool = true;
+    fn encoded_len(&self) -> usize {
+        2 + self.0.len()
+    }
+    fn encode_key(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&(self.0.len() as u16).to_le_bytes());
+        out.extend_from_slice(&self.0);
+    }
+    fn decode_key(input: &mut &[u8]) -> Result<Self> {
+        let mut reader = Reader(input);
+        let len = u16::from_le_bytes(reader.take(2)?.try_into().unwrap()) as usize;
+        if !(2..=Self::MAX_LEN).contains(&len) {
+            return Err(corrupt("invalid compound metadata key length"));
+        }
+        let key = Self(reader.take(len)?.to_vec());
+        *input = reader.0;
+        Ok(key)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct Ptr {
@@ -31,16 +139,10 @@ pub(super) enum Value {
 }
 
 #[derive(Clone, Debug)]
-pub(super) enum Node {
-    Leaf(Vec<(u64, Value)>),
-    Branch {
-        level: u8,
-        children: Vec<(u64, Ptr)>,
-    },
-    Blob {
-        next: Option<Ptr>,
-        data: Vec<u8>,
-    },
+pub(super) enum Node<K: TreeKey> {
+    Leaf(Vec<(K, Value)>),
+    Branch { level: u8, children: Vec<(K, Ptr)> },
+    Blob { next: Option<Ptr>, data: Vec<u8> },
 }
 
 pub(super) fn corrupt(message: impl Into<String>) -> ArgosError {
@@ -95,14 +197,14 @@ impl<'a> Reader<'a> {
 
 impl Value {
     pub(super) fn encoded_len(&self) -> usize {
-        12 + match self {
+        4 + match self {
             Self::Inline(bytes) => bytes.len(),
             Self::Blob { .. } => 40,
         }
     }
 }
 
-impl Node {
+impl<K: TreeKey> Node<K> {
     pub(super) fn level(&self) -> Option<u8> {
         match self {
             Self::Leaf(_) => Some(0),
@@ -110,10 +212,10 @@ impl Node {
             Self::Blob { .. } => None,
         }
     }
-    pub(super) fn max_key(&self) -> Option<u64> {
+    pub(super) fn max_key(&self) -> Option<K> {
         match self {
-            Self::Leaf(entries) => entries.last().map(|(key, _)| *key),
-            Self::Branch { children, .. } => children.last().map(|(key, _)| *key),
+            Self::Leaf(entries) => entries.last().map(|(key, _)| key.clone()),
+            Self::Branch { children, .. } => children.last().map(|(key, _)| key.clone()),
             Self::Blob { .. } => None,
         }
     }
@@ -132,8 +234,13 @@ impl Node {
     }
     pub(super) fn used(&self) -> usize {
         match self {
-            Self::Leaf(entries) => entries.iter().map(|(_, v)| v.encoded_len()).sum(),
-            Self::Branch { children, .. } => children.len() * 48,
+            Self::Leaf(entries) => entries
+                .iter()
+                .map(|(k, v)| k.encoded_len() + v.encoded_len())
+                .sum(),
+            Self::Branch { children, .. } => {
+                children.iter().map(|(k, _)| k.encoded_len() + 40).sum()
+            }
             Self::Blob { data, .. } => 40 + data.len(),
         }
     }
@@ -168,11 +275,22 @@ impl Node {
     pub(super) fn split(self) -> Result<(Self, Self)> {
         match self {
             Self::Leaf(mut entries) if entries.len() > 1 => {
-                let total: usize = entries.iter().map(|(_, v)| v.encoded_len()).sum();
+                let total: usize = entries
+                    .iter()
+                    .map(|(k, v)| k.encoded_len() + v.encoded_len())
+                    .sum();
                 let mut left = 0;
                 let mut index = 0;
                 while index + 1 < entries.len() && left < total / 2 {
-                    left += entries[index].1.encoded_len();
+                    let next =
+                        left + entries[index].0.encoded_len() + entries[index].1.encoded_len();
+                    if K::PERSISTENT_ALLOCATOR
+                        && index > 0
+                        && next.abs_diff(total / 2) >= left.abs_diff(total / 2)
+                    {
+                        break;
+                    }
+                    left = next;
                     index += 1;
                 }
                 let right = entries.split_off(index);
@@ -182,7 +300,18 @@ impl Node {
                 level,
                 mut children,
             } if children.len() > 1 => {
-                let right = children.split_off(children.len() / 2);
+                let total: usize = children.iter().map(|(k, _)| k.encoded_len() + 40).sum();
+                let mut left = 0;
+                let mut index = 0;
+                for (key, _) in children.iter().take(children.len() - 1) {
+                    let next = left + key.encoded_len() + 40;
+                    if index > 0 && next.abs_diff(total / 2) >= left.abs_diff(total / 2) {
+                        break;
+                    }
+                    left = next;
+                    index += 1;
+                }
+                let right = children.split_off(index);
                 Ok((
                     Self::Branch { level, children },
                     Self::Branch {
@@ -205,7 +334,7 @@ impl Node {
                     return Err(corrupt("invalid metadata leaf keys"));
                 }
                 for (key, value) in entries {
-                    payload.extend_from_slice(&key.to_le_bytes());
+                    key.encode_key(&mut payload);
                     match value {
                         Value::Inline(bytes) => {
                             if bytes.len() > INLINE_MAX {
@@ -234,7 +363,7 @@ impl Node {
                     return Err(corrupt("invalid metadata branch"));
                 }
                 for (key, ptr) in children {
-                    payload.extend_from_slice(&key.to_le_bytes());
+                    key.encode_key(&mut payload);
                     write_ptr(&mut payload, Some(*ptr), logical);
                 }
                 (2, *level, children.len())
@@ -249,7 +378,7 @@ impl Node {
             }
         };
         let mut out = [0; PAGE_SIZE];
-        out[..8].copy_from_slice(MAGIC);
+        out[..8].copy_from_slice(K::PAGE_MAGIC);
         out[8] = kind;
         out[9] = level;
         out[10..12].copy_from_slice(&(count as u16).to_le_bytes());
@@ -265,7 +394,7 @@ impl Node {
         Ok((out, logical))
     }
     pub(super) fn decode(bytes: &Bytes, expected: Hash) -> Result<Self> {
-        if &bytes[..8] != MAGIC || hash(&bytes[..TRAILER]) != bytes[TRAILER..] {
+        if &bytes[..8] != K::PAGE_MAGIC || hash(&bytes[..TRAILER]) != bytes[TRAILER..] {
             return Err(ArgosError::Checksum(
                 "metadata page physical checksum mismatch".into(),
             ));
@@ -278,10 +407,10 @@ impl Node {
         }
         let mut input = Reader(&bytes[HEADER..HEADER + len]);
         let node = match bytes[8] {
-            1 if level == 0 && count > 0 && count <= len / 12 => {
+            1 if level == 0 && count > 0 && count <= len / (K::MIN_ENCODED_LEN + 4) => {
                 let mut entries = Vec::with_capacity(count);
                 for _ in 0..count {
-                    let key = input.u64()?;
+                    let key = K::decode_key(&mut input.0)?;
                     let size = input.u32()?;
                     let value = if size & (1 << 31) != 0 {
                         let len = (size & !(1 << 31)) as usize;
@@ -296,10 +425,14 @@ impl Node {
                 }
                 Self::Leaf(entries)
             }
-            2 if level > 0 && level <= MAX_LEVEL && count > 0 && count * 48 == len => {
+            2 if level > 0
+                && level <= MAX_LEVEL
+                && count > 0
+                && count <= len / (K::MIN_ENCODED_LEN + 40) =>
+            {
                 let mut children = Vec::with_capacity(count);
                 for _ in 0..count {
-                    children.push((input.u64()?, input.required_ptr()?));
+                    children.push((K::decode_key(&mut input.0)?, input.required_ptr()?));
                 }
                 Self::Branch { level, children }
             }
@@ -319,37 +452,144 @@ impl Node {
     }
 }
 
+/// Feature negotiation is part of the logical quorum identity. An unknown
+/// compatible feature is preserved; unknown read-only-compatible features
+/// prevent writes; unknown incompatible features prevent all access.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct V3Features {
+    pub compat: u64,
+    pub ro_compat: u64,
+    pub incompat: u64,
+}
+
+impl Default for V3Features {
+    fn default() -> Self {
+        Self {
+            compat: 0,
+            ro_compat: 0,
+            incompat: Self::REQUIRED,
+        }
+    }
+}
+
+impl V3Features {
+    const REQUIRED: u64 = (1 << 0) | (1 << 1);
+
+    pub fn validate(self, writable: bool) -> Result<()> {
+        if self.incompat != Self::REQUIRED {
+            return Err(ArgosError::IncompatibleFormat(format!(
+                "unsupported V3 incompatible features: {:#x}",
+                self.incompat
+            )));
+        }
+        if writable && self.ro_compat != 0 {
+            return Err(ArgosError::ReadonlyRequired(format!(
+                "unsupported V3 read-only features: {:#x}",
+                self.ro_compat
+            )));
+        }
+        Ok(())
+    }
+
+    fn bytes(self) -> [u8; 24] {
+        let mut bytes = [0; 24];
+        bytes[..8].copy_from_slice(&self.compat.to_le_bytes());
+        bytes[8..16].copy_from_slice(&self.ro_compat.to_le_bytes());
+        bytes[16..].copy_from_slice(&self.incompat.to_le_bytes());
+        bytes
+    }
+}
+
+/// Member-local state bound to a root/certificate. The allocator describes
+/// the union of this logical root and the exact retained alternate root.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct PhysicalState {
+    pub(super) allocator: super::physical::AllocatorRoot,
+    pub(super) retained: Hash,
+    pub(super) features: V3Features,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct Root {
     pub(super) txid: u64,
     pub(super) tree: Option<Ptr>,
+    pub(super) physical: Option<PhysicalState>,
 }
 
 impl Root {
     pub(super) fn identity(self) -> (u64, Hash) {
-        (self.txid, self.tree.map_or([0; 32], |ptr| ptr.hash))
+        let tree = self.tree.map_or([0; 32], |ptr| ptr.hash);
+        if let Some(physical) = self.physical {
+            let mut bytes = b"ArgosFS/logical-root/v3\0".to_vec();
+            bytes.extend_from_slice(&physical.features.bytes());
+            bytes.extend_from_slice(&tree);
+            (self.txid, hash(&bytes))
+        } else {
+            (self.txid, tree)
+        }
     }
-    pub(super) fn encode(self, namespace: Hash, pages: u64, certificate: bool) -> Bytes {
+
+    pub(super) fn validate_features(self, writable: bool) -> Result<()> {
+        self.physical
+            .map_or(Ok(()), |physical| physical.features.validate(writable))
+    }
+    pub(super) fn local_identity(self) -> Hash {
+        let mut bytes = b"ArgosFS/physical-root/v3\0".to_vec();
+        bytes.extend_from_slice(&self.txid.to_le_bytes());
+        write_ptr(&mut bytes, self.tree, false);
+        if let Some(physical) = self.physical {
+            bytes.extend_from_slice(&physical.allocator.encode());
+            bytes.extend_from_slice(&physical.retained);
+            bytes.extend_from_slice(&physical.features.bytes());
+        }
+        hash(&bytes)
+    }
+
+    pub(super) fn encode<K: TreeKey>(
+        self,
+        namespace: Hash,
+        pages: u64,
+        certificate: bool,
+    ) -> Bytes {
         let mut out = [0; PAGE_SIZE];
-        out[..8].copy_from_slice(if certificate { CERT_MAGIC } else { ROOT_MAGIC });
+        out[..8].copy_from_slice(if certificate {
+            K::CERT_MAGIC
+        } else {
+            K::ROOT_MAGIC
+        });
         out[8..40].copy_from_slice(&namespace);
         out[40..48].copy_from_slice(&pages.to_le_bytes());
         out[48..56].copy_from_slice(&self.txid.to_le_bytes());
         let mut ptr = Vec::new();
         write_ptr(&mut ptr, self.tree, false);
         out[56..96].copy_from_slice(&ptr);
+        if K::PERSISTENT_ALLOCATOR {
+            let physical = self
+                .physical
+                .expect("V3 root requires physical allocation state");
+            out[96..144].copy_from_slice(&physical.allocator.encode());
+            out[144..176].copy_from_slice(&physical.retained);
+            out[176..178].copy_from_slice(&1u16.to_le_bytes());
+            out[184..208].copy_from_slice(&physical.features.bytes());
+        } else {
+            debug_assert!(self.physical.is_none());
+        }
         let checksum = hash(&out[..TRAILER]);
         out[TRAILER..].copy_from_slice(&checksum);
         out
     }
 
-    pub(super) fn decode(
+    pub(super) fn decode<K: TreeKey>(
         bytes: &Bytes,
         namespace: Hash,
         pages: u64,
         certificate: bool,
     ) -> Result<Self> {
-        let magic = if certificate { CERT_MAGIC } else { ROOT_MAGIC };
+        let magic = if certificate {
+            K::CERT_MAGIC
+        } else {
+            K::ROOT_MAGIC
+        };
         if &bytes[..8] != magic
             || bytes[8..40] != namespace
             || hash(&bytes[..TRAILER]) != bytes[TRAILER..]
@@ -364,9 +604,40 @@ impl Root {
         }
         let txid = reader.u64()?;
         let tree = reader.ptr()?;
-        if bytes[96..TRAILER].iter().any(|b| *b != 0) {
+        let (physical, end) = if K::PERSISTENT_ALLOCATOR {
+            let version = u16::from_le_bytes(bytes[176..178].try_into().unwrap());
+            if version != 1 {
+                return Err(ArgosError::IncompatibleFormat(format!(
+                    "V3 root envelope version {version}"
+                )));
+            }
+            if bytes[178..184].iter().any(|&byte| byte != 0) {
+                return Err(corrupt("invalid V3 root envelope padding"));
+            }
+            (
+                Some(PhysicalState {
+                    allocator: super::physical::AllocatorRoot::decode(
+                        bytes[96..144].try_into().unwrap(),
+                    )?,
+                    retained: bytes[144..176].try_into().unwrap(),
+                    features: V3Features {
+                        compat: u64::from_le_bytes(bytes[184..192].try_into().unwrap()),
+                        ro_compat: u64::from_le_bytes(bytes[192..200].try_into().unwrap()),
+                        incompat: u64::from_le_bytes(bytes[200..208].try_into().unwrap()),
+                    },
+                }),
+                208,
+            )
+        } else {
+            (None, 96)
+        };
+        if bytes[end..TRAILER].iter().any(|b| *b != 0) {
             return Err(corrupt("invalid metadata root padding"));
         }
-        Ok(Self { txid, tree })
+        Ok(Self {
+            txid,
+            tree,
+            physical,
+        })
     }
 }

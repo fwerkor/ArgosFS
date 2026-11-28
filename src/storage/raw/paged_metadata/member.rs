@@ -1,8 +1,10 @@
+use super::physical::{AllocationMap, AllocatorRoot, PreparedAllocation};
 use super::wire::*;
-use super::{Arena, Changes, CommitIo};
+use super::{Arena, CommitIo, TreeChanges};
 use crate::backend::StorageBackend;
 use crate::error::{ArgosError, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::ops::Bound;
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -37,6 +39,43 @@ impl Arena {
         Ok(())
     }
 
+    /// V3 reserves a deterministic tail for its self-contained physical
+    /// allocation map. Existing numeric-key arenas retain their exact layout.
+    pub(super) fn views<K: TreeKey>(
+        &self,
+        backend: &dyn StorageBackend,
+    ) -> Result<(Arena, Option<AllocationMap>)> {
+        self.validate(backend)?;
+        if !K::PERSISTENT_ALLOCATOR {
+            return Ok((self.clone(), None));
+        }
+        let total = self.pages();
+        let mut low = 1u64;
+        let mut high = total;
+        while low < high {
+            let mid = low + (high - low).div_ceil(2);
+            let needed = AllocationMap::required_bytes(mid)? / PAGE_SIZE as u64;
+            if mid <= total.saturating_sub(needed) {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        if low < RESERVED_PAGES + 2 {
+            return Err(ArgosError::Invalid(
+                "V3 arena too small for physical allocator".into(),
+            ));
+        }
+        let mut data = self.clone();
+        data.length = low * PAGE_SIZE as u64;
+        let allocator = Arena {
+            disk_id: self.disk_id.clone(),
+            offset: self.offset + data.length,
+            length: self.length - data.length,
+        };
+        Ok((data, Some(AllocationMap::new(backend, allocator, low)?)))
+    }
+
     fn offset_of(&self, page: u64) -> Result<u64> {
         if page >= self.pages() {
             return Err(corrupt("metadata page outside arena"));
@@ -59,8 +98,183 @@ impl Arena {
         backend.write_at(&self.disk_id, self.offset_of(page)?, bytes)
     }
 
-    fn read_node(&self, backend: &dyn StorageBackend, ptr: Ptr) -> Result<Node> {
+    fn read_node<K: TreeKey>(&self, backend: &dyn StorageBackend, ptr: Ptr) -> Result<Node<K>> {
         Node::decode(&self.read(backend, ptr.page)?, ptr.hash)
+    }
+    fn read_value<K: TreeKey>(
+        &self,
+        backend: &dyn StorageBackend,
+        value: Value,
+    ) -> Result<Vec<u8>> {
+        match value {
+            Value::Inline(bytes) => Ok(bytes),
+            Value::Blob { len, first } => {
+                // Never allocate more than the arena could physically hold.
+                if len as u64 > self.length {
+                    return Err(corrupt("metadata blob exceeds arena size"));
+                }
+                let mut out = Vec::new();
+                let mut next = Some(first);
+                while let Some(ptr) = next {
+                    let Node::Blob {
+                        next: following,
+                        data,
+                    } = self.read_node::<K>(backend, ptr)?
+                    else {
+                        return Err(corrupt("metadata overflow points to tree page"));
+                    };
+                    if out.len() + data.len() > len {
+                        return Err(corrupt("metadata overflow length mismatch"));
+                    }
+                    out.extend_from_slice(&data);
+                    next = following;
+                }
+                if out.len() != len {
+                    return Err(corrupt("metadata overflow length mismatch"));
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    pub(super) fn validate_tree_head<K: TreeKey>(
+        &self,
+        backend: &dyn StorageBackend,
+        root: Root,
+    ) -> Result<()> {
+        if let Some(ptr) = root.tree {
+            if self.read_node::<K>(backend, ptr)?.level().is_none() {
+                return Err(corrupt("metadata root points to an overflow page"));
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn scan_window<K: TreeKey>(
+        &self,
+        backend: &dyn StorageBackend,
+        root: Root,
+        window: &super::ScanWindow<K>,
+    ) -> Result<super::ScanPage<K>> {
+        struct Task<K> {
+            ptr: Ptr,
+            level: Option<u8>,
+            lower: Option<K>,
+            upper: Option<K>,
+        }
+        let below_start = |key: &K| match &window.start {
+            Bound::Included(start) => key < start,
+            Bound::Excluded(start) => key <= start,
+            Bound::Unbounded => false,
+        };
+        let past_end = |key: &K| match &window.end {
+            Bound::Included(end) => key > end,
+            Bound::Excluded(end) => key >= end,
+            Bound::Unbounded => false,
+        };
+        let descending = window.order == super::ScanOrder::Descending;
+        let mut result = super::ScanPage {
+            records: Vec::new(),
+            more: false,
+        };
+        let mut bytes = 0usize;
+        let mut pending = root
+            .tree
+            .into_iter()
+            .map(|ptr| Task {
+                ptr,
+                level: None,
+                lower: None,
+                upper: None,
+            })
+            .collect::<Vec<_>>();
+        while let Some(task) = pending.pop() {
+            let node = self.read_node::<K>(backend, task.ptr)?;
+            if node.level().is_none()
+                || task.level.is_some_and(|level| node.level() != Some(level))
+                || task
+                    .upper
+                    .as_ref()
+                    .is_some_and(|upper| node.max_key().as_ref() != Some(upper))
+            {
+                return Err(corrupt("metadata scan path height or upper key mismatch"));
+            }
+            match node {
+                Node::Branch { level, children } => {
+                    let mut lower = task.lower;
+                    let mut next = Vec::new();
+                    for (max, ptr) in children {
+                        if lower.as_ref().is_some_and(|key| key >= &max) {
+                            return Err(corrupt("metadata scan overlapping branch range"));
+                        }
+                        if !below_start(&max) && !lower.as_ref().is_some_and(&past_end) {
+                            next.push(Task {
+                                ptr,
+                                level: Some(level - 1),
+                                lower: lower.clone(),
+                                upper: Some(max.clone()),
+                            });
+                        }
+                        lower = Some(max);
+                    }
+                    if descending {
+                        pending.extend(next);
+                    } else {
+                        pending.extend(next.into_iter().rev());
+                    }
+                }
+                Node::Leaf(mut entries) => {
+                    if task
+                        .lower
+                        .as_ref()
+                        .is_some_and(|lower| &entries[0].0 <= lower)
+                    {
+                        return Err(corrupt("metadata scan overlapping leaf range"));
+                    }
+                    if descending {
+                        entries.reverse();
+                    }
+                    for (key, value) in entries {
+                        if below_start(&key) {
+                            if descending {
+                                return Ok(result);
+                            }
+                            continue;
+                        }
+                        if past_end(&key) {
+                            if descending {
+                                continue;
+                            }
+                            return Ok(result);
+                        }
+                        let len = match &value {
+                            Value::Inline(value) => value.len(),
+                            Value::Blob { len, .. } => *len,
+                        };
+                        let cost = key
+                            .encoded_len()
+                            .checked_add(len)
+                            .ok_or_else(|| corrupt("metadata scan record size overflow"))?;
+                        if result.records.len() == window.max_records
+                            || cost > window.max_bytes.saturating_sub(bytes)
+                        {
+                            if result.records.is_empty() {
+                                return Err(ArgosError::Invalid(
+                                    "metadata scan byte budget smaller than next record".into(),
+                                ));
+                            }
+                            result.more = true;
+                            return Ok(result);
+                        }
+                        let value = self.read_value::<K>(backend, value)?;
+                        bytes += cost;
+                        result.records.push((key, value));
+                    }
+                }
+                Node::Blob { .. } => unreachable!("validated tree node"),
+            }
+        }
+        Ok(result)
     }
 }
 
@@ -68,14 +282,14 @@ impl Arena {
 // Consecutive COW roots share most physical pages. Reusing their verified
 // descriptors avoids a second device read and hash without treating an
 // unverified pointer as evidence or retaining full metadata images in RAM.
-enum ScanNode {
+enum ScanNode<K: TreeKey> {
     Leaf {
-        range: (u64, u64),
+        range: (K, K),
         blobs: Vec<(Ptr, usize)>,
     },
     Branch {
         level: u8,
-        children: Vec<(u64, Ptr)>,
+        children: Vec<(K, Ptr)>,
     },
     Blob {
         next: Option<Ptr>,
@@ -83,11 +297,14 @@ enum ScanNode {
     },
 }
 
-impl ScanNode {
-    fn from_node(node: Node) -> Self {
+impl<K: TreeKey> ScanNode<K> {
+    fn from_node(node: Node<K>) -> Self {
         match node {
             Node::Leaf(entries) => {
-                let range = (entries.first().unwrap().0, entries.last().unwrap().0);
+                let range = (
+                    entries.first().unwrap().0.clone(),
+                    entries.last().unwrap().0.clone(),
+                );
                 let blobs = entries
                     .into_iter()
                     .filter_map(|(_, value)| match value {
@@ -122,17 +339,17 @@ impl ScanNode {
     }
 }
 
-type VerifiedPages = BTreeMap<u64, (Ptr, Arc<ScanNode>)>;
+type VerifiedPages<K> = BTreeMap<u64, (Ptr, Arc<ScanNode<K>>)>;
 
-struct Scanner<'a> {
+struct Scanner<'a, K: TreeKey> {
     arena: &'a Arena,
     backend: &'a dyn StorageBackend,
-    verified: &'a mut VerifiedPages,
+    verified: &'a mut VerifiedPages<K>,
     graph: Graph,
 }
 
-impl Scanner<'_> {
-    fn visit(&mut self, ptr: Ptr) -> Result<Arc<ScanNode>> {
+impl<K: TreeKey> Scanner<'_, K> {
+    fn visit(&mut self, ptr: Ptr) -> Result<Arc<ScanNode<K>>> {
         if self.graph.contains_key(&ptr.page) {
             return Err(corrupt("metadata root contains a cycle or duplicate page"));
         }
@@ -230,7 +447,7 @@ impl Scanner<'_> {
     }
 
     // Every root still has independent cycle, key-range and overflow checks.
-    fn tree(&mut self, ptr: Ptr, expected_level: Option<u8>) -> Result<(u64, u64)> {
+    fn tree(&mut self, ptr: Ptr, expected_level: Option<u8>) -> Result<(K, K)> {
         let node = self.visit(ptr)?;
         if expected_level.is_some() && node.level() != expected_level {
             return Err(corrupt("metadata tree height mismatch"));
@@ -241,15 +458,15 @@ impl Scanner<'_> {
                 for &(first, len) in blobs {
                     self.blob(first, len)?;
                 }
-                Ok(*range)
+                Ok(range.clone())
             }
             ScanNode::Branch { level, children } => {
                 self.prefetch(children.iter().map(|(_, ptr)| *ptr));
                 let mut first = None;
                 let mut last = None;
-                for &(key, child) in children {
-                    let (min, max) = self.tree(child, Some(level - 1))?;
-                    if max != key || last.is_some_and(|previous| previous >= min) {
+                for (key, child) in children {
+                    let (min, max) = self.tree(*child, Some(level - 1))?;
+                    if &max != key || last.as_ref().is_some_and(|previous| previous >= &min) {
                         return Err(corrupt("metadata branch key range mismatch"));
                     }
                     first.get_or_insert(min);
@@ -329,37 +546,107 @@ impl FreePages {
     }
 }
 
-pub(super) struct Member {
+pub(super) struct Member<K: TreeKey> {
     pub(super) arena: Arena,
+    data: Arena,
+    allocation: Option<AllocationMap>,
+    allocator_heads_valid: [bool; 2],
+    pub(super) headers_complete: bool,
+    headers: [Option<Root>; 2],
     pub(super) roots: [Option<Root>; 2],
     pub(super) certificates: [Option<Root>; 2],
     graph: Graph,
     free: FreePages,
+    key: std::marker::PhantomData<K>,
 }
 
-impl Member {
+impl<K: TreeKey> Member<K> {
     pub(super) fn open(
         backend: &dyn StorageBackend,
         arena: Arena,
         namespace: Hash,
+        full: bool,
     ) -> Result<Self> {
-        arena.validate(backend)?;
-        let mut roots = [None; 2];
+        let (data, allocation) = arena.views::<K>(backend)?;
+        let mut headers = [None; 2];
         let mut certificates = [None; 2];
+        let mut headers_complete = true;
+        let identity = super::member_identity(namespace, &arena.disk_id);
+        let decode = |bytes: &Bytes, certificate| -> Result<Option<Root>> {
+            match Root::decode::<K>(bytes, identity, arena.pages(), certificate) {
+                Ok(root) => Ok(Some(root)),
+                Err(err @ ArgosError::IncompatibleFormat(_)) => Err(err),
+                Err(_) => Ok(None),
+            }
+        };
+        for slot in 0..2 {
+            match arena.read(backend, slot as u64 + 2) {
+                Ok(bytes) => certificates[slot] = decode(&bytes, true)?,
+                Err(_) => headers_complete = false,
+            }
+            match arena.read(backend, slot as u64) {
+                Ok(bytes) => headers[slot] = decode(&bytes, false)?,
+                Err(_) => headers_complete = false,
+            }
+        }
+        let mut allocator_heads_valid = [true; 2];
+        if let Some(map) = &allocation {
+            for (slot, root) in headers.iter().enumerate() {
+                if let Some(root) = root {
+                    allocator_heads_valid[slot] = root
+                        .physical
+                        .is_some_and(|state| map.open_root(backend, state.allocator).is_ok());
+                }
+            }
+        }
+        let mut member = Self {
+            arena,
+            data,
+            allocation,
+            allocator_heads_valid,
+            headers_complete,
+            headers,
+            roots: [None; 2],
+            certificates,
+            graph: Graph::new(),
+            free: FreePages::default(),
+            key: std::marker::PhantomData,
+        };
+        if full {
+            match member.scan_graph(backend) {
+                Ok((roots, graph)) => {
+                    member.roots = roots;
+                    member.free = FreePages::from_graph(member.data.pages(), &graph);
+                    member.graph = graph;
+                }
+                Err(_) => {
+                    // Keep certificate evidence even when the body is
+                    // unreadable, but never recycle a partially read graph.
+                    member.headers_complete = false;
+                }
+            }
+        } else {
+            for (slot, root) in member.headers.iter().enumerate() {
+                if let Some(root) = root {
+                    if member.data.validate_tree_head::<K>(backend, *root).is_ok() {
+                        member.roots[slot] = Some(*root);
+                    }
+                }
+            }
+        }
+        Ok(member)
+    }
+
+    fn scan_graph(&self, backend: &dyn StorageBackend) -> Result<([Option<Root>; 2], Graph)> {
+        let mut roots = [None; 2];
         let mut graph = Graph::new();
-        let mut verified = VerifiedPages::new();
-        for (slot, root) in roots.iter_mut().enumerate() {
-            // A read error is not proof that a root is invalid. Exclude the
-            // whole member rather than recycling potentially live pages.
-            let certificate = arena.read(backend, slot as u64 + 2)?;
-            let identity = super::member_identity(namespace, &arena.disk_id);
-            certificates[slot] = Root::decode(&certificate, identity, arena.pages(), true).ok();
-            let bytes = arena.read(backend, slot as u64)?;
-            let Ok(candidate) = Root::decode(&bytes, identity, arena.pages(), false) else {
+        let mut verified = VerifiedPages::<K>::new();
+        for (slot, candidate) in self.headers.iter().copied().enumerate() {
+            let Some(candidate) = candidate else {
                 continue;
             };
             let mut scanner = Scanner {
-                arena: &arena,
+                arena: &self.data,
                 backend,
                 verified: &mut verified,
                 graph: Graph::new(),
@@ -380,10 +667,8 @@ impl Member {
                     graph.insert(id, entry);
                 }
             }
-            *root = Some(candidate);
+            roots[slot] = Some(candidate);
         }
-        // Each physical page contributes its outgoing references exactly
-        // once even when both roots share it.
         let edges = graph
             .values()
             .flat_map(|entry| entry.children.iter().copied())
@@ -398,14 +683,72 @@ impl Member {
             }
             page.refs += 1;
         }
-        let free = FreePages::from_graph(arena.pages(), &graph);
-        Ok(Self {
-            arena,
-            roots,
-            certificates,
-            graph,
-            free,
-        })
+        Ok((roots, graph))
+    }
+
+    fn allocator_root(&self, slot: usize) -> AllocatorRoot {
+        self.headers[slot]
+            .and_then(|root| root.physical)
+            .map_or_else(AllocatorRoot::default, |state| state.allocator)
+    }
+
+    fn paired(&self, keep: usize) -> bool {
+        if !self.headers_complete || self.roots != self.headers {
+            return false;
+        }
+        let Some(base) = self.roots[keep] else {
+            return false;
+        };
+        let Some(physical) = base.physical else {
+            return false;
+        };
+        let other = self.roots[1 - keep];
+        if base.txid == 0 && base.tree.is_none() && other == Some(base) {
+            return physical == PhysicalState::default();
+        }
+        // An old selected root may have lost its expected alternate during
+        // an interrupted newer publication. Never allocate from that stale
+        // union; reconstruct the exact live graph before attempting writes.
+        physical.retained == other.map_or([0; 32], Root::local_identity)
+    }
+
+    /// Exhaustive offline invariant check, intentionally separate from the
+    /// mount path. Confirms physical counts exactly match both retained roots.
+    pub(super) fn audit_allocator(
+        &self,
+        backend: &dyn StorageBackend,
+        current: (u64, Hash),
+    ) -> Result<()> {
+        let map = self
+            .allocation
+            .as_ref()
+            .ok_or_else(|| corrupt("missing V3 allocator"))?;
+        let slot = self
+            .root_slot(current)
+            .ok_or_else(|| corrupt("member has no current V3 root"))?;
+        if !self.paired(slot) {
+            return Err(corrupt(
+                "V3 allocator/alternate root pairing needs recovery",
+            ));
+        }
+        let (roots, graph) = self.scan_graph(backend)?;
+        if roots != self.headers {
+            return Err(corrupt("V3 retained logical root is damaged"));
+        }
+        let mut expected = BTreeMap::new();
+        for (page, entry) in graph {
+            expected.insert(
+                page,
+                u32::try_from(entry.refs)
+                    .map_err(|_| corrupt("physical reference count overflow"))?,
+            );
+        }
+        if map.allocated_entries(backend, self.allocator_root(slot))? != expected {
+            return Err(corrupt(
+                "V3 physical allocator differs from reachable root graph",
+            ));
+        }
+        Ok(())
     }
 
     pub(super) fn is_certified(&self, slot: usize) -> bool {
@@ -422,41 +765,40 @@ impl Member {
     pub(super) fn prepare_repair(
         &self,
         backend: &dyn StorageBackend,
-        source: &Member,
+        source: &Member<K>,
         source_slot: usize,
     ) -> Result<Prepared> {
         let root = source.roots[source_slot].ok_or_else(|| corrupt("missing repair source"))?;
-        // Keep the best verified local root while the new graph is copied.
+        // Verify the source graph before copying. Recovery is allowed to
+        // perform full scans; the ordinary commit path is not.
+        let source_full = if source.allocation.is_some() {
+            let (roots, graph) = source.scan_graph(backend)?;
+            if roots[source_slot] != Some(root) {
+                return Err(corrupt("repair source root is not fully readable"));
+            }
+            Some(graph)
+        } else {
+            None
+        };
+        let graph = source_full.as_ref().unwrap_or(&source.graph);
         let keep = (0..2)
             .filter(|&slot| self.roots[slot].is_some())
             .max_by_key(|&slot| (self.is_certified(slot), self.roots[slot].unwrap().txid))
             .unwrap_or(1);
-        let mut plan = Plan {
-            member: self,
+        let prepared = self.prepare_with(
             backend,
-            free: Box::new(self.free.iter()),
-            recycled: Vec::new(),
-            pages: BTreeMap::new(),
-            reads: 0,
-        };
-        let tree = root
-            .tree
-            .map(|ptr| plan.copy_tree(source, ptr))
-            .transpose()?;
-        let repaired = Root {
-            txid: root.txid,
-            tree,
-        };
-        if repaired.identity() != root.identity() {
+            keep,
+            root.txid,
+            root.physical.map(|p| p.features),
+            |plan| {
+                root.tree
+                    .map(|ptr| plan.copy_tree(source, graph, ptr))
+                    .transpose()
+            },
+        )?;
+        if prepared.root.identity() != root.identity() {
             return Err(corrupt("repair changed the logical metadata root"));
         }
-        let prepared = Prepared {
-            slot: 1 - keep,
-            root: repaired,
-            pages: plan.pages,
-            reads: plan.reads,
-        };
-        self.validate_plan(&prepared)?;
         Ok(prepared)
     }
 
@@ -465,34 +807,251 @@ impl Member {
         backend: &dyn StorageBackend,
         slot: usize,
         txid: u64,
-        changes: &Changes,
+        changes: &TreeChanges<K>,
     ) -> Result<Prepared> {
         let root = self.roots[slot].ok_or_else(|| corrupt("missing base root"))?;
+        self.prepare_with(
+            backend,
+            slot,
+            txid,
+            root.physical.map(|p| p.features),
+            |plan| {
+                if root.tree.is_none() {
+                    plan.build_empty(changes)
+                } else {
+                    let mut tree = root.tree;
+                    for (key, value) in changes {
+                        tree = plan.update_root(tree, key.clone(), value.as_deref())?;
+                    }
+                    Ok(tree)
+                }
+            },
+        )
+    }
+
+    fn prepare_with(
+        &self,
+        backend: &dyn StorageBackend,
+        keep: usize,
+        txid: u64,
+        features: Option<V3Features>,
+        build: impl FnOnce(&mut Plan<'_, K>) -> Result<Option<Ptr>>,
+    ) -> Result<Prepared> {
+        if !self.headers_complete {
+            return Err(corrupt("metadata member has incomplete recovery evidence"));
+        }
+        if !self.allocator_heads_valid.iter().all(|valid| *valid) {
+            return Err(corrupt("member physical allocator head is damaged"));
+        }
+        let reads_before = self
+            .allocation
+            .as_ref()
+            .map_or(0, AllocationMap::read_calls);
+        let fast = self.allocation.is_some() && self.paired(keep);
+        let rebuilt = if self.allocation.is_some() && !fast {
+            let (roots, graph) = self.scan_graph(backend)?;
+            if roots[keep] != self.roots[keep] {
+                return Err(corrupt("base metadata graph failed recovery validation"));
+            }
+            Some((roots, graph))
+        } else {
+            None
+        };
+        let fallback_free = rebuilt
+            .as_ref()
+            .map(|(_, graph)| FreePages::from_graph(self.data.pages(), graph));
+        let free = if fast {
+            FreeCursor::Persistent {
+                map: self.allocation.as_ref().unwrap(),
+                root: self.allocator_root(keep),
+                next: RESERVED_PAGES,
+                buffer: VecDeque::new(),
+            }
+        } else {
+            FreeCursor::Resident(Box::new(
+                fallback_free.as_ref().unwrap_or(&self.free).iter(),
+            ))
+        };
         let mut plan = Plan {
             member: self,
             backend,
-            free: Box::new(self.free.iter()),
+            free,
             recycled: Vec::new(),
             pages: BTreeMap::new(),
             reads: 0,
         };
-        let tree = if root.tree.is_none() {
-            plan.build_empty(changes)?
-        } else {
-            let mut tree = root.tree;
-            for (&key, value) in changes {
-                tree = plan.update_root(tree, key, value.as_deref())?;
-            }
-            tree
-        };
-        let prepared = Prepared {
-            slot: 1 - slot,
-            root: Root { txid, tree },
+        let tree = build(&mut plan)?;
+        let mut prepared = Prepared {
+            slot: 1 - keep,
+            root: Root {
+                txid,
+                tree,
+                physical: features.map(|features| PhysicalState {
+                    features,
+                    ..Default::default()
+                }),
+            },
             pages: plan.pages,
             reads: plan.reads,
+            allocation: None,
         };
-        self.validate_plan(&prepared)?;
+        if let Some(map) = &self.allocation {
+            self.prepare_allocator(backend, map, keep, rebuilt.as_ref(), &mut prepared)?;
+            prepared.reads += map.read_calls().saturating_sub(reads_before);
+        } else {
+            self.validate_plan(&prepared)?;
+        }
         Ok(prepared)
+    }
+
+    fn prepare_allocator(
+        &self,
+        backend: &dyn StorageBackend,
+        map: &AllocationMap,
+        keep: usize,
+        rebuilt: Option<&([Option<Root>; 2], Graph)>,
+        plan: &mut Prepared,
+    ) -> Result<()> {
+        let base = self.allocator_root(keep);
+        let retained = self.allocator_root(1 - keep);
+        map.open_root(backend, base)?;
+        map.open_root(backend, retained)?;
+        let roots = rebuilt.map_or(&self.roots, |(roots, _)| roots);
+        let mut counts = BTreeMap::<u64, u32>::new();
+        if let Some((_, graph)) = rebuilt {
+            // An interrupted root publication can invalidate the exact
+            // allocator/alternate pairing. Rebuild counts conservatively
+            // from both actually intact logical roots, clearing stale
+            // entries only after scanning those graphs successfully.
+            for page in map.allocated_entries(backend, base)?.into_keys() {
+                counts.insert(page, 0);
+            }
+            for (&page, entry) in graph {
+                counts.insert(
+                    page,
+                    u32::try_from(entry.refs)
+                        .map_err(|_| corrupt("physical reference count overflow"))?,
+                );
+            }
+        }
+        if rebuilt.is_none() {
+            let pages: BTreeSet<_> = plan
+                .pages
+                .keys()
+                .copied()
+                .chain(
+                    plan.pages
+                        .values()
+                        .flat_map(|page| page.children.iter().map(|ptr| ptr.page)),
+                )
+                .chain(plan.root.tree.map(|ptr| ptr.page))
+                .chain(
+                    roots[plan.slot]
+                        .and_then(|root| root.tree)
+                        .map(|ptr| ptr.page),
+                )
+                .collect();
+            counts = map.reference_counts(backend, base, &pages)?;
+        }
+        let load = |counts: &mut BTreeMap<u64, u32>, page: u64| -> Result<u32> {
+            if page < RESERVED_PAGES || page >= self.data.pages() {
+                return Err(corrupt("logical pointer outside V3 data arena"));
+            }
+            if let Some(&count) = counts.get(&page) {
+                return Ok(count);
+            }
+            let count = if rebuilt.is_some() {
+                0
+            } else {
+                map.reference_count(backend, base, page)?
+            };
+            counts.insert(page, count);
+            Ok(count)
+        };
+        let mut identities = BTreeMap::new();
+        for (&page, staged) in &plan.pages {
+            if staged.ptr.page != page || load(&mut counts, page)? != 0 {
+                return Err(corrupt("V3 plan attempted to overwrite referenced page"));
+            }
+            identities.insert(page, staged.ptr.hash);
+        }
+        // A staged page contributes outgoing references once. The root adds
+        // one additional incoming reference. Existing nodes already own their
+        // outgoing references, so untouched subtrees are never traversed.
+        for ptr in plan
+            .pages
+            .values()
+            .flat_map(|page| page.children.iter().copied())
+            .chain(plan.root.tree)
+        {
+            if identities
+                .insert(ptr.page, ptr.hash)
+                .is_some_and(|hash| hash != ptr.hash)
+            {
+                return Err(corrupt("V3 plan has conflicting physical page identities"));
+            }
+            let count = load(&mut counts, ptr.page)?;
+            if let Some(staged) = plan.pages.get(&ptr.page) {
+                if staged.ptr != ptr {
+                    return Err(corrupt("V3 staged reference mismatch"));
+                }
+            } else if count == 0 {
+                return Err(corrupt("V3 plan references an unallocated page"));
+            }
+            counts.insert(
+                ptr.page,
+                count
+                    .checked_add(1)
+                    .ok_or_else(|| corrupt("physical reference count overflow"))?,
+            );
+        }
+        if plan.pages.keys().any(|page| counts.get(page) != Some(&1)) {
+            return Err(corrupt("V3 plan has unreachable or shared staged page"));
+        }
+        // Release only the overwritten root after adding the new edges.
+        // A zero transition is the only reason to read/release descendants.
+        let mut pending: Vec<_> = roots[plan.slot]
+            .and_then(|root| root.tree)
+            .into_iter()
+            .collect();
+        while let Some(ptr) = pending.pop() {
+            if identities
+                .insert(ptr.page, ptr.hash)
+                .is_some_and(|hash| hash != ptr.hash)
+            {
+                return Err(corrupt("V3 retired page identity mismatch"));
+            }
+            let count = load(&mut counts, ptr.page)?
+                .checked_sub(1)
+                .ok_or_else(|| corrupt("physical reference count underflow"))?;
+            counts.insert(ptr.page, count);
+            if count == 0 {
+                let node = self.data.read_node::<K>(backend, ptr)?;
+                plan.reads += 1;
+                let children = node.children();
+                if rebuilt.is_none() {
+                    let missing = children
+                        .iter()
+                        .map(|ptr| ptr.page)
+                        .filter(|page| !counts.contains_key(page))
+                        .collect();
+                    counts.extend(map.reference_counts(backend, base, &missing)?);
+                }
+                pending.extend(children);
+            }
+        }
+        let allocation = map.prepare(backend, base, retained, &counts)?;
+        plan.root.physical = Some(PhysicalState {
+            allocator: allocation.root(),
+            retained: roots[keep].map_or([0; 32], Root::local_identity),
+            features: plan
+                .root
+                .physical
+                .ok_or_else(|| corrupt("missing V3 feature set"))?
+                .features,
+        });
+        plan.allocation = Some(allocation);
+        Ok(())
     }
 
     fn validate_plan(&self, plan: &Prepared) -> Result<()> {
@@ -587,6 +1146,12 @@ impl Member {
         if !batch.is_empty() {
             verify(start, &batch)?;
         }
+        if let Some(allocation) = &plan.allocation {
+            self.allocation
+                .as_ref()
+                .ok_or_else(|| corrupt("missing V3 allocation map"))?
+                .write_prepared(backend, allocation)?;
+        }
         Ok(())
     }
 
@@ -596,7 +1161,7 @@ impl Member {
         namespace: Hash,
         plan: Prepared,
     ) -> Result<CommitIo> {
-        let bytes = plan.root.encode(
+        let bytes = plan.root.encode::<K>(
             super::member_identity(namespace, &self.arena.disk_id),
             self.arena.pages(),
             false,
@@ -609,10 +1174,22 @@ impl Member {
                 self.arena.disk_id
             )));
         }
+        let allocator_pages = plan
+            .allocation
+            .as_ref()
+            .map_or(0, PreparedAllocation::pages_written);
         let io = CommitIo {
-            pages_read: plan.reads + plan.pages.len() + 1,
-            pages_written: plan.pages.len() + 1,
+            pages_read: plan.reads + plan.pages.len() + allocator_pages + 1,
+            pages_written: plan.pages.len() + allocator_pages + 1,
         };
+        self.headers[plan.slot] = Some(plan.root);
+        if self.allocation.is_some() {
+            self.roots[plan.slot] = Some(plan.root);
+            self.allocator_heads_valid[plan.slot] = true;
+            self.graph.clear();
+            self.free = FreePages::default();
+            return Ok(io);
+        }
         // Only after the replacement root is durable can the retired root
         // release references. All pages reachable from the other root remain
         // allocated, including those shared by both trees.
@@ -667,11 +1244,14 @@ impl Member {
         namespace: Hash,
         identity: (u64, Hash),
     ) -> Result<()> {
+        if !self.headers_complete || !self.allocator_heads_valid.iter().all(|valid| *valid) {
+            return Err(corrupt("member recovery evidence is incomplete"));
+        }
         let slot = self
             .root_slot(identity)
             .ok_or_else(|| corrupt("cannot certify missing root"))?;
         let root = self.roots[slot].unwrap();
-        let bytes = root.encode(
+        let bytes = root.encode::<K>(
             super::member_identity(namespace, &self.arena.disk_id),
             self.arena.pages(),
             true,
@@ -688,57 +1268,28 @@ impl Member {
         Ok(())
     }
 
-    fn read_value(&self, backend: &dyn StorageBackend, value: Value) -> Result<Vec<u8>> {
-        match value {
-            Value::Inline(bytes) => Ok(bytes),
-            Value::Blob { len, first } => {
-                // Never allocate more than the arena could physically hold.
-                if len as u64 > self.arena.length {
-                    return Err(corrupt("metadata blob exceeds arena size"));
-                }
-                let mut out = Vec::new();
-                let mut next = Some(first);
-                while let Some(ptr) = next {
-                    let Node::Blob {
-                        next: following,
-                        data,
-                    } = self.arena.read_node(backend, ptr)?
-                    else {
-                        return Err(corrupt("metadata overflow points to tree page"));
-                    };
-                    if out.len() + data.len() > len {
-                        return Err(corrupt("metadata overflow length mismatch"));
-                    }
-                    out.extend_from_slice(&data);
-                    next = following;
-                }
-                if out.len() != len {
-                    return Err(corrupt("metadata overflow length mismatch"));
-                }
-                Ok(out)
-            }
-        }
-    }
-
     pub(super) fn get(
         &self,
         backend: &dyn StorageBackend,
         slot: usize,
-        key: u64,
+        key: &K,
     ) -> Result<Option<Vec<u8>>> {
         let mut next = self.roots[slot].and_then(|root| root.tree);
         while let Some(ptr) = next {
-            match self.arena.read_node(backend, ptr)? {
+            match self.data.read_node::<K>(backend, ptr)? {
                 Node::Branch { children, .. } => {
                     next = children
-                        .get(children.partition_point(|(max, _)| *max < key))
+                        .get(children.partition_point(|(max, _)| max < key))
                         .map(|(_, ptr)| *ptr);
                 }
                 Node::Leaf(mut entries) => {
                     return entries
-                        .binary_search_by_key(&key, |(key, _)| *key)
+                        .binary_search_by(|(candidate, _)| candidate.cmp(key))
                         .ok()
-                        .map(|index| self.read_value(backend, entries.swap_remove(index).1))
+                        .map(|index| {
+                            self.arena
+                                .read_value::<K>(backend, entries.swap_remove(index).1)
+                        })
                         .transpose();
                 }
                 Node::Blob { .. } => {
@@ -749,24 +1300,37 @@ impl Member {
         Ok(None)
     }
 
+    pub(super) fn scan(
+        &self,
+        backend: &dyn StorageBackend,
+        slot: usize,
+        window: &super::ScanWindow<K>,
+    ) -> Result<super::ScanPage<K>> {
+        let root = self.roots[slot].ok_or_else(|| corrupt("missing scan root"))?;
+        self.data.scan_window(backend, root, window)
+    }
+
     pub(super) fn records(
         &self,
         backend: &dyn StorageBackend,
         slot: usize,
-    ) -> Result<BTreeMap<u64, Vec<u8>>> {
+    ) -> Result<BTreeMap<K, Vec<u8>>> {
         let mut out = BTreeMap::new();
         let mut pending = self.roots[slot]
             .and_then(|root| root.tree)
             .into_iter()
             .collect::<Vec<_>>();
         while let Some(ptr) = pending.pop() {
-            match self.arena.read_node(backend, ptr)? {
+            match self.data.read_node::<K>(backend, ptr)? {
                 Node::Branch { children, .. } => {
                     pending.extend(children.into_iter().rev().map(|(_, ptr)| ptr))
                 }
                 Node::Leaf(entries) => {
                     for (key, value) in entries {
-                        if out.insert(key, self.read_value(backend, value)?).is_some() {
+                        if out
+                            .insert(key, self.data.read_value::<K>(backend, value)?)
+                            .is_some()
+                        {
                             return Err(corrupt("duplicate metadata key"));
                         }
                     }
@@ -791,38 +1355,67 @@ pub(super) struct Prepared {
     pub(super) root: Root,
     pages: BTreeMap<u64, Staged>,
     reads: usize,
+    allocation: Option<PreparedAllocation>,
 }
 
-struct Plan<'a> {
-    member: &'a Member,
+enum FreeCursor<'a> {
+    Resident(Box<dyn Iterator<Item = u64> + 'a>),
+    Persistent {
+        map: &'a AllocationMap,
+        root: AllocatorRoot,
+        next: u64,
+        buffer: VecDeque<u64>,
+    },
+}
+
+struct Plan<'a, K: TreeKey> {
+    member: &'a Member<K>,
     backend: &'a dyn StorageBackend,
-    free: Box<dyn Iterator<Item = u64> + 'a>,
+    free: FreeCursor<'a>,
     recycled: Vec<u64>,
     pages: BTreeMap<u64, Staged>,
     reads: usize,
 }
 
-impl Plan<'_> {
-    fn read(&mut self, ptr: Ptr) -> Result<Node> {
+impl<K: TreeKey> Plan<'_, K> {
+    fn read(&mut self, ptr: Ptr) -> Result<Node<K>> {
         if let Some(page) = self.pages.get(&ptr.page) {
             return Node::decode(&page.bytes, ptr.hash);
         }
         self.reads += 1;
-        self.member.arena.read_node(self.backend, ptr)
+        self.member.data.read_node(self.backend, ptr)
     }
 
     fn alloc(&mut self) -> Result<u64> {
-        self.recycled
-            .pop()
-            .or_else(|| self.free.next())
-            .ok_or_else(|| ArgosError::DiskFull {
-                disk_id: self.member.arena.disk_id.clone(),
-                required: PAGE_SIZE as u64,
-                available: 0,
-            })
+        if let Some(page) = self.recycled.pop() {
+            return Ok(page);
+        }
+        let page = match &mut self.free {
+            FreeCursor::Resident(iter) => iter.next(),
+            FreeCursor::Persistent {
+                map,
+                root,
+                next,
+                buffer,
+            } => {
+                if buffer.is_empty() {
+                    let pages = map.free_window(self.backend, *root, *next, 128)?;
+                    if let Some(last) = pages.last() {
+                        *next = *last + 1;
+                    }
+                    buffer.extend(pages);
+                }
+                buffer.pop_front()
+            }
+        };
+        page.ok_or_else(|| ArgosError::DiskFull {
+            disk_id: self.member.arena.disk_id.clone(),
+            required: PAGE_SIZE as u64,
+            available: 0,
+        })
     }
 
-    fn store(&mut self, node: Node, replace: Option<Ptr>) -> Result<Ptr> {
+    fn store(&mut self, node: Node<K>, replace: Option<Ptr>) -> Result<Ptr> {
         let id = match replace.filter(|ptr| self.pages.contains_key(&ptr.page)) {
             Some(ptr) => ptr.page,
             None => self.alloc()?,
@@ -869,7 +1462,7 @@ impl Plan<'_> {
         })
     }
 
-    fn store_tree(&mut self, node: Node, old: Option<Ptr>) -> Result<Vec<(u64, Ptr)>> {
+    fn store_tree(&mut self, node: Node<K>, old: Option<Ptr>) -> Result<Vec<(K, Ptr)>> {
         if node.max_key().is_none() {
             if let Some(old) = old {
                 self.release_staged(old);
@@ -888,7 +1481,7 @@ impl Plan<'_> {
 
     // Merge or redistribute underfull siblings on deletion. Only the local
     // neighbors of a changed path are touched; no global compaction pass.
-    fn rebalance(&mut self, children: &mut Vec<(u64, Ptr)>, index: usize) -> Result<()> {
+    fn rebalance(&mut self, children: &mut Vec<(K, Ptr)>, index: usize) -> Result<()> {
         if children.len() < 2 {
             return Ok(());
         }
@@ -911,15 +1504,18 @@ impl Plan<'_> {
         Ok(())
     }
 
-    fn update(&mut self, ptr: Ptr, key: u64, value: Option<&[u8]>) -> Result<Vec<(u64, Ptr)>> {
+    fn update(&mut self, ptr: Ptr, key: K, value: Option<&[u8]>) -> Result<Vec<(K, Ptr)>> {
         match self.read(ptr)? {
             Node::Leaf(mut entries) => {
-                match (entries.binary_search_by_key(&key, |(key, _)| *key), value) {
+                match (
+                    entries.binary_search_by(|(candidate, _)| candidate.cmp(&key)),
+                    value,
+                ) {
                     (Ok(index), Some(bytes)) => {
                         // Changes are unique per transaction, so no replaced
                         // overflow chain can have been allocated by this plan.
                         if matches!(&entries[index].1, Value::Inline(old) if old == bytes) {
-                            return Ok(vec![(entries.last().unwrap().0, ptr)]);
+                            return Ok(vec![(entries.last().unwrap().0.clone(), ptr)]);
                         }
                         entries[index].1 = self.value(bytes)?;
                     }
@@ -927,7 +1523,7 @@ impl Plan<'_> {
                         entries.remove(index);
                     }
                     (Err(index), Some(bytes)) => entries.insert(index, (key, self.value(bytes)?)),
-                    (Err(_), None) => return Ok(vec![(entries.last().unwrap().0, ptr)]),
+                    (Err(_), None) => return Ok(vec![(entries.last().unwrap().0.clone(), ptr)]),
                 }
                 self.store_tree(Node::Leaf(entries), Some(ptr))
             }
@@ -936,12 +1532,12 @@ impl Plan<'_> {
                 mut children,
             } => {
                 let index = children
-                    .partition_point(|(max, _)| *max < key)
+                    .partition_point(|(max, _)| max < &key)
                     .min(children.len() - 1);
-                let old = children[index];
+                let old = children[index].clone();
                 let replacement = self.update(old.1, key, value)?;
                 if replacement.as_slice() == [old] {
-                    return Ok(vec![(children.last().unwrap().0, ptr)]);
+                    return Ok(vec![(children.last().unwrap().0.clone(), ptr)]);
                 }
                 children.splice(index..index + 1, replacement);
                 if value.is_none() {
@@ -956,13 +1552,12 @@ impl Plan<'_> {
     // Copy the exact authenticated tree shape rather than rebuilding from
     // keys (which could change the logical digest). An explicit postorder
     // stack also handles long overflow chains without recursive stack use.
-    fn copy_tree(&mut self, source: &Member, root: Ptr) -> Result<Ptr> {
+    fn copy_tree(&mut self, source: &Member<K>, graph: &Graph, root: Ptr) -> Result<Ptr> {
         let mut pending = vec![(root, false)];
         let mut translated = BTreeMap::<u64, Ptr>::new();
         while let Some((ptr, expanded)) = pending.pop() {
             if !expanded {
-                let entry = source
-                    .graph
+                let entry = graph
                     .get(&ptr.page)
                     .filter(|entry| entry.ptr == ptr)
                     .ok_or_else(|| corrupt("repair source graph changed"))?;
@@ -970,7 +1565,7 @@ impl Plan<'_> {
                 pending.extend(entry.children.iter().rev().map(|&child| (child, false)));
                 continue;
             }
-            let mut node = source.arena.read_node(self.backend, ptr)?;
+            let mut node = source.data.read_node(self.backend, ptr)?;
             self.reads += 1;
             let replace = |child: &mut Ptr| -> Result<()> {
                 *child = translated
@@ -1013,19 +1608,19 @@ impl Plan<'_> {
 
     // Initial import is a bottom-up packed build, not N repeated COW path
     // rewrites. Later transactions retain the ordinary bounded path update.
-    fn build_empty(&mut self, changes: &Changes) -> Result<Option<Ptr>> {
+    fn build_empty(&mut self, changes: &TreeChanges<K>) -> Result<Option<Ptr>> {
         let mut leaves = Vec::new();
         let mut entries = Vec::new();
         let mut used = 0;
-        for (&key, value) in changes {
+        for (key, value) in changes {
             let Some(bytes) = value else { continue };
             let value = self.value(bytes)?;
-            let len = value.encoded_len();
+            let len = key.encoded_len() + value.encoded_len();
             if used + len > NODE_CAPACITY {
                 leaves.extend(self.store_tree(Node::Leaf(std::mem::take(&mut entries)), None)?);
                 used = 0;
             }
-            entries.push((key, value));
+            entries.push((key.clone(), value));
             used += len;
         }
         if !entries.is_empty() {
@@ -1034,14 +1629,25 @@ impl Plan<'_> {
         let mut level = 1;
         while leaves.len() > 1 {
             let mut parents = Vec::new();
-            for children in leaves.chunks(NODE_CAPACITY / 48) {
-                parents.extend(self.store_tree(
-                    Node::Branch {
-                        level,
-                        children: children.to_vec(),
-                    },
-                    None,
-                )?);
+            let mut children = Vec::new();
+            let mut used = 0;
+            for (key, ptr) in leaves {
+                let len = key.encoded_len() + 40;
+                if used + len > NODE_CAPACITY {
+                    parents.extend(self.store_tree(
+                        Node::Branch {
+                            level,
+                            children: std::mem::take(&mut children),
+                        },
+                        None,
+                    )?);
+                    used = 0;
+                }
+                children.push((key, ptr));
+                used += len;
+            }
+            if !children.is_empty() {
+                parents.extend(self.store_tree(Node::Branch { level, children }, None)?);
             }
             leaves = parents;
             level += 1;
@@ -1052,7 +1658,7 @@ impl Plan<'_> {
     fn update_root(
         &mut self,
         root: Option<Ptr>,
-        key: u64,
+        key: K,
         value: Option<&[u8]>,
     ) -> Result<Option<Ptr>> {
         let Some(root) = root else {

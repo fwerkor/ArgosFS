@@ -151,6 +151,7 @@ pub use autopilot::{AutopilotConfig, ReshapeReport};
 pub(crate) use capacity::CapacitySnapshot;
 use helpers::*;
 pub use member_balance::{MemberBalanceOptions, MemberBalanceReport};
+pub(crate) use namespace::decode_entry_name_bytes;
 use namespace::*;
 
 #[derive(Clone, Debug)]

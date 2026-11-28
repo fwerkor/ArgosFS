@@ -1920,7 +1920,7 @@ pub(super) fn validate_entry_name_bytes(name: &[u8]) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn decode_entry_name_bytes(name: &str) -> Vec<u8> {
+pub(crate) fn decode_entry_name_bytes(name: &str) -> Vec<u8> {
     for prefix in [
         ESCAPED_UTF8_NAME_PREFIX,
         NON_UTF8_NAME_PREFIX,
