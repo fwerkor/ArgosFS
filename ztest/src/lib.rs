@@ -6,6 +6,7 @@
 pub mod atomic;
 pub mod fault;
 pub mod invariants;
+pub mod mixed;
 pub mod model;
 pub mod oracle;
 pub mod supervisor;

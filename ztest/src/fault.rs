@@ -246,6 +246,8 @@ pub struct FaultBackend {
     recovery_fault: Option<RecoveryFault>,
     recovery_io: AtomicU64,
     recovery_enabled: AtomicBool,
+    failed_member: Mutex<Option<DeviceId>>,
+    failed_member_ios: AtomicU64,
 }
 
 impl FaultBackend {
@@ -260,6 +262,8 @@ impl FaultBackend {
             recovery_fault: None,
             recovery_io: AtomicU64::new(0),
             recovery_enabled: AtomicBool::new(false),
+            failed_member: Mutex::new(None),
+            failed_member_ios: AtomicU64::new(0),
         }
     }
 
@@ -278,6 +282,36 @@ impl FaultBackend {
 
     pub fn enable_boundary(&self) {
         self.recovery_enabled.store(true, Ordering::SeqCst);
+    }
+
+    /// Stop counting at the end of the synchronized transaction.
+    pub fn finish_boundary(&self) -> u64 {
+        self.recovery_enabled.store(false, Ordering::SeqCst);
+        self.recovery_io.load(Ordering::SeqCst)
+    }
+
+    /// Simulate an unannounced member outage at the live backend seam.
+    pub fn fail_member(&self, id: DeviceId) {
+        *self.failed_member.lock().unwrap_or_else(|p| p.into_inner()) = Some(id);
+    }
+
+    pub fn failed_member_ios(&self) -> u64 {
+        self.failed_member_ios.load(Ordering::SeqCst)
+    }
+
+    fn check_member(&self, device: &str, offset: u64, bytes: usize) -> Result<()> {
+        if self
+            .failed_member
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_deref()
+            == Some(device)
+        {
+            self.failed_member_ios.fetch_add(1, Ordering::SeqCst);
+            self.event("member_eio", device, offset, bytes);
+            return Err(self.injected_error());
+        }
+        Ok(())
     }
 
     fn recovery_boundary(
@@ -416,6 +450,7 @@ impl FaultBackend {
         buf: &mut [u8],
         shard_read: bool,
     ) -> Result<()> {
+        self.check_member(device_id, offset, buf.len())?;
         self.recovery_boundary(false, device_id, offset, buf.len())?;
         let inner = self.inner();
         if !self.is_armed() {
@@ -570,6 +605,7 @@ impl StorageBackend for FaultBackend {
     }
 
     fn write_at(&self, device_id: &DeviceId, offset: u64, data: &[u8]) -> Result<()> {
+        self.check_member(device_id, offset, data.len())?;
         self.recovery_boundary(true, device_id, offset, data.len())?;
         let inner = self.inner();
         if !self.is_armed() {
@@ -694,6 +730,7 @@ impl StorageBackend for FaultBackend {
     }
 
     fn flush_device(&self, device_id: &DeviceId) -> Result<()> {
+        self.check_member(device_id, 0, 0)?;
         self.recovery_boundary(true, device_id, 0, 0)?;
         let inner = self.inner();
         if !self.is_armed() {
@@ -726,7 +763,14 @@ impl StorageBackend for FaultBackend {
 
     fn flush_all(&self) -> Result<()> {
         let inner = self.inner();
-        if !self.is_armed() && !self.recovery_enabled.load(Ordering::SeqCst) {
+        if !self.is_armed()
+            && !self.recovery_enabled.load(Ordering::SeqCst)
+            && self
+                .failed_member
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_none()
+        {
             return inner.flush_all();
         }
         let devices = inner.list_devices()?;
@@ -1026,6 +1070,19 @@ mod tests {
         assert_eq!(&logical, b"aabbbb");
         backend.flush_device(&id).unwrap();
         assert_eq!(&inner.bytes(&id)[..6], b"aabbbb");
+    }
+
+    #[test]
+    fn live_member_outage_fails_io_even_when_random_faults_are_disarmed() {
+        let (backend, inner, _) = backend(quiet_config());
+        let id = "disk-0000".to_string();
+        backend.write_at(&id, 0, b"old").unwrap();
+        backend.fail_member(id.clone());
+        assert!(backend.read_at(&id, 0, &mut [0; 3]).is_err());
+        assert!(backend.write_at(&id, 0, b"new").is_err());
+        assert!(backend.flush_device(&id).is_err());
+        assert_eq!(backend.failed_member_ios(), 3);
+        assert_eq!(&inner.bytes(&id)[..3], b"old");
     }
 
     #[test]
