@@ -509,25 +509,24 @@ fn write_metadata_copies_bytes(root: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Stream a canonical metadata image into SHA-256. Serializing into a giant
-/// temporary Vec, deserializing it, and serializing it again previously cost
-/// multiple whole-namespace passes and gigabytes of transient allocations.
-///
-/// The serde round-trip is retained for floating-point normalization, and
-/// the final digest is calculated over exactly the legacy pretty JSON bytes.
+/// Stream the historical normalized pretty JSON into SHA-256. Keep the
+/// serde round-trip for legacy float semantics, but normalize the inode map
+/// one inode at a time, rather than retaining a full compact image and a
+/// second decoded namespace simultaneously.
 pub fn canonical_metadata_hash(meta: &Metadata) -> Result<String> {
     let mut clone = meta.clone();
     clone.integrity = MetadataIntegrity::default();
-    // A serde round-trip normalizes floating-point representations. This is
-    // part of the historical integrity hash and cannot be omitted without
-    // invalidating checkpoints written by prior ArgosFS versions.
-    let compact = serde_json::to_vec(&clone)?;
-    let round_trip = serde_json::from_slice::<Metadata>(&compact)?;
-    drop(compact);
+    let inodes = std::mem::take(&mut clone.inodes);
+    let mut round_trip: Metadata = serde_json::from_slice(&serde_json::to_vec(&clone)?)?;
+    round_trip.inodes = inodes.into_legacy_hash_view();
+    hash_pretty_json(&round_trip)
+}
+
+fn hash_pretty_json(meta: &impl Serialize) -> Result<String> {
     let mut sink = Sha256Sink(Sha256::new());
     {
         let mut buffered = BufWriter::with_capacity(256 * 1024, &mut sink);
-        serde_json::to_writer_pretty(&mut buffered, &round_trip)?;
+        serde_json::to_writer_pretty(&mut buffered, meta)?;
         buffered.flush()?;
     }
     Ok(hex::encode(sink.0.finalize()))
@@ -785,7 +784,7 @@ fn record_hash(record: &JournalRecord) -> Result<String> {
 fn record_hash_decoded(record: &JournalRecord) -> Result<String> {
     let mut clone = record.clone();
     clone.record_hash.clear();
-    Ok(sha256_hex(&serde_json::to_vec_pretty(&clone)?))
+    hash_pretty_json(&clone)
 }
 
 fn record_hash_value(value: &serde_json::Value) -> Result<String> {
@@ -837,7 +836,7 @@ fn legacy_record_hash_value(value: &serde_json::Value) -> Result<String> {
 fn canonical_metadata_hash_decoded(meta: &Metadata) -> Result<String> {
     let mut clone = meta.clone();
     clone.integrity = MetadataIntegrity::default();
-    Ok(sha256_hex(&serde_json::to_vec_pretty(&clone)?))
+    hash_pretty_json(&clone)
 }
 
 fn canonical_metadata_hash_bytes(bytes: &[u8]) -> Result<String> {
