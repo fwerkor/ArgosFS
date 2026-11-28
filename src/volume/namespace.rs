@@ -744,7 +744,7 @@ impl ArgosFs {
         }
         let start = spans[0].0;
         let inode_lock = self.inode_lock(ino);
-        let _inode_guard = inode_lock.lock();
+        let _inode_guard = inode_lock.write();
         let mut meta = self.meta.write();
         let (old_size, stripe_size) = self.range_update_geometry_locked(&meta, ino)?;
         let new_size = old_size.max(end);
@@ -807,7 +807,31 @@ impl ArgosFs {
             .ok_or_else(|| ArgosError::Invalid("write range is too large".to_string()))?;
 
         let inode_lock = self.inode_lock(ino);
-        let _inode_guard = inode_lock.lock();
+        if access.is_none() {
+            let shared = inode_lock.read();
+            let eligible =
+                self.parallel_overwrite_geometry(&self.meta.read(), ino, start, data.len());
+            if eligible {
+                let prepared = self.prepare_write(ino, data, None);
+                if let Some(result) = self.try_parallel_raw_range(
+                    ino,
+                    start,
+                    data,
+                    clear_setid,
+                    write_time,
+                    prepared.as_ref(),
+                    true,
+                ) {
+                    result?;
+                    self.runtime
+                        .commit_metrics
+                        .add_data_plane_bytes(DataPlaneByteKind::RangeAccepted, data.len());
+                    return Ok(data.len());
+                }
+            }
+            drop(shared);
+        }
+        let _inode_guard = inode_lock.write();
         // Permission and geometry are rechecked under the writer lock.
         // Avoid speculative work for explicit access checks.
         let prepared = if access.is_none() {
@@ -1065,7 +1089,7 @@ impl ArgosFs {
             .map_err(|_| ArgosError::Invalid("truncate size is too large".to_string()))?;
 
         let inode_lock = self.inode_lock(ino);
-        let _inode_guard = inode_lock.lock();
+        let _inode_guard = inode_lock.write();
         let mut meta = self.meta.write();
         let (old_size, stripe_raw_size) = self.range_update_geometry_locked(&meta, ino)?;
 

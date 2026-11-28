@@ -190,3 +190,80 @@ fn raw_members_separate_shard_and_bulk_read_handles() {
         .shard_file
         .is_none());
 }
+
+#[test]
+fn batched_writes_preserve_order_gaps_overlaps_and_capacity() {
+    let file = image(8192);
+    let backend = FileBlockBackend::open_loop(&[file.path().to_path_buf()], true).unwrap();
+    let id = "disk-0000".to_string();
+    let ranges: Vec<(u64, &[u8])> = vec![
+        (0, b"abc"),
+        (3, b"def"),
+        (6, b"ghi"),
+        (2, b"XY"),
+        (16, b"tail"),
+        (20, b"!"),
+    ];
+    backend.write_batch(&id, &ranges).unwrap();
+    backend.flush_device(&id).unwrap();
+    let mut data = vec![0; 21];
+    backend.read_at(&id, 0, &mut data).unwrap();
+    assert_eq!(&data[..9], b"abXYefghi");
+    assert_eq!(&data[9..16], &[0; 7]);
+    assert_eq!(&data[16..], b"tail!");
+
+    assert!(matches!(
+        backend.write_batch(&id, &[(0, b"bad"), (8191, b"xx")]),
+        Err(ArgosError::DiskFull { .. })
+    ));
+    assert!(matches!(
+        backend.write_batch(&id, &[(0, b"bad"), (u64::MAX, b"x")]),
+        Err(ArgosError::Invalid(_))
+    ));
+    assert_eq!(
+        backend.read_shard_owned(&id, 0, vec![0; 9]).unwrap(),
+        b"abXYefghi"
+    );
+}
+
+#[test]
+fn batched_writes_handle_many_adjacent_ranges() {
+    let file = image(8192);
+    let backend = FileBlockBackend::open_loop(&[file.path().to_path_buf()], true).unwrap();
+    let id = "disk-0000".to_string();
+    let payloads = (0..150u8).map(|i| [i; 17]).collect::<Vec<_>>();
+    let ranges = payloads
+        .iter()
+        .enumerate()
+        .map(|(i, data)| ((i * 17) as u64, data.as_slice()))
+        .collect::<Vec<_>>();
+    backend.write_batch(&id, &ranges).unwrap();
+    let expected = payloads.into_iter().flatten().collect::<Vec<_>>();
+    assert_eq!(
+        backend
+            .read_shard_owned(&id, 0, vec![0; expected.len()])
+            .unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn owned_uring_batch_preserves_fragmented_ranges_and_ordered_fallback() {
+    for mode in [IoMode::Buffered, IoMode::IoUring] {
+        let file = image(8192);
+        let backend = FileBlockBackend::open_loop(&[file.path().to_path_buf()], true).unwrap();
+        let id = "disk-0000".to_string();
+        let backend = crate::storage::guard::GuardedBackend::new(Arc::new(backend));
+        backend
+            .write_owned_batch(&id, vec![(0, b"abc".to_vec()), (8, b"def".to_vec())], mode)
+            .unwrap();
+        backend
+            .write_owned_batch(&id, vec![(1, b"xyz".to_vec()), (2, b"AB".to_vec())], mode)
+            .unwrap();
+        backend.flush_device(&id).unwrap();
+        let out = backend.read_shard_owned(&id, 0, vec![0; 11]).unwrap();
+        assert_eq!(&out[..4], b"axAB");
+        assert_eq!(&out[4..8], &[0; 4]);
+        assert_eq!(&out[8..], b"def");
+    }
+}

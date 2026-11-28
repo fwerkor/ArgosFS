@@ -322,3 +322,47 @@ Crash injection for loop/raw can be driven with `ARGOSFS_CRASH_POINT` using
 `after-data-flush-before-journal-commit`,
 `after-journal-commit-before-metadata-commit`,
 `after-metadata-commit-before-superblock-update`, or `during-replay`.
+
+### Bounded member I/O batches
+
+Aligned multi-stripe appends group a member's reserved shard writes into
+ordered batches of at most 64 ranges and 4 MiB (a larger individual shard
+retains its original single-operation path). The existing independent member
+workers run concurrently. On Linux, consecutive physical ranges are combined
+with positioned vectored writes; gaps and overlaps retain their original
+order. A batch is one guarded I/O operation, and the member's existing
+durability flush still precedes metadata publication. Partial completion or
+an error never publishes the reservation. The entire outstanding batch is
+treated as in-flight if a member times out, and that member remains fenced.
+
+Full and partial raw shard reads transfer ownership of the bounded read
+buffer into the deadline worker and return that same allocation on success.
+This avoids a second allocation and a userspace payload copy without allowing
+a timed-out operation to retain a borrowed caller buffer.
+
+These changes apply to the existing raw/loop backend, require no new on-disk
+features, and do not depend on FUSE-over-io_uring.
+
+The default buffered policy and the explicit `io-uring` policy automatically
+try io_uring for fragmented, ordered and nonoverlapping raw append batches,
+using up to 64 simultaneous positioned writes on a ring reused by the member's deadline worker. Contiguous runs
+retain the cheaper vectored write path; overlapping, oversized, unsupported
+or out-of-order batches retain the ordered fallback. Ring initialization
+or WRITE opcode probe failure falls back before any writes are issued.
+Set `ARGOSFS_DISABLE_IO_URING=1` at process startup to disable ring acceleration. Completion failures are
+reported, and ambiguous submission failures fence the member rather than
+replaying potentially outstanding operations. All completions must be
+observed before the existing member flush and metadata publication.
+
+Strict-durability raw/loop pools additionally admit full-stripe overwrites
+within an existing non-inline file to the parallel COW reservation lane.
+Logical publication remains ordered, and each writer replaces only its own
+range. The allocator replays the exact reserved extent, even when an earlier
+successful overwrite freed unrelated ranges; a failed earlier reservation
+still invalidates subsequent stripe tickets. Partial-stripe operations,
+extension, mixed-layout boundary crossings, encryption and deferred commits
+retain the ordinary serialization path.
+
+Select the raw/loop I/O policy using the existing command with a pool
+selector, e.g. `argosfs set-io-mode --images a.img,b.img,c.img --mode io-uring`.
+The existing host-volume positional syntax remains supported.

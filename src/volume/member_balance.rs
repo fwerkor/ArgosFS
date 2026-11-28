@@ -163,7 +163,7 @@ impl ArgosFs {
             }
             report.scanned_files += 1;
             let inode_lock = self.inode_lock(ino);
-            let _guard = inode_lock.lock();
+            let _guard = inode_lock.write();
             let mut meta = self.meta.write();
             self.ensure_block_backend_writable_locked(&meta)?;
             if meta.config.defer_metadata_commit || bulk_import_enabled() {

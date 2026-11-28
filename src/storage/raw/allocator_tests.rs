@@ -628,3 +628,31 @@ fn orphan_reclaim_only_recovers_unreferenced_allocated_ranges() {
     bad.next_offset = b.offset;
     assert!(orphan_reclaim_plan(&bad, vec![b]).is_err());
 }
+
+#[test]
+fn exact_reservation_preserves_unrelated_reclaimed_ranges() {
+    let mut state = init_allocator(4096, 4096 * 16, 4096);
+    let a = allocate(&mut state, "disk", 4096, 1).unwrap();
+    let b = allocate(&mut state, "disk", 4096, 1).unwrap();
+    let c = allocate(&mut state, "disk", 4096, 1).unwrap();
+    let tail = PhysicalExtent {
+        offset: state.next_offset,
+        ..a.clone()
+    };
+    free(&mut state, &a).unwrap();
+    reserve_exact(&mut state, &tail).unwrap();
+    assert_eq!(state.next_offset, tail.offset + tail.length);
+    assert_eq!(
+        allocate(&mut state, "disk", 4096, 2).unwrap().offset,
+        a.offset
+    );
+    assert!(reserve_exact(&mut state, &b).is_err());
+    free(&mut state, &a).unwrap();
+    free(&mut state, &b).unwrap();
+    free(&mut state, &c).unwrap();
+    reserve_exact(&mut state, &b).unwrap();
+    assert_eq!(state.free_extents.len(), 2);
+    assert_eq!(state.free_extents[0].offset, a.offset);
+    assert_eq!(state.free_extents[1].offset, c.offset);
+    assert!(reserve_exact(&mut state, &b).is_err());
+}

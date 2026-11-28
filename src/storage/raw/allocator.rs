@@ -124,6 +124,80 @@ pub fn allocate(
     })
 }
 
+/// Replay a previously reserved physical extent without re-running placement.
+/// Earlier successful COW overwrites may have freed other ranges meanwhile.
+/// The exact reserved interval must still be free or at the allocation tail.
+pub(crate) fn reserve_exact(state: &mut RawAllocatorState, extent: &PhysicalExtent) -> Result<()> {
+    let conflict = || ArgosError::Conflict("raw reserved extent no longer available".into());
+    let block_size = state.block_size.max(4096);
+    let end = extent
+        .offset
+        .checked_add(extent.length)
+        .ok_or_else(conflict)?;
+    if extent.length == 0
+        || !extent.offset.is_multiple_of(block_size)
+        || !extent.length.is_multiple_of(block_size)
+        || extent.offset < state.data_start
+        || end > state.data_end
+    {
+        return Err(conflict());
+    }
+    if extent.offset == align_up(state.next_offset, block_size) {
+        state.next_offset = end;
+        return Ok(());
+    }
+    if end > state.next_offset || !state.free_extents.is_normalized() {
+        return Err(conflict());
+    }
+    let free = &mut state.free_extents;
+    let mut lo = 0;
+    let mut hi = free.len();
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if free[mid].offset <= extent.offset {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    let index = lo.checked_sub(1).ok_or_else(conflict)?;
+    let entry = free[index].clone();
+    let free_end = entry
+        .offset
+        .checked_add(entry.length)
+        .ok_or_else(conflict)?;
+    if extent.offset < entry.offset || end > free_end {
+        return Err(conflict());
+    }
+    let old_bound = free.known_length_upper_bound();
+    free.remove(index);
+    let mut index = index;
+    if entry.offset < extent.offset {
+        free.insert(
+            index,
+            RawFreeExtent {
+                offset: entry.offset,
+                length: extent.offset - entry.offset,
+            },
+        );
+        index += 1;
+    }
+    if end < free_end {
+        free.insert(
+            index,
+            RawFreeExtent {
+                offset: end,
+                length: free_end - end,
+            },
+        );
+    }
+    free.mark_normalized();
+    if let Some(bound) = old_bound {
+        free.mark_length_upper_bound(bound);
+    }
+    Ok(())
+}
+
 pub fn free(state: &mut RawAllocatorState, extent: &PhysicalExtent) -> Result<()> {
     if extent.offset < state.data_start
         || extent.offset.saturating_add(extent.length) > state.data_end

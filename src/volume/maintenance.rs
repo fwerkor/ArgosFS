@@ -588,7 +588,7 @@ impl ArgosFs {
         exclude.insert(disk_id.to_string());
         for ino in targets {
             let inode_lock = self.inode_lock(ino);
-            let _inode_guard = inode_lock.lock();
+            let _inode_guard = inode_lock.write();
             let data = match self.read_inode(ino, 0, u64::MAX as usize, false) {
                 Ok(data) => data,
                 Err(ArgosError::NotFound(_)) if !self.meta.read().inodes.contains_key(&ino) => {
@@ -796,7 +796,7 @@ impl ArgosFs {
                 break;
             };
             let inode_lock = self.inode_lock(ino);
-            let _inode_guard = inode_lock.lock();
+            let _inode_guard = inode_lock.write();
             let data = match self.read_inode(ino, 0, u64::MAX as usize, true) {
                 Ok(data) => data,
                 Err(ArgosError::NotFound(_)) if !self.meta.read().inodes.contains_key(&ino) => {
@@ -927,7 +927,7 @@ impl ArgosFs {
         let mut next_cursor = cursor;
         for ino in targets {
             let inode_lock = self.inode_lock(ino);
-            let _inode_guard = inode_lock.lock();
+            let _inode_guard = inode_lock.write();
             next_cursor = Some(ino);
             let data = match self.read_inode(ino, 0, u64::MAX as usize, true) {
                 Ok(data) => data,
@@ -990,7 +990,7 @@ impl ArgosFs {
         let mut next_cursor = cursor;
         for ino in self.file_window(cursor, max_files) {
             let inode_lock = self.inode_lock(ino);
-            let _inode_guard = inode_lock.lock();
+            let _inode_guard = inode_lock.write();
             next_cursor = Some(ino);
             if !self.meta.read().inodes.contains_key(&ino) {
                 continue;
@@ -1166,7 +1166,7 @@ impl ArgosFs {
                 }
                 Some(NodeKind::File) => {
                     let inode_lock = self.inode_lock(ino);
-                    let _inode_guard = inode_lock.lock();
+                    let _inode_guard = inode_lock.write();
                     // A writer may have changed the inode after the ID scan.
                     // The inode lock is held before reading *any* repair state.
                     let inode = {
@@ -1581,7 +1581,7 @@ impl ArgosFs {
         let total = targets.len();
         for (index, (ino, stripes)) in targets.into_iter().enumerate() {
             let lock = self.inode_lock(ino);
-            let _guard = lock.lock();
+            let _guard = lock.write();
             let mut meta = self.meta.write();
             // A concurrent writer might have removed this file or moved a
             // stripe: do not apply stale worklist entries to its new blocks.

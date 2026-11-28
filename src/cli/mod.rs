@@ -993,12 +993,16 @@ pub fn run() -> Result<()> {
         }
         Command::SetIoMode {
             root,
+            storage,
             mode,
             direct_io,
             no_zero_copy,
             no_numa,
         } => {
-            let fs = ArgosFs::open(root)?;
+            let storage = storage.resolve(BackendKind::Host)?;
+            validate_root_backend(root.as_deref(), storage.backend)?;
+            let fs = open_backend(root, storage.backend, storage.images, storage.devices, true)?;
+            validate_requested_pool(&fs, storage.pool.as_deref())?;
             fs.set_io_policy(
                 mode,
                 direct_io || mode == IoMode::Direct,

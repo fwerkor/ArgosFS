@@ -320,3 +320,61 @@ fn unsupported_cache_eviction_does_not_quarantine_member() {
     assert!(backend.failure(&disk).is_none());
     backend.flush_device(&disk).unwrap();
 }
+
+#[test]
+fn owned_shard_reads_return_original_allocation_and_preserve_deadlines() {
+    let memory = MemoryBackend::new(4096);
+    let backend = GuardedBackend::with_timeout(Arc::new(memory), Duration::from_secs(1));
+    backend.write_at(&id(), 7, b"payload").unwrap();
+    let buf = vec![0; 7];
+    let ptr = buf.as_ptr();
+    let result = backend.read_shard_owned(&id(), 7, buf).unwrap();
+    assert_eq!(result, b"payload");
+    assert_eq!(result.as_ptr(), ptr);
+    assert!(backend.read_shard_owned(&id(), 4094, vec![0; 7]).is_err());
+
+    let mut slow = MemoryBackend::new(4096);
+    slow.read_delay = Duration::from_millis(200);
+    let backend = GuardedBackend::with_timeout(Arc::new(slow), Duration::from_millis(50));
+    assert!(matches!(
+        backend.read_shard_owned(&id(), 0, vec![0; 16]),
+        Err(ArgosError::DeviceTimeout { .. })
+    ));
+    assert!(matches!(
+        backend.read_shard_owned(&id(), 0, vec![0; 16]),
+        Err(ArgosError::DeviceFailed { .. })
+    ));
+}
+
+#[test]
+fn guarded_batch_propagates_errors_and_fences_future_operations() {
+    let mut memory = MemoryBackend::new(4096);
+    memory.write_error = Some(libc::EIO);
+    let attempts = memory.write_attempts.clone();
+    let backend = GuardedBackend::with_timeout(Arc::new(memory), Duration::from_secs(1));
+    let writes: &[(u64, &[u8])] = &[(0, b"a"), (1, b"b")];
+    assert!(matches!(
+        backend.write_batch(&id(), writes),
+        Err(ArgosError::DeviceFailed { .. })
+    ));
+    assert!(matches!(
+        backend.write_batch(&id(), writes),
+        Err(ArgosError::DeviceFailed { .. })
+    ));
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn guarded_batch_preserves_order_and_flush_barrier() {
+    let backend =
+        GuardedBackend::with_timeout(Arc::new(MemoryBackend::new(4096)), Duration::from_secs(1));
+    backend
+        .write_batch(&id(), &[(0, b"ab"), (2, b"cd"), (1, b"XY")])
+        .unwrap();
+    backend.flush_device(&id()).unwrap();
+    assert_eq!(
+        backend.read_shard_owned(&id(), 0, vec![0; 4]).unwrap(),
+        b"aXYd"
+    );
+    assert_eq!(backend.worker_seq.load(Ordering::SeqCst), 1);
+}
