@@ -147,6 +147,8 @@ struct FaultBackend {
     inner: Arc<dyn StorageBackend>,
     failures: Mutex<BTreeMap<String, Phase>>,
     offline: Mutex<BTreeSet<String>>,
+    reads: Mutex<BTreeMap<(String, u64), usize>>,
+    read_calls: std::sync::atomic::AtomicUsize,
 }
 
 impl FaultBackend {
@@ -155,6 +157,8 @@ impl FaultBackend {
             inner,
             failures: Mutex::new(BTreeMap::new()),
             offline: Mutex::new(BTreeSet::new()),
+            reads: Mutex::new(BTreeMap::new()),
+            read_calls: std::sync::atomic::AtomicUsize::new(0),
         }
     }
     fn check(&self, disk: &str) -> Result<()> {
@@ -174,6 +178,15 @@ impl StorageBackend for FaultBackend {
     }
     fn read_at(&self, id: &DeviceId, offset: u64, buf: &mut [u8]) -> Result<()> {
         self.check(id)?;
+        self.read_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut reads = self.reads.lock();
+        for page in 0..buf.len().div_ceil(PAGE_SIZE) {
+            *reads
+                .entry((id.clone(), offset + (page * PAGE_SIZE) as u64))
+                .or_default() += 1;
+        }
+        drop(reads);
         self.inner.read_at(id, offset, buf)
     }
     fn write_at(&self, id: &DeviceId, offset: u64, data: &[u8]) -> Result<()> {
@@ -515,4 +528,47 @@ fn paged_real_inode_population_294k_incremental_commit() {
     assert_eq!(recovered.inodes[&147000].uid, 123);
     assert_eq!(recovered.inodes[&1].entries["renamed-file"], 147000);
     assert!(!recovered.inodes[&1].entries.contains_key("file-147000"));
+}
+
+#[test]
+fn cold_open_reads_shared_cow_pages_only_once_per_member() {
+    let (_dir, backend, arenas) = fixture(3, 4096);
+    let faults = Arc::new(FaultBackend::new(backend));
+    let mut tree = PagedMetadata::format(faults.clone(), POOL, arenas.clone()).unwrap();
+    let changes = (0..4096)
+        .map(|i| {
+            (
+                i,
+                Some(vec![(i % 251) as u8; if i % 113 == 0 { 9000 } else { 128 }]),
+            )
+        })
+        .collect();
+    tree.commit(&changes).unwrap();
+    tree.commit(&BTreeMap::from([(100, Some(b"changed".to_vec()))]))
+        .unwrap();
+    drop(tree);
+    faults.reads.lock().clear();
+    faults
+        .read_calls
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    let tree = PagedMetadata::open(faults.clone(), POOL, arenas).unwrap();
+    {
+        let reads = faults.reads.lock();
+        assert!(reads.len() > 600, "exercise a substantial shared graph");
+        let calls = faults.read_calls.load(std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "cold recovery: {} unique pages, {calls} read requests",
+            reads.len()
+        );
+        assert!(
+            calls < reads.len() * 3 / 4,
+            "adjacent page reads were not coalesced"
+        );
+        assert!(
+            reads.values().all(|&n| n == 1),
+            "cold open reread an authenticated page"
+        );
+    }
+    assert_eq!(tree.get(100).unwrap(), Some(b"changed".to_vec()));
+    assert_eq!(tree.get(113).unwrap().unwrap().len(), 9000);
 }
