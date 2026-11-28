@@ -185,7 +185,8 @@ pub fn run() -> Result<()> {
                     "required_feature": "raw-delta-integrity-v2",
                     "required_features": [
                         "raw-delta-integrity-v2",
-                        "raw-journal-array-splice"
+                        "raw-journal-array-splice",
+                        "raw-journal-lz4"
                     ],
                     "pool_uuid": fs.metadata_snapshot().uuid
                 })

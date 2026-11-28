@@ -73,6 +73,19 @@ operation as v2 delta integrity, and is intentionally one-way: older readers
 reject it rather than attempting to interpret a splice record they do not
 know.
 
+## Compressed raw journal records
+
+The same explicit offline upgrade enables the required journal LZ4 feature
+(bit 2). Older pools remain readable and continue to write plain JSON until
+every active member has the feature. Records of at least 1 KiB are compressed
+only when LZ4 saves at least one eighth of the payload. The existing envelope
+retains its length and SHA-256 fields; the length's high bit identifies the
+compressed encoding, and the digest covers the actual stored bytes. The
+expanded size is checked before allocation and capped at 64 MiB. Logical
+record hashes, delta integrity, quorum certificates, region offsets and
+checkpoint recovery rules are unchanged. Compression reduces journal
+consumption and the frequency of expensive full checkpoint rollovers.
+
 ## Raw delta-integrity v2 (Issue #230; explicit upgrade)
 
 The raw/loop metadata journal can authenticate each deferred transaction using

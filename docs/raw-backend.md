@@ -124,9 +124,10 @@ SHA-256 unless explicitly upgraded. Large pools can enable authenticated,
 changed-record delta hashes on the normal deferred group-commit path using the
 one-way `argosfs upgrade-integrity --pool-config FILE --offline-confirmed`
 command. The upgrade requires **all active members** and an unmounted pool,
-changes a mandatory feature bit in both superblocks, and prevents older
-ArgosFS binaries from mounting. The v2 change does not alter region offsets,
-the journal envelope, or existing payload checksums. See
+changes mandatory feature bits in both superblocks, and prevents older
+ArgosFS binaries from mounting. The v2 change does not alter region offsets
+or existing payload checksums. The upgraded journal can also compress individual
+records, identified by a flag in the existing envelope. See
 [`incremental-journal-delta.md`](incremental-journal-delta.md) for upgrade,
 crash-recovery and downgrade precautions.
 

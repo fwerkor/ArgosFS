@@ -40,7 +40,7 @@ fn superblock_rejects_unknown_required_features_and_overlapping_regions() {
     sb.required_feature_flags = REQUIRED_FEATURE_DELTA_INTEGRITY | REQUIRED_FEATURE_ARRAY_SPLICE;
     assert_eq!(RawSuperblock::decode(&sb.encode()).unwrap(), sb);
     // Any future required bit remains fail-closed until explicitly supported.
-    sb.required_feature_flags = 1 << 2;
+    sb.required_feature_flags = 1 << 3;
     assert!(matches!(
         RawSuperblock::decode(&sb.encode()).unwrap_err(),
         ArgosError::IncompatibleFormat(_)

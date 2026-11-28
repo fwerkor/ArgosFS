@@ -25,7 +25,8 @@ use crate::journal;
 use crate::raw_format::{
     align_down, align_up, RawDeviceLabel, RawSuperblock, BACKUP_REGION_SIZE, DEVICE_LABEL_OFFSET,
     DEVICE_LABEL_SIZE, PRIMARY_SUPERBLOCK_OFFSET, PROTECTIVE_HEADER_OFFSET,
-    REQUIRED_FEATURE_ARRAY_SPLICE, REQUIRED_FEATURE_DELTA_INTEGRITY, SUPERBLOCK_SIZE,
+    REQUIRED_FEATURE_ARRAY_SPLICE, REQUIRED_FEATURE_DELTA_INTEGRITY,
+    REQUIRED_FEATURE_JOURNAL_COMPRESSION, SUPERBLOCK_SIZE,
 };
 use crate::storage::guard::GuardedBackend;
 use crate::types::{
@@ -562,8 +563,9 @@ pub(crate) fn upgrade_delta_integrity_members(
             }
         }
         let mut next = primary;
-        next.required_feature_flags |=
-            REQUIRED_FEATURE_DELTA_INTEGRITY | REQUIRED_FEATURE_ARRAY_SPLICE;
+        next.required_feature_flags |= REQUIRED_FEATURE_DELTA_INTEGRITY
+            | REQUIRED_FEATURE_ARRAY_SPLICE
+            | REQUIRED_FEATURE_JOURNAL_COMPRESSION;
         for offset in [sb.backup_superblock_offset, PRIMARY_SUPERBLOCK_OFFSET] {
             backend.write_at(&sb.disk_id, offset, &next.encode())?;
             backend.flush_device(&sb.disk_id)?;

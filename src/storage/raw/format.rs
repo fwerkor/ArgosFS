@@ -39,6 +39,9 @@ pub const REQUIRED_FEATURE_DELTA_INTEGRITY: u64 = 1 << 0;
 /// readers fail closed on this required bit instead of silently rejecting or
 /// misapplying a splice record.
 pub const REQUIRED_FEATURE_ARRAY_SPLICE: u64 = 1 << 1;
+/// Journal records can carry LZ4-compressed JSON behind a flagged length.
+/// Older readers must reject upgraded members before attempting replay.
+pub const REQUIRED_FEATURE_JOURNAL_COMPRESSION: u64 = 1 << 2;
 /// Bits 8..15 of optional feature flags identify the erasure-code wire format.
 /// Zero is the implicit legacy ID used by superblocks formatted before #259.
 /// Both IDs currently use byte-identical GF(2^8) systematic Vandermonde parity.
@@ -48,8 +51,9 @@ pub const CODEC_ID_LEGACY_GF8: u8 = 0;
 pub const CODEC_ID_VANDERMONDE_GF8: u8 = 1;
 const CODEC_ID_SHIFT: u32 = 8;
 const CODEC_ID_MASK: u64 = 0xff << CODEC_ID_SHIFT;
-const SUPPORTED_REQUIRED_FEATURE_FLAGS: u64 =
-    REQUIRED_FEATURE_DELTA_INTEGRITY | REQUIRED_FEATURE_ARRAY_SPLICE;
+const SUPPORTED_REQUIRED_FEATURE_FLAGS: u64 = REQUIRED_FEATURE_DELTA_INTEGRITY
+    | REQUIRED_FEATURE_ARRAY_SPLICE
+    | REQUIRED_FEATURE_JOURNAL_COMPRESSION;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RawRegion {
