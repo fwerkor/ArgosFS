@@ -198,17 +198,51 @@ fn path_iteration_and_file_windows_cover_nested_non_utf8_and_cursor_wrap() {
     assert!(fs.file_window(None, 0).is_empty());
     let all = fs.file_window(None, usize::MAX);
     assert_eq!(all.len(), 4);
-    assert!(all.windows(2).all(|pair| pair[0].0 < pair[1].0));
+    assert!(all.windows(2).all(|pair| pair[0] < pair[1]));
     let first = fs.file_window(None, 2);
     assert_eq!(first.len(), 2);
-    assert_eq!(first[0].0, all[0].0);
-    let after = fs.file_window(Some(first[1].0), 2);
-    assert_eq!(after[0].0, all[2].0);
+    assert_eq!(first[0], all[0]);
+    let after = fs.file_window(Some(first[1]), 2);
+    assert_eq!(after[0], all[2]);
     let wrapped = fs.file_window(Some(u64::MAX), 2);
-    assert_eq!(
-        wrapped.iter().map(|(ino, _)| *ino).collect::<Vec<_>>(),
-        first.iter().map(|(ino, _)| *ino).collect::<Vec<_>>()
-    );
+    assert_eq!(wrapped, first);
+}
+
+#[test]
+fn ordered_file_windows_track_dirty_edits_and_snapshot_rollback() {
+    let (_dir, fs) = host_volume();
+    let a = fs
+        .create_file_at(ROOT_INO, OsStr::new("a"), 0o600)
+        .unwrap()
+        .ino;
+    let b = fs
+        .create_file_at(ROOT_INO, OsStr::new("b"), 0o600)
+        .unwrap()
+        .ino;
+    let c = fs
+        .create_file_at(ROOT_INO, OsStr::new("c"), 0o600)
+        .unwrap()
+        .ino;
+    let mut inodes = fs.meta.read().inodes.clone();
+    assert_eq!(inodes.file_window_ids(None, usize::MAX), vec![a, b, c]);
+    assert_eq!(inodes.file_window_ids(Some(b), 3), vec![c, a, b]);
+    let before = inodes.clone();
+    let mut new_file = inodes[&a].clone();
+    let d = c + 1;
+    new_file.id = d;
+    inodes.insert(d, new_file);
+    inodes.remove(&a);
+    inodes.get_mut(&b).unwrap().kind = NodeKind::Symlink;
+    assert_eq!(inodes.file_window_ids(None, 10), vec![c, d]);
+    assert_eq!(inodes.file_window_ids(Some(d), 10), vec![c, d]);
+    assert_eq!(before.file_window_ids(None, 10), vec![a, b, c]);
+    inodes.mark_committed();
+    assert_eq!(inodes.file_window_ids(None, 10), vec![c, d]);
+    let serialized = serde_json::to_vec(&inodes).unwrap();
+    let recovered: crate::model::inodes::TrackedInodes =
+        serde_json::from_slice(&serialized).unwrap();
+    assert_eq!(recovered.file_window_ids(Some(c), 10), vec![d, c]);
+    assert_eq!(serde_json::to_vec(&recovered).unwrap(), serialized);
 }
 
 #[test]
