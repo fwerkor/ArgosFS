@@ -234,10 +234,209 @@ pub(super) struct CheckpointWire<'a> {
     pub(super) checkpoint_member_catalog: crate::model::inodes::CheckpointMemberCatalog,
 }
 
+// The framed representation is a standard concatenation of Zstd frames
+// and skippable padding. Existing checkpoint readers decode exactly the same
+// compact JSON; the explicit integrity upgrade opts in to its space policy.
+const FRAMED_CHECKPOINT_MIN_INODES: usize = 4096;
+const FRAMED_CHECKPOINT_TAIL_ALIGNMENT: usize = 64 * 1024;
+const ZSTD_SKIPPABLE_MAGIC: u32 = 0x184d2a50;
+
+/// Pad with a legal Zstd skippable frame. Most inode edits then change only
+/// their own physical pages rather than shifting all later frames.
+fn padded_frame_end(len: usize, alignment: usize) -> Option<usize> {
+    let remainder = len % alignment;
+    if remainder == 0 {
+        return Some(len);
+    }
+    let gap = alignment - remainder;
+    len.checked_add(if gap < 8 { gap + alignment } else { gap })
+}
+
+fn pad_zstd_stream(bytes: &mut Vec<u8>, end: usize) {
+    let gap = end - bytes.len();
+    if gap == 0 {
+        return;
+    }
+    debug_assert!(gap >= 8 && gap - 8 <= u32::MAX as usize);
+    bytes.extend_from_slice(&ZSTD_SKIPPABLE_MAGIC.to_le_bytes());
+    bytes.extend_from_slice(&((gap - 8) as u32).to_le_bytes());
+    bytes.resize(end, 0);
+}
+
+fn append_checkpoint_frame(bytes: &mut Vec<u8>, frame: &[u8], slot_len: u64) -> bool {
+    let Some(end) = bytes
+        .len()
+        .checked_add(frame.len())
+        .and_then(|len| padded_frame_end(len, METADATA_PAGE_SIZE))
+    else {
+        return false;
+    };
+    if !checkpoint_fits(end, slot_len) {
+        return false;
+    }
+    bytes.extend_from_slice(frame);
+    pad_zstd_stream(bytes, end);
+    true
+}
+
+struct CheckpointDigestWriter<'a, W> {
+    output: W,
+    hash: &'a mut Sha256,
+    len: u64,
+}
+
+impl<W: std::io::Write> std::io::Write for CheckpointDigestWriter<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let count = self.output.write(bytes)?;
+        self.len = self
+            .len
+            .checked_add(count as u64)
+            .ok_or_else(|| std::io::Error::other("checkpoint expanded length overflow"))?;
+        self.hash.update(&bytes[..count]);
+        Ok(count)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.output.flush()
+    }
+}
+
+fn prepare_framed_checkpoint(
+    metadata: &Metadata,
+    superblocks: &[RawSuperblock],
+) -> Result<Option<CheckpointPayload>> {
+    use std::io::Write;
+    let slot_len = superblocks
+        .iter()
+        .map(|sb| sb.metadata.length / 2)
+        .min()
+        .unwrap_or(u64::MAX);
+
+    // Each group needs at least one page. A heavily sparse inode ID
+    // space may be better represented by the existing dense encoder.
+    let minimum = metadata
+        .inodes
+        .checkpoint_frame_count()
+        .checked_add(2)
+        .and_then(|pages| pages.checked_mul(METADATA_PAGE_SIZE));
+    if minimum.is_none_or(|bytes| !checkpoint_fits(bytes, slot_len)) {
+        return Ok(None);
+    }
+
+    // Serialize the header without the inode map. Inodes are the last
+    // serialized Metadata field; check this invariant instead of silently
+    // producing a different wire image if the schema changes.
+    let mut header = metadata.clone();
+    header.inodes = Default::default();
+    let compact = serde_json::to_vec(&header)?;
+    let Some(prefix) = compact.strip_suffix(b"}}") else {
+        return Ok(None);
+    };
+    if !prefix.ends_with(b",\"inodes\":{") {
+        return Ok(None);
+    }
+    let mut bytes = Vec::new();
+    let prefix_frame = zstd::stream::encode_all(prefix, CHECKPOINT_ZSTD_LEVEL)?;
+    if !append_checkpoint_frame(&mut bytes, &prefix_frame, slot_len) {
+        return Ok(None);
+    }
+    let mut hash = Sha256::new();
+    hash.update(prefix);
+    let mut expanded_len = prefix.len() as u64;
+    let mut buffer = [0u8; 64 * 1024];
+
+    for frame in metadata.inodes.checkpoint_frames()? {
+        if !append_checkpoint_frame(&mut bytes, &frame.bytes, slot_len) {
+            return Ok(None);
+        }
+        expanded_len = expanded_len
+            .checked_add(frame.expanded_len as u64)
+            .ok_or_else(|| ArgosError::Invalid("checkpoint expanded length overflow".into()))?;
+        if expanded_len > METADATA_DECOMPRESSED_MAX {
+            return Ok(None);
+        }
+        // The old wire format commits to the SHA-256 of the entire expanded
+        // JSON. Reusing encoded frames avoids serde and compression work;
+        // streaming their expanded bytes retains the exact historical digest.
+        let mut decoder = zstd::stream::read::Decoder::new(frame.bytes.as_slice())?;
+        let mut actual = 0usize;
+        loop {
+            let count = decoder.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            hash.update(&buffer[..count]);
+            actual += count;
+        }
+        if actual != frame.expanded_len {
+            return Err(ArgosError::CorruptedMetadata(
+                "checkpoint cached frame length mismatch".into(),
+            ));
+        }
+    }
+
+    let encoder = zstd::stream::write::Encoder::new(Vec::new(), CHECKPOINT_ZSTD_LEVEL)?;
+    let mut tail = CheckpointDigestWriter {
+        output: std::io::BufWriter::with_capacity(64 * 1024, encoder),
+        hash: &mut hash,
+        len: 0,
+    };
+    tail.write_all(b"}")?;
+    tail.write_all(b",\"checkpoint_member_catalog\":")?;
+    serde_json::to_writer(&mut tail, &metadata.inodes.checkpoint_catalog())?;
+    tail.write_all(b"}")?;
+    expanded_len = expanded_len
+        .checked_add(tail.len)
+        .ok_or_else(|| ArgosError::Invalid("checkpoint expanded length overflow".into()))?;
+    if expanded_len > METADATA_DECOMPRESSED_MAX {
+        return Ok(None);
+    }
+    let tail_frame = tail
+        .output
+        .into_inner()
+        .map_err(|err| err.into_error())?
+        .finish()?;
+    if !append_checkpoint_frame(&mut bytes, &tail_frame, slot_len) {
+        return Ok(None);
+    }
+    // Keep the page count (and therefore the index/data boundary) stable
+    // across small growth. This padding is optional and never displaces a
+    // checkpoint that would otherwise fit.
+    if let Some(end) = padded_frame_end(bytes.len(), FRAMED_CHECKPOINT_TAIL_ALIGNMENT) {
+        if checkpoint_fits(end, slot_len) {
+            pad_zstd_stream(&mut bytes, end);
+        }
+    }
+    Ok(Some(CheckpointPayload {
+        bytes,
+        original: Some((expanded_len, hex::encode(hash.finalize()))),
+        has_catalog: true,
+    }))
+}
+
 pub(super) fn prepare_checkpoint_payload(
     metadata: &Metadata,
     superblocks: &[RawSuperblock],
 ) -> Result<CheckpointPayload> {
+    let active = metadata
+        .disks
+        .values()
+        .filter(|disk| disk.status != DiskStatus::Removed)
+        .count();
+    if metadata.inodes.len() >= FRAMED_CHECKPOINT_MIN_INODES
+        && active > 0
+        && superblocks.len() == active
+        && superblocks
+            .iter()
+            .all(|sb| sb.required_feature_flags & REQUIRED_FEATURE_JOURNAL_COMPRESSION != 0)
+    {
+        // Prefer retaining the optional catalog. If the paged representation
+        // cannot fit, fall back to the original dense checkpoint encoding
+        // before dropping the catalog, preserving existing capacity limits.
+        if let Some(payload) = prepare_framed_checkpoint(metadata, superblocks)? {
+            return Ok(payload);
+        }
+    }
     let wire = CheckpointWire {
         metadata,
         checkpoint_member_catalog: metadata.inodes.checkpoint_catalog(),

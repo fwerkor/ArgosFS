@@ -2,6 +2,7 @@
 //!
 //! The in-memory representation is independent of the serialized Metadata
 //! format: JSON always writes keys in increasing inode order.
+use super::checkpoint_chunks::{CheckpointChunks, CheckpointFrame};
 use super::types::{Inode, InodeId};
 use imbl::{HashMap, OrdMap, OrdSet};
 use serde::de::Deserializer;
@@ -171,6 +172,7 @@ pub(crate) fn capture_checkpoint_proof(enabled: bool) -> CheckpointProofGuard {
 
 #[derive(Clone, Debug)]
 pub struct TrackedInodes {
+    checkpoint_chunks: OnceLock<CheckpointChunks>,
     map: HashMap<InodeId, Inode>,
     dirty: BTreeSet<InodeId>,
     // Forked snapshots share their baseline; a commit/recovery resets it.
@@ -183,6 +185,7 @@ pub struct TrackedInodes {
 impl Default for TrackedInodes {
     fn default() -> Self {
         Self {
+            checkpoint_chunks: OnceLock::new(),
             map: HashMap::new(),
             dirty: BTreeSet::new(),
             baseline: Arc::new(()),
@@ -214,11 +217,17 @@ impl TrackedInodes {
             return None;
         }
         self.dirty.insert(*ino);
+        if let Some(chunks) = self.checkpoint_chunks.get_mut() {
+            chunks.invalidate(*ino);
+        }
         self.map.get_mut(ino)
     }
 
     pub fn insert(&mut self, ino: InodeId, inode: Inode) -> Option<Inode> {
         self.dirty.insert(ino);
+        if let Some(chunks) = self.checkpoint_chunks.get_mut() {
+            chunks.insert(ino);
+        }
         self.map.insert(ino, inode)
     }
 
@@ -226,8 +235,23 @@ impl TrackedInodes {
         let removed = self.map.remove(ino);
         if removed.is_some() {
             self.dirty.insert(*ino);
+            if let Some(chunks) = self.checkpoint_chunks.get_mut() {
+                chunks.remove(*ino);
+            }
         }
         removed
+    }
+
+    pub(crate) fn checkpoint_frame_count(&self) -> usize {
+        self.checkpoint_chunks
+            .get_or_init(|| CheckpointChunks::from_map(&self.map))
+            .len()
+    }
+
+    pub(crate) fn checkpoint_frames(&self) -> crate::error::Result<Vec<Arc<CheckpointFrame>>> {
+        self.checkpoint_chunks
+            .get_or_init(|| CheckpointChunks::from_map(&self.map))
+            .frames(&self.map)
     }
 
     pub fn keys(&self) -> impl Iterator<Item = &InodeId> {
