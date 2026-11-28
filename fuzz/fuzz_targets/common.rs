@@ -91,7 +91,7 @@ pub fn metadata_from(data: &[u8], salt: usize) -> Metadata {
 
 pub fn add_small_inode_tree(meta: &mut Metadata, data: &[u8], salt: usize) {
     let mut root_entries = BTreeMap::new();
-    root_entries.insert(text_at(data, salt, 20, "file"), 2);
+    root_entries.insert(text_at(data, salt, 20, "file"), 2u64);
 
     let mut root_xattrs = BTreeMap::new();
     root_xattrs.insert(

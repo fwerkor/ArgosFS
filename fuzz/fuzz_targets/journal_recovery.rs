@@ -80,16 +80,17 @@ fuzz_target!(|data: &[u8]| {
         if point.is_empty()
             || matches!(
                 point,
-                "after-primary-metadata"
-                    | "after-secondary-metadata"
-                    | "after-compatible-metadata"
+                "after-primary-metadata" | "after-secondary-metadata" | "after-compatible-metadata"
             )
         {
             last_metadata_copy = expected.clone();
         }
         let recovered = journal::load_or_recover(root)
             .expect("every injected journal crash must retain the durable state");
-        assert_eq!(recovered.metadata.txid, expected.txid, "lost committed transaction at {point}");
+        assert_eq!(
+            recovered.metadata.txid, expected.txid,
+            "lost committed transaction at {point}"
+        );
         assert_eq!(
             serde_json::to_value(&recovered.metadata).unwrap(),
             serde_json::to_value(&expected).unwrap(),
