@@ -182,18 +182,83 @@ fn build_journal_entry_measured(
     Ok((encode_journal_record(&record)?, logical_record_hash))
 }
 
+// The high bit is reserved for compressed records. All historical journal
+// regions are much smaller than 2 GiB, so no valid legacy record used it.
+const JOURNAL_COMPRESSED_FLAG: u32 = 1 << 31;
+const JOURNAL_MAX_EXPANDED_RECORD: usize = 64 * 1024 * 1024;
+const JOURNAL_COMPRESSION_MIN_BYTES: usize = 1024;
+
 fn encode_journal_record(record: &RawJournalRecord) -> Result<Vec<u8>> {
     let record_bytes = serde_json::to_vec(record)?;
-    let record_len = u32::try_from(record_bytes.len())
-        .map_err(|_| ArgosError::Invalid("raw journal record is too large".to_string()))?;
-    let payload_hash = sha256_hex(&record_bytes);
-    let mut entry = Vec::with_capacity(4 + 32 + record_bytes.len());
-    entry.extend_from_slice(&record_len.to_le_bytes());
-    let payload_hash_bytes = hex::decode(payload_hash)
-        .map_err(|err| ArgosError::Invalid(format!("raw journal hash encode failed: {err}")))?;
-    entry.extend_from_slice(&payload_hash_bytes);
-    entry.extend_from_slice(&record_bytes);
+    encode_journal_payload(&record_bytes, false)
+}
+
+fn encode_journal_payload(bytes: &[u8], compressed: bool) -> Result<Vec<u8>> {
+    let record_len = u32::try_from(bytes.len())
+        .ok()
+        .filter(|len| *len != 0 && *len < JOURNAL_COMPRESSED_FLAG)
+        .ok_or_else(|| ArgosError::Invalid("raw journal record is too large".to_string()))?;
+    let tagged_len = record_len
+        | if compressed {
+            JOURNAL_COMPRESSED_FLAG
+        } else {
+            0
+        };
+    let mut entry = Vec::with_capacity(36 + bytes.len());
+    entry.extend_from_slice(&tagged_len.to_le_bytes());
+    entry.extend_from_slice(&Sha256::digest(bytes));
+    entry.extend_from_slice(bytes);
     Ok(entry)
+}
+
+fn compress_journal_entry(entry: Vec<u8>, enabled: bool) -> Result<Vec<u8>> {
+    let bytes = &entry[36..];
+    if !enabled
+        || !(JOURNAL_COMPRESSION_MIN_BYTES..=JOURNAL_MAX_EXPANDED_RECORD).contains(&bytes.len())
+    {
+        return Ok(entry);
+    }
+    // LZ4 is intentionally low latency. Avoid expanding small/incompressible
+    // records or paying decompression costs for negligible space savings.
+    let compressed = lz4_flex::compress_prepend_size(bytes);
+    if compressed.len() <= bytes.len() - bytes.len() / 8 {
+        encode_journal_payload(&compressed, true)
+    } else {
+        Ok(entry)
+    }
+}
+
+pub(super) fn journal_entry_length(sb: &RawSuperblock, header: &[u8; 36]) -> Result<(usize, bool)> {
+    let tagged = u32::from_le_bytes(header[..4].try_into().unwrap());
+    let compressed = tagged & JOURNAL_COMPRESSED_FLAG != 0;
+    if compressed && sb.required_feature_flags & REQUIRED_FEATURE_JOURNAL_COMPRESSION == 0 {
+        return Err(ArgosError::IncompatibleFormat(
+            "compressed journal record lacks required feature".into(),
+        ));
+    }
+    Ok(((tagged & !JOURNAL_COMPRESSED_FLAG) as usize, compressed))
+}
+
+pub(super) fn decode_journal_payload(bytes: &[u8], compressed: bool) -> Result<RawJournalRecord> {
+    if !compressed {
+        return Ok(serde_json::from_slice(bytes)?);
+    }
+    let len = bytes
+        .get(..4)
+        .map(|prefix| u32::from_le_bytes(prefix.try_into().unwrap()) as usize)
+        .filter(|len| *len != 0 && *len <= JOURNAL_MAX_EXPANDED_RECORD)
+        .ok_or_else(|| {
+            ArgosError::CorruptedMetadata("invalid expanded journal record length".into())
+        })?;
+    let expanded = lz4_flex::decompress_size_prepended(bytes).map_err(|err| {
+        ArgosError::CorruptedMetadata(format!("invalid compressed journal record: {err}"))
+    })?;
+    if expanded.len() != len {
+        return Err(ArgosError::CorruptedMetadata(
+            "compressed journal record length mismatch".into(),
+        ));
+    }
+    Ok(serde_json::from_slice(&expanded)?)
 }
 
 fn build_quorum_commit_entry(
@@ -314,7 +379,7 @@ pub(super) fn journal_tip_identity(
     while cursor + 36 <= end {
         let mut entry_header = [0u8; 36];
         reader.read_exact(&mut entry_header)?;
-        let len = u32::from_le_bytes(entry_header[..4].try_into().unwrap()) as usize;
+        let (len, compressed) = journal_entry_length(sb, &entry_header)?;
         if len == 0 || cursor + 36 + len as u64 > end {
             return Err(ArgosError::CorruptedMetadata(format!(
                 "invalid raw journal extent at {}:{}",
@@ -323,13 +388,13 @@ pub(super) fn journal_tip_identity(
         }
         let mut bytes = vec![0u8; len];
         reader.read_exact(&mut bytes)?;
-        if hex::encode(&entry_header[4..36]) != sha256_hex(&bytes) {
+        if Sha256::digest(&bytes).as_slice() != &entry_header[4..36] {
             return Err(ArgosError::Checksum(format!(
                 "raw journal payload checksum mismatch at {}:{}",
                 sb.disk_id, cursor
             )));
         }
-        let record = serde_json::from_slice::<RawJournalRecord>(&bytes)?;
+        let record = decode_journal_payload(&bytes, compressed)?;
         if raw_record_hash(&record)? != record.record_hash {
             return Err(ArgosError::Checksum(format!(
                 "raw journal record hash mismatch at {}:{}",
@@ -619,6 +684,13 @@ pub(super) fn append_journal_quorum(
         prepared_delta,
         metrics,
     )?;
+    // Compression is enabled only after all active members advertise the
+    // required bit, including when a pool was only partially upgraded.
+    let compression_enabled = superblocks.len() == active
+        && superblocks
+            .iter()
+            .all(|sb| sb.required_feature_flags & REQUIRED_FEATURE_JOURNAL_COMPRESSION != 0);
+    let entry = compress_journal_entry(entry, compression_enabled)?;
     let journal_certificate =
         build_quorum_commit_entry(metadata, Some(target_record_hash.as_str()))?;
     let mut report = QuorumWriteReport::default();

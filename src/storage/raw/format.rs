@@ -39,6 +39,9 @@ pub const REQUIRED_FEATURE_DELTA_INTEGRITY: u64 = 1 << 0;
 /// readers fail closed on this required bit instead of silently rejecting or
 /// misapplying a splice record.
 pub const REQUIRED_FEATURE_ARRAY_SPLICE: u64 = 1 << 1;
+/// Journal records can carry LZ4-compressed JSON behind a flagged length.
+/// Older readers must reject upgraded members before attempting replay.
+pub const REQUIRED_FEATURE_JOURNAL_COMPRESSION: u64 = 1 << 2;
 /// Independent authenticated metadata page arena and immutable membership manifest.
 pub const REQUIRED_FEATURE_PAGED_METADATA: u64 = 1 << 3;
 /// Offline upgrade fence; old binaries cannot open a member while its new arena is staged.
@@ -54,6 +57,7 @@ const CODEC_ID_SHIFT: u32 = 8;
 const CODEC_ID_MASK: u64 = 0xff << CODEC_ID_SHIFT;
 const SUPPORTED_REQUIRED_FEATURE_FLAGS: u64 = REQUIRED_FEATURE_DELTA_INTEGRITY
     | REQUIRED_FEATURE_ARRAY_SPLICE
+    | REQUIRED_FEATURE_JOURNAL_COMPRESSION
     | REQUIRED_FEATURE_PAGED_METADATA
     | REQUIRED_FEATURE_PAGED_MIGRATION;
 

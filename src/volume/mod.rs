@@ -218,68 +218,30 @@ impl DeferredCommitState {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct QuotaRuntime {
-    active: BTreeSet<InodeId>,
-    usage_bytes: BTreeMap<InodeId, u64>,
-    memberships: BTreeMap<InodeId, BTreeSet<InodeId>>,
+    active: imbl::OrdSet<InodeId>,
+    usage_bytes: imbl::OrdMap<InodeId, u128>,
+    // Number of reachable directory entries for each (inode, quota).
+    // A file with multiple hard links is charged only on the first edge.
+    memberships: imbl::OrdMap<InodeId, imbl::OrdMap<InodeId, u64>>,
 }
 
 impl QuotaRuntime {
     fn from_metadata(meta: &Metadata) -> Result<Self> {
-        fn visit(
-            meta: &Metadata,
-            ino: InodeId,
-            quota_ino: InodeId,
-            seen: &mut BTreeSet<InodeId>,
-            runtime: &mut QuotaRuntime,
-        ) -> Result<u64> {
-            if !seen.insert(ino) {
-                return Ok(0);
-            }
-            let inode = meta
-                .inodes
-                .get(&ino)
-                .ok_or_else(|| ArgosError::NotFound(format!("inode {ino}")))?;
-            runtime
-                .memberships
-                .entry(ino)
-                .or_default()
-                .insert(quota_ino);
-            match inode.kind {
-                NodeKind::File => Ok(inode.size),
-                NodeKind::Directory => {
-                    let mut total = 0u64;
-                    for child in inode.entries.values() {
-                        total =
-                            total.saturating_add(visit(meta, *child, quota_ino, seen, runtime)?);
-                    }
-                    Ok(total)
-                }
-                NodeKind::Symlink | NodeKind::Special => Ok(0),
-            }
-        }
-
         let mut runtime = Self::default();
-        let quota_inodes = meta
-            .inodes
-            .iter()
-            .filter_map(|(ino, inode)| inode.quota_bytes.map(|_| *ino))
-            .collect::<Vec<_>>();
-        for quota_ino in quota_inodes {
-            runtime.active.insert(quota_ino);
-            let used = visit(
-                meta,
-                quota_ino,
-                quota_ino,
-                &mut BTreeSet::new(),
-                &mut runtime,
-            )?;
-            runtime.usage_bytes.insert(quota_ino, used);
+        for (ino, inode) in &meta.inodes {
+            if inode.quota_bytes.is_some() {
+                runtime.active.insert(*ino);
+                runtime.usage_bytes.insert(*ino, 0);
+                runtime.change_edge(meta, *ino, *ino, true)?;
+            }
         }
         Ok(runtime)
     }
 }
+
+type DirectoryParentIndex = BTreeMap<InodeId, (InodeId, String)>;
 
 /// Mount-local state shared by every handle, independent of backend configuration.
 struct MountRuntime {
@@ -293,11 +255,9 @@ struct MountRuntime {
     repair_counters: RepairCounters,
     mount_owners: AtomicUsize,
     read_retries: usize,
-    /// Child -> parent, built on the first parent lookup and then kept current
-    /// by namespace mutations. Readdir only needs it for directories, but
-    /// indexing every child preserves the helper's previous behavior for
-    /// files and hard links too.
-    parent_index: RwLock<Option<BTreeMap<InodeId, InodeId>>>,
+    /// Directory child -> (parent, encoded entry name). Validate by exact
+    /// lookup rather than scanning a potentially very wide parent.
+    parent_index: RwLock<Option<DirectoryParentIndex>>,
 }
 
 impl MountRuntime {

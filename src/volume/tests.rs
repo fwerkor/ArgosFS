@@ -330,6 +330,67 @@ fn parent_index_follows_rename_rmdir_and_hardlink_changes() {
 }
 
 #[test]
+fn directory_parent_index_uses_exact_names_and_recovers_stale_hints() {
+    use std::os::unix::ffi::OsStringExt;
+    let (_dir, fs) = host_volume();
+    let a = fs.mkdir_at(ROOT_INO, OsStr::new("a"), 0o755).unwrap();
+    let b = fs.mkdir_at(ROOT_INO, OsStr::new("b"), 0o755).unwrap();
+    let raw = std::ffi::OsString::from_vec(b"child-\xff".to_vec());
+    let child = fs.mkdir_at(a.ino, &raw, 0o755).unwrap();
+    let other = fs.mkdir_at(b.ino, OsStr::new("other"), 0o755).unwrap();
+    let file = fs.create_file_at(a.ino, OsStr::new("file"), 0o600).unwrap();
+    {
+        let meta = fs.meta.read();
+        assert_eq!(fs.parent_inode_locked(&meta, child.ino).unwrap(), a.ino);
+        let index = fs.runtime.parent_index.read();
+        let index = index.as_ref().unwrap();
+        assert_eq!(
+            index.len(),
+            meta.inodes
+                .values()
+                .filter(|inode| inode.kind == NodeKind::Directory && inode.id != ROOT_INO)
+                .count()
+        );
+        assert!(!index.contains_key(&file.ino));
+    }
+    fs.rename_at_with_policy(
+        a.ino,
+        &raw,
+        b.ino,
+        OsStr::new("other"),
+        RenamePolicy {
+            exchange: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    {
+        let meta = fs.meta.read();
+        assert_eq!(fs.parent_inode_locked(&meta, child.ino).unwrap(), b.ino);
+        assert_eq!(fs.parent_inode_locked(&meta, other.ino).unwrap(), a.ino);
+    }
+    // Simulate an old hint after a rollback or recovery. The old name now
+    // refers to another directory, so checking merely its existence is wrong.
+    fs.runtime
+        .parent_index
+        .write()
+        .as_mut()
+        .unwrap()
+        .insert(child.ino, (a.ino, entry_name_from_os(&raw).unwrap()));
+    {
+        let meta = fs.meta.read();
+        assert_eq!(fs.parent_inode_locked(&meta, child.ino).unwrap(), b.ino);
+    }
+    fs.rename_at(b.ino, OsStr::new("other"), b.ino, OsStr::new("renamed"))
+        .unwrap();
+    let index = fs.runtime.parent_index.read();
+    assert_eq!(
+        index.as_ref().unwrap().get(&child.ino),
+        Some(&(b.ino, "renamed".to_owned()))
+    );
+}
+
+#[test]
 fn inode_helpers_touch_allocate_paths_and_attributes() {
     let (_dir, fs) = host_volume();
     let mut meta = fs.meta.write();
@@ -2239,13 +2300,14 @@ fn immediate_v2_prepares_splices_only_after_all_members_upgrade() {
     let mut cursor = 0;
     let mut splices = 0;
     while cursor + 36 <= body.len() {
-        let n = u32::from_le_bytes(body[cursor..cursor + 4].try_into().unwrap()) as usize;
-        let record: serde_json::Value =
-            serde_json::from_slice(&body[cursor + 36..cursor + 36 + n]).unwrap();
-        if let Some(delta) = record["metadata_delta"].as_array() {
-            splices += delta.iter().filter(|op| op["op"] == "splice").count();
+        let (len, delta) = raw_store::journal_delta_for_test(sb, &body[cursor..]).unwrap();
+        if let Some(delta) = delta {
+            splices += delta
+                .iter()
+                .filter(|op| matches!(op, journal::MetadataDeltaOp::Splice { .. }))
+                .count();
         }
-        cursor += 36 + n;
+        cursor += len;
     }
     assert!(
         splices > 0,
