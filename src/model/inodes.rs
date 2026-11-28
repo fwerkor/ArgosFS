@@ -2,7 +2,7 @@
 //!
 //! The in-memory representation is independent of the serialized Metadata
 //! format: JSON always writes keys in increasing inode order.
-use super::types::{Inode, InodeId};
+use super::types::{Inode, InodeId, NodeKind};
 use imbl::{HashMap, OrdMap, OrdSet};
 use serde::de::Deserializer;
 use serde::ser::{SerializeMap, Serializer};
@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::ops::Index;
+use std::ops::{Bound, Index};
 use std::sync::{Arc, OnceLock};
 
 use super::checkpoint_chunks::{CheckpointChunks, CheckpointFrame};
@@ -245,6 +245,9 @@ pub struct TrackedInodes {
     // Distinct baselines require a full comparison, never a dirty-only diff.
     baseline: Arc<()>,
     member_catalog: OnceLock<MemberCatalog>,
+    // Derived, lazily populated ordered file IDs. Snapshot clones share the
+    // persistent tree; dirty inode IDs reconcile arbitrary edits and rollback.
+    file_ids: OnceLock<OrdSet<InodeId>>,
     checkpoint_proof: Option<ReferenceProof>,
     // Only set on the temporary serialization view for legacy integrity.
     normalize_legacy_hash: bool,
@@ -258,6 +261,7 @@ impl Default for TrackedInodes {
             dirty: BTreeSet::new(),
             baseline: Arc::new(()),
             member_catalog: OnceLock::new(),
+            file_ids: OnceLock::new(),
             checkpoint_proof: None,
             normalize_legacy_hash: false,
         }
@@ -347,8 +351,64 @@ impl TrackedInodes {
         if let Some(catalog) = self.member_catalog.get_mut() {
             catalog.advance(&self.map, &self.dirty);
         }
+        if let Some(ids) = self.file_ids.get_mut() {
+            Self::refresh_file_ids(ids, &self.map, &self.dirty);
+        }
         self.dirty.clear();
         self.baseline = Arc::new(());
+    }
+
+    fn refresh_file_ids(
+        ids: &mut OrdSet<InodeId>,
+        map: &HashMap<InodeId, Inode>,
+        dirty: &BTreeSet<InodeId>,
+    ) {
+        for ino in dirty {
+            let is_file = map
+                .get(ino)
+                .is_some_and(|inode| inode.kind == NodeKind::File);
+            match (is_file, ids.contains(ino)) {
+                (true, false) => {
+                    ids.insert(*ino);
+                }
+                (false, true) => {
+                    ids.remove(ino);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// A bounded numeric cursor window over live file IDs. The first call
+    /// builds the index; subsequent calls only reconcile dirty inodes and
+    /// seek directly to the cursor. No file data or shard records are cloned.
+    pub(crate) fn file_window_ids(
+        &self,
+        cursor: Option<InodeId>,
+        max_files: usize,
+    ) -> Vec<InodeId> {
+        if max_files == 0 {
+            return Vec::new();
+        }
+        let mut ids = self
+            .file_ids
+            .get_or_init(|| {
+                self.map
+                    .iter()
+                    .filter_map(|(ino, inode)| (inode.kind == NodeKind::File).then_some(*ino))
+                    .collect()
+            })
+            .clone();
+        Self::refresh_file_ids(&mut ids, &self.map, &self.dirty);
+        match cursor {
+            Some(cursor) => ids
+                .range::<_, InodeId>((Bound::Excluded(cursor), Bound::Unbounded))
+                .chain(ids.range(..=cursor))
+                .take(max_files)
+                .copied()
+                .collect(),
+            None => ids.iter().take(max_files).copied().collect(),
+        }
     }
 
     /// Build once on writable open. Deserializing temporary metadata for
