@@ -10,6 +10,10 @@ pub struct MemberBalanceReport {
     pub used_before: u64,
     pub used_after: u64,
     pub target_bytes: u64,
+    pub scanned_files: usize,
+    pub scanned_blocks: usize,
+    pub next_cursor: Option<InodeId>,
+    pub resume_block: Option<(InodeId, usize)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -20,6 +24,14 @@ pub struct MemberBalanceOptions {
     pub max_inode: Option<InodeId>,
     /// Prefer systematic data shards over parity when selecting a donor.
     pub prefer_data: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct MemberBalanceWindow {
+    pub max_files: usize,
+    pub max_blocks: usize,
+    pub cursor: Option<InodeId>,
+    pub resume_block: Option<(InodeId, usize)>,
 }
 
 impl ArgosFs {
@@ -35,6 +47,33 @@ impl ArgosFs {
         target: &str,
         max_shards: usize,
         options: &MemberBalanceOptions,
+    ) -> Result<MemberBalanceReport> {
+        self.rebalance_member_inner(target, max_shards, options, None)
+    }
+
+    /// Bound both the namespace work and shard migrations in a background run.
+    /// A cursor advances only past fully visited files so partial large-file
+    /// moves remain eligible for the next batch.
+    pub(super) fn rebalance_member_window(
+        &self,
+        target: &str,
+        max_shards: usize,
+        window: MemberBalanceWindow,
+    ) -> Result<MemberBalanceReport> {
+        self.rebalance_member_inner(
+            target,
+            max_shards,
+            &MemberBalanceOptions::default(),
+            Some(window),
+        )
+    }
+
+    fn rebalance_member_inner(
+        &self,
+        target: &str,
+        max_shards: usize,
+        options: &MemberBalanceOptions,
+        window: Option<MemberBalanceWindow>,
     ) -> Result<MemberBalanceReport> {
         if options
             .min_inode
@@ -54,7 +93,21 @@ impl ArgosFs {
                 options.min_inode.is_none_or(|min| id >= min)
                     && options.max_inode.is_none_or(|max| id <= max)
             };
-            let ids = if let Some(path) = &options.path {
+            let ids = if let Some(window) = window {
+                if let Some((ino, _)) = window.resume_block {
+                    let mut ids = vec![ino];
+                    ids.extend(
+                        meta.inodes
+                            .file_window_ids(Some(ino), window.max_files.saturating_sub(1))
+                            .into_iter()
+                            .filter(|id| *id != ino),
+                    );
+                    ids.truncate(window.max_files);
+                    ids
+                } else {
+                    meta.inodes.file_window_ids(window.cursor, window.max_files)
+                }
+            } else if let Some(path) = &options.path {
                 let root = self.resolve_path_locked(&meta, path, true, 40)?;
                 let mut stack = vec![root];
                 let mut seen = BTreeSet::new();
@@ -89,15 +142,21 @@ impl ArgosFs {
                     used_before: disk.used_bytes,
                     used_after: disk.used_bytes,
                     target_bytes: self.member_balance_goal(&meta, disk),
+                    next_cursor: window.and_then(|window| window.cursor),
+                    resume_block: window.and_then(|window| window.resume_block),
                     ..Default::default()
                 },
             )
         };
-        ids.sort_unstable();
+        if window.is_none() {
+            ids.sort_unstable();
+        }
+        let max_blocks = window.map_or(usize::MAX, |w| w.max_blocks);
         for ino in ids {
-            if report.moved_shards >= max_shards as u64 {
+            if report.moved_shards >= max_shards as u64 || report.scanned_blocks >= max_blocks {
                 break;
             }
+            report.scanned_files += 1;
             let inode_lock = self.inode_lock(ino);
             let _guard = inode_lock.lock();
             let mut meta = self.meta.write();
@@ -116,6 +175,8 @@ impl ArgosFs {
                 .filter(|i| i.kind == NodeKind::File)
                 .cloned()
             else {
+                report.next_cursor = Some(ino);
+                report.resume_block = None;
                 continue;
             };
             let before = meta.clone();
@@ -126,15 +187,25 @@ impl ArgosFs {
             let mut bytes = 0u64;
             let mut data_moved = 0u64;
             let mut donor_debt = BTreeMap::<String, u64>::new();
+            let start = report
+                .resume_block
+                .filter(|(id, _)| *id == ino)
+                .map_or(0, |(_, position)| position.min(blocks.len()));
+            report.resume_block = None;
             let result = (|| -> Result<()> {
-                for block in &mut blocks {
-                    if report.moved_shards + moved >= max_shards as u64 {
+                for position in start..blocks.len() {
+                    if report.moved_shards + moved >= max_shards as u64
+                        || report.scanned_blocks >= max_blocks
+                    {
+                        report.resume_block = Some((ino, position));
                         break;
                     }
                     let target_disk = self.balance_target(&meta, target)?;
                     if target_disk.used_bytes >= report.target_bytes {
                         break;
                     }
+                    report.scanned_blocks += 1;
+                    let mut block = blocks[position].clone();
                     if block.shards.iter().any(|s| s.disk_id == target) {
                         continue;
                     }
@@ -177,7 +248,7 @@ impl ArgosFs {
                                 .then_some((index, used as f64 / source.capacity_bytes as f64))
                         })
                         .collect::<Vec<_>>();
-                    let k = layout_by_id(&meta, block_layout_id(block))?.k;
+                    let k = layout_by_id(&meta, block_layout_id(&block))?.k;
                     candidates.sort_by(|a, b| {
                         let data_order = if options.prefer_data {
                             (block.shards[a.0].slot >= k).cmp(&(block.shards[b.0].slot >= k))
@@ -218,6 +289,7 @@ impl ArgosFs {
                     old.shards = vec![source];
                     retired.push(old);
                     block.shards[index] = replacement;
+                    blocks.edit_at(position, |entry| *entry = block);
                     moved += 1;
                     bytes += data.len() as u64;
                 }
@@ -226,6 +298,9 @@ impl ArgosFs {
             if let Err(err) = result {
                 *meta = before;
                 return Err(err);
+            }
+            if report.resume_block.is_none() {
+                report.next_cursor = Some(ino);
             }
             if moved == 0 {
                 continue;
@@ -266,6 +341,40 @@ impl ArgosFs {
             .ok_or_else(|| ArgosError::MissingDevice(target.into()))?
             .used_bytes;
         Ok(report)
+    }
+
+    pub(super) fn autopilot_member_target(
+        &self,
+        report: &HealthReport,
+        min_skew: f64,
+        critical_risk: f64,
+    ) -> Option<String> {
+        let meta = self.meta.read();
+        if meta.backend == BackendKind::Host
+            || meta.disks.iter().any(|(id, disk)| {
+                disk.status != DiskStatus::Removed
+                    && (disk.status != DiskStatus::Online || self.is_device_quarantined(id))
+            })
+        {
+            return None;
+        }
+        report
+            .disks
+            .iter()
+            .filter_map(|health| {
+                if health.predicted_failure || health.risk_score >= critical_risk {
+                    return None;
+                }
+                let disk = self.balance_target(&meta, &health.id).ok()?;
+                let goal = self.member_balance_goal(&meta, disk);
+                if goal == 0 || disk.used_bytes >= goal {
+                    return None;
+                }
+                let deficit = (goal - disk.used_bytes) as f64 / goal as f64;
+                (deficit >= min_skew).then_some((deficit, &health.id))
+            })
+            .max_by(|a, b| a.0.total_cmp(&b.0).then_with(|| b.1.cmp(a.1)))
+            .map(|(_, id)| id.clone())
     }
 
     fn balance_target<'a>(&self, meta: &'a Metadata, id: &str) -> Result<&'a Disk> {

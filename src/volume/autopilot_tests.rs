@@ -544,3 +544,121 @@ fn dry_run_explains_budget_redundancy_cooldown_and_low_risk_rejections() {
                 })
         }));
 }
+
+#[test]
+fn raw_autopilot_moves_bounded_verified_shards_to_returning_member() {
+    let dir = tempdir().unwrap();
+    let paths = (0..4)
+        .map(|i| dir.path().join(format!("member-{i}.img")))
+        .collect::<Vec<_>>();
+    let fs = ArgosFs::create_loop_paged(
+        &paths,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            compression: Compression::None,
+            ..Default::default()
+        },
+        64 * 1024 * 1024,
+        "autopilot-member",
+        false,
+    )
+    .unwrap();
+    let target = "disk-0003";
+    fs.mark_disk(target, DiskStatus::Offline).unwrap();
+    fs.write_file("/empty", b"", 0o600).unwrap();
+    let data = vec![73; 128 * 1024];
+    fs.write_file("/payload", &data, 0o600).unwrap();
+    let config = AutopilotConfig {
+        probe_interval_sec: u64::MAX,
+        smart_interval_sec: u64::MAX,
+        scrub_interval_sec: u64::MAX,
+        rebalance_interval_sec: 0,
+        max_drains_per_run: 0,
+        rebalance_files_per_run: 1,
+        ..Default::default()
+    };
+    assert!(fs
+        .autopilot_member_target(&fs.health_report(), 0.08, 0.85)
+        .is_none());
+    fs.mark_disk(target, DiskStatus::Online).unwrap();
+    fs.sync().unwrap();
+    let before = fs.metadata_snapshot();
+    let ino = fs.resolve_path("/payload", true).unwrap();
+    let plan = fs.autopilot_dry_run_with_config(config.clone()).unwrap();
+    assert_eq!(plan["planner"]["rebalance"]["member_target"], target);
+    assert_eq!(plan["planner"]["rebalance"]["budget_shards"], 1);
+    assert_eq!(before.disks[target].used_bytes, 0);
+    let observe = fs
+        .autopilot_once_with_config_and_policy(
+            config.clone(),
+            AutopilotPolicy {
+                mode: AutopilotMode::Observe,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(observe["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|a| a["action"] == "rebalance-paused"));
+    assert_eq!(fs.metadata_snapshot().disks[target].used_bytes, 0);
+    let first = fs.autopilot_once_with_config(config.clone()).unwrap();
+    let action = first["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["action"] == "rebalance-member-incremental")
+        .unwrap();
+    assert_eq!(action["report"]["scanned_files"], 1);
+    assert_eq!(action["report"]["moved_shards"], 0);
+    for position in 1..=2 {
+        let result = fs.autopilot_once_with_config(config.clone()).unwrap();
+        let action = result["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["action"] == "rebalance-member-incremental")
+            .unwrap();
+        assert_eq!(action["report"]["scanned_files"], 1);
+        assert_eq!(action["report"]["moved_shards"], 1);
+        assert_eq!(action["report"]["scanned_blocks"], 1);
+        assert_eq!(action["report"]["resume_block"], json!([ino, position]));
+        assert!(!result["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["action"] == "rebalance-incremental"));
+    }
+    // The already-balanced prefix is skipped within the scan budget,
+    // without rescanning it indefinitely or exceeding the shard budget.
+    let empty = fs.resolve_path("/empty", true).unwrap();
+    let mut window = super::super::member_balance::MemberBalanceWindow {
+        max_files: 1,
+        max_blocks: 1,
+        cursor: Some(empty),
+        resume_block: None,
+    };
+    for position in 1..=3 {
+        let batch = fs.rebalance_member_window(target, 10, window).unwrap();
+        assert_eq!(batch.scanned_blocks, 1);
+        assert_eq!(batch.moved_shards, u64::from(position == 3));
+        assert_eq!(batch.resume_block, Some((ino, position)));
+        window.resume_block = batch.resume_block;
+    }
+    let after = fs.metadata_snapshot();
+    assert!(after.disks[target].used_bytes > 0);
+    assert_eq!(before.inodes[&ino].mtime, after.inodes[&ino].mtime);
+    assert_eq!(before.inodes[&ino].ctime, after.inodes[&ino].ctime);
+    assert_eq!(
+        before.inodes[&ino].blocks.len(),
+        after.inodes[&ino].blocks.len()
+    );
+    assert_eq!(fs.read_file("/payload", false).unwrap(), data);
+    fs.mark_clean_unmount().unwrap();
+    drop(fs);
+    let fs = ArgosFs::open_loop(&paths, false).unwrap();
+    assert_eq!(fs.read_file("/payload", false).unwrap(), data);
+}
