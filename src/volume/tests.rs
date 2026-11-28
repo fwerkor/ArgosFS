@@ -279,6 +279,57 @@ fn directory_helpers_find_parents_descendants_and_sticky_permissions() {
 }
 
 #[test]
+fn parent_index_follows_rename_rmdir_and_hardlink_changes() {
+    let (_dir, fs) = host_volume();
+    let a = fs.mkdir_at(ROOT_INO, OsStr::new("a"), 0o755).unwrap();
+    let b = fs.mkdir_at(ROOT_INO, OsStr::new("b"), 0o755).unwrap();
+    let child = fs.mkdir_at(a.ino, OsStr::new("child"), 0o755).unwrap();
+    let file = fs
+        .create_file_at_with_owner(a.ino, OsStr::new("file"), 0o600, 1000, 1000)
+        .unwrap();
+
+    // Build the inverse index before mutating so its incremental updates run.
+    {
+        let meta = fs.meta.read();
+        assert_eq!(fs.parent_inode_locked(&meta, child.ino).unwrap(), a.ino);
+        assert_eq!(fs.parent_inode_locked(&meta, file.ino).unwrap(), a.ino);
+    }
+
+    fs.rename_at(a.ino, OsStr::new("child"), b.ino, OsStr::new("child"))
+        .unwrap();
+    {
+        let meta = fs.meta.read();
+        assert_eq!(fs.parent_inode_locked(&meta, child.ino).unwrap(), b.ino);
+    }
+    let entries = fs.readdir(child.ino).unwrap();
+    assert_eq!(
+        entries
+            .iter()
+            .find(|entry| entry.name == "..")
+            .unwrap()
+            .attr
+            .ino,
+        b.ino
+    );
+
+    // A hard link does not invalidate the existing parent, but removing that
+    // link must let a later lookup find the other one.
+    fs.link_at(file.ino, b.ino, OsStr::new("file-link"))
+        .unwrap();
+    fs.unlink_at(a.ino, OsStr::new("file")).unwrap();
+    {
+        let meta = fs.meta.read();
+        assert_eq!(fs.parent_inode_locked(&meta, file.ino).unwrap(), b.ino);
+    }
+
+    fs.rmdir_at(b.ino, OsStr::new("child")).unwrap();
+    {
+        let meta = fs.meta.read();
+        assert!(fs.parent_inode_locked(&meta, child.ino).is_err());
+    }
+}
+
+#[test]
 fn inode_helpers_touch_allocate_paths_and_attributes() {
     let (_dir, fs) = host_volume();
     let mut meta = fs.meta.write();

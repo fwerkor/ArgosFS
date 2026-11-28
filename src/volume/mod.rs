@@ -291,6 +291,11 @@ struct MountRuntime {
     repair_counters: RepairCounters,
     mount_owners: AtomicUsize,
     read_retries: usize,
+    /// Child -> parent, built on the first parent lookup and then kept current
+    /// by namespace mutations. Readdir only needs it for directories, but
+    /// indexing every child preserves the helper's previous behavior for
+    /// files and hard links too.
+    parent_index: RwLock<Option<BTreeMap<InodeId, InodeId>>>,
 }
 
 impl MountRuntime {
@@ -306,6 +311,7 @@ impl MountRuntime {
             repair_counters: RepairCounters::default(),
             mount_owners: AtomicUsize::new(1),
             read_retries: configured_read_retries(),
+            parent_index: RwLock::new(None),
         }
     }
 }
