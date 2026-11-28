@@ -9,6 +9,24 @@ struct RawAppendPlan<'a> {
     writes: BTreeMap<String, Vec<(u64, &'a [u8])>>,
 }
 
+// Bound the number and total size of ranges per guarded worker operation.
+// A single large shard still follows its original per-operation deadline.
+const MAX_RAW_BATCH_BYTES: usize = 4 * 1024 * 1024;
+const MAX_RAW_BATCH_RANGES: usize = 64;
+
+fn raw_write_batch_len(writes: &[(u64, &[u8])]) -> usize {
+    let mut bytes = 0usize;
+    let mut count = 0;
+    for (_, data) in writes.iter().take(MAX_RAW_BATCH_RANGES) {
+        if count > 0 && bytes.saturating_add(data.len()) > MAX_RAW_BATCH_BYTES {
+            break;
+        }
+        bytes = bytes.saturating_add(data.len());
+        count += 1;
+    }
+    count
+}
+
 impl ArgosFs {
     /// Called under the caller's inode lock. None means the ordinary path
     /// must be used; Some(Err) is an actual write/commit failure.
@@ -62,13 +80,19 @@ impl ArgosFs {
                     scope.spawn(move || -> Result<(String, u64, f64)> {
                         let start = Instant::now();
                         let mut bytes = 0u64;
-                        for (offset, payload) in writes {
-                            self.backend_write_at_locked(snapshot, disk, *offset, payload)?;
-                            self.runtime.commit_metrics.add_data_plane_bytes(
-                                DataPlaneByteKind::ShardPayloadWritten,
-                                payload.len(),
-                            );
-                            bytes = bytes.saturating_add(payload.len() as u64);
+                        let mut remaining = writes.as_slice();
+                        while !remaining.is_empty() {
+                            let count = raw_write_batch_len(remaining);
+                            let (batch, rest) = remaining.split_at(count);
+                            self.backend_write_batch_locked(snapshot, disk, batch)?;
+                            for (_, payload) in batch {
+                                self.runtime.commit_metrics.add_data_plane_bytes(
+                                    DataPlaneByteKind::ShardPayloadWritten,
+                                    payload.len(),
+                                );
+                                bytes = bytes.saturating_add(payload.len() as u64);
+                            }
+                            remaining = rest;
                         }
                         self.backend_flush_locked(snapshot, disk)?;
                         Ok((disk.clone(), bytes, start.elapsed().as_secs_f64()))
@@ -292,5 +316,22 @@ impl ArgosFs {
             },
             RawAppendPlan { blocks, writes },
         ))
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+
+    #[test]
+    fn batch_limits_count_bytes_and_always_make_progress() {
+        let data = vec![0; 128 * 1024];
+        let writes = vec![(0, data.as_slice()); 80];
+        assert_eq!(raw_write_batch_len(&writes), 32);
+        let tiny = vec![(0, b"x".as_slice()); 80];
+        assert_eq!(raw_write_batch_len(&tiny), 64);
+        let large = vec![0; MAX_RAW_BATCH_BYTES + 1];
+        assert_eq!(raw_write_batch_len(&[(0, &large), (0, b"x")]), 1);
+        assert_eq!(raw_write_batch_len(&[]), 0);
     }
 }

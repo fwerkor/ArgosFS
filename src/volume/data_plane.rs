@@ -2067,9 +2067,8 @@ impl ArgosFs {
     pub(super) fn read_shard_locked(&self, meta: &Metadata, shard: &Shard) -> Result<Vec<u8>> {
         match shard.location.as_ref() {
             Some(ShardLocation::RawExtent(extent)) => {
-                let mut data = zeroed_io_buffer(shard.size, "raw shard read")?;
-                self.backend_read_at_locked(meta, &extent.disk_id, extent.offset, &mut data)?;
-                Ok(data)
+                let data = zeroed_io_buffer(shard.size, "raw shard read")?;
+                self.backend_read_owned_locked(meta, &extent.disk_id, extent.offset, data)
             }
             Some(ShardLocation::HostPath { disk_id, relpath }) => advanced_io::read_all(
                 &self.shard_path_locked(meta, disk_id, relpath),
@@ -2161,7 +2160,7 @@ impl ArgosFs {
                     .offset
                     .checked_add(offset as u64)
                     .ok_or_else(|| ArgosError::Invalid("raw extent read overflow".to_string()))?;
-                self.backend_read_at_locked(meta, &extent.disk_id, absolute, &mut data)?;
+                return self.backend_read_owned_locked(meta, &extent.disk_id, absolute, data);
             }
             Some(ShardLocation::HostPath { disk_id, relpath }) => {
                 read_path_range_exact(
@@ -2209,23 +2208,28 @@ impl ArgosFs {
         }
     }
 
-    pub(super) fn backend_read_at_locked(
+    fn backend_read_owned_locked(
         &self,
         meta: &Metadata,
         disk_id: &str,
         offset: u64,
-        buf: &mut [u8],
-    ) -> Result<()> {
+        buf: Vec<u8>,
+    ) -> Result<Vec<u8>> {
         if self.is_device_quarantined(disk_id) {
             return Err(ArgosError::MissingDevice(disk_id.to_string()));
         }
+        let length = buf.len();
         let result = match self
             .backend
-            .read_shard_at(&disk_id.to_string(), offset, buf)
+            .read_shard_owned(&disk_id.to_string(), offset, buf)
         {
             Err(ArgosError::MissingDevice(_)) if meta.backend != BackendKind::Host => {
                 let backend = self.single_device_backend_locked(meta, disk_id, false)?;
-                backend.read_shard_at(&disk_id.to_string(), offset, buf)
+                backend.read_shard_owned(
+                    &disk_id.to_string(),
+                    offset,
+                    zeroed_io_buffer(length, "raw shard retry")?,
+                )
             }
             other => other,
         };
@@ -2251,6 +2255,30 @@ impl ArgosFs {
             Err(ArgosError::MissingDevice(_)) if meta.backend != BackendKind::Host => {
                 let backend = self.single_device_backend_locked(meta, disk_id, true)?;
                 backend.write_at(&disk_id.to_string(), offset, data)
+            }
+            other => other,
+        };
+        if let Err(err) = &result {
+            if Self::device_error_should_quarantine(err) && meta.backend != BackendKind::Host {
+                self.quarantine_device(disk_id);
+            }
+        }
+        result
+    }
+
+    pub(super) fn backend_write_batch_locked(
+        &self,
+        meta: &Metadata,
+        disk_id: &str,
+        writes: &[(u64, &[u8])],
+    ) -> Result<()> {
+        if self.is_device_quarantined(disk_id) {
+            return Err(ArgosError::MissingDevice(disk_id.to_string()));
+        }
+        let result = match self.backend.write_batch(&disk_id.to_string(), writes) {
+            Err(ArgosError::MissingDevice(_)) if meta.backend != BackendKind::Host => {
+                let backend = self.single_device_backend_locked(meta, disk_id, true)?;
+                backend.write_batch(&disk_id.to_string(), writes)
             }
             other => other,
         };

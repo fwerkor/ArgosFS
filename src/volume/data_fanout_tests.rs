@@ -7,6 +7,7 @@ struct WriteFanoutProbe {
     active: AtomicUsize,
     peak: AtomicUsize,
     writes: AtomicUsize,
+    largest_batch: AtomicUsize,
     fail_device: Option<String>,
     fail_first_offset: Option<u64>,
     failed_first: std::sync::atomic::AtomicBool,
@@ -44,6 +45,14 @@ impl StorageBackend for WriteFanoutProbe {
         };
         self.active.fetch_sub(1, Ordering::SeqCst);
         result
+    }
+    fn write_batch(&self, device: &String, writes: &[(u64, &[u8])]) -> Result<()> {
+        self.largest_batch.fetch_max(writes.len(), Ordering::SeqCst);
+        // Preserve the existing per-range failure injection.
+        for (offset, data) in writes {
+            self.write_at(device, *offset, data)?;
+        }
+        Ok(())
     }
     fn flush_device(&self, device: &String) -> Result<()> {
         self.inner.flush_device(device)
@@ -96,6 +105,7 @@ fn probe(fs: &mut ArgosFs, fail: Option<String>) -> Arc<WriteFanoutProbe> {
         active: AtomicUsize::new(0),
         peak: AtomicUsize::new(0),
         writes: AtomicUsize::new(0),
+        largest_batch: AtomicUsize::new(0),
         fail_device: fail,
         fail_first_offset: None,
         failed_first: std::sync::atomic::AtomicBool::new(false),
@@ -235,6 +245,7 @@ fn failed_earlier_reservation_cannot_publish_or_release_later_writer_extent() {
         active: AtomicUsize::new(0),
         peak: AtomicUsize::new(0),
         writes: AtomicUsize::new(0),
+        largest_batch: AtomicUsize::new(0),
         fail_device: None,
         fail_first_offset: Some(before.raw_pool.allocators["disk-0000"].next_offset),
         failed_first: std::sync::atomic::AtomicBool::new(false),
@@ -278,4 +289,94 @@ fn failed_earlier_reservation_cannot_publish_or_release_later_writer_extent() {
     let reopened = ArgosFs::open_loop(&paths, false).unwrap();
     assert!(reopened.read_file("/a", false).unwrap().is_empty());
     assert_eq!(reopened.read_file("/b", false).unwrap(), data);
+}
+
+#[test]
+fn multi_stripe_append_batches_member_writes_on_default_format() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = (0..3)
+        .map(|i| dir.path().join(format!("batch-{i}.img")))
+        .collect::<Vec<_>>();
+    let mut fs = ArgosFs::create_loop(
+        &paths,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            compression: Compression::None,
+            ..VolumeConfig::default()
+        },
+        64 * 1024 * 1024,
+        "batch-default",
+        false,
+    )
+    .unwrap();
+    let ino = fs.create_file_path("/data", 0o600).unwrap();
+    let backend = probe(&mut fs, None);
+    let data = (0..8 * 8192).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+    assert_eq!(fs.write_inode_range(ino, 0, &data).unwrap(), data.len());
+    assert_eq!(backend.largest_batch.load(Ordering::SeqCst), 8);
+    assert_eq!(backend.writes.load(Ordering::SeqCst), 24);
+    fs.sync().unwrap();
+    drop(fs);
+    let reopened = ArgosFs::open_loop(&paths, false).unwrap();
+    assert_eq!(reopened.read_file("/data", false).unwrap(), data);
+}
+
+#[test]
+fn partial_member_batch_failure_never_publishes_default_format_append() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = (0..3)
+        .map(|i| dir.path().join(format!("partial-batch-{i}.img")))
+        .collect::<Vec<_>>();
+    let mut fs = ArgosFs::create_loop(
+        &paths,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            compression: Compression::None,
+            ..VolumeConfig::default()
+        },
+        64 * 1024 * 1024,
+        "partial-batch",
+        false,
+    )
+    .unwrap();
+    let old = vec![7; 8192];
+    fs.write_file("/data", &old, 0o600).unwrap();
+    fs.sync().unwrap();
+    let ino = fs.resolve_path("/data", true).unwrap();
+    let before = fs.metadata_snapshot();
+    let region = &fs.raw_superblocks[0].data;
+    let backend = Arc::new(WriteFanoutProbe {
+        inner: fs.backend.clone(),
+        data_start: region.offset,
+        data_end: region.offset + region.length,
+        active: AtomicUsize::new(0),
+        peak: AtomicUsize::new(0),
+        writes: AtomicUsize::new(0),
+        largest_batch: AtomicUsize::new(0),
+        fail_device: None,
+        fail_first_offset: Some(before.raw_pool.allocators["disk-0000"].next_offset + 4096),
+        failed_first: std::sync::atomic::AtomicBool::new(false),
+    });
+    fs.backend = backend.clone();
+    assert!(fs
+        .write_inode_range(ino, old.len() as u64, &vec![8; 3 * 8192])
+        .is_err());
+    assert!(backend.failed_first.load(Ordering::SeqCst));
+    assert_eq!(backend.largest_batch.load(Ordering::SeqCst), 3);
+    assert_eq!(backend.active.load(Ordering::SeqCst), 0);
+    let after = fs.metadata_snapshot();
+    assert_eq!(after.txid, before.txid);
+    assert_eq!(after.inodes[&ino].size, old.len() as u64);
+    assert_eq!(
+        serde_json::to_value(&after.raw_pool.allocators).unwrap(),
+        serde_json::to_value(&before.raw_pool.allocators).unwrap()
+    );
+    fs.sync().unwrap();
+    drop(fs);
+    let reopened = ArgosFs::open_loop(&paths, false).unwrap();
+    assert_eq!(reopened.read_file("/data", false).unwrap(), old);
 }

@@ -33,12 +33,32 @@ pub trait StorageBackend: Send + Sync {
     fn read_shard_at(&self, device_id: &DeviceId, offset: u64, buf: &mut [u8]) -> Result<()> {
         self.read_at(device_id, offset, buf)
     }
+    /// Transfer ownership of a read buffer so deadline workers can return it
+    /// directly instead of copying completed payloads into a second buffer.
+    fn read_shard_owned(
+        &self,
+        device_id: &DeviceId,
+        offset: u64,
+        mut buf: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        self.read_shard_at(device_id, offset, &mut buf)?;
+        Ok(buf)
+    }
     /// Read an explicitly sized checkpoint range without speculative readahead.
     /// Checkpoint readers already batch contiguous pages themselves.
     fn read_recovery_at(&self, device_id: &DeviceId, offset: u64, buf: &mut [u8]) -> Result<()> {
         self.read_shard_at(device_id, offset, buf)
     }
     fn write_at(&self, device_id: &DeviceId, offset: u64, data: &[u8]) -> Result<()>;
+    /// Write ordered, independently positioned ranges. A successful return
+    /// covers every range; on error a prefix may have been written. The caller
+    /// owns allocation rollback and the durability barrier.
+    fn write_batch(&self, device_id: &DeviceId, writes: &[(u64, &[u8])]) -> Result<()> {
+        for (offset, data) in writes {
+            self.write_at(device_id, *offset, data)?;
+        }
+        Ok(())
+    }
     fn flush_device(&self, device_id: &DeviceId) -> Result<()>;
     fn flush_all(&self) -> Result<()>;
     /// Drop cached pages for a range before a verification read.  The default
@@ -245,6 +265,57 @@ impl StorageBackend for FileBlockBackend {
         Ok(())
     }
 
+    fn write_batch(&self, device_id: &DeviceId, writes: &[(u64, &[u8])]) -> Result<()> {
+        let device = self.device(device_id)?;
+        // Validate the complete batch before modifying any range.
+        for (offset, data) in writes {
+            let end = offset
+                .checked_add(data.len() as u64)
+                .ok_or_else(|| ArgosError::Invalid("write offset overflow".into()))?;
+            if end > device.capacity {
+                return Err(ArgosError::DiskFull {
+                    disk_id: device_id.clone(),
+                    required: data.len() as u64,
+                    available: device.capacity.saturating_sub(*offset),
+                });
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let mut index = 0;
+            while index < writes.len() {
+                let (offset, data) = writes[index];
+                if data.is_empty() {
+                    index += 1;
+                    continue;
+                }
+                let mut end = offset + data.len() as u64;
+                let mut next = index + 1;
+                // Preserve submission order, including overlaps. Only
+                // adjacent ranges can share one positioned vectored syscall.
+                while next < writes.len() && next - index < 64 {
+                    let (start, data) = writes[next];
+                    if start != end || data.is_empty() {
+                        break;
+                    }
+                    end += data.len() as u64;
+                    next += 1;
+                }
+                if next == index + 1 {
+                    self.write_at(device_id, offset, data)?;
+                } else {
+                    write_contiguous_ranges(&device.file, offset, &writes[index..next])?;
+                }
+                index = next;
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        for (offset, data) in writes {
+            self.write_at(device_id, *offset, data)?;
+        }
+        Ok(())
+    }
+
     fn flush_device(&self, device_id: &DeviceId) -> Result<()> {
         self.device(device_id)?.file.sync_all()?;
         Ok(())
@@ -297,6 +368,59 @@ impl StorageBackend for FileBlockBackend {
         }
         Ok(())
     }
+}
+
+#[cfg(target_os = "linux")]
+fn write_contiguous_ranges(file: &File, mut offset: u64, writes: &[(u64, &[u8])]) -> Result<()> {
+    let mut index = 0;
+    let mut consumed = 0;
+    while index < writes.len() {
+        let mut vectors = Vec::with_capacity(writes.len() - index);
+        for (i, (_, data)) in writes[index..].iter().enumerate() {
+            let data = if i == 0 { &data[consumed..] } else { data };
+            vectors.push(libc::iovec {
+                iov_base: data.as_ptr().cast_mut().cast(),
+                iov_len: data.len(),
+            });
+        }
+        let position = libc::off_t::try_from(offset)
+            .map_err(|_| ArgosError::Invalid("write offset exceeds off_t".into()))?;
+        // SAFETY: the slice payloads and iovec array live through this
+        // synchronous syscall; pwritev only reads the buffers.
+        let result = unsafe {
+            libc::pwritev(
+                file.as_raw_fd(),
+                vectors.as_ptr(),
+                vectors.len() as i32,
+                position,
+            )
+        };
+        if result < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err.into());
+        }
+        if result == 0 {
+            return Err(
+                std::io::Error::new(std::io::ErrorKind::WriteZero, "short vectored write").into(),
+            );
+        }
+        let mut written = result as usize;
+        offset += written as u64;
+        while index < writes.len() {
+            let remaining = writes[index].1.len() - consumed;
+            if written < remaining {
+                consumed += written;
+                break;
+            }
+            written -= remaining;
+            index += 1;
+            consumed = 0;
+        }
+    }
+    Ok(())
 }
 
 fn read_exact_at(file: &File, device_id: &DeviceId, offset: u64, mut buf: &mut [u8]) -> Result<()> {

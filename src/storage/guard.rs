@@ -285,6 +285,40 @@ impl StorageBackend for GuardedBackend {
         self.read_with_policy(device_id, offset, buf, true)
     }
 
+    fn read_shard_owned(&self, device_id: &String, offset: u64, buf: Vec<u8>) -> Result<Vec<u8>> {
+        let inner = self.inner.clone();
+        let id = device_id.clone();
+        let length = buf.len();
+        let data = self.run(device_id, "read", move || {
+            inner.read_shard_owned(&id, offset, buf)
+        })?;
+        if data.len() != length {
+            return Err(ArgosError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("short read on {device_id} at offset {offset}"),
+            )));
+        }
+        Ok(data)
+    }
+
+    fn write_batch(&self, device_id: &String, writes: &[(u64, &[u8])]) -> Result<()> {
+        // Keep owned payloads inside the deadline worker: it may outlive
+        // the caller after a device timeout.
+        let inner = self.inner.clone();
+        let id = device_id.clone();
+        let owned: Vec<_> = writes
+            .iter()
+            .map(|(offset, data)| (*offset, data.to_vec()))
+            .collect();
+        self.run(device_id, "write batch", move || {
+            let ranges: Vec<_> = owned
+                .iter()
+                .map(|(offset, data)| (*offset, data.as_slice()))
+                .collect();
+            inner.write_batch(&id, &ranges)
+        })
+    }
+
     fn write_at(&self, device_id: &String, offset: u64, data: &[u8]) -> Result<()> {
         let inner = self.inner.clone();
         let id = device_id.clone();

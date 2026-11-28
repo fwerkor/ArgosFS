@@ -322,3 +322,23 @@ Crash injection for loop/raw can be driven with `ARGOSFS_CRASH_POINT` using
 `after-data-flush-before-journal-commit`,
 `after-journal-commit-before-metadata-commit`,
 `after-metadata-commit-before-superblock-update`, or `during-replay`.
+
+### Bounded member I/O batches
+
+Aligned multi-stripe appends group a member's reserved shard writes into
+ordered batches of at most 64 ranges and 4 MiB (a larger individual shard
+retains its original single-operation path). The existing independent member
+workers run concurrently. On Linux, consecutive physical ranges are combined
+with positioned vectored writes; gaps and overlaps retain their original
+order. A batch is one guarded I/O operation, and the member's existing
+durability flush still precedes metadata publication. Partial completion or
+an error never publishes the reservation. The entire outstanding batch is
+treated as in-flight if a member times out, and that member remains fenced.
+
+Full and partial raw shard reads transfer ownership of the bounded read
+buffer into the deadline worker and return that same allocation on success.
+This avoids a second allocation and a userspace payload copy without allowing
+a timed-out operation to retain a borrowed caller buffer.
+
+These changes apply to the existing raw/loop backend, require no new on-disk
+features, and do not depend on FUSE-over-io_uring.
