@@ -359,7 +359,7 @@ pub fn execute(trace: &Trace, dir: &Path) -> Result<()> {
     let create = if trace.paged {
         ArgosFs::create_loop_paged
     } else {
-        ArgosFs::create_loop
+        ArgosFs::create_loop_legacy
     };
     let mut fs = create(&images, config, 64 * 1024 * 1024, "ztest-model", false)?;
     fs.mkdir("/model", 0o755)?;
@@ -486,6 +486,9 @@ pub fn run(trace: Trace, dir: &Path, minimize: bool) -> Result<()> {
             let chunk = reduced.ops.len().div_ceil(granularity);
             let mut improved = false;
             for start in (0..reduced.ops.len()).step_by(chunk) {
+                if attempt >= 128 {
+                    break;
+                }
                 let mut candidate = reduced.clone();
                 candidate
                     .ops

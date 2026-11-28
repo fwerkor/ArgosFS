@@ -151,8 +151,10 @@ struct ModelArgs {
     seed: u64,
     #[arg(long, default_value_t = 64)]
     operations: usize,
-    #[arg(long)]
+    #[arg(long, conflicts_with = "legacy_metadata")]
     paged_metadata: bool,
+    #[arg(long)]
+    legacy_metadata: bool,
     #[arg(long)]
     topology: bool,
     #[arg(long)]
@@ -187,7 +189,7 @@ fn dispatch() -> Result<()> {
             } else {
                 argosfs_ztest::model::Trace::generate(
                     args.seed,
-                    args.paged_metadata,
+                    !args.legacy_metadata,
                     args.operations,
                     args.topology,
                 )
