@@ -1012,3 +1012,60 @@ fn fsck_validates_encrypted_multistripe_files_and_reports_missing_key() {
         .iter()
         .any(|error| error.contains("ARGOSFS_KEY")));
 }
+
+#[test]
+fn legacy_rewrite_delta_uses_committed_base_not_rollback_snapshot() {
+    let dir = tempdir().unwrap();
+    let images: Vec<_> = (0..3)
+        .map(|i| dir.path().join(format!("disk{i}.img")))
+        .collect();
+    let fs = ArgosFs::create_loop_legacy(
+        &images,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            compression: Compression::None,
+            l2_cache_bytes: 0,
+            ..Default::default()
+        },
+        32 * 1024 * 1024,
+        "legacy-rewrite-base",
+        false,
+    )
+    .unwrap();
+    let original = vec![0x71; 16384];
+    let payload = vec![0x92; 16384];
+    fs.write_file("/file", &original, 0o600).unwrap();
+    let ino = fs.resolve_path("/file", true).unwrap();
+    let txid = {
+        let mut meta = fs.meta.write();
+        // Rebalance classifies the inode before taking the rewrite's local
+        // rollback snapshot. No preceding advisory read is required.
+        assert_ne!(meta.inodes[&ino].storage_class, StorageTier::Cold);
+        meta.inodes.get_mut(&ino).unwrap().storage_class = StorageTier::Cold;
+        fs.replace_inode_data_locked(
+            &mut meta,
+            ino,
+            &payload,
+            "rebalance-rewrite",
+            json!({"inode": ino}),
+            true,
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        meta.txid
+    };
+    fs.sync().unwrap();
+    drop(fs);
+    let available = images[1..].to_vec();
+    let recovered = ArgosFs::open_loop(&available, false).unwrap();
+    assert!(recovered.metadata_snapshot().txid >= txid);
+    assert_eq!(
+        recovered.metadata_snapshot().inodes[&ino].storage_class,
+        StorageTier::Cold
+    );
+    assert_eq!(recovered.read_file("/file", false).unwrap(), payload);
+    let report = recovered.transaction_report().unwrap();
+    assert_eq!(report.invalid_entries, 0, "{:?}", report.errors);
+}
