@@ -1877,7 +1877,7 @@ impl ArgosFs {
     }
 }
 
-pub(super) fn entry_name_from_os(name: &OsStr) -> Result<String> {
+pub(crate) fn entry_name_from_os(name: &OsStr) -> Result<String> {
     let bytes = name.as_bytes();
     validate_entry_name_bytes(bytes)?;
     if let Some(name) = name.to_str() {

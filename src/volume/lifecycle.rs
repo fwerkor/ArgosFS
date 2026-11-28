@@ -1,5 +1,13 @@
 use super::*;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MetadataFormat {
+    Legacy,
+    Paged,
+    #[cfg(test)]
+    V3,
+}
+
 impl ArgosFs {
     pub fn create(
         root: impl AsRef<Path>,
@@ -230,7 +238,7 @@ impl ArgosFs {
             config,
             pool_name,
             force,
-            true,
+            MetadataFormat::Paged,
         )
     }
 
@@ -250,7 +258,27 @@ impl ArgosFs {
             config,
             pool_name,
             force,
-            true,
+            MetadataFormat::Paged,
+        )
+    }
+
+    /// Internal integration fixture only. No user-facing V3 mkfs until
+    /// the complete disk-resident runtime and migration are qualified.
+    #[cfg(test)]
+    pub(super) fn create_loop_v3_experimental(
+        images: &[PathBuf],
+        config: VolumeConfig,
+        image_size: u64,
+        pool_name: &str,
+    ) -> Result<Self> {
+        prepare_loop_images(images, image_size, false)?;
+        Self::create_block_backend_format(
+            BackendKind::LoopBlock,
+            images,
+            config,
+            pool_name,
+            false,
+            MetadataFormat::V3,
         )
     }
 
@@ -295,7 +323,14 @@ impl ArgosFs {
         pool_name: &str,
         force: bool,
     ) -> Result<Self> {
-        Self::create_block_backend_format(kind, paths, config, pool_name, force, false)
+        Self::create_block_backend_format(
+            kind,
+            paths,
+            config,
+            pool_name,
+            force,
+            MetadataFormat::Legacy,
+        )
     }
 
     fn create_block_backend_format(
@@ -304,8 +339,9 @@ impl ArgosFs {
         mut config: VolumeConfig,
         pool_name: &str,
         force: bool,
-        paged: bool,
+        format: MetadataFormat,
     ) -> Result<Self> {
+        let paged = format != MetadataFormat::Legacy;
         if config.k == 0 {
             return Err(ArgosError::Invalid("k must be positive".to_string()));
         }
@@ -349,6 +385,10 @@ impl ArgosFs {
             if paged {
                 sb.required_feature_flags |= raw_format::REQUIRED_FEATURE_PAGED_METADATA
                     | raw_format::REQUIRED_FEATURE_PAGED_TOPOLOGY;
+            }
+            #[cfg(test)]
+            if format == MetadataFormat::V3 {
+                sb.required_feature_flags |= raw_format::REQUIRED_FEATURE_METADATA_V3;
             }
             let allocator = allocator::init_allocator(
                 sb.data.offset,

@@ -649,6 +649,33 @@ impl ArgosFs {
     /// metadata commits. The old page-store handle stays alive until the
     /// joint configuration certificate is durable.
     fn reconfigure_paged_locked(&self, meta: &mut Metadata, before: &Metadata) -> Result<()> {
+        self.reconfigure_paged_with_growth_locked(meta, before, None)
+    }
+
+    /// Experimental full-COW arena growth through the same joint-quorum
+    /// protocol. This is not yet a user-facing online expansion API.
+    #[cfg(test)]
+    pub(super) fn grow_v3_metadata_arena(&self, size: u64) -> Result<()> {
+        self.sync()?;
+        let mut meta = self.meta.write();
+        self.ensure_block_backend_writable_locked(&meta)?;
+        self.commit_deferred_locked(&mut meta, false)?;
+        let before = meta.clone();
+        if let Err(err) = self.reconfigure_paged_with_growth_locked(&mut meta, &before, Some(size))
+        {
+            *meta = before;
+            self.fence_on_quorum_loss(&err);
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn reconfigure_paged_with_growth_locked(
+        &self,
+        meta: &mut Metadata,
+        before: &Metadata,
+        grow: Option<u64>,
+    ) -> Result<()> {
         let handle = self
             .paged_metadata
             .as_ref()
@@ -688,13 +715,24 @@ impl ArgosFs {
         let backend = self.metadata_block_backend_locked(meta, &superblocks, true)?;
         let unavailable = self.quarantined_devices.lock().clone();
         self.validate_data_durability_locked(meta, &unavailable)?;
-        let new_store = raw_store::reconfigure_paged_metadata(
-            backend,
-            &superblocks,
-            &base,
-            meta,
-            &store.events(),
-        )?;
+        let new_store = if let Some(size) = grow {
+            raw_store::grow_paged_metadata(
+                backend,
+                &superblocks,
+                &base,
+                meta,
+                &store.events(),
+                Some(size),
+            )?
+        } else {
+            raw_store::reconfigure_paged_metadata(
+                backend,
+                &superblocks,
+                &base,
+                meta,
+                &store.events(),
+            )?
+        };
         *store = new_store;
         drop(store);
         let mut state = self.deferred_commit.lock();

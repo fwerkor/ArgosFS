@@ -11,6 +11,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 pub const PAGED_INTEGRITY_SCHEME: u32 = 3;
+pub const V3_INTEGRITY_SCHEME: u32 = 4;
 const MAX_EXPANDED_RECORD: usize = 128 * 1024 * 1024;
 const JSON: u8 = 0;
 const LZ4: u8 = 1;
@@ -61,20 +62,22 @@ fn decode<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
 }
 
 mod records;
+mod v3;
 use records::{
     append_event, decode_image, import_events, initial_records, plan_records, RecordIndex,
 };
+use v3::V3ImageStore;
 
 /// Typed metadata image on dedicated authenticated page arenas. Each
 /// directory entry, block mapping and free extent has an independent record.
-pub struct ImageStore {
+struct NumericImageStore {
     tree: PagedMetadata,
     pool: Uuid,
     base: Metadata,
     index: RecordIndex,
 }
 
-impl ImageStore {
+impl NumericImageStore {
     pub fn format(
         backend: Arc<dyn StorageBackend>,
         arenas: Vec<Arena>,
@@ -130,10 +133,6 @@ impl ImageStore {
 
     /// Commit only candidate changed inode records and the metadata header.
     /// The caller's baseline advances only after a certified root commit.
-    pub fn commit(&mut self, next: &mut Metadata) -> Result<CommitReport> {
-        self.commit_allowed(next, None, None)
-    }
-
     pub(crate) fn commit_allowed(
         &mut self,
         next: &mut Metadata,
@@ -197,7 +196,7 @@ impl ImageStore {
         pool: Uuid,
         arenas: Vec<Arena>,
     ) -> Result<(Metadata, Vec<PagedAuditEvent>)> {
-        let (records, hash) = super::recover_records(backend, *pool.as_bytes(), arenas)?;
+        let (records, hash) = super::recover_records::<u64>(backend, *pool.as_bytes(), arenas)?;
         let (meta, index) = decode_image(records, pool, hash)?;
         Ok((meta, index.events()))
     }
@@ -207,7 +206,7 @@ impl ImageStore {
         pool: Uuid,
         arenas: Vec<Arena>,
     ) -> Result<Metadata> {
-        let (records, hash) = super::recover_records(backend, *pool.as_bytes(), arenas)?;
+        let (records, hash) = super::recover_records::<u64>(backend, *pool.as_bytes(), arenas)?;
         decode_image(records, pool, hash).map(|(meta, _)| meta)
     }
 
@@ -223,5 +222,149 @@ impl ImageStore {
         &mut self,
     ) -> Result<BTreeMap<String, std::result::Result<CommitIo, String>>> {
         self.tree.repair_stale()
+    }
+}
+
+/// The materialized volume compatibility adapter. The V3 branch is explicit
+/// and experimental; its disk-resident reader is not yet the live volume's
+/// authoritative inode API.
+pub struct ImageStore {
+    inner: ImageStoreKind,
+}
+
+enum ImageStoreKind {
+    Numeric(NumericImageStore),
+    V3(V3ImageStore),
+}
+
+impl ImageStore {
+    pub fn format(
+        backend: Arc<dyn StorageBackend>,
+        arenas: Vec<Arena>,
+        metadata: &mut Metadata,
+    ) -> Result<Self> {
+        NumericImageStore::format(backend, arenas, metadata).map(|store| Self {
+            inner: ImageStoreKind::Numeric(store),
+        })
+    }
+    pub(crate) fn format_with_events(
+        backend: Arc<dyn StorageBackend>,
+        arenas: Vec<Arena>,
+        metadata: &mut Metadata,
+        events: &[PagedAuditEvent],
+        selected: Option<&BTreeSet<String>>,
+    ) -> Result<Self> {
+        if metadata.integrity.hash_scheme == Some(V3_INTEGRITY_SCHEME) {
+            V3ImageStore::format(backend, arenas, metadata, events, selected).map(|store| Self {
+                inner: ImageStoreKind::V3(store),
+            })
+        } else {
+            NumericImageStore::format_with_events(backend, arenas, metadata, events, selected).map(
+                |store| Self {
+                    inner: ImageStoreKind::Numeric(store),
+                },
+            )
+        }
+    }
+    pub(crate) fn format_v3(
+        backend: Arc<dyn StorageBackend>,
+        arenas: Vec<Arena>,
+        metadata: &mut Metadata,
+    ) -> Result<Self> {
+        V3ImageStore::format(backend, arenas, metadata, &[], None).map(|store| Self {
+            inner: ImageStoreKind::V3(store),
+        })
+    }
+    pub fn open(backend: Arc<dyn StorageBackend>, pool: Uuid, arenas: Vec<Arena>) -> Result<Self> {
+        NumericImageStore::open(backend, pool, arenas).map(|store| Self {
+            inner: ImageStoreKind::Numeric(store),
+        })
+    }
+    pub(crate) fn open_v3(
+        backend: Arc<dyn StorageBackend>,
+        pool: Uuid,
+        arenas: Vec<Arena>,
+    ) -> Result<Self> {
+        V3ImageStore::open(backend, pool, arenas).map(|store| Self {
+            inner: ImageStoreKind::V3(store),
+        })
+    }
+    pub(crate) fn recover_with_events(
+        backend: &dyn StorageBackend,
+        pool: Uuid,
+        arenas: Vec<Arena>,
+    ) -> Result<(Metadata, Vec<PagedAuditEvent>)> {
+        NumericImageStore::recover_with_events(backend, pool, arenas)
+    }
+    pub(crate) fn recover_v3(
+        backend: &dyn StorageBackend,
+        pool: Uuid,
+        arenas: Vec<Arena>,
+    ) -> Result<(Metadata, Vec<PagedAuditEvent>)> {
+        V3ImageStore::recover(backend, pool, arenas)
+    }
+    pub(crate) fn recover(
+        backend: &dyn StorageBackend,
+        pool: Uuid,
+        arenas: Vec<Arena>,
+    ) -> Result<Metadata> {
+        NumericImageStore::recover(backend, pool, arenas)
+    }
+    pub fn snapshot(&self) -> Metadata {
+        match &self.inner {
+            ImageStoreKind::Numeric(store) => store.snapshot(),
+            ImageStoreKind::V3(store) => store.snapshot(),
+        }
+    }
+    pub fn commit(&mut self, next: &mut Metadata) -> Result<CommitReport> {
+        self.commit_allowed(next, None, None)
+    }
+    pub(crate) fn commit_allowed(
+        &mut self,
+        next: &mut Metadata,
+        allowed: Option<&BTreeSet<String>>,
+        event: Option<(&str, serde_json::Value)>,
+    ) -> Result<CommitReport> {
+        match &mut self.inner {
+            ImageStoreKind::Numeric(store) => store.commit_allowed(next, allowed, event),
+            ImageStoreKind::V3(store) => store.commit_allowed(next, allowed, event),
+        }
+    }
+    pub(crate) fn commit_event(
+        &mut self,
+        allowed: &BTreeSet<String>,
+        action: &str,
+        details: serde_json::Value,
+    ) -> Result<CommitReport> {
+        match &mut self.inner {
+            ImageStoreKind::Numeric(store) => store.commit_event(allowed, action, details),
+            ImageStoreKind::V3(store) => store.commit_event(allowed, action, details),
+        }
+    }
+    pub(crate) fn events(&self) -> Vec<PagedAuditEvent> {
+        match &self.inner {
+            ImageStoreKind::Numeric(store) => store.events(),
+            ImageStoreKind::V3(store) => store.events(),
+        }
+    }
+    pub fn root_hash(&self) -> [u8; 32] {
+        match &self.inner {
+            ImageStoreKind::Numeric(store) => store.root_hash(),
+            ImageStoreKind::V3(store) => store.root_hash(),
+        }
+    }
+    pub(crate) fn confirm_all(&mut self, count: usize) -> Result<()> {
+        match &mut self.inner {
+            ImageStoreKind::Numeric(store) => store.confirm_all(count),
+            ImageStoreKind::V3(store) => store.confirm_all(count),
+        }
+    }
+    pub fn repair_stale(
+        &mut self,
+    ) -> Result<BTreeMap<String, std::result::Result<CommitIo, String>>> {
+        match &mut self.inner {
+            ImageStoreKind::Numeric(store) => store.repair_stale(),
+            ImageStoreKind::V3(store) => store.repair_stale(),
+        }
     }
 }

@@ -177,17 +177,36 @@ fn paged_pool_offline_upgrade_preserves_data_and_is_retryable() {
 
 #[test]
 fn paged_topology_add_remove_and_reopen_with_retired_members() {
+    topology_roundtrip(false);
+}
+
+#[test]
+fn v3_experimental_topology_add_remove_and_reopen_with_retired_members() {
+    topology_roundtrip(true);
+}
+
+fn topology_roundtrip(v3: bool) {
     for deferred in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let mut paths = images(&dir);
-        let fs = ArgosFs::create_loop_paged(
-            &paths,
-            config(deferred),
-            64 * 1024 * 1024,
-            "topology",
-            false,
-        )
-        .unwrap();
+        let fs = if v3 {
+            ArgosFs::create_loop_v3_experimental(
+                &paths,
+                config(deferred),
+                64 * 1024 * 1024,
+                "topology",
+            )
+            .unwrap()
+        } else {
+            ArgosFs::create_loop_paged(
+                &paths,
+                config(deferred),
+                64 * 1024 * 1024,
+                "topology",
+                false,
+            )
+            .unwrap()
+        };
         let bytes = vec![61; 16384];
         fs.write_file("/before", &bytes, 0o600).unwrap();
         fs.sync().unwrap();
@@ -319,4 +338,131 @@ fn paged_topology_replace_missing_member() {
     );
     assert_eq!(fs.read_file("/data", false).unwrap(), data);
     assert_eq!(fs.read_file("/after", false).unwrap(), b"after");
+}
+
+#[test]
+fn v3_experimental_volume_namespace_data_quota_and_reopen() {
+    use crate::storage::raw::paged_metadata::V3_INTEGRITY_SCHEME;
+    for deferred in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = images(&dir);
+        let fs = ArgosFs::create_loop_v3_experimental(
+            &paths,
+            config(deferred),
+            128 * 1024 * 1024,
+            "v3-integration",
+        )
+        .unwrap();
+        let parent = fs.mkdir("/dir", 0o755).unwrap();
+        let data = (0..128 * 1024).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+        fs.write_file("/dir/file", &data, 0o600).unwrap();
+        let ino = fs.resolve_path("/dir/file", true).unwrap();
+        fs.link_at(ino, parent, std::ffi::OsStr::new("alias"))
+            .unwrap();
+        fs.set_directory_quota("/dir", 256 * 1024).unwrap();
+        assert_eq!(
+            fs.directory_quota("/dir").unwrap(),
+            (Some(256 * 1024), data.len() as u64)
+        );
+        fs.rename_path("/dir/file", "/dir/renamed").unwrap();
+        fs.sync().unwrap();
+        assert_eq!(fs.read_file("/dir/alias", false).unwrap(), data);
+        assert_eq!(
+            fs.metadata_snapshot().integrity.hash_scheme,
+            Some(V3_INTEGRITY_SCHEME)
+        );
+        assert_eq!(
+            fs.transaction_report().unwrap().selected_metadata_source,
+            "raw-v3-compatibility"
+        );
+        fs.mark_clean_unmount().unwrap();
+        drop(fs);
+        let fs = ArgosFs::open_loop(&paths, true).unwrap();
+        assert_eq!(fs.read_file("/dir/renamed", false).unwrap(), data);
+        assert_eq!(fs.resolve_path("/dir/alias", true).unwrap(), ino);
+        fs.truncate_path("/dir/renamed", 64 * 1024).unwrap();
+        fs.unlink_path("/dir/alias").unwrap();
+        fs.sync().unwrap();
+        assert_eq!(
+            fs.directory_quota("/dir").unwrap(),
+            (Some(256 * 1024), 64 * 1024)
+        );
+        fs.mark_clean_unmount().unwrap();
+        drop(fs);
+        let fs = ArgosFs::open_loop(&paths, false).unwrap();
+        assert_eq!(
+            fs.read_file("/dir/renamed", false).unwrap(),
+            data[..64 * 1024]
+        );
+        assert!(fs.resolve_path("/dir/alias", true).is_err());
+        assert_eq!(
+            fs.metadata_snapshot().integrity.hash_scheme,
+            Some(V3_INTEGRITY_SCHEME)
+        );
+        assert_eq!(
+            fs.directory_quota("/dir").unwrap(),
+            (Some(256 * 1024), 64 * 1024)
+        );
+    }
+}
+
+#[test]
+fn v3_experimental_metadata_growth_reuses_alternate_region_on_topology_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut paths = images(&dir);
+    let fs =
+        ArgosFs::create_loop_v3_experimental(&paths, config(false), 512 * 1024 * 1024, "v3-grow")
+            .unwrap();
+    let data = vec![81; 96 * 1024];
+    fs.write_file("/before", &data, 0o600).unwrap();
+    fs.sync().unwrap();
+    let before = fs.metadata_snapshot();
+    let size = fs.raw_superblocks[0].metadata.length * 2;
+    assert!(matches!(
+        fs.grow_v3_metadata_arena(size * 4),
+        Err(ArgosError::DiskFull { .. })
+    ));
+    assert_eq!(fs.metadata_snapshot().txid, before.txid);
+    fs.grow_v3_metadata_arena(size).unwrap();
+    let grown = fs.metadata_snapshot();
+    for (id, alloc) in &grown.raw_pool.allocators {
+        assert_eq!(
+            before.raw_pool.allocators[id].data_end - alloc.data_end,
+            2 * size
+        );
+    }
+    assert_eq!(fs.read_file("/before", false).unwrap(), data);
+    assert!(fs.grow_v3_metadata_arena(size).is_err());
+    assert_eq!(fs.metadata_snapshot().txid, grown.txid);
+    fs.mark_clean_unmount().unwrap();
+    drop(fs);
+    let fs = ArgosFs::open_loop(&paths, true).unwrap();
+    let added = dir.path().join("added.img");
+    fs.add_block_device(added.clone(), 512 * 1024 * 1024, false)
+        .unwrap();
+    paths.push(added);
+    for (id, alloc) in &grown.raw_pool.allocators {
+        assert_eq!(
+            fs.metadata_snapshot().raw_pool.allocators[id].data_end,
+            alloc.data_end
+        );
+    }
+    fs.write_file("/after", &data, 0o600).unwrap();
+    fs.mark_clean_unmount().unwrap();
+    drop(fs);
+    let fs = ArgosFs::open_loop(&paths, true).unwrap();
+    fs.remove_disk("disk-0000").unwrap();
+    for (id, alloc) in &grown.raw_pool.allocators {
+        if id != "disk-0000" {
+            assert_eq!(
+                fs.metadata_snapshot().raw_pool.allocators[id].data_end,
+                alloc.data_end
+            );
+        }
+    }
+    fs.mark_clean_unmount().unwrap();
+    drop(fs);
+    let fs = ArgosFs::open_loop(&paths[1..], false).unwrap();
+    assert_eq!(fs.read_file("/before", false).unwrap(), data);
+    assert_eq!(fs.read_file("/after", false).unwrap(), data);
 }

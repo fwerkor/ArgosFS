@@ -222,7 +222,10 @@ pub(crate) fn initialize_member_headers(
     backend.flush_all()
 }
 
-pub(crate) use paged::{clear_paged_manifest, reconfigure as reconfigure_paged_metadata};
+pub(crate) use paged::{
+    clear_paged_manifest, reconfigure as reconfigure_paged_metadata,
+    reconfigure_with_growth as grow_paged_metadata,
+};
 
 pub fn preflight_devices_empty(
     backend: &dyn StorageBackend,

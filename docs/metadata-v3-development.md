@@ -1,9 +1,11 @@
 # Metadata V3 development: disk-resident authenticated engine
 
 **Development-only wire format. Do not use this engine to format or upgrade a
-production pool.** The raw/loop CLI still uses the existing paged format.
-No new superblock feature is enabled by this work. Do not freeze the V3 wire
-layout until the volume integration and the qualification gates below pass.
+production pool.** The raw/loop CLI still creates the existing numeric paged
+format. An internal test-only loop constructor sets the experimental V3
+incompatible feature bit; the normal open and commit paths can exercise it.
+No user-facing V3 mkfs or upgrade is provided. Do not freeze the format until
+the remaining qualification gates pass.
 
 ## Implemented core
 
@@ -66,6 +68,24 @@ layout until the volume integration and the qualification gates below pass.
   acknowledgements; verification compares every record and audits all
   configured member allocators. The legacy source is still materialized in
   memory and no production superblock publication is implemented.
+- The existing volume API now has an experimental V3 compatibility adapter:
+  raw/loop superblocks identify V3, the existing data-plane and namespace
+  operations commit typed records, and ordinary recovery restores the
+  authenticated image. The adapter materializes the namespace on open;
+  this is not the final lazy writable mount. Primary updates reuse the
+  existing persistent-map diff, including directory/block/free-extent
+  deltas. File statistics are incrementally updated. Quota indexes are
+  rebuilt only when a relevant namespace, size, or quota change requires
+  it; this remains a materialized quota path.
+- V3 membership transitions reuse the existing joint-quorum configuration
+  protocol with separate staged arenas and format-aware recovery. The
+  experimental growth operation reserves two equal larger arenas from
+  a never-allocated data suffix and atomically switches the manifest.
+  Later topology changes alternate those regions rather than carving
+  additional space. Growth requires all current members and enough
+  contiguous space for both copies. It copies the live metadata tree and
+  does not yet reclaim superseded reserves after repeated growth, or
+  implement segmented/path-bounded growth.
 
 ## Safety invariants
 
@@ -102,16 +122,18 @@ Before exposing any final-format mkfs/migration:
 1. Finish runtime namespace/quota/index mutation paths and data-extent
    accounting. Extend the root catalog if required and finalize record schema
    evolution rules. Preserve unknown compatible data.
-2. Integrate disk-resident transactions into the live volume model and
-   remove whole-image dependencies from namespace, data allocation,
+2. Replace the experimental materialized compatibility adapter with
+   disk-resident transactions in the live volume model and remove whole-image dependencies from namespace, data allocation,
    quotas, verification, FUSE, CLI, health and Autopilot. Bound dirty
    memory, page caches, snapshot readers and maintenance windows.
-3. Support dynamic metadata segment growth/compaction, durable snapshot
+3. Replace full-copy paired-arena growth with dynamic metadata segment
+   growth/compaction and reclaim superseded regions; implement durable snapshot
    and clone references (including data extents), and local metadata
    repair. Generalize the physical map retention rules for the final root
    catalog; add a safe allocator rebuild protocol when its own pages are
    damaged.
-4. Integrate topology epochs and joint-quorum transitions; design and
+4. Qualify V3 topology epochs and joint-quorum transitions under fault
+   injection; design and
    connect authenticated source recovery to the implemented resumable
    staging/verification, then implement crash-safe superblock publication
    from both legacy formats. No production conversion without explicit approval.
@@ -123,3 +145,13 @@ Before exposing any final-format mkfs/migration:
 
 The existing format remains the supported deployment path while these
 gates are open.
+
+## Experimental volume integration tests
+
+Loop-backed volume tests exercise immediate and group commit, file writes,
+truncate, rename, hard links and nested metadata accounting through the actual
+volume API, followed by reopen. Member add/remove across three configuration
+epochs and rejection of an obsolete quorum are tested with the same workload
+as numeric paged pools. Paired-region growth tests verify insufficient-space
+refusal, durable data across reopen and reuse of the reserve on later
+membership changes. These are not FUSE mount or physical power-cut benchmarks.

@@ -151,8 +151,8 @@ pub use autopilot::{AutopilotConfig, ReshapeReport};
 pub(crate) use capacity::CapacitySnapshot;
 use helpers::*;
 pub use member_balance::{MemberBalanceOptions, MemberBalanceReport};
-pub(crate) use namespace::decode_entry_name_bytes;
 use namespace::*;
+pub(crate) use namespace::{decode_entry_name_bytes, entry_name_from_os};
 
 #[derive(Clone, Debug)]
 struct DeferredCommitState {

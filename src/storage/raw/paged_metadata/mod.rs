@@ -17,7 +17,7 @@ mod typed_cache;
 pub use reader::CertifiedReader;
 pub use typed_cache::{CacheInfo, RecordCache};
 mod wire;
-pub use image::{ImageStore, PAGED_INTEGRITY_SCHEME};
+pub use image::{ImageStore, PAGED_INTEGRITY_SCHEME, V3_INTEGRITY_SCHEME};
 pub use wire::{TreeKey, TypedKey, V3Features};
 
 use crate::backend::StorageBackend;
@@ -261,12 +261,12 @@ fn select_members_inner<K: TreeKey>(
     Ok((namespace, quorum, members, current))
 }
 
-pub(super) fn recover_records(
+pub(super) fn recover_records<K: TreeKey>(
     backend: &dyn StorageBackend,
     pool: [u8; 16],
     arenas: Vec<Arena>,
-) -> Result<(BTreeMap<u64, Vec<u8>>, Hash)> {
-    let (_, quorum, members, current) = select_members::<u64>(backend, pool, arenas)?;
+) -> Result<(BTreeMap<K, Vec<u8>>, Hash)> {
+    let (_, quorum, members, current) = select_members::<K>(backend, pool, arenas)?;
     let mut last = None;
     for member in &members {
         if let Some(slot) = member.root_slot(current) {
