@@ -149,7 +149,9 @@ respects the existing background I/O policy, and copies verified encoded
 shards directly without rewriting entire files. Each pass limits moved shards,
 candidate files, and inspected blocks; the target and file/block cursors
 persist across service ticks. A partially visited file resumes at its next
-block; namespace changes are revisited on the next circular pass.
+block; namespace changes are revisited on the next pass. A full scan with no
+shard movement defers that member until other eligible targets have been
+considered, so an unreachable capacity goal cannot starve the pool.
 Host volumes retain the existing file-rewrite rebalance path.
 The rebalance budget is adjusted by a utility EWMA. Manual `argosfs scrub`
 and `argosfs rebalance` still keep their explicit full-volume behavior.

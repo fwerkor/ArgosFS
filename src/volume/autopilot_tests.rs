@@ -580,7 +580,7 @@ fn raw_autopilot_moves_bounded_verified_shards_to_returning_member() {
         ..Default::default()
     };
     assert!(fs
-        .autopilot_member_target(&fs.health_report(), 0.08, 0.85)
+        .autopilot_member_target(&fs.health_report(), 0.08, 0.85, None, &BTreeSet::new())
         .is_none());
     fs.mark_disk(target, DiskStatus::Online).unwrap();
     fs.sync().unwrap();
@@ -661,4 +661,79 @@ fn raw_autopilot_moves_bounded_verified_shards_to_returning_member() {
     drop(fs);
     let fs = ArgosFs::open_loop(&paths, false).unwrap();
     assert_eq!(fs.read_file("/payload", false).unwrap(), data);
+}
+
+#[test]
+fn raw_autopilot_rotates_after_a_complete_unfillable_pass() {
+    let dir = tempdir().unwrap();
+    let paths = (0..4)
+        .map(|i| {
+            let path = dir.path().join(format!("member-{i}.img"));
+            let mib = if i == 0 { 512 } else { 64 };
+            std::fs::File::create(&path)
+                .unwrap()
+                .set_len(mib * 1024 * 1024)
+                .unwrap();
+            path
+        })
+        .collect::<Vec<_>>();
+    let fs = ArgosFs::create_raw_paged(
+        &paths,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            compression: Compression::None,
+            ..Default::default()
+        },
+        "autopilot-rotation",
+        false,
+    )
+    .unwrap();
+    let unfillable = "disk-0000";
+    let returning = "disk-0003";
+    fs.mark_disk(returning, DiskStatus::Offline).unwrap();
+    let data = vec![37; 64 * 1024];
+    fs.write_file("/first", &data, 0o600).unwrap();
+    fs.write_file("/second", &data, 0o600).unwrap();
+    fs.mark_disk(returning, DiskStatus::Online).unwrap();
+    fs.sync().unwrap();
+    // The largest member is already in every stripe, while the returning
+    // member has a smaller proportional deficit but still accepts shards.
+    assert_eq!(fs.rebalance_member(returning, 3).unwrap().moved_shards, 3);
+    let config = AutopilotConfig {
+        probe_interval_sec: u64::MAX,
+        smart_interval_sec: u64::MAX,
+        scrub_interval_sec: u64::MAX,
+        rebalance_interval_sec: 0,
+        max_drains_per_run: 0,
+        rebalance_files_per_run: 1,
+        ..Default::default()
+    };
+    let plan = || fs.autopilot_dry_run_with_config(config.clone()).unwrap();
+    assert_eq!(plan()["planner"]["rebalance"]["member_target"], unfillable);
+    for completed in [false, true] {
+        let result = fs.autopilot_once_with_config(config.clone()).unwrap();
+        let action = result["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["action"] == "rebalance-member-incremental")
+            .unwrap();
+        assert_eq!(action["target"], unfillable);
+        assert_eq!(action["report"]["moved_shards"], 0);
+        assert_eq!(action["report"]["pass_complete"], completed);
+    }
+    assert_eq!(plan()["planner"]["rebalance"]["member_target"], returning);
+    let result = fs.autopilot_once_with_config(config).unwrap();
+    let action = result["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["action"] == "rebalance-member-incremental")
+        .unwrap();
+    assert_eq!(action["target"], returning);
+    assert_eq!(action["report"]["moved_shards"], 1);
+    assert_eq!(fs.read_file("/first", false).unwrap(), data);
+    assert_eq!(fs.read_file("/second", false).unwrap(), data);
 }

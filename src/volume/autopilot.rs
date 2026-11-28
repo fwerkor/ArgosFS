@@ -75,6 +75,10 @@ struct AutopilotState {
     #[serde(default)]
     member_rebalance_block_cursor: Option<(InodeId, usize)>,
     #[serde(default)]
+    member_rebalance_pass_moved: bool,
+    #[serde(default)]
+    member_rebalance_deferred: BTreeSet<String>,
+    #[serde(default)]
     disks: BTreeMap<String, AutopilotDiskState>,
     #[serde(default)]
     action_stats: BTreeMap<String, AutopilotActionStats>,
@@ -324,6 +328,8 @@ impl ArgosFs {
             &report,
             config.rebalance_min_skew,
             config.critical_risk_score,
+            state.member_rebalance_target.as_deref(),
+            &state.member_rebalance_deferred,
         );
         let needs_rebalance = if block_backend {
             member_target.is_some()
@@ -347,9 +353,14 @@ impl ArgosFs {
             if budget > 0 {
                 state.last_rebalance_at = now;
                 if let Some(target) = member_target {
+                    // If every eligible member was deferred, start a new round.
+                    if state.member_rebalance_deferred.contains(&target) {
+                        state.member_rebalance_deferred.clear();
+                    }
                     if state.member_rebalance_target.as_ref() != Some(&target) {
                         state.member_rebalance_cursor = None;
                         state.member_rebalance_block_cursor = None;
+                        state.member_rebalance_pass_moved = false;
                     }
                     state.member_rebalance_target = Some(target.clone());
                     match self.rebalance_member_window(
@@ -365,6 +376,16 @@ impl ArgosFs {
                         Ok(balance) => {
                             state.member_rebalance_cursor = balance.next_cursor;
                             state.member_rebalance_block_cursor = balance.resume_block;
+                            state.member_rebalance_pass_moved |= balance.moved_shards > 0;
+                            if balance.pass_complete {
+                                if !state.member_rebalance_pass_moved {
+                                    state.member_rebalance_deferred.insert(target.clone());
+                                }
+                                state.member_rebalance_target = None;
+                                state.member_rebalance_cursor = None;
+                                state.member_rebalance_block_cursor = None;
+                                state.member_rebalance_pass_moved = false;
+                            }
                             record_autopilot_action(
                                 &mut state,
                                 "rebalance",
@@ -450,6 +471,7 @@ impl ArgosFs {
                 "member_rebalance_target": state.member_rebalance_target,
                 "member_rebalance_cursor": state.member_rebalance_cursor,
                 "member_rebalance_block_cursor": state.member_rebalance_block_cursor,
+                "member_rebalance_deferred": state.member_rebalance_deferred,
                 "stopped_for_conflict": stop_mutations,
                 "background_io": {
                     "throttle_decisions": throttle_decisions
@@ -572,6 +594,8 @@ impl ArgosFs {
             &report,
             config.rebalance_min_skew,
             config.critical_risk_score,
+            state.member_rebalance_target.as_deref(),
+            &state.member_rebalance_deferred,
         );
         let needs_rebalance = if block_backend {
             member_target.is_some()

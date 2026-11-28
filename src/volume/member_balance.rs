@@ -14,6 +14,7 @@ pub struct MemberBalanceReport {
     pub scanned_blocks: usize,
     pub next_cursor: Option<InodeId>,
     pub resume_block: Option<(InodeId, usize)>,
+    pub pass_complete: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -100,12 +101,16 @@ impl ArgosFs {
                         meta.inodes
                             .file_window_ids(Some(ino), window.max_files.saturating_sub(1))
                             .into_iter()
-                            .filter(|id| *id != ino),
+                            .filter(|id| *id > ino),
                     );
                     ids.truncate(window.max_files);
                     ids
                 } else {
-                    meta.inodes.file_window_ids(window.cursor, window.max_files)
+                    meta.inodes
+                        .file_window_ids(window.cursor, window.max_files)
+                        .into_iter()
+                        .filter(|id| window.cursor.is_none_or(|cursor| *id > cursor))
+                        .collect()
                 }
             } else if let Some(path) = &options.path {
                 let root = self.resolve_path_locked(&meta, path, true, 40)?;
@@ -333,9 +338,15 @@ impl ArgosFs {
             report.parity_shards_moved += moved - data_moved;
         }
         self.sync()?;
-        report.used_after = self
-            .meta
-            .read()
+        let meta = self.meta.read();
+        report.pass_complete = window.is_some()
+            && report.resume_block.is_none()
+            && !meta
+                .inodes
+                .file_window_ids(report.next_cursor, 1)
+                .into_iter()
+                .any(|id| report.next_cursor.is_none_or(|cursor| id > cursor));
+        report.used_after = meta
             .disks
             .get(target)
             .ok_or_else(|| ArgosError::MissingDevice(target.into()))?
@@ -348,6 +359,8 @@ impl ArgosFs {
         report: &HealthReport,
         min_skew: f64,
         critical_risk: f64,
+        preferred: Option<&str>,
+        deferred: &BTreeSet<String>,
     ) -> Option<String> {
         let meta = self.meta.read();
         if meta.backend == BackendKind::Host
@@ -373,7 +386,15 @@ impl ArgosFs {
                 let deficit = (goal - disk.used_bytes) as f64 / goal as f64;
                 (deficit >= min_skew).then_some((deficit, &health.id))
             })
-            .max_by(|a, b| a.0.total_cmp(&b.0).then_with(|| b.1.cmp(a.1)))
+            .max_by(|a, b| {
+                (!deferred.contains(a.1))
+                    .cmp(&!deferred.contains(b.1))
+                    .then_with(|| {
+                        (preferred == Some(a.1.as_str())).cmp(&(preferred == Some(b.1.as_str())))
+                    })
+                    .then_with(|| a.0.total_cmp(&b.0))
+                    .then_with(|| b.1.cmp(a.1))
+            })
             .map(|(_, id)| id.clone())
     }
 
