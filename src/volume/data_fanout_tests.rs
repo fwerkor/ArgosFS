@@ -380,3 +380,74 @@ fn partial_member_batch_failure_never_publishes_default_format_append() {
     let reopened = ArgosFs::open_loop(&paths, false).unwrap();
     assert_eq!(reopened.read_file("/data", false).unwrap(), old);
 }
+
+#[test]
+fn disjoint_full_stripe_overwrites_of_one_inode_overlap_and_recover() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = (0..3)
+        .map(|i| dir.path().join(format!("overwrite-{i}.img")))
+        .collect::<Vec<_>>();
+    let mut fs = ArgosFs::create_loop(
+        &paths,
+        VolumeConfig {
+            k: 2,
+            m: 1,
+            chunk_size: 4096,
+            compression: Compression::None,
+            ..VolumeConfig::default()
+        },
+        64 * 1024 * 1024,
+        "overwrite-default",
+        false,
+    )
+    .unwrap();
+    let original = vec![7; 4 * 8192];
+    fs.write_file("/data", &original, 0o600).unwrap();
+    let ino = fs.resolve_path("/data", true).unwrap();
+    let before = fs.metadata_snapshot();
+    let backend = probe(&mut fs, None);
+    let a = vec![31; 8192];
+    let b = vec![47; 8192];
+    std::thread::scope(|scope| {
+        let first = scope.spawn(|| fs.write_inode_range(ino, 0, &a));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while backend.active.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(fs.try_metadata_snapshot().unwrap().txid, before.txid);
+        let second = scope.spawn(|| fs.write_inode_range(ino, 2 * 8192, &b));
+        assert_eq!(first.join().unwrap().unwrap(), 8192);
+        assert_eq!(second.join().unwrap().unwrap(), 8192);
+    });
+    assert!(backend.peak.load(Ordering::SeqCst) > 3);
+    assert_eq!(
+        backend.writes.load(Ordering::SeqCst),
+        6,
+        "reservation replay rewrote payload"
+    );
+    let mut expected = original;
+    expected[..8192].copy_from_slice(&a);
+    expected[2 * 8192..3 * 8192].copy_from_slice(&b);
+    assert_eq!(fs.read_file("/data", false).unwrap(), expected);
+    fs.sync().unwrap();
+    drop(fs);
+    let reopened = ArgosFs::open_loop(&paths, false).unwrap();
+    assert_eq!(reopened.read_file("/data", false).unwrap(), expected);
+    let meta = reopened.metadata_snapshot();
+    for (disk, state) in &meta.raw_pool.allocators {
+        let extents = meta
+            .inodes
+            .values()
+            .flat_map(|inode| &inode.blocks)
+            .flat_map(|block| &block.shards)
+            .filter_map(|shard| match &shard.location {
+                Some(ShardLocation::RawExtent(extent)) if &extent.disk_id == disk => {
+                    Some(extent.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        allocator::validate_allocations(state, extents).unwrap();
+    }
+}

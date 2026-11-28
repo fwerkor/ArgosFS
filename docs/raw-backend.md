@@ -352,3 +352,16 @@ failure falls back before any writes are issued. Completion failures are
 reported, and ambiguous submission failures fence the member rather than
 replaying potentially outstanding operations. All completions must be
 observed before the existing member flush and metadata publication.
+
+Strict-durability raw/loop pools additionally admit full-stripe overwrites
+within an existing non-inline file to the parallel COW reservation lane.
+Logical publication remains ordered, and each writer replaces only its own
+range. The allocator replays the exact reserved extent, even when an earlier
+successful overwrite freed unrelated ranges; a failed earlier reservation
+still invalidates subsequent stripe tickets. Partial-stripe operations,
+extension, mixed-layout boundary crossings, encryption and deferred commits
+retain the ordinary serialization path.
+
+Select the raw/loop I/O policy using the existing command with a pool
+selector, e.g. `argosfs set-io-mode --images a.img,b.img,c.img --mode io-uring`.
+The existing host-volume positional syntax remains supported.

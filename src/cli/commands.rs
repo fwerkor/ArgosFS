@@ -700,7 +700,9 @@ pub(super) enum Command {
     EncryptionStatus { root: PathBuf },
     #[command(about = "Persist the data-plane I/O policy")]
     SetIoMode {
-        root: PathBuf,
+        root: Option<PathBuf>,
+        #[command(flatten)]
+        storage: PoolArgs,
         #[arg(long, default_value = "buffered")]
         mode: IoMode,
         #[arg(long)]

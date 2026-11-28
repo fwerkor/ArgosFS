@@ -21,9 +21,10 @@ pub(super) struct ReservationSpec {
 }
 
 impl ReservationSpec {
-    /// Reproduce the exact allocation decisions in order. Failed earlier
-    /// writers can invalidate a later plan; such plans retry on the normal
-    /// path, rather than manufacturing holes or changing allocator policy.
+    /// Replay exact allocation decisions in order. A successful earlier COW
+    /// replacement can release unrelated free extents without invalidating
+    /// later reservations. A failed earlier writer still invalidates the
+    /// stripe cursor and cannot introduce holes.
     pub(super) fn apply(&self, metadata: &mut Metadata) -> Result<()> {
         if metadata.next_stripe != self.first_stripe {
             return Err(ArgosError::Conflict(
@@ -36,22 +37,12 @@ impl ReservationSpec {
                 .allocators
                 .get_mut(&expected.disk_id)
                 .ok_or_else(|| ArgosError::MissingDevice(expected.disk_id.clone()))?;
-            let actual = allocator::allocate(
-                state,
-                &expected.disk_id,
-                expected.length,
-                expected.generation,
-            )?;
-            if actual.offset != expected.offset || actual.length != expected.length {
-                return Err(ArgosError::Conflict(
-                    "raw reservation allocation changed".into(),
-                ));
-            }
+            allocator::reserve_exact(state, expected)?;
             let disk = metadata
                 .disks
                 .get_mut(&expected.disk_id)
                 .ok_or_else(|| ArgosError::MissingDevice(expected.disk_id.clone()))?;
-            disk.used_bytes = disk.used_bytes.saturating_add(actual.length);
+            disk.used_bytes = disk.used_bytes.saturating_add(expected.length);
         }
         metadata.next_stripe = self.next_stripe;
         Ok(())

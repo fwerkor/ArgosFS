@@ -297,7 +297,7 @@ impl ArgosFs {
         details: serde_json::Value,
     ) -> Result<()> {
         let inode_lock = self.inode_lock(ino);
-        let _inode_guard = inode_lock.lock();
+        let _inode_guard = inode_lock.write();
         let prepared = self.prepare_write(ino, data, None);
         let mut meta = self.meta.write();
         self.replace_inode_data_prepared_locked(

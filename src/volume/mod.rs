@@ -248,7 +248,7 @@ struct MountRuntime {
     read_advisory: read_advisory::ReadAdvisory,
     commit_metrics: CommitMetrics,
     dirty_host_shards: Mutex<BTreeSet<PathBuf>>,
-    inode_locks: Mutex<BTreeMap<InodeId, Arc<Mutex<()>>>>,
+    inode_locks: Mutex<BTreeMap<InodeId, Arc<RwLock<()>>>>,
     decode_flights: decode_flights::DecodeFlights,
     read_retries_seen: AtomicU64,
     read_recovered: AtomicU64,
@@ -642,12 +642,12 @@ impl ArgosFs {
         err.is_fatal_device_error()
     }
 
-    fn inode_lock(&self, ino: InodeId) -> Arc<Mutex<()>> {
+    fn inode_lock(&self, ino: InodeId) -> Arc<RwLock<()>> {
         self.runtime
             .inode_locks
             .lock()
             .entry(ino)
-            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .or_insert_with(|| Arc::new(RwLock::new(())))
             .clone()
     }
 
