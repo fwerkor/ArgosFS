@@ -99,3 +99,36 @@ fn raw_sync_after_read_retains_durable_hash_until_a_real_write() {
     );
     assert_eq!(reopened.metadata_snapshot().txid, committed_txid);
 }
+
+#[test]
+fn legacy_rebalance_replays_tier_classification_with_rewritten_blocks() {
+    let tmp = TempDir::new().unwrap();
+    let images: Vec<_> = (0..3)
+        .map(|i| tmp.path().join(format!("disk-{i}.img")))
+        .collect();
+    let mut cfg = config();
+    cfg.k = 2;
+    cfg.m = 1;
+    let fs = ArgosFs::create_loop_legacy(
+        &images,
+        cfg,
+        32 * 1024 * 1024,
+        "rebalance-base-regression",
+        false,
+    )
+    .unwrap();
+    let payload = vec![0x5a; 8192];
+    fs.write_file("/seed", &payload, 0o644).unwrap();
+    for _ in 0..16 {
+        assert_eq!(fs.read_file("/seed", false).unwrap(), payload);
+    }
+    // Persist the read counters without classifying the file yet.
+    fs.mkdir("/commit-advisory", 0o755).unwrap();
+    fs.rebalance().unwrap();
+    fs.sync().unwrap();
+    let committed = fs.metadata_snapshot();
+    std::mem::forget(fs);
+    let recovered = ArgosFs::open_loop(&images, false).unwrap();
+    assert_eq!(recovered.metadata_snapshot().txid, committed.txid);
+    assert_eq!(recovered.read_file("/seed", false).unwrap(), payload);
+}
