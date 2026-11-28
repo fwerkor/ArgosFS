@@ -226,3 +226,23 @@ reclaimed only by the durable metadata transaction. It balances by capacity
 within a storage tier and does not reduce failure-domain diversity. A pass may
 stop short of the average if no safe placement is available; scrub separately
 to repair actual damage. The operation is deliberately not a mount side effect.
+
+
+### Linux FUSE request negotiation
+
+The mount requests parallel directory operations and adaptive READDIRPLUS only
+when advertised by the kernel; adaptive READDIRPLUS requires its base
+capability. The request limits retain the default 1 MiB write and readahead
+targets, 64 background requests and a 75% congestion threshold. Operators may
+override the targets with `ARGOSFS_FUSE_MAX_WRITE` and
+`ARGOSFS_FUSE_MAX_READAHEAD` (4096–1048576 bytes), or
+`ARGOSFS_FUSE_MAX_BACKGROUND` (8–256). The negotiated limits remain bounded
+by the kernel/library; invalid values use the defaults. These are mount-time
+settings and do not affect the persistent format.
+
+The `io-uring` shard I/O policy reuses a bounded pool of drained rings across
+worker threads. Unavailable setup falls back to buffered I/O; completed I/O
+errors are propagated rather than silently replaying an uncertain write.
+Each successful host-file shard write still crosses its existing sync barrier.
+This is not FUSE-over-io_uring: that requires a separate transport in the
+FUSE library. Raw block backends do not yet use this host-path ring pool.

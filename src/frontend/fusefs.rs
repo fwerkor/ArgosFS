@@ -58,6 +58,28 @@ fn fuse_thread_count(variable: &str, min: usize, max: usize) -> usize {
         })
 }
 
+// Bound request memory and keep the existing defaults unless the operator
+// deliberately tunes the mount for a different storage workload.
+fn fuse_io_setting(value: Option<&str>, min: u32, max: u32, default: u32) -> u32 {
+    value
+        .and_then(|value| value.parse().ok())
+        .filter(|value| (min..=max).contains(value))
+        .unwrap_or(default)
+}
+
+fn fuse_io_env(name: &str, min: u32, max: u32, default: u32) -> u32 {
+    fuse_io_setting(std::env::var(name).ok().as_deref(), min, max, default)
+}
+
+fn fuse_optional_capabilities(supported: InitFlags) -> InitFlags {
+    let mut flags = supported & InitFlags::FUSE_PARALLEL_DIROPS;
+    if supported.contains(InitFlags::FUSE_DO_READDIRPLUS) {
+        flags |= InitFlags::FUSE_DO_READDIRPLUS;
+        flags |= supported & InitFlags::FUSE_READDIRPLUS_AUTO;
+    }
+    flags
+}
+
 pub struct ArgosFuse {
     shared: Arc<ArgosFuseShared>,
     commit_worker: Option<DeferredCommitWorker>,
@@ -488,12 +510,24 @@ impl Filesystem for ArgosFuse {
         _req: &Request,
         config: &mut KernelConfig,
     ) -> std::result::Result<(), std::io::Error> {
-        let _ = config.set_max_write(1024 * 1024);
-        let _ = config.set_max_readahead(1024 * 1024);
-        let _ = config.set_max_background(64);
-        let _ = config.set_congestion_threshold(48);
-        let _ = config
-            .add_capabilities(InitFlags::FUSE_PARALLEL_DIROPS | InitFlags::FUSE_READDIRPLUS_AUTO);
+        let max_write = fuse_io_env("ARGOSFS_FUSE_MAX_WRITE", 4096, 1024 * 1024, 1024 * 1024);
+        let max_readahead =
+            fuse_io_env("ARGOSFS_FUSE_MAX_READAHEAD", 4096, 1024 * 1024, 1024 * 1024);
+        let background = fuse_io_env("ARGOSFS_FUSE_MAX_BACKGROUND", 8, 256, 64) as u16;
+        if let Err(limit) = config.set_max_write(max_write) {
+            let _ = config.set_max_write(limit);
+        }
+        if let Err(limit) = config.set_max_readahead(max_readahead) {
+            if limit != 0 {
+                let _ = config.set_max_readahead(limit);
+            }
+        }
+        let _ = config.set_max_background(background);
+        let _ = config.set_congestion_threshold(background * 3 / 4);
+        // add_capabilities rejects the entire set if even one flag is
+        // unsupported. Negotiate each supported feature independently;
+        // READDIRPLUS_AUTO also requires DO_READDIRPLUS.
+        let _ = config.add_capabilities(fuse_optional_capabilities(config.capabilities()));
         Ok(())
     }
 

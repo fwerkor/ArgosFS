@@ -1317,3 +1317,34 @@ fn blocked_inode_flush_does_not_hold_mount_writeback_map() {
     assert_eq!(volume.read_file("/a", false).unwrap(), b"pending-a");
     assert!(fuse.writeback.lock().dirty.is_empty());
 }
+
+#[test]
+fn optional_fuse_capabilities_negotiate_without_all_or_nothing_failure() {
+    use InitFlags as F;
+    assert_eq!(
+        fuse_optional_capabilities(F::FUSE_PARALLEL_DIROPS),
+        F::FUSE_PARALLEL_DIROPS
+    );
+    assert_eq!(
+        fuse_optional_capabilities(F::FUSE_DO_READDIRPLUS),
+        F::FUSE_DO_READDIRPLUS
+    );
+    assert_eq!(
+        fuse_optional_capabilities(F::FUSE_READDIRPLUS_AUTO),
+        F::empty()
+    );
+    let supported = F::FUSE_DO_READDIRPLUS | F::FUSE_READDIRPLUS_AUTO | F::FUSE_PARALLEL_DIROPS;
+    assert_eq!(
+        fuse_optional_capabilities(supported | F::FUSE_WRITEBACK_CACHE),
+        supported
+    );
+}
+
+#[test]
+fn fuse_io_setting_rejects_invalid_and_unbounded_values() {
+    for value in [None, Some(""), Some("abc"), Some("0"), Some("257")] {
+        assert_eq!(fuse_io_setting(value, 8, 256, 64), 64);
+    }
+    assert_eq!(fuse_io_setting(Some("8"), 8, 256, 64), 8);
+    assert_eq!(fuse_io_setting(Some("256"), 8, 256, 64), 256);
+}
