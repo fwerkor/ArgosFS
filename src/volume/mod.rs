@@ -129,6 +129,7 @@ mod shard_read_batch;
 mod shard_repair;
 #[cfg(test)]
 mod shard_repair_tests;
+mod snapshots;
 use shard_repair::RepairCounters;
 #[cfg(test)]
 mod paged_metadata_tests;
@@ -152,6 +153,7 @@ pub(crate) use capacity::CapacitySnapshot;
 use helpers::*;
 pub use member_balance::{MemberBalanceOptions, MemberBalanceReport};
 use namespace::*;
+pub(crate) use namespace::{decode_entry_name_bytes, entry_name_from_os};
 
 #[derive(Clone, Debug)]
 struct DeferredCommitState {
@@ -219,16 +221,16 @@ impl DeferredCommitState {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct QuotaRuntime {
+pub(crate) struct QuotaRuntime {
     active: imbl::OrdSet<InodeId>,
-    usage_bytes: imbl::OrdMap<InodeId, u128>,
+    pub(crate) usage_bytes: imbl::OrdMap<InodeId, u128>,
     // Number of reachable directory entries for each (inode, quota).
     // A file with multiple hard links is charged only on the first edge.
-    memberships: imbl::OrdMap<InodeId, imbl::OrdMap<InodeId, u64>>,
+    pub(crate) memberships: imbl::OrdMap<InodeId, imbl::OrdMap<InodeId, u64>>,
 }
 
 impl QuotaRuntime {
-    fn from_metadata(meta: &Metadata) -> Result<Self> {
+    pub(crate) fn from_metadata(meta: &Metadata) -> Result<Self> {
         let mut runtime = Self::default();
         for (ino, inode) in &meta.inodes {
             if inode.quota_bytes.is_some() {
@@ -657,6 +659,11 @@ impl ArgosFs {
 
     pub fn snapshot(&self, name: &str) -> Result<PathBuf> {
         let mut meta = self.meta.write();
+        if meta.integrity.hash_scheme
+            == Some(crate::storage::raw::paged_metadata::V3_INTEGRITY_SCHEME)
+        {
+            return Err(ArgosError::Unsupported("legacy JSON export is not a V3 filesystem snapshot; use create_filesystem_snapshot".into()));
+        }
         let trimmed = name.trim();
         if trimmed.is_empty() {
             return Err(ArgosError::Invalid(

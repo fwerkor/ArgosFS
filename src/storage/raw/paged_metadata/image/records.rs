@@ -14,7 +14,7 @@ fn corrupt(message: &str) -> ArgosError {
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum Key {
+pub(super) enum Key {
     Header,
     Inode(u64),
     Dirent(u64, String),
@@ -27,7 +27,7 @@ enum Key {
 }
 
 #[derive(Deserialize, Serialize)]
-enum Record {
+pub(super) enum Record {
     Header(Box<Metadata>),
     Inode(Box<InodeCorePage>),
     Dirent(u64, String, u64),
@@ -151,6 +151,27 @@ pub(super) fn import_events(
     Ok(plan.finish())
 }
 
+pub(super) trait RecordSink {
+    fn put(&mut self, record: Record) -> Result<()>;
+    fn remove(&mut self, key: Key) -> Result<()>;
+    fn replace(&mut self, old: Option<Record>, new: Option<Record>) -> Result<()> {
+        match (old, new) {
+            (Some(old), Some(new)) => {
+                if old.key() != new.key() {
+                    return Err(corrupt("metadata record identity changed"));
+                }
+                if encode(&old)? != encode(&new)? {
+                    self.put(new)?;
+                }
+            }
+            (Some(old), None) => self.remove(old.key())?,
+            (None, Some(new)) => self.put(new)?,
+            (None, None) => {}
+        }
+        Ok(())
+    }
+}
+
 struct Plan {
     changes: Changes,
     index: RecordIndex,
@@ -164,6 +185,12 @@ impl Plan {
         }
     }
 
+    fn finish(self) -> (Changes, RecordIndex) {
+        (self.changes, self.index)
+    }
+}
+
+impl RecordSink for Plan {
     fn put(&mut self, record: Record) -> Result<()> {
         let key = record.key();
         let id = if let Some(&id) = self.index.ids.get(&key) {
@@ -192,27 +219,6 @@ impl Plan {
         self.changes.insert(id, None);
         Ok(())
     }
-
-    fn replace(&mut self, old: Option<Record>, new: Option<Record>) -> Result<()> {
-        match (old, new) {
-            (Some(old), Some(new)) => {
-                if old.key() != new.key() {
-                    return Err(corrupt("metadata record identity changed"));
-                }
-                if encode(&old)? != encode(&new)? {
-                    self.put(new)?;
-                }
-            }
-            (Some(old), None) => self.remove(old.key())?,
-            (None, Some(new)) => self.put(new)?,
-            (None, None) => {}
-        }
-        Ok(())
-    }
-
-    fn finish(self) -> (Changes, RecordIndex) {
-        (self.changes, self.index)
-    }
 }
 
 fn header(meta: &Metadata) -> Record {
@@ -220,8 +226,12 @@ fn header(meta: &Metadata) -> Record {
     header.inodes = Default::default();
     header.disks.clear();
     header.raw_pool.allocators.clear();
+    header.raw_pool.snapshot_state = None;
     header.checkpoint_member_catalog = None;
-    if header.integrity.hash_scheme == Some(PAGED_INTEGRITY_SCHEME) {
+    if matches!(
+        header.integrity.hash_scheme,
+        Some(PAGED_INTEGRITY_SCHEME | super::V3_INTEGRITY_SCHEME)
+    ) {
         header.integrity.meta_hash.clear();
     }
     Record::Header(Box::new(header))
@@ -265,7 +275,7 @@ fn diff<'a, K: Ord, V: PartialEq + 'a>(
 }
 
 fn inode_records(
-    plan: &mut Plan,
+    plan: &mut impl RecordSink,
     key: u64,
     old: Option<&Inode>,
     new: Option<&Inode>,
@@ -326,7 +336,7 @@ fn inode_records(
 }
 
 fn allocator_records(
-    plan: &mut Plan,
+    plan: &mut impl RecordSink,
     disk: &str,
     old: Option<&RawAllocatorState>,
     new: Option<&RawAllocatorState>,
@@ -395,6 +405,15 @@ pub(super) fn plan_records(
     index: RecordIndex,
 ) -> Result<(Changes, RecordIndex)> {
     let mut plan = Plan::new(index);
+    plan_primary_changes(base, next, &mut plan)?;
+    Ok(plan.finish())
+}
+
+pub(super) fn plan_primary_changes(
+    base: &Metadata,
+    next: &Metadata,
+    plan: &mut impl RecordSink,
+) -> Result<()> {
     plan.put(header(next))?;
     for id in base
         .disks
@@ -416,16 +435,16 @@ pub(super) fn plan_records(
         .collect::<BTreeSet<_>>()
     {
         allocator_records(
-            &mut plan,
+            plan,
             id,
             base.raw_pool.allocators.get(id),
             next.raw_pool.allocators.get(id),
         )?;
     }
     for key in base.inodes.changed_candidates(&next.inodes) {
-        inode_records(&mut plan, key, base.inodes.get(&key), next.inodes.get(&key))?;
+        inode_records(plan, key, base.inodes.get(&key), next.inodes.get(&key))?;
     }
-    Ok(plan.finish())
+    Ok(())
 }
 
 pub(super) fn decode_image(

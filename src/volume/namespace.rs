@@ -1877,7 +1877,7 @@ impl ArgosFs {
     }
 }
 
-pub(super) fn entry_name_from_os(name: &OsStr) -> Result<String> {
+pub(crate) fn entry_name_from_os(name: &OsStr) -> Result<String> {
     let bytes = name.as_bytes();
     validate_entry_name_bytes(bytes)?;
     if let Some(name) = name.to_str() {
@@ -1920,7 +1920,7 @@ pub(super) fn validate_entry_name_bytes(name: &[u8]) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn decode_entry_name_bytes(name: &str) -> Vec<u8> {
+pub(crate) fn decode_entry_name_bytes(name: &str) -> Vec<u8> {
     for prefix in [
         ESCAPED_UTF8_NAME_PREFIX,
         NON_UTF8_NAME_PREFIX,

@@ -2,10 +2,12 @@
 //! checksummed membership manifest, not a second recovery authority.
 use super::*;
 use crate::raw_format::{
-    REQUIRED_FEATURE_PAGED_METADATA as ACTIVE, REQUIRED_FEATURE_PAGED_MIGRATION as PENDING,
-    REQUIRED_FEATURE_PAGED_TOPOLOGY as TOPOLOGY,
+    REQUIRED_FEATURE_METADATA_V3 as V3, REQUIRED_FEATURE_PAGED_METADATA as ACTIVE,
+    REQUIRED_FEATURE_PAGED_MIGRATION as PENDING, REQUIRED_FEATURE_PAGED_TOPOLOGY as TOPOLOGY,
 };
-use crate::storage::raw::paged_metadata::{Arena, ImageStore, PAGED_INTEGRITY_SCHEME};
+use crate::storage::raw::paged_metadata::{
+    Arena, ImageStore, PAGED_INTEGRITY_SCHEME, V3_INTEGRITY_SCHEME,
+};
 
 const MANIFEST_MAGIC: &[u8; 16] = b"ARGOSFS-PG-MAN\0\0";
 const MAX_MANIFEST: usize = 1024 * 1024;
@@ -22,6 +24,8 @@ struct Manifest {
 struct ManifestMember {
     device_uuid: Uuid,
     arena: Arena,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    alternate_arena: Option<Arena>,
     data_offset: u64,
     data_length: u64,
 }
@@ -29,7 +33,24 @@ struct ManifestMember {
 pub(super) fn uses_paged(superblocks: &[RawSuperblock]) -> bool {
     superblocks
         .iter()
-        .any(|sb| sb.required_feature_flags & (ACTIVE | PENDING) != 0)
+        .any(|sb| sb.required_feature_flags & (ACTIVE | PENDING | V3) != 0)
+}
+
+fn uses_v3(superblocks: &[RawSuperblock]) -> Result<bool> {
+    let v3 = superblocks
+        .iter()
+        .any(|sb| sb.required_feature_flags & V3 != 0);
+    if v3
+        && superblocks.iter().any(|sb| {
+            sb.required_feature_flags & (ACTIVE | V3) != (ACTIVE | V3)
+                || sb.required_feature_flags & PENDING != 0
+        })
+    {
+        return Err(ArgosError::IncompatibleFormat(
+            "mixed experimental V3 and numeric paged member formats".into(),
+        ));
+    }
+    Ok(v3)
 }
 
 pub(super) fn reject_paged(superblocks: &[RawSuperblock]) -> Result<()> {
@@ -39,6 +60,49 @@ pub(super) fn reject_paged(superblocks: &[RawSuperblock]) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+impl ManifestMember {
+    fn valid_arena_layout(&self, sb: &RawSuperblock) -> bool {
+        let Some(data_end) = self.data_offset.checked_add(self.data_length) else {
+            return false;
+        };
+        let valid = |arena: &Arena| {
+            arena.disk_id == sb.disk_id
+                && arena.length >= 8 * RAW_HEADER_SIZE as u64
+                && arena.length.is_multiple_of(RAW_HEADER_SIZE as u64)
+                && arena.offset.is_multiple_of(RAW_HEADER_SIZE as u64)
+        };
+        if !valid(&self.arena) {
+            return false;
+        }
+        if let Some(other) = &self.alternate_arena {
+            if sb.required_feature_flags & V3 == 0
+                || !valid(other)
+                || other.length != self.arena.length
+            {
+                return false;
+            }
+            let (first, second) = if self.arena.offset < other.offset {
+                (&self.arena, other)
+            } else {
+                (other, &self.arena)
+            };
+            return first.offset == data_end
+                && first.offset.checked_add(first.length) == Some(second.offset)
+                && second
+                    .offset
+                    .checked_add(second.length)
+                    .is_some_and(|end| end <= sb.backup_superblock_offset);
+        }
+        (self.arena.offset == sb.metadata.offset && self.arena.length == sb.metadata.length)
+            || (self.arena.offset == data_end
+                && self
+                    .arena
+                    .offset
+                    .checked_add(self.arena.length)
+                    .is_some_and(|end| end <= sb.backup_superblock_offset))
+    }
 }
 
 impl Manifest {
@@ -52,6 +116,7 @@ impl Manifest {
                 device_uuid: sb.device_uuid,
                 data_offset: sb.data.offset,
                 data_length: sb.data.length,
+                alternate_arena: None,
                 arena: Arena {
                     disk_id: sb.disk_id.clone(),
                     offset: sb.metadata.offset,
@@ -97,13 +162,7 @@ impl Manifest {
                         && m.arena.disk_id == sb.disk_id
                         && m.data_offset == sb.data.offset
                         && m.data_length <= sb.data.length
-                        && ((m.arena.offset == sb.metadata.offset
-                            && m.arena.length == sb.metadata.length)
-                            || (m.data_offset.checked_add(m.data_length) == Some(m.arena.offset)
-                                && m.arena
-                                    .offset
-                                    .checked_add(m.arena.length)
-                                    .is_some_and(|end| end <= sb.backup_superblock_offset)))
+                        && m.valid_arena_layout(sb)
                 })
             {
                 return Err(ArgosError::IncompatibleFormat(format!(
@@ -173,22 +232,24 @@ fn read_manifest(backend: &dyn StorageBackend, sb: &RawSuperblock) -> Result<Man
 
 mod topology;
 pub(crate) use topology::clear_transition_slots as clear_paged_manifest;
-pub(crate) use topology::reconfigure;
 use topology::select_manifest;
+pub(crate) use topology::{reconfigure, reconfigure_with_growth};
 
 fn validate_image(meta: &Metadata, manifest: &Manifest) -> Result<()> {
-    if meta.integrity.hash_scheme != Some(PAGED_INTEGRITY_SCHEME)
-        || meta
-            .disks
-            .values()
-            .filter(|disk| disk.status != DiskStatus::Removed)
-            .map(|disk| disk.id.as_str())
+    if !matches!(
+        meta.integrity.hash_scheme,
+        Some(PAGED_INTEGRITY_SCHEME | V3_INTEGRITY_SCHEME)
+    ) || meta
+        .disks
+        .values()
+        .filter(|disk| disk.status != DiskStatus::Removed)
+        .map(|disk| disk.id.as_str())
+        .collect::<BTreeSet<_>>()
+        != manifest
+            .members
+            .iter()
+            .map(|member| member.arena.disk_id.as_str())
             .collect::<BTreeSet<_>>()
-            != manifest
-                .members
-                .iter()
-                .map(|member| member.arena.disk_id.as_str())
-                .collect::<BTreeSet<_>>()
     {
         return Err(ArgosError::CorruptedMetadata(
             "paged metadata membership or integrity scheme mismatch".into(),
@@ -221,7 +282,11 @@ pub(super) fn initialize(
 ) -> Result<ImageStore> {
     let manifest = Manifest::from_superblocks(superblocks)?;
     metadata.integrity.generation = metadata.txid;
-    metadata.integrity.hash_scheme = Some(PAGED_INTEGRITY_SCHEME);
+    metadata.integrity.hash_scheme = Some(if uses_v3(superblocks)? {
+        V3_INTEGRITY_SCHEME
+    } else {
+        PAGED_INTEGRITY_SCHEME
+    });
     metadata.integrity.meta_hash.clear();
     validate_image(metadata, &manifest)?;
     stage(backend, superblocks, &manifest, metadata)
@@ -254,7 +319,11 @@ fn stage(
         backend.write_at(&sb.disk_id, sb.allocator.offset, &bytes)?;
         backend.flush_device(&sb.disk_id)?;
     }
-    let mut store = ImageStore::format(backend, manifest.arenas(), metadata)?;
+    let mut store = if uses_v3(superblocks)? {
+        ImageStore::format_v3(backend, manifest.arenas(), metadata)?
+    } else {
+        ImageStore::format(backend, manifest.arenas(), metadata)?
+    };
     store.confirm_all(superblocks.len())?;
     Ok(store)
 }
@@ -265,7 +334,11 @@ pub(super) fn open(
     write: bool,
 ) -> Result<ImageStore> {
     let manifest = select_manifest(&*backend, superblocks, write)?;
-    let mut store = ImageStore::open(backend, manifest.pool, manifest.arenas())?;
+    let mut store = if uses_v3(superblocks)? {
+        ImageStore::open_v3(backend, manifest.pool, manifest.arenas())?
+    } else {
+        ImageStore::open(backend, manifest.pool, manifest.arenas())?
+    };
     validate_image(&store.snapshot(), &manifest)?;
     if write {
         // Repair accessible stale replicas before mutations. A failed repair
@@ -280,8 +353,11 @@ pub(super) fn recover(
     superblocks: &[RawSuperblock],
 ) -> Result<(Metadata, TransactionReport)> {
     let manifest = select_manifest(backend, superblocks, false)?;
-    let (metadata, events) =
-        ImageStore::recover_with_events(backend, manifest.pool, manifest.arenas())?;
+    let (metadata, events) = if uses_v3(superblocks)? {
+        ImageStore::recover_v3(backend, manifest.pool, manifest.arenas())?
+    } else {
+        ImageStore::recover_with_events(backend, manifest.pool, manifest.arenas())?
+    };
     validate_image(&metadata, &manifest)?;
     let report = report(&metadata, events);
     Ok((metadata, report))
@@ -292,7 +368,12 @@ pub(super) fn report(
     events: Vec<crate::types::PagedAuditEvent>,
 ) -> TransactionReport {
     TransactionReport {
-        selected_metadata_source: "raw-paged-metadata".into(),
+        selected_metadata_source: if metadata.integrity.hash_scheme == Some(V3_INTEGRITY_SCHEME) {
+            "raw-v3-compatibility"
+        } else {
+            "raw-paged-metadata"
+        }
+        .into(),
         valid_entries: events.len() as u64,
         paged_events: events,
         last_valid_txid: metadata.txid,
@@ -331,7 +412,7 @@ pub(crate) fn commit(
     let before = meta.integrity.clone();
     meta.integrity.generation = meta.txid;
     meta.integrity.previous_meta_hash = base.integrity.meta_hash;
-    meta.integrity.hash_scheme = Some(PAGED_INTEGRITY_SCHEME);
+    meta.integrity.hash_scheme = base.integrity.hash_scheme;
     let report = match store.commit_allowed(meta, Some(&allowed), Some(event)) {
         Ok(report) => report,
         Err(err) => {
@@ -339,6 +420,22 @@ pub(crate) fn commit(
             return Err(err);
         }
     };
+    Ok(write_report(report, allowed, metrics))
+}
+
+pub(crate) fn commit_snapshot(
+    store: &mut ImageStore,
+    meta: &mut Metadata,
+    superblocks: &[RawSuperblock],
+    metrics: &CommitMetrics,
+    name: &str,
+    create: bool,
+) -> Result<QuorumWriteReport> {
+    let allowed = superblocks
+        .iter()
+        .map(|sb| sb.disk_id.clone())
+        .collect::<BTreeSet<_>>();
+    let report = store.commit_snapshot(meta, &allowed, name, create)?;
     Ok(write_report(report, allowed, metrics))
 }
 
@@ -393,6 +490,11 @@ pub(super) fn upgrade(
     requested_pool: Option<&str>,
     arena_bytes: Option<u64>,
 ) -> Result<Metadata> {
+    if uses_v3(superblocks)? {
+        return Err(ArgosError::Unsupported(
+            "experimental V3 cannot use numeric paged format upgrade".into(),
+        ));
+    }
     if superblocks.is_empty() {
         return Err(ArgosError::Invalid(
             "no devices supplied for paged metadata upgrade".into(),

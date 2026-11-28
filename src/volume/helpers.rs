@@ -184,17 +184,43 @@ pub(super) fn sync_directory(path: &Path) {
     }
 }
 
-pub(super) fn recompute_disk_usage_from_metadata(meta: &mut Metadata) {
-    normalize_metadata_layouts(meta);
+pub(super) fn referenced_disk_usage(meta: &Metadata) -> BTreeMap<String, u64> {
     let mut referenced_usage = BTreeMap::<String, u64>::new();
+    let mut live_pins = BTreeSet::new();
     for inode in meta.inodes.values() {
         for block in &inode.blocks {
             for shard in &block.shards {
+                if let Some(ShardLocation::RawExtent(extent)) = &shard.location {
+                    if meta
+                        .raw_pool
+                        .snapshot_state
+                        .as_ref()
+                        .and_then(|state| state.pin(extent))
+                        .is_some()
+                    {
+                        live_pins.insert((extent.disk_id.clone(), extent.offset));
+                    }
+                }
                 *referenced_usage.entry(shard.disk_id.clone()).or_default() +=
                     shard_accounted_size(shard);
             }
         }
     }
+    if let Some(state) = &meta.raw_pool.snapshot_state {
+        for (id, pins) in &state.pins {
+            for (&offset, pin) in pins {
+                if !live_pins.contains(&(id.clone(), offset)) {
+                    *referenced_usage.entry(id.clone()).or_default() += pin.extent.length;
+                }
+            }
+        }
+    }
+    referenced_usage
+}
+
+pub(super) fn recompute_disk_usage_from_metadata(meta: &mut Metadata) {
+    normalize_metadata_layouts(meta);
+    let referenced_usage = referenced_disk_usage(meta);
     for (disk_id, disk) in meta.disks.iter_mut() {
         disk.used_bytes = referenced_usage.get(disk_id).copied().unwrap_or(0);
     }

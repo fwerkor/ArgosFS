@@ -572,3 +572,9 @@ fn cold_open_reads_shared_cow_pages_only_once_per_member() {
     assert_eq!(tree.get(100).unwrap(), Some(b"changed".to_vec()));
     assert_eq!(tree.get(113).unwrap().unwrap().len(), 9000);
 }
+
+#[path = "v3_tests.rs"]
+mod v3_tests;
+
+#[path = "snapshot_tests.rs"]
+mod snapshot_tests;

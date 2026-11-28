@@ -646,6 +646,29 @@ pub struct RawPoolMetadata {
     pub mount_generation: u64,
     #[serde(default)]
     pub allocators: BTreeMap<String, RawAllocatorState>,
+    /// V3-only live pin index. Numeric and legacy formats never populate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_state: Option<RawSnapshotState>,
+}
+
+/// A pin holds a physical generation even after its live inode is gone.
+/// The reference count counts distinct named snapshots, not directory links.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RawSnapshotPin {
+    pub extent: PhysicalExtent,
+    pub references: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RawSnapshotState {
+    pub names: imbl::OrdSet<String>,
+    pub pins: imbl::OrdMap<String, imbl::OrdMap<u64, RawSnapshotPin>>,
+}
+
+impl RawSnapshotState {
+    pub fn pin(&self, extent: &PhysicalExtent) -> Option<&RawSnapshotPin> {
+        self.pins.get(&extent.disk_id)?.get(&extent.offset)
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -809,6 +832,11 @@ pub struct FsckReport {
     pub shard_read_retries: u64,
     /// Shards that a retry read successfully after a mismatch.
     pub shard_read_recovered: u64,
+    /// Historical shard placements verified by the experimental V3 audit.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub snapshot_shards_checked: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub snapshot_shards_damaged: u64,
     pub orphan_shards: u64,
     pub removed_orphans: u64,
     /// Allocated raw extent bytes with no durable shard reference.
@@ -832,6 +860,10 @@ pub struct FsckReport {
     #[serde(default)]
     pub write_verify_skipped: u64,
     pub errors: Vec<String>,
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 #[cfg(test)]

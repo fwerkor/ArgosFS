@@ -1,6 +1,9 @@
 use super::wire::{self, put_u32, put_u64};
 mod paged;
-pub(crate) use paged::{commit as commit_paged_metadata, commit_event as commit_paged_event};
+pub(crate) use paged::{
+    commit as commit_paged_metadata, commit_event as commit_paged_event,
+    commit_snapshot as commit_paged_snapshot,
+};
 mod checkpoint;
 use checkpoint::*;
 mod journal_io;
@@ -222,7 +225,10 @@ pub(crate) fn initialize_member_headers(
     backend.flush_all()
 }
 
-pub(crate) use paged::{clear_paged_manifest, reconfigure as reconfigure_paged_metadata};
+pub(crate) use paged::{
+    clear_paged_manifest, reconfigure as reconfigure_paged_metadata,
+    reconfigure_with_growth as grow_paged_metadata,
+};
 
 pub fn preflight_devices_empty(
     backend: &dyn StorageBackend,

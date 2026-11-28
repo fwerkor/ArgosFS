@@ -300,11 +300,24 @@ fn certify_transition(
     Ok(())
 }
 
+fn recover_configuration(
+    backend: &dyn StorageBackend,
+    manifest: &Manifest,
+    v3: bool,
+) -> Result<Metadata> {
+    if v3 {
+        ImageStore::recover_v3(backend, manifest.pool, manifest.arenas()).map(|(meta, _)| meta)
+    } else {
+        ImageStore::recover(backend, manifest.pool, manifest.arenas())
+    }
+}
+
 pub(super) fn select_manifest(
     backend: &dyn StorageBackend,
     superblocks: &[RawSuperblock],
     write: bool,
 ) -> Result<Manifest> {
+    let v3 = uses_v3(superblocks)?;
     if !superblocks
         .iter()
         .any(|sb| sb.required_feature_flags & ACTIVE != 0)
@@ -410,14 +423,13 @@ pub(super) fn select_manifest(
                             .into(),
                     ));
                 }
-                let old =
-                    ImageStore::recover(backend, transition.old.pool, transition.old.arenas())?;
+                let old = recover_configuration(backend, &transition.old, v3)?;
                 if old.txid != transition.old_txid || old.integrity.meta_hash != transition.old_hash
                 {
                     return Err(ArgosError::Conflict("old configuration advanced during interrupted prepare; offline recovery required".into()));
                 }
             }
-            let new = ImageStore::recover(backend, transition.new.pool, transition.new.arenas())?;
+            let new = recover_configuration(backend, &transition.new, v3)?;
             if new.txid != transition.new_txid || new.integrity.meta_hash != transition.new_hash {
                 return Err(ArgosError::CorruptedMetadata(
                     "staged paged configuration root mismatch".into(),
@@ -496,6 +508,28 @@ pub(crate) fn reconfigure(
     next: &mut Metadata,
     events: &[crate::types::PagedAuditEvent],
 ) -> Result<ImageStore> {
+    reconfigure_with_growth(backend, superblocks, base, next, events, None)
+}
+
+pub(crate) fn reconfigure_with_growth(
+    backend: Arc<dyn StorageBackend>,
+    superblocks: &[RawSuperblock],
+    base: &Metadata,
+    next: &mut Metadata,
+    events: &[crate::types::PagedAuditEvent],
+    requested_arena: Option<u64>,
+) -> Result<ImageStore> {
+    if base.raw_pool.snapshot_state != next.raw_pool.snapshot_state {
+        return Err(ArgosError::Conflict(
+            "topology cannot change snapshot ownership".into(),
+        ));
+    }
+    let v3 = uses_v3(superblocks)?;
+    if v3 != (base.integrity.hash_scheme == Some(V3_INTEGRITY_SCHEME)) {
+        return Err(ArgosError::IncompatibleFormat(
+            "topology transition metadata format mismatch".into(),
+        ));
+    }
     if superblocks
         .iter()
         .any(|sb| sb.required_feature_flags & TOPOLOGY == 0)
@@ -505,7 +539,7 @@ pub(crate) fn reconfigure(
         ));
     }
     let old = select_manifest(&*backend, superblocks, false)?;
-    let recovered = ImageStore::recover(&*backend, old.pool, old.arenas())?;
+    let recovered = recover_configuration(&*backend, &old, v3)?;
     if recovered.txid != base.txid || recovered.integrity.meta_hash != base.integrity.meta_hash {
         return Err(ArgosError::IndeterminateCommit(
             "paged configuration changed since mounted base".into(),
@@ -517,6 +551,32 @@ pub(crate) fn reconfigure(
         .filter(|disk| disk.status != DiskStatus::Removed)
         .map(|disk| disk.id.clone())
         .collect::<BTreeSet<_>>();
+    if let Some(state) = &next.raw_pool.snapshot_state {
+        if state.pins.keys().any(|id| !wanted.contains(id)) {
+            return Err(ArgosError::Unsupported(
+                "historical data placement relocation is required before member removal".into(),
+            ));
+        }
+    }
+    let previous_pair = old
+        .members
+        .iter()
+        .filter_map(|member| member.alternate_arena.as_ref().map(|arena| arena.length))
+        .max();
+    if let Some(size) = requested_arena {
+        if !v3
+            || !size.is_multiple_of(RAW_HEADER_SIZE as u64)
+            || size < 8 * RAW_HEADER_SIZE as u64
+            || old.members.iter().any(|member| size <= member.arena.length)
+            || wanted != member_ids(&old)
+            || wanted
+                .iter()
+                .any(|id| !superblocks.iter().any(|sb| &sb.disk_id == id))
+        {
+            return Err(ArgosError::Invalid("V3 metadata growth requires a larger aligned arena and all unchanged active members".into()));
+        }
+    }
+    let pair_size = requested_arena.or(previous_pair);
     let mut new = Manifest {
         pool: old.pool,
         epoch: old
@@ -561,32 +621,26 @@ pub(crate) fn reconfigure(
                 "invalid data allocator during reconfiguration".into(),
             ));
         }
-        let arena = if let Some(prior) = prior {
-            if prior.arena.offset != sb.metadata.offset {
-                // Legacy metadata area or previous alternate arena is free
-                // once the newer configuration is authoritative.
-                Arena {
-                    disk_id: id.clone(),
-                    offset: sb.metadata.offset,
-                    length: sb.metadata.length,
-                }
+        let (arena, alternate_arena) = if let Some(size) = pair_size {
+            if let Some(prior) =
+                prior.filter(|p| p.alternate_arena.as_ref().is_some_and(|a| a.length >= size))
+            {
+                (
+                    prior.alternate_arena.clone().unwrap(),
+                    Some(prior.arena.clone()),
+                )
             } else {
-                // Reuse the reserved tail on later switches. On the first
-                // switch reserve space never reached by the data allocator.
+                let reserve = size
+                    .checked_mul(2)
+                    .ok_or_else(|| ArgosError::Invalid("V3 metadata reserve overflow".into()))?;
                 let end = alloc.data_end;
-                let prior_tail = sb.backup_superblock_offset.saturating_sub(end);
-                let length = if prior_tail >= sb.metadata.length {
-                    prior_tail
-                } else {
-                    sb.metadata.length
-                };
-                let start = if prior_tail >= sb.metadata.length {
-                    end
-                } else {
-                    end.checked_sub(length).ok_or_else(|| {
-                        ArgosError::Invalid("no space for alternate metadata arena".into())
-                    })?
-                };
+                let start = end
+                    .checked_sub(reserve)
+                    .ok_or_else(|| ArgosError::DiskFull {
+                        disk_id: id.clone(),
+                        required: reserve,
+                        available: end.saturating_sub(alloc.next_offset),
+                    })?;
                 if start <= alloc.data_start
                     || alloc.next_offset > start
                     || alloc
@@ -596,27 +650,84 @@ pub(crate) fn reconfigure(
                 {
                     return Err(ArgosError::DiskFull {
                         disk_id: id.clone(),
-                        required: length,
+                        required: reserve,
                         available: end.saturating_sub(alloc.next_offset),
                     });
                 }
                 alloc.data_end = start;
-                Arena {
-                    disk_id: id.clone(),
-                    offset: start,
-                    length,
-                }
+                (
+                    Arena {
+                        disk_id: id.clone(),
+                        offset: start,
+                        length: size,
+                    },
+                    Some(Arena {
+                        disk_id: id.clone(),
+                        offset: start + size,
+                        length: size,
+                    }),
+                )
             }
         } else {
-            Arena {
-                disk_id: id.clone(),
-                offset: sb.metadata.offset,
-                length: sb.metadata.length,
-            }
+            let arena = if let Some(prior) = prior {
+                if prior.arena.offset != sb.metadata.offset {
+                    // Legacy metadata area or previous alternate arena is free
+                    // once the newer configuration is authoritative.
+                    Arena {
+                        disk_id: id.clone(),
+                        offset: sb.metadata.offset,
+                        length: sb.metadata.length,
+                    }
+                } else {
+                    // Reuse the reserved tail on later switches. On the first
+                    // switch reserve space never reached by the data allocator.
+                    let end = alloc.data_end;
+                    let prior_tail = sb.backup_superblock_offset.saturating_sub(end);
+                    let length = if prior_tail >= sb.metadata.length {
+                        prior_tail
+                    } else {
+                        sb.metadata.length
+                    };
+                    let start = if prior_tail >= sb.metadata.length {
+                        end
+                    } else {
+                        end.checked_sub(length).ok_or_else(|| {
+                            ArgosError::Invalid("no space for alternate metadata arena".into())
+                        })?
+                    };
+                    if start <= alloc.data_start
+                        || alloc.next_offset > start
+                        || alloc
+                            .free_extents
+                            .iter()
+                            .any(|e| e.offset.checked_add(e.length).is_none_or(|end| end > start))
+                    {
+                        return Err(ArgosError::DiskFull {
+                            disk_id: id.clone(),
+                            required: length,
+                            available: end.saturating_sub(alloc.next_offset),
+                        });
+                    }
+                    alloc.data_end = start;
+                    Arena {
+                        disk_id: id.clone(),
+                        offset: start,
+                        length,
+                    }
+                }
+            } else {
+                Arena {
+                    disk_id: id.clone(),
+                    offset: sb.metadata.offset,
+                    length: sb.metadata.length,
+                }
+            };
+            (arena, None)
         };
         new.members.push(ManifestMember {
             device_uuid: sb.device_uuid,
             arena,
+            alternate_arena,
             data_offset: alloc.data_start,
             data_length: alloc.data_end - alloc.data_start,
         });
@@ -654,7 +765,7 @@ pub(crate) fn reconfigure(
     next.updated_at = now_f64();
     next.integrity.generation = next.txid;
     next.integrity.previous_meta_hash = base.integrity.meta_hash.clone();
-    next.integrity.hash_scheme = Some(PAGED_INTEGRITY_SCHEME);
+    next.integrity.hash_scheme = base.integrity.hash_scheme;
     next.integrity.meta_hash.clear();
     validate_image(next, &new)?;
     // No old root or manifest is overwritten during staging.
@@ -663,6 +774,23 @@ pub(crate) fn reconfigure(
         .filter(|sb| has_member(&new, sb))
         .map(|sb| sb.disk_id.clone())
         .collect::<BTreeSet<_>>();
+    for member in new
+        .members
+        .iter()
+        .filter(|m| selected.contains(&m.arena.disk_id))
+    {
+        if old.members.iter().any(|prior| {
+            let a = &member.arena;
+            let b = &prior.arena;
+            a.disk_id == b.disk_id
+                && a.offset < b.offset.saturating_add(b.length)
+                && b.offset < a.offset.saturating_add(a.length)
+        }) {
+            return Err(ArgosError::Conflict(
+                "staged metadata arena overlaps current authority".into(),
+            ));
+        }
+    }
     for member in new
         .members
         .iter()
@@ -681,17 +809,29 @@ pub(crate) fn reconfigure(
         .map_or(Some(1), |event| event.sequence.checked_add(1))
         .ok_or_else(|| ArgosError::Invalid("paged event sequence exhausted".into()))?;
     events.push(crate::types::PagedAuditEvent {
-        sequence,txid:next.txid,time:now_f64(),action:"reconfigure".into(),
+        sequence,txid:next.txid,time:now_f64(),action:if requested_arena.is_some(){"grow-metadata"}else{"reconfigure"}.into(),
         details:serde_json::json!({"epoch":new.epoch,"old_members":member_ids(&old),"new_members":member_ids(&new)}),
         advisory:false,
     });
-    let mut store = ImageStore::format_with_events(
-        backend.clone(),
-        new.arenas(),
-        next,
-        &events,
-        Some(&selected),
-    )?;
+    let mut store = if v3 && base.raw_pool.snapshot_state.is_some() {
+        ImageStore::transfer_v3(
+            backend.clone(),
+            old.arenas(),
+            new.arenas(),
+            base,
+            next,
+            &events,
+            &selected,
+        )?
+    } else {
+        ImageStore::format_with_events(
+            backend.clone(),
+            new.arenas(),
+            next,
+            &events,
+            Some(&selected),
+        )?
+    };
     store.confirm_all(selected.len())?;
     let transition = Transition {
         old,

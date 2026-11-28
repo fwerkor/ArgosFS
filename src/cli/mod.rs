@@ -190,6 +190,11 @@ pub fn run() -> Result<()> {
             validate_requested_pool(&fs, storage.pool.as_deref())?;
             let metadata = fs.metadata_snapshot();
             if metadata.integrity.hash_scheme
+                == Some(crate::storage::raw::paged_metadata::V3_INTEGRITY_SCHEME)
+            {
+                bail!("experimental V3 cannot use legacy integrity upgrade");
+            }
+            if metadata.integrity.hash_scheme
                 == Some(crate::storage::raw::paged_metadata::PAGED_INTEGRITY_SCHEME)
             {
                 fs.mark_clean_unmount()?;

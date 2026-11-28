@@ -540,6 +540,16 @@ impl ArgosFs {
         {
             let mut meta = self.meta.write();
             self.ensure_block_backend_writable_locked(&meta)?;
+            if meta
+                .raw_pool
+                .snapshot_state
+                .as_ref()
+                .is_some_and(|state| state.pins.contains_key(disk_id))
+            {
+                return Err(ArgosError::Unsupported(
+                    "historical data relocation is required before member evacuation".into(),
+                ));
+            }
             if !meta.disks.contains_key(disk_id) {
                 return Err(ArgosError::NotFound(disk_id.to_string()));
             }
@@ -613,6 +623,18 @@ impl ArgosFs {
     }
 
     pub fn remove_disk(&self, disk_id: &str) -> Result<u64> {
+        if self
+            .meta
+            .read()
+            .raw_pool
+            .snapshot_state
+            .as_ref()
+            .is_some_and(|state| state.pins.contains_key(disk_id))
+        {
+            return Err(ArgosError::Unsupported(
+                "historical data relocation is required before member evacuation".into(),
+            ));
+        }
         let rewritten = self.drain_disk(disk_id)?;
         if self.paged_metadata.is_some() {
             self.sync()?;
@@ -649,6 +671,33 @@ impl ArgosFs {
     /// metadata commits. The old page-store handle stays alive until the
     /// joint configuration certificate is durable.
     fn reconfigure_paged_locked(&self, meta: &mut Metadata, before: &Metadata) -> Result<()> {
+        self.reconfigure_paged_with_growth_locked(meta, before, None)
+    }
+
+    /// Experimental full-COW arena growth through the same joint-quorum
+    /// protocol. This is not yet a user-facing online expansion API.
+    #[cfg(test)]
+    pub(super) fn grow_v3_metadata_arena(&self, size: u64) -> Result<()> {
+        self.sync()?;
+        let mut meta = self.meta.write();
+        self.ensure_block_backend_writable_locked(&meta)?;
+        self.commit_deferred_locked(&mut meta, false)?;
+        let before = meta.clone();
+        if let Err(err) = self.reconfigure_paged_with_growth_locked(&mut meta, &before, Some(size))
+        {
+            *meta = before;
+            self.fence_on_quorum_loss(&err);
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn reconfigure_paged_with_growth_locked(
+        &self,
+        meta: &mut Metadata,
+        before: &Metadata,
+        grow: Option<u64>,
+    ) -> Result<()> {
         let handle = self
             .paged_metadata
             .as_ref()
@@ -688,13 +737,24 @@ impl ArgosFs {
         let backend = self.metadata_block_backend_locked(meta, &superblocks, true)?;
         let unavailable = self.quarantined_devices.lock().clone();
         self.validate_data_durability_locked(meta, &unavailable)?;
-        let new_store = raw_store::reconfigure_paged_metadata(
-            backend,
-            &superblocks,
-            &base,
-            meta,
-            &store.events(),
-        )?;
+        let new_store = if let Some(size) = grow {
+            raw_store::grow_paged_metadata(
+                backend,
+                &superblocks,
+                &base,
+                meta,
+                &store.events(),
+                Some(size),
+            )?
+        } else {
+            raw_store::reconfigure_paged_metadata(
+                backend,
+                &superblocks,
+                &base,
+                meta,
+                &store.events(),
+            )?
+        };
         *store = new_store;
         drop(store);
         let mut state = self.deferred_commit.lock();
@@ -1081,6 +1141,7 @@ impl ArgosFs {
         mut progress: Option<&mut FsckProgress<'_>>,
     ) -> Result<FsckReport> {
         let mut report = FsckReport::default();
+        self.audit_snapshot_data(&mut report)?;
         // The filesystem encryption configuration is stable during a scrub.
         // Argon2id derivation is intentionally amortized over encrypted files,
         // while every stripe still validates its own authenticated contents.
@@ -1418,16 +1479,7 @@ impl ArgosFs {
                     Err(err) => report.errors.push(err.to_string()),
                 }
             }
-            let mut referenced_usage = BTreeMap::<String, u64>::new();
-            for shard in meta
-                .inodes
-                .values()
-                .flat_map(|inode| inode.blocks.iter())
-                .flat_map(|block| block.shards.iter())
-            {
-                let current = referenced_usage.entry(shard.disk_id.clone()).or_default();
-                *current = current.saturating_add(shard_accounted_size(shard));
-            }
+            let referenced_usage = referenced_disk_usage(&meta);
             for (disk_id, disk) in meta.disks.iter_mut() {
                 let used_bytes = referenced_usage.get(disk_id).copied().unwrap_or(0);
                 if disk.used_bytes != used_bytes {
@@ -1495,6 +1547,14 @@ impl ArgosFs {
         let targets = {
             let meta = self.meta.read();
             self.ensure_block_backend_writable_locked(&meta)?;
+            if meta
+                .raw_pool
+                .snapshot_state
+                .as_ref()
+                .is_some_and(|state| state.pins.contains_key(disk_id))
+            {
+                return Err(ArgosError::Unsupported("historical object relocation is required before claiming member repair complete".into()));
+            }
             let member = meta
                 .disks
                 .get(disk_id)
@@ -1667,6 +1727,33 @@ fn raw_orphan_plans(meta: &Metadata, pending: &[FileBlock]) -> Result<Vec<RawOrp
                     shard.disk_id, shard.slot
                 )))
             }
+        }
+    }
+    if let Some(state) = &meta.raw_pool.snapshot_state {
+        for (id, pins) in &state.pins {
+            if !meta.raw_pool.allocators.contains_key(id) {
+                return Err(ArgosError::CorruptedMetadata(
+                    "missing snapshot pin allocator".into(),
+                ));
+            }
+            let allocated = extents.entry(id.clone()).or_default();
+            let live = allocated
+                .iter()
+                .map(|extent| (extent.offset, extent))
+                .collect::<BTreeMap<_, _>>();
+            let mut historical = Vec::new();
+            for (&offset, pin) in pins {
+                match live.get(&offset) {
+                    Some(extent) if **extent != pin.extent => {
+                        return Err(ArgosError::CorruptedMetadata(
+                            "snapshot pin aliases live allocation".into(),
+                        ))
+                    }
+                    Some(_) => {}
+                    None => historical.push(pin.extent.clone()),
+                }
+            }
+            allocated.extend(historical);
         }
     }
     let mut plans = Vec::new();
