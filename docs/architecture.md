@@ -141,12 +141,20 @@ online disks must either cross a critical score or remain predicted-failing for
 multiple runs before drain starts. Failed drain attempts enter cooldown instead
 of retrying every service tick.
 
-Maintenance is incremental. Scrub advances through a bounded file window, and
-rebalance runs only when online disk usage skew exceeds the configured threshold.
-The rebalance budget is adjusted by a small utility EWMA so actions that have
-recently provided little benefit become less aggressive while useful actions can
-use a larger window. Manual `argosfs scrub` and `argosfs rebalance` still keep
-their explicit full-volume behavior.
+Maintenance is incremental. Scrub advances through a bounded file window.
+For raw/loop pools the automatic capacity-balancing path selects the most
+underfilled healthy online member relative to capacity in its own placement
+tier. It skips degraded pools and quarantined or predicted-failing targets,
+respects the existing background I/O policy, and copies verified encoded
+shards directly without rewriting entire files. Each pass limits moved shards,
+candidate files, and inspected blocks; the target and file/block cursors
+persist across service ticks. A partially visited file resumes at its next
+block; namespace changes are revisited on the next pass. A full scan with no
+shard movement defers that member until other eligible targets have been
+considered, so an unreachable capacity goal cannot starve the pool.
+Host volumes retain the existing file-rewrite rebalance path.
+The rebalance budget is adjusted by a utility EWMA. Manual `argosfs scrub`
+and `argosfs rebalance` still keep their explicit full-volume behavior.
 
 Metadata commits are serialized with an advisory transaction lock and checked
 against the latest on-disk txid. A stale process receives a conflict error
@@ -212,8 +220,9 @@ watchdog, and recovery hooks around the same CLI preflight/fsck path.
 ### Returning raw members to service
 
 An offline rebuild may move a missing member's shards to surviving members.
-When the original member returns online, unmount the pool and run
-`argosfs rebalance --devices <comma-separated-members> --member <disk-id>`.
+When the original member returns online, Autopilot can refill it incrementally
+as described above. To explicitly target a member, unmount other users of the
+pool and run `argosfs rebalance --devices <comma-separated-members> --member <disk-id>`.
 Use `--images` for a loop pool and `--max-shards N` for a bounded pass.
 Use `--path /repository` to restrict the pass to a file or directory subtree,
 `--min-inode` / `--max-inode` for an inclusive inode range, and `--prefer-data`
