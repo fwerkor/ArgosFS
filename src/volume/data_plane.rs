@@ -438,6 +438,27 @@ impl ArgosFs {
         Ok((old_size, stripe_raw_size))
     }
 
+    pub(super) fn cover_inode_rewrite_window_locked(
+        &self,
+        meta: &Metadata,
+        ino: InodeId,
+        start: usize,
+        end: usize,
+        new_size: usize,
+    ) -> Result<(usize, usize)> {
+        let inode = meta
+            .inodes
+            .get(&ino)
+            .ok_or_else(|| ArgosError::NotFound(format!("inode {ino}")))?;
+        let (start, end) = inode.blocks.cover_window(start as u64, end as u64);
+        Ok((
+            usize::try_from(start)
+                .map_err(|_| ArgosError::Invalid("rewrite start overflow".into()))?,
+            usize::try_from(end.min(new_size as u64))
+                .map_err(|_| ArgosError::Invalid("rewrite end overflow".into()))?,
+        ))
+    }
+
     pub(super) fn decode_inode_window_locked(
         &self,
         meta: &mut Metadata,

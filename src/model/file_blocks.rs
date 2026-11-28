@@ -176,6 +176,24 @@ impl FileBlocks {
         self.index = OnceLock::from(index);
     }
 
+    /// Include whole existing blocks intersecting the boundaries of a rewrite.
+    /// During a layout transition their geometry can differ from the current
+    /// write layout, so rounding only to the new stripe size loses old data.
+    pub(crate) fn cover_window(&self, start: u64, end: u64) -> (u64, u64) {
+        let cover = |point: u64| {
+            let index = self.lower_bound(point);
+            index
+                .checked_sub(1)
+                .and_then(|i| self.blocks.get(i))
+                .filter(|b| {
+                    b.raw_offset < point && point < b.raw_offset.saturating_add(b.raw_size as u64)
+                })
+        };
+        let start = cover(start).map_or(start, |b| b.raw_offset);
+        let end = cover(end).map_or(end, |b| b.raw_offset.saturating_add(b.raw_size as u64));
+        (start, end)
+    }
+
     /// Remove just the overlapping range and blocks beyond the new EOF.
     /// The valid non-overlap proof lets us find boundaries logarithmically.
     /// For old malformed/overlapping lists use the exact legacy predicate.
