@@ -103,13 +103,13 @@ jobs:
       - name: Summarize weekly matrices
         run: |
           {
-            echo "### Weekly five-matrix chaos run"
+            echo "### Weekly chaos run"
             echo
             echo "- Schedule: Wednesday 03:00 Asia/Shanghai"
             echo "- Seed source: ${{ steps.seeds.outputs.source }}"
             echo "- Core seeds: ${{ steps.seeds.outputs.seeds }}"
             echo "- FUSE seeds: ${{ steps.seeds.outputs.fuse_seeds }}"
-            echo "- FUSE block-fault seeds: ${{ steps.seeds.outputs.fault_seeds }}"
+            echo "- FUSE block-fault and ztest seeds: ${{ steps.seeds.outputs.fault_seeds }}"
             echo "- Full CapOS QEMU matrix: x86_64, arm64"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -176,6 +176,46 @@ jobs:
         with:
           name: weekly-core-${{ matrix.arch }}-${{ matrix.seed }}
           path: ${{ runner.temp }}/weekly-core-${{ matrix.arch }}-${{ matrix.seed }}
+          if-no-files-found: ignore
+
+  ztest-matrix:
+    name: ztest (${{ matrix.format }}, ${{ matrix.seed }})
+    needs: prepare-matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        format: [legacy, paged]
+        seed: ${{ fromJSON(needs.prepare-matrix.outputs.fault_seeds) }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install system dependencies
+        run: scripts/ci/install-deps.sh
+      - name: Install Rust toolchain
+        run: scripts/ci/install-rust.sh stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ztest
+          key: weekly-ztest-release
+      - name: Build harness
+        run: cargo build --manifest-path ztest/Cargo.toml --locked --release
+      - name: Strict model and crash stress
+        env:
+          SEED: ${{ matrix.seed }}
+          FORMAT: ${{ matrix.format }}
+        run: |
+          bin="$(cargo metadata --manifest-path ztest/Cargo.toml --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')/release/argosfs-ztest"
+          root="$RUNNER_TEMP/ztest"
+          mkdir -p "$root"
+          "$bin" model --work-dir "$root/model" --seed "$SEED" --operations 256 --topology "--$FORMAT-metadata"
+          "$bin" run --work-dir "$root/crash" --seed "$SEED" --cycles 16 --kill-after-ms-min 500 --kill-after-ms-max 2500 --min-faults 1 --reorder-pending --recovery-cuts 3 --recovery-eios 1 "--$FORMAT-metadata"
+      - name: Upload trace and recovery artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: weekly-ztest-${{ matrix.format }}-${{ matrix.seed }}
+          path: ${{ runner.temp }}/ztest
           if-no-files-found: ignore
 
   fuse-posix-matrix:
@@ -421,11 +461,12 @@ jobs:
     uses: ./.github/workflows/capos-full-qemu.yml
 
   weekly-required:
-    name: Weekly five-matrix gate
+    name: Weekly six-matrix gate
     runs-on: ubuntu-24.04
     needs:
       - prepare-matrix
       - core-randomized-matrix
+      - ztest-matrix
       - fuse-posix-matrix
       - fuse-block-fault-matrix
       - coverage-guided-fuzz
@@ -447,8 +488,8 @@ jobs:
               if result["result"] != "success"
           }
           if failed:
-              raise SystemExit(f"weekly five-matrix gates did not all pass: {failed}")
-          print("weekly core, FUSE, storage-fault, coverage-fuzz, and QEMU matrices passed")
+              raise SystemExit(f"weekly six-matrix gates did not all pass: {failed}")
+          print("weekly core, ztest, FUSE, storage-fault, coverage-fuzz, and QEMU matrices passed")
           PY
 
   open-issue-on-failure:
@@ -473,7 +514,7 @@ jobs:
           set -euo pipefail
           existing="$(gh issue list --repo "$REPO" --state open --search "\"$TITLE\" in:title" --json number --jq '.[0].number // empty')"
           body="$(cat <<EOF
-          Weekly five-matrix chaos CI failed or was cancelled.
+          Weekly chaos CI failed or was cancelled.
 
           - Run: $RUN_URL
           - Commit: $HEAD_SHA
@@ -481,7 +522,7 @@ jobs:
           - FUSE seeds: $FUSE_SEEDS
           - FUSE block-fault seeds: $FAULT_SEEDS
 
-          The required gate covers the direct core reference model on x86_64 and arm64, mounted FUSE randomized/POSIX compatibility, FUSE plus real device-mapper faults, sharded coverage-guided libFuzzer campaigns, and the full CapOS QEMU matrix on x86_64 and arm64. Download the seed manifest and the failing shard artifacts for exact replay parameters and logs.
+          The required gate covers the direct core reference model on x86_64 and arm64, strict ztest model and interrupted recovery on both metadata formats, mounted FUSE randomized/POSIX compatibility, FUSE plus real device-mapper faults, sharded coverage-guided libFuzzer campaigns, and the full CapOS QEMU matrix on x86_64 and arm64. Download the seed manifest and the failing shard artifacts for exact replay parameters and logs.
           EOF
           )"
           if [ -n "$existing" ]; then

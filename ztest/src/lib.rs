@@ -3,7 +3,10 @@
 //! The crate is intentionally outside the main Cargo workspace so it can be
 //! split into its own package or repository without touching ArgosFS internals.
 
+pub mod atomic;
 pub mod fault;
+pub mod invariants;
+pub mod model;
 pub mod oracle;
 pub mod supervisor;
 pub mod workload;

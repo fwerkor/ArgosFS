@@ -59,6 +59,9 @@ pub struct FaultConfig {
     /// Keep this many bytes of writes in a volatile cache before forcing them
     /// to the inner backend. Zero means write-through.
     pub volatile_window_bytes: u64,
+    /// Persist independent writes out of issue order within a flush epoch.
+    #[serde(default)]
+    pub reorder_pending: bool,
     /// Restrict durable bit rot to offsets at or above `data_floor`.
     pub bit_rot_data_only: bool,
     /// Scale write-side fault probabilities for metadata/journal offsets below
@@ -91,6 +94,7 @@ impl Default for FaultConfig {
             bits_per_flip: 2,
             torn_sector_bytes: 512,
             volatile_window_bytes: 256 * 1024,
+            reorder_pending: false,
             bit_rot_data_only: true,
             metadata_write_fault_scale: 0.1,
             data_floor: 16 * 1024 * 1024,
@@ -224,6 +228,14 @@ struct DeviceState {
 }
 
 /// The wrapper itself. `set_inner` is called once by the ArgosFS open hook.
+/// One-shot fault used only in a disposable recovery subprocess.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct RecoveryFault {
+    pub after_io: u64,
+    pub mutations_only: bool,
+    pub eio: bool,
+}
+
 pub struct FaultBackend {
     inner: OnceLock<Arc<dyn StorageBackend>>,
     config: FaultConfig,
@@ -231,6 +243,9 @@ pub struct FaultBackend {
     armed: AtomicBool,
     stats: Arc<FaultStats>,
     event_log: Mutex<Option<File>>,
+    recovery_fault: Option<RecoveryFault>,
+    recovery_io: AtomicU64,
+    recovery_enabled: AtomicBool,
 }
 
 impl FaultBackend {
@@ -242,7 +257,56 @@ impl FaultBackend {
             armed: AtomicBool::new(false),
             stats,
             event_log: Mutex::new(event_log),
+            recovery_fault: None,
+            recovery_io: AtomicU64::new(0),
+            recovery_enabled: AtomicBool::new(false),
         }
+    }
+
+    pub fn with_recovery_fault(mut self, fault: RecoveryFault) -> Self {
+        self.recovery_fault = Some(fault);
+        self.recovery_enabled.store(true, Ordering::SeqCst);
+        self
+    }
+
+    /// Start the boundary counter after mount, so a mutation trace cuts
+    /// the intended transaction rather than mount-time bookkeeping.
+    pub fn with_deferred_boundary(mut self, fault: RecoveryFault) -> Self {
+        self.recovery_fault = Some(fault);
+        self
+    }
+
+    pub fn enable_boundary(&self) {
+        self.recovery_enabled.store(true, Ordering::SeqCst);
+    }
+
+    fn recovery_boundary(
+        &self,
+        mutation: bool,
+        device: &str,
+        offset: u64,
+        bytes: usize,
+    ) -> Result<()> {
+        let Some(fault) = self.recovery_fault else {
+            return Ok(());
+        };
+        if !self.recovery_enabled.load(Ordering::SeqCst) || (fault.mutations_only && !mutation) {
+            return Ok(());
+        }
+        if self.recovery_io.fetch_add(1, Ordering::SeqCst) != fault.after_io {
+            return Ok(());
+        }
+        if fault.eio {
+            self.event("recovery_eio", device, offset, bytes);
+            return Err(self.injected_error());
+        }
+        self.event("recovery_cut", device, offset, bytes);
+        // The supervisor requires SIGKILL *and* the boundary marker.
+        // Only a dedicated recovery subprocess installs this fault.
+        unsafe {
+            libc::raise(libc::SIGKILL);
+        }
+        std::process::abort();
     }
 
     /// Install the real backend. Must be called before the wrapper is used.
@@ -352,6 +416,7 @@ impl FaultBackend {
         buf: &mut [u8],
         shard_read: bool,
     ) -> Result<()> {
+        self.recovery_boundary(false, device_id, offset, buf.len())?;
         let inner = self.inner();
         if !self.is_armed() {
             return if shard_read {
@@ -424,18 +489,40 @@ impl FaultBackend {
         Ok(())
     }
 
+    fn persist_one(&self, device_id: &DeviceId, state: &mut DeviceState) -> Result<()> {
+        let index = if self.config.reorder_pending {
+            // An overlapping write must never overtake an earlier write.
+            // Nonoverlapping writes can reach media in a different order.
+            (0..state.pending.len())
+                .rev()
+                .find(|&index| {
+                    let candidate = &state.pending[index];
+                    let end = candidate.offset.saturating_add(candidate.data.len() as u64);
+                    state.pending[..index].iter().all(|earlier| {
+                        let earlier_end = earlier.offset.saturating_add(earlier.data.len() as u64);
+                        end <= earlier.offset || earlier_end <= candidate.offset
+                    })
+                })
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let pending = &state.pending[index];
+        self.inner()
+            .write_at(device_id, pending.offset, &pending.data)?;
+        let pending = state.pending.remove(index);
+        state.pending_bytes = state
+            .pending_bytes
+            .saturating_sub(pending.data.len() as u64);
+        self.stats
+            .pending_write_bytes
+            .fetch_sub(pending.data.len() as u64, Ordering::Relaxed);
+        Ok(())
+    }
+
     fn commit_pending(&self, device_id: &DeviceId, state: &mut DeviceState) -> Result<()> {
-        let inner = self.inner();
         while !state.pending.is_empty() {
-            let pending = &state.pending[0];
-            inner.write_at(device_id, pending.offset, &pending.data)?;
-            let pending = state.pending.remove(0);
-            state.pending_bytes = state
-                .pending_bytes
-                .saturating_sub(pending.data.len() as u64);
-            self.stats
-                .pending_write_bytes
-                .fetch_sub(pending.data.len() as u64, Ordering::Relaxed);
+            self.persist_one(device_id, state)?;
         }
         Ok(())
     }
@@ -483,6 +570,7 @@ impl StorageBackend for FaultBackend {
     }
 
     fn write_at(&self, device_id: &DeviceId, offset: u64, data: &[u8]) -> Result<()> {
+        self.recovery_boundary(true, device_id, offset, data.len())?;
         let inner = self.inner();
         if !self.is_armed() {
             return inner.write_at(device_id, offset, data);
@@ -591,15 +679,7 @@ impl StorageBackend for FaultBackend {
                 .pending_write_bytes
                 .fetch_add(payload.len() as u64, Ordering::Relaxed);
             while device.pending_bytes > self.config.volatile_window_bytes {
-                let pending = &device.pending[0];
-                inner.write_at(device_id, pending.offset, &pending.data)?;
-                let pending = device.pending.remove(0);
-                device.pending_bytes = device
-                    .pending_bytes
-                    .saturating_sub(pending.data.len() as u64);
-                self.stats
-                    .pending_write_bytes
-                    .fetch_sub(pending.data.len() as u64, Ordering::Relaxed);
+                self.persist_one(device_id, device)?;
             }
         }
 
@@ -614,6 +694,7 @@ impl StorageBackend for FaultBackend {
     }
 
     fn flush_device(&self, device_id: &DeviceId) -> Result<()> {
+        self.recovery_boundary(true, device_id, 0, 0)?;
         let inner = self.inner();
         if !self.is_armed() {
             return inner.flush_device(device_id);
@@ -645,7 +726,7 @@ impl StorageBackend for FaultBackend {
 
     fn flush_all(&self) -> Result<()> {
         let inner = self.inner();
-        if !self.is_armed() {
+        if !self.is_armed() && !self.recovery_enabled.load(Ordering::SeqCst) {
             return inner.flush_all();
         }
         let devices = inner.list_devices()?;
@@ -924,6 +1005,47 @@ mod tests {
         fault.flush_device(&"disk-0000".to_string()).unwrap();
         assert_eq!(stats.snapshot().dropped_flushes, 1);
         assert!(inner.bytes("disk-0000")[..12].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn reordered_eviction_preserves_overlapping_issue_order() {
+        let mut config = quiet_config();
+        config.volatile_window_bytes = 8;
+        config.reorder_pending = true;
+        let (backend, inner, _) = backend(config);
+        let id = "disk-0000".to_string();
+        backend.arm();
+        backend.write_at(&id, 0, b"aaaa").unwrap();
+        backend.write_at(&id, 2, b"bbbb").unwrap();
+        backend.write_at(&id, 8, b"cccc").unwrap();
+        let persisted = inner.bytes(&id);
+        assert_eq!(&persisted[..6], &[0; 6]);
+        assert_eq!(&persisted[8..12], b"cccc");
+        let mut logical = [0; 6];
+        backend.read_at(&id, 0, &mut logical).unwrap();
+        assert_eq!(&logical, b"aabbbb");
+        backend.flush_device(&id).unwrap();
+        assert_eq!(&inner.bytes(&id)[..6], b"aabbbb");
+    }
+
+    #[test]
+    fn deferred_boundary_injects_only_once_after_enable() {
+        let (backend, inner, _) = backend(quiet_config());
+        let fault = FaultBackend::new(quiet_config(), Arc::new(FaultStats::default()), None)
+            .with_deferred_boundary(RecoveryFault {
+                after_io: 1,
+                mutations_only: true,
+                eio: true,
+            });
+        fault.set_inner(inner);
+        let id = "disk-0000".to_string();
+        fault.write_at(&id, 0, b"first").unwrap();
+        fault.enable_boundary();
+        fault.read_at(&id, 0, &mut [0; 5]).unwrap();
+        fault.write_at(&id, 0, b"second").unwrap();
+        assert!(fault.write_at(&id, 0, b"error").is_err());
+        fault.write_at(&id, 0, b"third").unwrap();
+        drop(backend);
     }
 
     #[test]

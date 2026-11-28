@@ -69,6 +69,16 @@ struct AutopilotState {
     #[serde(default)]
     rebalance_cursor: Option<InodeId>,
     #[serde(default)]
+    member_rebalance_target: Option<String>,
+    #[serde(default)]
+    member_rebalance_cursor: Option<InodeId>,
+    #[serde(default)]
+    member_rebalance_block_cursor: Option<(InodeId, usize)>,
+    #[serde(default)]
+    member_rebalance_pass_moved: bool,
+    #[serde(default)]
+    member_rebalance_deferred: BTreeSet<String>,
+    #[serde(default)]
     disks: BTreeMap<String, AutopilotDiskState>,
     #[serde(default)]
     action_stats: BTreeMap<String, AutopilotActionStats>,
@@ -310,40 +320,113 @@ impl ArgosFs {
             }
         }
 
+        // Scrub or drain may have changed member health and occupancy.
+        report = self.health_report();
         let skew = autopilot_rebalance_skew(&report);
+        let block_backend = self.meta.read().backend != BackendKind::Host;
+        let member_target = self.autopilot_member_target(
+            &report,
+            config.rebalance_min_skew,
+            config.critical_risk_score,
+            state.member_rebalance_target.as_deref(),
+            &state.member_rebalance_deferred,
+        );
+        let needs_rebalance = if block_backend {
+            member_target.is_some()
+        } else {
+            skew >= config.rebalance_min_skew
+        };
         if !stop_mutations
             && autopilot_due(state.last_rebalance_at, config.rebalance_interval_sec, now)
-            && skew >= config.rebalance_min_skew
+            && needs_rebalance
         {
             let requested_budget = adaptive_autopilot_budget(
                 config.rebalance_files_per_run,
                 state.action_stats.get("rebalance"),
             );
+            let unit = if block_backend { "shards" } else { "files" };
             let rebalance_throttle =
-                plan_background_io("rebalance", "files", requested_budget, &report, &policy);
+                plan_background_io("rebalance", unit, requested_budget, &report, &policy);
             let budget = rebalance_throttle.effective_budget;
             let rebalance_pause_reason = rebalance_throttle.pause_reason.clone();
             throttle_decisions.push(json!(rebalance_throttle));
             if budget > 0 {
-                match self.rebalance_limited(budget, state.rebalance_cursor) {
-                    Ok((rewritten, cursor)) => {
-                        state.rebalance_cursor = cursor;
-                        state.last_rebalance_at = now;
-                        record_autopilot_action(
-                            &mut state,
-                            "rebalance",
-                            true,
-                            skew * 10.0 - rewritten as f64 * 0.02,
-                            rewritten,
-                            0,
-                        );
-                        actions.push(json!({"action": "rebalance-incremental", "budget_files": budget, "requested_budget_files": config.rebalance_files_per_run, "rewritten_files": rewritten, "cursor": state.rebalance_cursor, "skew": skew}));
+                state.last_rebalance_at = now;
+                if let Some(target) = member_target {
+                    // If every eligible member was deferred, start a new round.
+                    if state.member_rebalance_deferred.contains(&target) {
+                        state.member_rebalance_deferred.clear();
                     }
-                    Err(err) => {
-                        stop_mutations |= matches!(err, ArgosError::Conflict(_));
-                        state.last_rebalance_at = now;
-                        record_autopilot_action(&mut state, "rebalance", false, -2.0, 0, 0);
-                        actions.push(json!({"action": "rebalance-skipped", "budget_files": budget, "skew": skew, "error": err.to_string()}));
+                    if state.member_rebalance_target.as_ref() != Some(&target) {
+                        state.member_rebalance_cursor = None;
+                        state.member_rebalance_block_cursor = None;
+                        state.member_rebalance_pass_moved = false;
+                    }
+                    state.member_rebalance_target = Some(target.clone());
+                    match self.rebalance_member_window(
+                        &target,
+                        budget,
+                        super::member_balance::MemberBalanceWindow {
+                            max_files: budget,
+                            max_blocks: budget.saturating_mul(64),
+                            cursor: state.member_rebalance_cursor,
+                            resume_block: state.member_rebalance_block_cursor,
+                        },
+                    ) {
+                        Ok(balance) => {
+                            state.member_rebalance_cursor = balance.next_cursor;
+                            state.member_rebalance_block_cursor = balance.resume_block;
+                            state.member_rebalance_pass_moved |= balance.moved_shards > 0;
+                            if balance.pass_complete {
+                                if !state.member_rebalance_pass_moved {
+                                    state.member_rebalance_deferred.insert(target.clone());
+                                }
+                                state.member_rebalance_target = None;
+                                state.member_rebalance_cursor = None;
+                                state.member_rebalance_block_cursor = None;
+                                state.member_rebalance_pass_moved = false;
+                            }
+                            record_autopilot_action(
+                                &mut state,
+                                "rebalance",
+                                true,
+                                balance.moved_shards as f64,
+                                0,
+                                0,
+                            );
+                            actions.push(json!({"action": "rebalance-member-incremental",
+                                "target": target, "budget_shards": budget, "budget_files": budget, "budget_blocks": budget.saturating_mul(64),
+                                "report": balance, "skew": skew}));
+                        }
+                        Err(err) => {
+                            stop_mutations |= matches!(
+                                err,
+                                ArgosError::Conflict(_) | ArgosError::IndeterminateCommit(_)
+                            );
+                            record_autopilot_action(&mut state, "rebalance", false, -2.0, 0, 0);
+                            actions.push(json!({"action": "rebalance-member-skipped",
+                                "target": target, "error": err.to_string()}));
+                        }
+                    }
+                } else {
+                    match self.rebalance_limited(budget, state.rebalance_cursor) {
+                        Ok((rewritten, cursor)) => {
+                            state.rebalance_cursor = cursor;
+                            record_autopilot_action(
+                                &mut state,
+                                "rebalance",
+                                true,
+                                skew * 10.0 - rewritten as f64 * 0.02,
+                                rewritten,
+                                0,
+                            );
+                            actions.push(json!({"action": "rebalance-incremental", "budget_files": budget, "requested_budget_files": config.rebalance_files_per_run, "rewritten_files": rewritten, "cursor": state.rebalance_cursor, "skew": skew}));
+                        }
+                        Err(err) => {
+                            stop_mutations |= matches!(err, ArgosError::Conflict(_));
+                            record_autopilot_action(&mut state, "rebalance", false, -2.0, 0, 0);
+                            actions.push(json!({"action": "rebalance-skipped", "budget_files": budget, "skew": skew, "error": err.to_string()}));
+                        }
                     }
                 }
             } else {
@@ -385,6 +468,10 @@ impl ArgosFs {
                 "adaptive_mode": adaptive_mode,
                 "scrub_cursor": state.scrub_cursor,
                 "rebalance_cursor": state.rebalance_cursor,
+                "member_rebalance_target": state.member_rebalance_target,
+                "member_rebalance_cursor": state.member_rebalance_cursor,
+                "member_rebalance_block_cursor": state.member_rebalance_block_cursor,
+                "member_rebalance_deferred": state.member_rebalance_deferred,
                 "stopped_for_conflict": stop_mutations,
                 "background_io": {
                     "throttle_decisions": throttle_decisions
@@ -502,13 +589,26 @@ impl ArgosFs {
             }));
         }
         let skew = autopilot_rebalance_skew(&report);
+        let block_backend = self.meta.read().backend != BackendKind::Host;
+        let member_target = self.autopilot_member_target(
+            &report,
+            config.rebalance_min_skew,
+            config.critical_risk_score,
+            state.member_rebalance_target.as_deref(),
+            &state.member_rebalance_deferred,
+        );
+        let needs_rebalance = if block_backend {
+            member_target.is_some()
+        } else {
+            skew >= config.rebalance_min_skew
+        };
         let requested_rebalance_budget = adaptive_autopilot_budget(
             config.rebalance_files_per_run,
             state.action_stats.get("rebalance"),
         );
         let rebalance_throttle = plan_background_io(
             "rebalance",
-            "files",
+            if block_backend { "shards" } else { "files" },
             requested_rebalance_budget,
             &report,
             &policy,
@@ -526,7 +626,10 @@ impl ArgosFs {
                 "rebalance": {
                     "skew": skew,
                     "threshold": config.rebalance_min_skew,
-                    "would_run": skew >= config.rebalance_min_skew && rebalance_budget > 0,
+                    "would_run": needs_rebalance && rebalance_budget > 0,
+                    "member_target": member_target,
+                    "budget_shards": if block_backend { rebalance_budget } else { 0 },
+                    "budget_blocks": if block_backend { rebalance_budget.saturating_mul(64) } else { 0 },
                     "budget_files": rebalance_budget
                 },
                 "background_io": {
