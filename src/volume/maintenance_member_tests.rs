@@ -224,7 +224,7 @@ fn targeted_member_repair_recovers_on_loop_backend_after_reopen() {
     let images = (0..4)
         .map(|index| dir.path().join(format!("member-{index}.img")))
         .collect::<Vec<_>>();
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,

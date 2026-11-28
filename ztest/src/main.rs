@@ -22,9 +22,15 @@ struct Cli {
 enum Command {
     /// Create a pool, repeatedly SIGKILL a workload, and verify recovery.
     Run(RunArgs),
+    /// Run or replay an exact-state model trace on clean storage.
+    Model(ModelArgs),
     /// Internal workload process. The run supervisor starts this.
     #[command(hide = true)]
     Worker(WorkerArgs),
+    #[command(hide = true)]
+    RecoveryWorker(WorkerArgs),
+    #[command(hide = true)]
+    MutationWorker(WorkerArgs),
 }
 
 #[derive(Parser)]
@@ -34,9 +40,12 @@ struct RunArgs {
     work_dir: Option<PathBuf>,
     #[arg(long)]
     keep_work_dir: bool,
-    /// Create the test pool using authenticated paged metadata.
-    #[arg(long)]
+    /// Explicitly select authenticated paged metadata (the default).
+    #[arg(long, conflicts_with = "legacy_metadata")]
     paged_metadata: bool,
+    /// Exercise the original checkpoint/journal format instead.
+    #[arg(long)]
+    legacy_metadata: bool,
     /// Number of crash/recover cycles.
     #[arg(long, default_value_t = 5)]
     cycles: usize,
@@ -74,6 +83,15 @@ struct RunArgs {
     /// Allow heuristic over-budget loss retirement in exploratory stress runs.
     #[arg(long)]
     allow_expected_loss: bool,
+    /// Additional deterministic crash attempts during each recovery.
+    #[arg(long, default_value_t = 0)]
+    recovery_cuts: usize,
+    /// One-shot EIO attempts during each recovery.
+    #[arg(long, default_value_t = 0)]
+    recovery_eios: usize,
+    /// Reorder independent writes in the volatile cache before persistence.
+    #[arg(long)]
+    reorder_pending: bool,
 
     /// Percentage of reads that return EIO.
     #[arg(long, default_value_t = 0.10)]
@@ -126,6 +144,26 @@ struct RunArgs {
 }
 
 #[derive(Parser)]
+struct ModelArgs {
+    #[arg(long)]
+    work_dir: PathBuf,
+    #[arg(long, default_value_t = 1)]
+    seed: u64,
+    #[arg(long, default_value_t = 64)]
+    operations: usize,
+    #[arg(long, conflicts_with = "legacy_metadata")]
+    paged_metadata: bool,
+    #[arg(long)]
+    legacy_metadata: bool,
+    #[arg(long)]
+    topology: bool,
+    #[arg(long)]
+    replay: Option<PathBuf>,
+    #[arg(long)]
+    minimize: bool,
+}
+
+#[derive(Parser)]
 struct WorkerArgs {
     #[arg(long)]
     config: PathBuf,
@@ -144,6 +182,27 @@ fn dispatch() -> Result<()> {
             let outcome = run(run_config(args)?)?;
             println!("{}", serde_json::to_string_pretty(&outcome)?);
             Ok(())
+        }
+        Command::Model(args) => {
+            let trace = if let Some(path) = args.replay {
+                serde_json::from_slice(&std::fs::read(path)?)?
+            } else {
+                argosfs_ztest::model::Trace::generate(
+                    args.seed,
+                    !args.legacy_metadata,
+                    args.operations,
+                    args.topology,
+                )
+            };
+            argosfs_ztest::model::run(trace, &args.work_dir, args.minimize)
+        }
+        Command::MutationWorker(args) => {
+            let bytes = std::fs::read(&args.config)?;
+            argosfs_ztest::atomic::worker(serde_json::from_slice(&bytes)?)
+        }
+        Command::RecoveryWorker(args) => {
+            let bytes = std::fs::read(&args.config)?;
+            argosfs_ztest::supervisor::run_recovery_worker(serde_json::from_slice(&bytes)?)
         }
         Command::Worker(args) => {
             // A panic in a chaos thread must terminate the whole child, not
@@ -200,6 +259,7 @@ fn run_config(args: RunArgs) -> Result<RunConfig> {
         bits_per_flip: args.bits_per_flip,
         torn_sector_bytes: args.torn_sector_bytes,
         volatile_window_bytes: args.volatile_window_kib * 1024,
+        reorder_pending: args.reorder_pending,
         bit_rot_data_only: !args.bit_rot_metadata,
         metadata_write_fault_scale: args.metadata_write_fault_scale,
         data_floor: 16 * 1024 * 1024,
@@ -209,7 +269,7 @@ fn run_config(args: RunArgs) -> Result<RunConfig> {
     Ok(RunConfig {
         work_dir: args.work_dir,
         keep_work_dir: args.keep_work_dir,
-        paged_metadata: args.paged_metadata,
+        paged_metadata: !args.legacy_metadata,
         cycles: args.cycles,
         seed: args.seed,
         devices: args.devices,
@@ -225,6 +285,8 @@ fn run_config(args: RunArgs) -> Result<RunConfig> {
         kill_after_max: Duration::from_millis(args.kill_after_ms_max),
         min_faults: args.min_faults,
         parity_drill: !args.no_parity_drill,
+        recovery_cuts: args.recovery_cuts,
+        recovery_eios: args.recovery_eios,
         allow_expected_loss: args.allow_expected_loss,
         fault,
     })

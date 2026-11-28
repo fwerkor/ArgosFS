@@ -1,21 +1,23 @@
 //! Supervisor: create a pool, repeatedly kill a workload child, and verify
 //! crash recovery plus parity repair from a host-side oracle.
 
-use crate::fault::FaultConfig;
+use crate::fault::{FaultBackend, FaultConfig, FaultStats, RecoveryFault};
 use crate::oracle::Oracle;
 use crate::workload::{
     cleanup_unpublished_checked, ensure_dir, remove_tree_checked, verify_oracle, WorkerConfig,
 };
 use anyhow::{bail, Context, Result};
+use argosfs::storage::backend::StorageBackend;
 use argosfs::types::{BackendKind, Compression, FsckReport, Metadata, ShardLocation, VolumeConfig};
 use argosfs::{ArgosError, ArgosFs};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const SENTINEL_SIGKILL: i32 = libc::SIGKILL;
@@ -28,6 +30,8 @@ pub struct RunOutcome {
     pub faults: BTreeMap<String, u64>,
     pub total_faults: u64,
     pub recovered: bool,
+    pub recovery_interruptions: usize,
+    pub recovery_eios: usize,
     /// Committed files retired because the fault model destroyed more shards
     /// than the pool's parity budget could reconstruct.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -67,6 +71,8 @@ pub struct RunConfig {
     pub kill_after_max: Duration,
     pub min_faults: u64,
     pub parity_drill: bool,
+    pub recovery_cuts: usize,
+    pub recovery_eios: usize,
     pub allow_expected_loss: bool,
     pub fault: FaultConfig,
 }
@@ -137,9 +143,9 @@ pub fn run(config: RunConfig) -> Result<RunOutcome> {
     };
     {
         let create = if config.paged_metadata {
-            ArgosFs::create_loop_paged
-        } else {
             ArgosFs::create_loop
+        } else {
+            ArgosFs::create_loop_legacy
         };
         let fs = create(
             &images,
@@ -185,6 +191,8 @@ pub fn run(config: RunConfig) -> Result<RunOutcome> {
     let executable = std::env::current_exe().context("locate ztest executable")?;
     let mut rng = SupervisorRng::new(seed ^ 0x5A5A_1234_DEAD_BEEF);
     let mut cycles_done = 0usize;
+    let mut recovery_interruptions = 0;
+    let mut recovery_eios = 0;
     let mut expected_loss = Vec::new();
     let mut faults = BTreeMap::<String, u64>::new();
     for cycle in 0..config.cycles {
@@ -243,6 +251,41 @@ pub fn run(config: RunConfig) -> Result<RunOutcome> {
             bail!("cycle {cycle}: worker exited before SIGKILL with {status:?}\n{details}");
         }
 
+        let cuts_before = recovery_interruptions;
+        let eios_before = recovery_eios;
+        for index in 0..config.recovery_cuts + config.recovery_eios {
+            let eio = index >= config.recovery_cuts;
+            let mutation = !eio && index % 2 == 1;
+            let recovery = RecoveryConfig {
+                images: images.clone(),
+                oracle: oracle_path.clone(),
+                fault_log: work_dir.join(format!("cycle-{cycle:03}.recovery-{index:03}.jsonl")),
+                fault: RecoveryFault {
+                    // The first cut is during open. The second waits for a
+                    // mutating I/O (journal replay, cleanup or scrub).
+                    after_io: if mutation {
+                        0
+                    } else {
+                        1 + (index as u64 * 7 % 32)
+                    },
+                    mutations_only: mutation,
+                    eio,
+                },
+            };
+            if run_recovery_attempt(&executable, &work_dir, &recovery, cycle, index)? {
+                if eio {
+                    recovery_eios += 1;
+                } else {
+                    recovery_interruptions += 1;
+                }
+            }
+        }
+        if config.recovery_cuts > 0 && recovery_interruptions == cuts_before {
+            bail!("cycle {cycle}: recovery cuts did not reach an I/O boundary");
+        }
+        if config.recovery_eios > 0 && recovery_eios == eios_before {
+            bail!("cycle {cycle}: recovery EIO did not reach an I/O boundary");
+        }
         expected_loss.extend(
             verify_recovery(
                 &images,
@@ -284,6 +327,8 @@ pub fn run(config: RunConfig) -> Result<RunOutcome> {
         faults,
         total_faults,
         recovered: true,
+        recovery_interruptions,
+        recovery_eios,
         expected_loss,
         parity_drill,
     };
@@ -294,6 +339,9 @@ pub fn run(config: RunConfig) -> Result<RunOutcome> {
 }
 
 fn validate(config: &RunConfig) -> Result<()> {
+    if config.recovery_cuts > 64 || config.recovery_eios > 64 {
+        bail!("at most 64 recovery cuts and 64 recovery EIO attempts per cycle");
+    }
     let shards = config.k.checked_add(config.m).context("k+m overflow")?;
     if config.devices < shards {
         bail!(
@@ -332,6 +380,96 @@ fn validate(config: &RunConfig) -> Result<()> {
 /// transient fence, and lets the cleanup finish; the same thing happens when a
 /// service restarts a fenced mount. Only a fence that survives repeated
 /// recovery is a hard failure; unrelated errors fail immediately.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RecoveryConfig {
+    images: Vec<PathBuf>,
+    oracle: PathBuf,
+    fault_log: PathBuf,
+    fault: RecoveryFault,
+}
+
+pub fn run_recovery_worker(config: RecoveryConfig) -> Result<()> {
+    let log = File::create(&config.fault_log)?;
+    let fault = Arc::new(
+        FaultBackend::new(
+            FaultConfig::default(),
+            Arc::new(FaultStats::default()),
+            Some(log),
+        )
+        .with_recovery_fault(config.fault),
+    );
+    // The normal stochastic fault stream remains disarmed; only the
+    // selected one-shot boundary fault is active, including during open.
+    let fs = ArgosFs::open_loop_with_backend(&config.images, true, move |inner| {
+        fault.set_inner(inner);
+        fault.clone() as Arc<dyn StorageBackend>
+    })?;
+    let oracle = Oracle::load(&config.oracle)?;
+    discard_disposable_state(&fs, &oracle)?;
+    // Do not retire committed data here. The final clean recovery classifies
+    // all remaining damage against the original durable oracle.
+    fs.scrub()?;
+    fs.sync()?;
+    Ok(())
+}
+
+fn run_recovery_attempt(
+    executable: &Path,
+    dir: &Path,
+    config: &RecoveryConfig,
+    cycle: usize,
+    index: usize,
+) -> Result<bool> {
+    let prefix = format!("cycle-{cycle:03}.recovery-{index:03}");
+    let config_path = dir.join(format!("{prefix}.config.json"));
+    fs::write(&config_path, serde_json::to_vec_pretty(config)?)?;
+    let log = File::create(dir.join(format!("{prefix}.worker.log")))?;
+    let mut child = Command::new(executable)
+        .arg("recovery-worker")
+        .arg("--config")
+        .arg(config_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log.try_clone()?))
+        .stderr(Stdio::from(log))
+        .spawn()?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill()?;
+            child.wait()?;
+            bail!("{prefix}: recovery worker timed out");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let events = fs::read_to_string(&config.fault_log)?;
+    let kind = if config.fault.eio {
+        "recovery_eio"
+    } else {
+        "recovery_cut"
+    };
+    let injected = events.lines().any(|line| {
+        serde_json::from_str::<serde_json::Value>(line)
+            .ok()
+            .and_then(|v| v["kind"].as_str().map(str::to_owned))
+            .is_some_and(|value| value == kind)
+    });
+    if config.fault.eio {
+        // A single reported EIO can legitimately prevent mount. Panics,
+        // unrelated signals, and failures before injection are not accepted.
+        if status.success() || (injected && status.code() == Some(1)) {
+            return Ok(injected);
+        }
+    } else if injected && status.signal() == Some(SENTINEL_SIGKILL) {
+        return Ok(true);
+    } else if !injected && status.success() {
+        return Ok(false);
+    }
+    bail!("{prefix}: unexpected recovery exit {status}, injected={injected}");
+}
+
 fn open_and_clean_recovered_pool(
     images: &[PathBuf],
     oracle: &Oracle,
@@ -340,8 +478,12 @@ fn open_and_clean_recovered_pool(
     with_cleanup_retries(
         3,
         |attempt| {
-            ArgosFs::open_loop(images, true)
-                .with_context(|| format!("open pool after cycle {cycle} crash (attempt {attempt})"))
+            let fs = ArgosFs::open_loop(images, true).with_context(|| {
+                format!("open pool after cycle {cycle} crash (attempt {attempt})")
+            })?;
+            crate::invariants::verify_structure(&fs)
+                .with_context(|| format!("cycle {cycle}: recovered namespace before cleanup"))?;
+            Ok(fs)
         },
         |fs| {
             discard_disposable_state(fs, oracle)
@@ -399,6 +541,7 @@ fn verify_recovery(
     // scratch file is not mistaken for durable data loss. The worker performs
     // the same cleanup before it starts.
     let fs = open_and_clean_recovered_pool(images, &oracle, cycle)?;
+    crate::invariants::verify_structure(&fs)?;
     let mut oracle_inodes = BTreeMap::new();
     for (path, _) in oracle.all_files() {
         let inode = fs
@@ -456,6 +599,7 @@ fn verify_recovery(
     fs.mark_clean_unmount()?;
     drop(fs);
     let reopened = ArgosFs::open_loop(images, false).context("reopen recovered pool read-only")?;
+    crate::invariants::verify_clean(&reopened)?;
     let failures = verify_oracle(&reopened, &oracle);
     if !failures.is_empty() {
         bail!("cycle {cycle}: persisted repair/oracle verification failed: {failures:#?}");
@@ -847,7 +991,7 @@ mod tests {
         let scratch = vec![0xA5u8; 8192];
         let mut extents = Vec::new();
         {
-            let fs = ArgosFs::create_loop(
+            let fs = ArgosFs::create_loop_legacy(
                 &images,
                 VolumeConfig {
                     k: 2,
@@ -926,7 +1070,7 @@ mod tests {
         let oracle_path = temp.path().join("oracle.json");
         let fault_log = temp.path().join("cycle-000.faults.jsonl");
         let committed = vec![0x5Au8; 8192];
-        let fs = ArgosFs::create_loop(
+        let fs = ArgosFs::create_loop_legacy(
             &images,
             VolumeConfig {
                 k: 2,
@@ -1038,7 +1182,7 @@ mod tests {
         let committed = vec![0x5Au8; 8192];
         let mut extents = Vec::new();
         {
-            let fs = ArgosFs::create_loop(
+            let fs = ArgosFs::create_loop_legacy(
                 &images,
                 VolumeConfig {
                     k: 2,

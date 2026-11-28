@@ -203,7 +203,7 @@ fn raw_statfs_uses_allocator_regions_and_free_extents() {
     let images = (0..3)
         .map(|index| tmp.path().join(format!("disk-{index}.img")))
         .collect::<Vec<_>>();
-    let volume = ArgosFs::create_loop(
+    let volume = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,
@@ -242,7 +242,7 @@ fn statfs_advances_after_deferred_reclamation_commit() {
     let images = (0..3)
         .map(|index| tmp.path().join(format!("disk-{index}.img")))
         .collect::<Vec<_>>();
-    let volume = ArgosFs::create_loop(
+    let volume = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,
@@ -387,7 +387,7 @@ fn buffered_write_is_rejected_on_a_readonly_volume() {
     let images = (0..3)
         .map(|index| tmp.path().join(format!("readonly-write-{index}.img")))
         .collect::<Vec<_>>();
-    let volume = ArgosFs::create_loop(
+    let volume = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,
@@ -536,7 +536,7 @@ fn successful_retry_reaps_an_unlinked_inode_after_writeback() {
 fn periodic_worker_commits_idle_deferred_metadata() {
     let tmp = tempfile::tempdir().unwrap();
     let images = vec![tmp.path().join("disk.img")];
-    let volume = ArgosFs::create_loop(
+    let volume = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 1,

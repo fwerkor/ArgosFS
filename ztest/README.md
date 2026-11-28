@@ -9,6 +9,10 @@ It is intentionally a separate, workspace-excluded package. Nothing outside the
 small `#[doc(hidden)]` backend-open hook in ArgosFS needs to know it exists, so
 the harness can move to its own repository or distribution package later.
 
+Fresh test pools use paged metadata by default. Pass `run --legacy-metadata`
+to exercise the original checkpoint/journal format; `--paged-metadata`
+remains an explicit selection of the default.
+
 ## What it injects
 
 The fault backend wraps the normal loop/raw backend:
@@ -123,3 +127,43 @@ format, metadata, or the public CLI.
 - The oracle verifies durable committed files. Scratch mutations under injected
   torn/lost writes are expected to fail or expose stale data; only the durable
   oracle is a correctness assertion.
+
+## Strict model traces and recovery boundaries
+
+The separate model workload checks the exact file contents and directory
+entries after each operation, without treating arbitrary failures as legal.
+It exercises overlapping/disjoint writes to one inode, competing renames,
+hard links, symlinks, range writes, truncation, deletion and persisted
+transaction ordering. The optional topology drill opens a degraded pool,
+adds a larger replacement, removes the missing member and rebalances; every
+modeled file must still match. Atomic rename/unlink drills kill a subprocess
+at selected mutating I/O boundaries and accept only whole old/new states
+before sync or the new state after sync, including hard-link identity.
+
+```sh
+cargo run --release -- model --work-dir /tmp/model-356 --seed 356 --operations 256 --topology
+cargo run --release -- model --work-dir /tmp/model-replay --replay /tmp/model-356/trace.json --minimize
+cargo run --release -- model --work-dir /tmp/model-legacy --legacy-metadata --seed 356 --topology
+```
+
+The model saves a versioned operation trace before execution; failed runs
+retain their pool and logs. With `--minimize`, a bounded delta debugger
+removes chunks of operations and accepts a reduction only when two fresh
+pools reproduce the same failure category and root error. Seeds and traces
+reproduce operation inputs and the selected crash boundary, not the exact
+OS thread schedule; races remain nondeterministic.
+
+`run --recovery-cuts 2 --recovery-eios 1 --reorder-pending` additionally
+interrupts recovery itself, injects a one-shot EIO during recovery, and
+allows independent buffered writes to reach media out of issue order.
+Overlapping writes retain their order, and successful flushes drain the
+pending window. Recovery faults are logged separately and an unreached
+boundary cannot count as an injected fault. Repeated recovery culminates
+in a clean reopen with a strict durable-data oracle, independent namespace
+and allocator interval checks, and non-repairing fsck. The scratch model
+also treats wrong data/read errors as fatal when no new fault has been
+observed since the last verified state; ambiguous scratch mutations remain
+exploratory and are not durable-data guarantees.
+
+Both metadata formats are exercised by pull-request smoke tests and the
+weekly randomized CI matrix. The model does not replace mounted FUSE tests.

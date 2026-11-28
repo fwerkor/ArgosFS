@@ -6,7 +6,7 @@ use crate::util::content_hash_hex;
 fn fixture() -> (tempfile::TempDir, ArgosFs, String, u64, u64, Vec<u8>) {
     let dir = tempfile::tempdir().unwrap();
     let image = dir.path().join("verifier.img");
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         std::slice::from_ref(&image),
         VolumeConfig {
             k: 1,
@@ -231,7 +231,7 @@ fn dynamic_member_is_verified_through_guarded_fallback() {
 fn redundant_pool_can_quarantine_one_corrupted_member_without_write_fence() {
     let dir = tempfile::tempdir().unwrap();
     let images = [dir.path().join("a.img"), dir.path().join("b.img")];
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 1,
@@ -286,7 +286,7 @@ fn repaired_raw_extent_is_verified_against_its_original_stripe() {
     let images = (0..4)
         .map(|index| dir.path().join(format!("member-{index}.img")))
         .collect::<Vec<_>>();
-    let mut fs = ArgosFs::create_loop(
+    let mut fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,

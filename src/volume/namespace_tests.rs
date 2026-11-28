@@ -722,7 +722,7 @@ fn symlinks_do_not_consume_regular_file_quota() {
 fn complete_stripe_replacement_never_reads_corrupt_old_shards() {
     let dir = tempdir().unwrap();
     let image = dir.path().join("overwrite-corrupt.img");
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         std::slice::from_ref(&image),
         VolumeConfig {
             k: 1,

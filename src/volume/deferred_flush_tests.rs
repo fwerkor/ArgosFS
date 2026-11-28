@@ -71,7 +71,7 @@ fn deferred_data_flush_fanout_joins_all_devices_before_validation() {
     let images = (0..3)
         .map(|i| dir.path().join(format!("flush-{i}.img")))
         .collect::<Vec<_>>();
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,

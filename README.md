@@ -29,6 +29,10 @@ target/debug/argosfs scan --backend loop --images disk0.img,disk1.img,disk2.img 
 target/debug/argosfs preflight-root --backend loop --images disk0.img,disk1.img,disk2.img --mode rw
 ```
 
+New raw/loop pools use authenticated paged metadata by default. Use
+`mkfs --legacy-metadata` when the original checkpoint/journal format is required.
+Existing pools retain their format; migration is explicitly offline and one-way.
+
 See `docs/cli.md`, `docs/raw-backend.md`, `docs/capos-rootfs.md`, and
 `docs/repository-layout.md` and `docs/erasure-codec.md` for CLI selection/configuration, the raw layout,
 CapOS boot flow, and repository organization.
