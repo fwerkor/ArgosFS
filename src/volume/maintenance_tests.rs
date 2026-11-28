@@ -177,7 +177,7 @@ fn briefly_missing_loop_member_returns_without_rewriting_stripes() {
     let images = (0..4)
         .map(|index| dir.path().join(format!("reconnect-{index}.img")))
         .collect::<Vec<_>>();
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,
@@ -271,7 +271,7 @@ fn runtime_usb_quarantine_waits_for_grace_before_incremental_repair() {
     let images = (0..4)
         .map(|index| dir.path().join(format!("hotplug-{index}.img")))
         .collect::<Vec<_>>();
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,

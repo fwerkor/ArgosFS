@@ -41,7 +41,8 @@ fn loop_write_failure_rolls_back_raw_allocator() {
     let tmp = TempDir::new().unwrap();
     let images = loop_images(&tmp, 1);
     let fs =
-        ArgosFs::create_loop(&images, config(1, 0), 32 * 1024 * 1024, "rollback", false).unwrap();
+        ArgosFs::create_loop_legacy(&images, config(1, 0), 32 * 1024 * 1024, "rollback", false)
+            .unwrap();
     let before = fs.metadata_snapshot();
     let disk_id = before.disks.keys().next().unwrap().clone();
     let before_allocator = before.raw_pool.allocators.get(&disk_id).unwrap().clone();
@@ -66,7 +67,8 @@ fn readonly_loop_open_rejects_metadata_and_data_mutations() {
     let tmp = TempDir::new().unwrap();
     let images = loop_images(&tmp, 1);
     let fs =
-        ArgosFs::create_loop(&images, config(1, 0), 32 * 1024 * 1024, "readonly", false).unwrap();
+        ArgosFs::create_loop_legacy(&images, config(1, 0), 32 * 1024 * 1024, "readonly", false)
+            .unwrap();
     fs.write_file("/existing", b"existing data", 0o644).unwrap();
     let disk_id = fs.metadata_snapshot().disks.keys().next().unwrap().clone();
     drop(fs);
@@ -111,7 +113,7 @@ fn readonly_loop_open_rejects_metadata_and_data_mutations() {
 fn readonly_loop_sync_is_rejected() {
     let tmp = TempDir::new().unwrap();
     let images = loop_images(&tmp, 1);
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &images,
         config(1, 0),
         32 * 1024 * 1024,
@@ -133,7 +135,7 @@ fn readonly_loop_sync_is_rejected() {
 fn readonly_loop_failed_metadata_updates_do_not_mutate_memory_or_persist() {
     let tmp = TempDir::new().unwrap();
     let images = loop_images(&tmp, 1);
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &images,
         config(1, 0),
         32 * 1024 * 1024,
@@ -181,8 +183,8 @@ fn readonly_recoverable_damage_still_returns_data() {
     let images = loop_images(&tmp, 3);
     let mut cfg = config(2, 1);
     cfg.compression = Compression::None;
-    let fs =
-        ArgosFs::create_loop(&images, cfg, 32 * 1024 * 1024, "readonly-recover", false).unwrap();
+    let fs = ArgosFs::create_loop_legacy(&images, cfg, 32 * 1024 * 1024, "readonly-recover", false)
+        .unwrap();
     let payload = b"abcdefghijklmnopqrstuvwxyz0123456789".to_vec();
     fs.write_file("/payload", &payload, 0o644).unwrap();
     let ino = fs.resolve_path("/payload", true).unwrap();

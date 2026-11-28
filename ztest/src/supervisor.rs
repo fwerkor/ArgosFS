@@ -137,9 +137,9 @@ pub fn run(config: RunConfig) -> Result<RunOutcome> {
     };
     {
         let create = if config.paged_metadata {
-            ArgosFs::create_loop_paged
-        } else {
             ArgosFs::create_loop
+        } else {
+            ArgosFs::create_loop_legacy
         };
         let fs = create(
             &images,
@@ -847,7 +847,7 @@ mod tests {
         let scratch = vec![0xA5u8; 8192];
         let mut extents = Vec::new();
         {
-            let fs = ArgosFs::create_loop(
+            let fs = ArgosFs::create_loop_legacy(
                 &images,
                 VolumeConfig {
                     k: 2,
@@ -926,7 +926,7 @@ mod tests {
         let oracle_path = temp.path().join("oracle.json");
         let fault_log = temp.path().join("cycle-000.faults.jsonl");
         let committed = vec![0x5Au8; 8192];
-        let fs = ArgosFs::create_loop(
+        let fs = ArgosFs::create_loop_legacy(
             &images,
             VolumeConfig {
                 k: 2,
@@ -1038,7 +1038,7 @@ mod tests {
         let committed = vec![0x5Au8; 8192];
         let mut extents = Vec::new();
         {
-            let fs = ArgosFs::create_loop(
+            let fs = ArgosFs::create_loop_legacy(
                 &images,
                 VolumeConfig {
                     k: 2,

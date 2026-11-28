@@ -21,7 +21,7 @@ fn raw_journal_replays_write_after_read_side_metadata_mutation() {
     let tmp = TempDir::new().unwrap();
     let image = tmp.path().join("disk.img");
     let images = vec![image];
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &images,
         config(),
         32 * 1024 * 1024,
@@ -60,7 +60,7 @@ fn raw_sync_after_read_retains_durable_hash_until_a_real_write() {
     let tmp = TempDir::new().unwrap();
     let image = tmp.path().join("disk-sync.img");
     let images = vec![image];
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &images,
         config(),
         32 * 1024 * 1024,

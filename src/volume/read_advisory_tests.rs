@@ -6,7 +6,7 @@ fn fixture() -> (tempfile::TempDir, Vec<PathBuf>, ArgosFs, InodeId) {
     let images = (0..3)
         .map(|i| dir.path().join(format!("reads-{i}.img")))
         .collect::<Vec<_>>();
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,
@@ -157,7 +157,7 @@ fn immediate_commit_rollback_baseline_keeps_preceding_read_telemetry() {
     let images = (0..3)
         .map(|i| dir.path().join(format!("rollback-{i}.img")))
         .collect::<Vec<_>>();
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,

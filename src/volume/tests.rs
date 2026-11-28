@@ -102,7 +102,7 @@ fn deferred_state_and_interval_distinguish_host_writable_and_readonly_block_back
         deferred_commit_max_transactions: 100,
         ..VolumeConfig::default()
     };
-    let writable = ArgosFs::create_loop(
+    let writable = ArgosFs::create_loop_legacy(
         std::slice::from_ref(&image),
         config,
         32 * 1024 * 1024,
@@ -137,7 +137,7 @@ fn deferred_state_and_interval_distinguish_host_writable_and_readonly_block_back
 fn quorum_loss_write_fence_stops_mutations_and_background_retries() {
     let dir = tempfile::tempdir().unwrap();
     let image = dir.path().join("write-fence.img");
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         std::slice::from_ref(&image),
         VolumeConfig {
             k: 1,
@@ -580,7 +580,7 @@ fn indeterminate_deferred_group_commit_fences_further_mutations() {
     let images = (0..3)
         .map(|index| dir.path().join(format!("indeterminate-fence-{index}.img")))
         .collect::<Vec<_>>();
-    let mut fs = ArgosFs::create_loop(
+    let mut fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,
@@ -635,7 +635,7 @@ fn indeterminate_deferred_group_commit_fences_further_mutations() {
 fn raw_journal_events_refresh_stale_read_telemetry_integrity() {
     let dir = tempfile::tempdir().unwrap();
     let image = dir.path().join("event-integrity.img");
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         std::slice::from_ref(&image),
         VolumeConfig {
             k: 1,
@@ -696,7 +696,7 @@ fn quorum_report_fences_when_failed_member_owns_required_data() {
     let images = (0..3)
         .map(|index| dir.path().join(format!("fanout-{index}.img")))
         .collect::<Vec<_>>();
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 1,
@@ -741,7 +741,7 @@ fn durability_validation_counts_offline_and_quarantined_shards_together() {
     let images = (0..3)
         .map(|index| dir.path().join(format!("admin-unavailable-{index}.img")))
         .collect::<Vec<_>>();
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,
@@ -784,7 +784,7 @@ fn immediate_precommit_durability_rejection_rolls_back_namespace_mutation() {
     let images = (0..3)
         .map(|index| dir.path().join(format!("rollback-{index}.img")))
         .collect::<Vec<_>>();
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,
@@ -832,7 +832,7 @@ fn immediate_precommit_durability_rejection_rolls_back_namespace_mutation() {
 fn failed_inspection_of_new_block_member_blocks_deferred_commit() {
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path().join("base.img");
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         std::slice::from_ref(&base),
         VolumeConfig {
             k: 1,
@@ -874,7 +874,7 @@ fn failed_inspection_of_new_block_member_blocks_deferred_commit() {
 fn dynamically_inspected_member_rejects_repointed_duplicate_identity() {
     let dir = tempfile::tempdir().unwrap();
     let base = dir.path().join("identity-base.img");
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         std::slice::from_ref(&base),
         VolumeConfig {
             k: 1,
@@ -923,7 +923,7 @@ fn metadata_fanout_excludes_raw_superblock_absent_from_membership() {
         dir.path().join("member-a.img"),
         dir.path().join("member-b.img"),
     ];
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 1,
@@ -959,7 +959,7 @@ fn metadata_backend_helpers_cover_host_empty_and_removed_member_filtering() {
 
     let dir = tempfile::tempdir().unwrap();
     let images = [dir.path().join("a.img"), dir.path().join("b.img")];
-    let loop_fs = ArgosFs::create_loop(
+    let loop_fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 1,
@@ -1125,7 +1125,7 @@ fn volume_constructors_validate_layouts_force_recreation_and_backend_kinds() {
     ));
 
     let loop_image = dir.path().join("loop.img");
-    let loop_fs = ArgosFs::create_loop(
+    let loop_fs = ArgosFs::create_loop_legacy(
         std::slice::from_ref(&loop_image),
         VolumeConfig {
             k: 1,
@@ -1147,7 +1147,7 @@ fn volume_constructors_validate_layouts_force_recreation_and_backend_kinds() {
         .unwrap()
         .set_len(32 * 1024 * 1024)
         .unwrap();
-    let raw_fs = ArgosFs::create_raw(
+    let raw_fs = ArgosFs::create_raw_legacy(
         std::slice::from_ref(&raw_image),
         VolumeConfig {
             k: 1,
@@ -1169,7 +1169,7 @@ fn loop_pool_tracks_absence_across_reopens_and_clears_grace_on_return() {
     let images = (0..4)
         .map(|index| dir.path().join(format!("rejoin-{index}.img")))
         .collect::<Vec<_>>();
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,
@@ -1337,7 +1337,7 @@ fn rename_covers_same_inode_exchange_cycles_cross_parent_and_type_conflicts() {
 fn quota_rejected_rename_does_not_stage_deferred_reclaims() {
     let dir = tempfile::tempdir().unwrap();
     let image = dir.path().join("quota-rename.img");
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         std::slice::from_ref(&image),
         VolumeConfig {
             k: 1,
@@ -1428,7 +1428,7 @@ impl StorageBackend for OverlapProbeBackend {
 fn concurrent_readers_share_metadata_guard_and_merge_telemetry() {
     let dir = tempfile::tempdir().unwrap();
     let image = dir.path().join("parallel-read.img");
-    let mut fs = ArgosFs::create_loop(
+    let mut fs = ArgosFs::create_loop_legacy(
         std::slice::from_ref(&image),
         VolumeConfig {
             k: 1,
@@ -1548,7 +1548,7 @@ fn scrub_checks_physical_shards_despite_concurrent_reconstruction_cache_insert()
     let images = (0..3)
         .map(|i| dir.path().join(format!("scrub-race-{i}.img")))
         .collect::<Vec<_>>();
-    let mut fs = ArgosFs::create_loop(
+    let mut fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,
@@ -1651,7 +1651,7 @@ fn concurrent_read_rechecks_corrupt_shard_before_self_heal() {
     let images = (0..3)
         .map(|i| dir.path().join(format!("repair-shard-{i}.img")))
         .collect::<Vec<_>>();
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,
@@ -1730,8 +1730,8 @@ fn legacy_codec_superblocks_import_write_recover_without_reformatting() {
         compression: Compression::None,
         ..VolumeConfig::default()
     };
-    let fs =
-        ArgosFs::create_loop(&images, config, 32 * 1024 * 1024, "codec-legacy", false).unwrap();
+    let fs = ArgosFs::create_loop_legacy(&images, config, 32 * 1024 * 1024, "codec-legacy", false)
+        .unwrap();
     let original = (0..125_000)
         .map(|i| ((i as u64 * 151) ^ (i as u64 >> 9)) as u8)
         .collect::<Vec<_>>();
@@ -1787,7 +1787,7 @@ fn offline_delta_integrity_upgrade_replays_transactions_and_fences_downgrade() {
     let images = (0..3)
         .map(|index| dir.path().join(format!("v2-{index}.img")))
         .collect::<Vec<_>>();
-    let mut fs = ArgosFs::create_loop(
+    let mut fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,
@@ -1858,7 +1858,7 @@ fn v2_recovery_uses_authenticated_base_for_successive_deltas() {
     let images = (0..3)
         .map(|index| dir.path().join(format!("v2-restart-{index}.img")))
         .collect::<Vec<_>>();
-    let mut fs = ArgosFs::create_loop(
+    let mut fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,
@@ -1925,7 +1925,7 @@ fn v2_event_rollover_reanchors_deferred_hash_before_next_commit() {
     let images = (0..3)
         .map(|n| dir.path().join(format!("event-rollover-{n}.img")))
         .collect::<Vec<_>>();
-    let mut fs = ArgosFs::create_loop(
+    let mut fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,
@@ -1988,7 +1988,7 @@ fn v2_added_block_members_inherit_required_features_and_survive_recovery() {
     let mut images = (0..3)
         .map(|n| dir.path().join(format!("grow-{n}.img")))
         .collect::<Vec<_>>();
-    let mut fs = ArgosFs::create_loop(
+    let mut fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,
@@ -2046,7 +2046,7 @@ fn upgraded_legacy_event_rollover_with_read_telemetry_reanchors_before_first_v2_
     let images = (0..3)
         .map(|n| dir.path().join(format!("event-legacy-{n}.img")))
         .collect::<Vec<_>>();
-    let mut fs = ArgosFs::create_loop(
+    let mut fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,
@@ -2109,7 +2109,7 @@ fn deferred_durability_cache_tracks_changed_inodes_and_device_status() {
     let images = (0..3)
         .map(|i| dir.path().join(format!("durability-cache-{i}.img")))
         .collect::<Vec<_>>();
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,
@@ -2178,7 +2178,7 @@ fn deferred_commit_reports_real_journal_and_checkpoint_phases() {
     let images = (0..3)
         .map(|n| dir.path().join(format!("timed-{n}.img")))
         .collect::<Vec<_>>();
-    let mut fs = ArgosFs::create_loop(
+    let mut fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,
@@ -2243,7 +2243,7 @@ fn upgraded_immediate_transactions_use_delta_and_incremental_durability() {
     let images = (0..3)
         .map(|i| dir.path().join(format!("immediate-v2-{i}.img")))
         .collect::<Vec<_>>();
-    let mut fs = ArgosFs::create_loop(
+    let mut fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,
@@ -2303,7 +2303,7 @@ fn immediate_v2_prepares_splices_only_after_all_members_upgrade() {
     let images = (0..3)
         .map(|i| dir.path().join(format!("immediate-splice-{i}.img")))
         .collect::<Vec<_>>();
-    let mut fs = ArgosFs::create_loop(
+    let mut fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,
@@ -2369,7 +2369,7 @@ fn force_mkfs_removes_the_previous_pool_cache_directory() {
         m: 0,
         ..VolumeConfig::default()
     };
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         std::slice::from_ref(&image),
         config.clone(),
         32 * 1024 * 1024,
@@ -2384,7 +2384,7 @@ fn force_mkfs_removes_the_previous_pool_cache_directory() {
     assert!(old_cache.exists());
     drop(fs);
 
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         std::slice::from_ref(&image),
         config,
         32 * 1024 * 1024,

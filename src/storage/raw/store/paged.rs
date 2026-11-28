@@ -712,7 +712,7 @@ mod tests {
             let paths = (0..3)
                 .map(|i| dir.path().join(format!("{i}.img")))
                 .collect::<Vec<_>>();
-            let fs = crate::ArgosFs::create_loop(
+            let fs = crate::ArgosFs::create_loop_legacy(
                 &paths,
                 VolumeConfig {
                     k: 2,

@@ -282,9 +282,12 @@ pub(super) enum Command {
         /// Maximum metadata transactions in one deferred group.
         #[arg(long, default_value_t = DEFAULT_DEFERRED_COMMIT_MAX_TRANSACTIONS)]
         deferred_commit_max_transactions: u64,
-        /// Opt into the new paged metadata disk format for a fresh raw/loop pool.
-        #[arg(long)]
+        /// Explicitly select the default paged metadata format for raw/loop pools.
+        #[arg(long, conflicts_with = "legacy_metadata")]
         paged_metadata: bool,
+        /// Create a raw/loop pool in the original checkpoint/journal format.
+        #[arg(long)]
+        legacy_metadata: bool,
         /// Permit destructive replacement of recognized signatures or existing images.
         #[arg(long)]
         force: bool,

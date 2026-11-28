@@ -45,7 +45,7 @@ fn raw_superblock_builder_rejects_overflowing_layout_fields() {
 fn verify_journal_cli_supports_loop_backend() {
     let tmp = TempDir::new().unwrap();
     let images = loop_images(&tmp, 3);
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &images,
         config(2, 1),
         32 * 1024 * 1024,
@@ -134,7 +134,7 @@ fn targeted_member_scrub_emits_only_jsonl_on_stderr() {
 fn tree_transfer_cli_rejects_mismatched_pool_config() {
     let tmp = TempDir::new().unwrap();
     let images = loop_images(&tmp, 1);
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &images,
         config(1, 0),
         32 * 1024 * 1024,
@@ -194,7 +194,8 @@ fn single_device_loop_rootfs_smoke_import_export() {
     let tmp = TempDir::new().unwrap();
     let images = loop_images(&tmp, 1);
     let fs =
-        ArgosFs::create_loop(&images, config(1, 0), 32 * 1024 * 1024, "capos-root", false).unwrap();
+        ArgosFs::create_loop_legacy(&images, config(1, 0), 32 * 1024 * 1024, "capos-root", false)
+            .unwrap();
     create_rootfs_mountpoints(&fs);
     fs.mkdir("/sbin", 0o755).unwrap();
     fs.write_file("/sbin/init", b"#!/bin/sh\nexit 0\n", 0o755)
@@ -223,7 +224,8 @@ fn raw_journal_replay_chains_from_bulk_checkpoint_for_rootfs_writes() {
     let tmp = TempDir::new().unwrap();
     let images = loop_images(&tmp, 1);
     let fs =
-        ArgosFs::create_loop(&images, config(1, 0), 32 * 1024 * 1024, "capos-root", false).unwrap();
+        ArgosFs::create_loop_legacy(&images, config(1, 0), 32 * 1024 * 1024, "capos-root", false)
+            .unwrap();
     create_rootfs_mountpoints(&fs);
 
     let _bulk_import = argosfs::volume::bulk_import_scope(true);
@@ -261,7 +263,7 @@ fn loop_block_open_remaps_metadata_paths_to_current_devices() {
     let original = tmp.path().join("original.img");
     let moved = tmp.path().join("moved.img");
     let original_images = vec![original.clone()];
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &original_images,
         config(1, 0),
         32 * 1024 * 1024,
@@ -303,7 +305,8 @@ fn reshape_single_to_redundant_resume_keeps_multilayout_readable() {
     let tmp = TempDir::new().unwrap();
     let mut images = loop_images(&tmp, 1);
     let fs =
-        ArgosFs::create_loop(&images, config(1, 0), 32 * 1024 * 1024, "capos-root", false).unwrap();
+        ArgosFs::create_loop_legacy(&images, config(1, 0), 32 * 1024 * 1024, "capos-root", false)
+            .unwrap();
     let a_payload = vec![b'a'; 20 * 1024];
     let b_payload = vec![b'b'; 20 * 1024];
     fs.write_file("/a", &a_payload, 0o644).unwrap();
@@ -361,7 +364,8 @@ fn reshape_crash_after_data_flush_keeps_old_layout_data_readable() {
     let tmp = TempDir::new().unwrap();
     let mut images = loop_images(&tmp, 1);
     let fs =
-        ArgosFs::create_loop(&images, config(1, 0), 32 * 1024 * 1024, "capos-root", false).unwrap();
+        ArgosFs::create_loop_legacy(&images, config(1, 0), 32 * 1024 * 1024, "capos-root", false)
+            .unwrap();
     let payload = vec![b'r'; 20 * 1024];
     fs.write_file("/payload", &payload, 0o644).unwrap();
     let new_image = tmp.path().join("disk1.img");
@@ -393,7 +397,8 @@ fn reshape_single_device_to_k4_m2_chain() {
     let tmp = TempDir::new().unwrap();
     let mut images = loop_images(&tmp, 1);
     let fs =
-        ArgosFs::create_loop(&images, config(1, 0), 32 * 1024 * 1024, "capos-root", false).unwrap();
+        ArgosFs::create_loop_legacy(&images, config(1, 0), 32 * 1024 * 1024, "capos-root", false)
+            .unwrap();
     fs.write_file("/chain", b"reshape-chain", 0o644).unwrap();
 
     let disk1 = tmp.path().join("disk1.img");
@@ -432,7 +437,8 @@ fn loop_block_backend_round_trips_raw_extents_without_host_shards() {
     let tmp = TempDir::new().unwrap();
     let images = loop_images(&tmp, 3);
     let fs =
-        ArgosFs::create_loop(&images, config(2, 1), 32 * 1024 * 1024, "capos-root", false).unwrap();
+        ArgosFs::create_loop_legacy(&images, config(2, 1), 32 * 1024 * 1024, "capos-root", false)
+            .unwrap();
     fs.write_file("/etc-os-release", b"NAME=CapOS\n", 0o644)
         .unwrap();
 
@@ -463,7 +469,8 @@ fn loop_block_scan_inspect_and_repair_corrupt_extent() {
     let tmp = TempDir::new().unwrap();
     let images = loop_images(&tmp, 3);
     let fs =
-        ArgosFs::create_loop(&images, config(2, 1), 32 * 1024 * 1024, "capos-root", false).unwrap();
+        ArgosFs::create_loop_legacy(&images, config(2, 1), 32 * 1024 * 1024, "capos-root", false)
+            .unwrap();
     fs.write_file("/payload", b"abcdefghijklmnopqrstuvwxyz", 0o644)
         .unwrap();
     let meta = fs.metadata_snapshot();
@@ -510,7 +517,8 @@ fn clean_state_tracks_mount_lifetime_and_generation() {
     let tmp = TempDir::new().unwrap();
     let images = loop_images(&tmp, 1);
     let fs =
-        ArgosFs::create_loop(&images, config(1, 0), 32 * 1024 * 1024, "capos-root", false).unwrap();
+        ArgosFs::create_loop_legacy(&images, config(1, 0), 32 * 1024 * 1024, "capos-root", false)
+            .unwrap();
     let (mounted, _) =
         argosfs::raw_store::inspect_device(BackendKind::LoopBlock, images[0].clone()).unwrap();
     assert!(!mounted.clean);
@@ -555,7 +563,8 @@ fn loop_block_scan_and_inspect_recover_from_backup_superblock() {
     let tmp = TempDir::new().unwrap();
     let images = loop_images(&tmp, 3);
     let fs =
-        ArgosFs::create_loop(&images, config(2, 1), 32 * 1024 * 1024, "capos-root", false).unwrap();
+        ArgosFs::create_loop_legacy(&images, config(2, 1), 32 * 1024 * 1024, "capos-root", false)
+            .unwrap();
     fs.write_file("/payload", b"backup-superblock", 0o644)
         .unwrap();
     drop(fs);
@@ -584,7 +593,8 @@ fn loop_block_degraded_read_with_one_missing_image() {
     let tmp = TempDir::new().unwrap();
     let images = loop_images(&tmp, 3);
     let fs =
-        ArgosFs::create_loop(&images, config(2, 1), 32 * 1024 * 1024, "capos-root", false).unwrap();
+        ArgosFs::create_loop_legacy(&images, config(2, 1), 32 * 1024 * 1024, "capos-root", false)
+            .unwrap();
     fs.write_file("/payload", b"read-through-missing-disk", 0o644)
         .unwrap();
     drop(fs);
@@ -604,7 +614,8 @@ fn rootfs_preflight_fails_closed_for_degraded_rw_default() {
     let tmp = TempDir::new().unwrap();
     let images = loop_images(&tmp, 3);
     let fs =
-        ArgosFs::create_loop(&images, config(2, 1), 32 * 1024 * 1024, "capos-root", false).unwrap();
+        ArgosFs::create_loop_legacy(&images, config(2, 1), 32 * 1024 * 1024, "capos-root", false)
+            .unwrap();
     create_rootfs_mountpoints(&fs);
     fs.write_file("/sbin-init", b"init", 0o755).unwrap();
     drop(fs);
@@ -635,7 +646,8 @@ fn rootfs_preflight_rejects_missing_switch_root_mountpoint() {
     let tmp = TempDir::new().unwrap();
     let images = loop_images(&tmp, 1);
     let fs =
-        ArgosFs::create_loop(&images, config(1, 0), 32 * 1024 * 1024, "capos-root", false).unwrap();
+        ArgosFs::create_loop_legacy(&images, config(1, 0), 32 * 1024 * 1024, "capos-root", false)
+            .unwrap();
     for path in ["/dev", "/proc", "/sys"] {
         fs.mkdir(path, 0o755).unwrap();
     }
@@ -655,7 +667,8 @@ fn rootfs_preflight_rejects_dirty_raw_pool_for_rw() {
     let tmp = TempDir::new().unwrap();
     let images = loop_images(&tmp, 1);
     let fs =
-        ArgosFs::create_loop(&images, config(1, 0), 32 * 1024 * 1024, "capos-root", false).unwrap();
+        ArgosFs::create_loop_legacy(&images, config(1, 0), 32 * 1024 * 1024, "capos-root", false)
+            .unwrap();
     create_rootfs_mountpoints(&fs);
     fs.mkdir("/sbin", 0o755).unwrap();
     fs.write_file("/sbin/init", b"init", 0o755).unwrap();
@@ -689,7 +702,8 @@ fn loop_block_crash_after_data_flush_before_journal_keeps_old_data() {
     let tmp = TempDir::new().unwrap();
     let images = loop_images(&tmp, 3);
     let fs =
-        ArgosFs::create_loop(&images, config(2, 1), 32 * 1024 * 1024, "capos-root", false).unwrap();
+        ArgosFs::create_loop_legacy(&images, config(2, 1), 32 * 1024 * 1024, "capos-root", false)
+            .unwrap();
     fs.write_file("/crash", b"old", 0o644).unwrap();
 
     journal::set_thread_crash_point(Some(
@@ -712,7 +726,8 @@ fn raw_journal_partial_tail_is_audited_and_data_remains_readable() {
     let tmp = TempDir::new().unwrap();
     let images = loop_images(&tmp, 1);
     let fs =
-        ArgosFs::create_loop(&images, config(1, 0), 32 * 1024 * 1024, "capos-root", false).unwrap();
+        ArgosFs::create_loop_legacy(&images, config(1, 0), 32 * 1024 * 1024, "capos-root", false)
+            .unwrap();
     fs.write_file("/journal-tail", b"valid-before-tail", 0o644)
         .unwrap();
     fs.sync().unwrap();
@@ -751,7 +766,7 @@ fn raw_journal_partial_tail_is_audited_and_data_remains_readable() {
 fn fsck_repair_clears_a_stale_raw_journal_tail() {
     let tmp = TempDir::new().unwrap();
     let images = loop_images(&tmp, 1);
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &images,
         config(1, 0),
         32 * 1024 * 1024,
@@ -835,7 +850,8 @@ fn raw_journal_member_reports_quorum_across_devices() {
     let tmp = TempDir::new().unwrap();
     let images = loop_images(&tmp, 3);
     let fs =
-        ArgosFs::create_loop(&images, config(2, 1), 32 * 1024 * 1024, "capos-root", false).unwrap();
+        ArgosFs::create_loop_legacy(&images, config(2, 1), 32 * 1024 * 1024, "capos-root", false)
+            .unwrap();
     fs.write_file("/quorum", b"journal quorum", 0o644).unwrap();
     fs.sync().unwrap();
 
@@ -857,7 +873,7 @@ fn raw_journal_member_reports_quorum_across_devices() {
 fn raw_journal_rollover_keeps_one_quorum_across_mixed_members() {
     let tmp = TempDir::new().unwrap();
     let images = loop_images(&tmp, 4);
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &images,
         config(3, 1),
         32 * 1024 * 1024,
@@ -929,7 +945,8 @@ fn raw_journal_rollover_checkpoints_large_import_style_workloads() {
     let tmp = TempDir::new().unwrap();
     let images = loop_images(&tmp, 1);
     let fs =
-        ArgosFs::create_loop(&images, config(1, 0), 32 * 1024 * 1024, "capos-root", false).unwrap();
+        ArgosFs::create_loop_legacy(&images, config(1, 0), 32 * 1024 * 1024, "capos-root", false)
+            .unwrap();
     let mut meta = fs.metadata_snapshot();
     drop(fs);
 
@@ -981,7 +998,8 @@ fn raw_primary_metadata_corruption_recovers_from_mirror_or_other_device() {
     let tmp = TempDir::new().unwrap();
     let images = loop_images(&tmp, 1);
     let fs =
-        ArgosFs::create_loop(&images, config(1, 0), 32 * 1024 * 1024, "capos-root", false).unwrap();
+        ArgosFs::create_loop_legacy(&images, config(1, 0), 32 * 1024 * 1024, "capos-root", false)
+            .unwrap();
     fs.write_file("/metadata", b"metadata-copy", 0o644).unwrap();
     fs.sync().unwrap();
     drop(fs);
@@ -1008,7 +1026,8 @@ fn raw_metadata_tree_checkpoint_spans_pages() {
     let tmp = TempDir::new().unwrap();
     let images = loop_images(&tmp, 1);
     let fs =
-        ArgosFs::create_loop(&images, config(1, 0), 32 * 1024 * 1024, "capos-root", false).unwrap();
+        ArgosFs::create_loop_legacy(&images, config(1, 0), 32 * 1024 * 1024, "capos-root", false)
+            .unwrap();
     for index in 0..4 {
         fs.setxattr_inode(
             1,
@@ -1058,7 +1077,8 @@ fn raw_deferred_journal_flush_persists_after_sync() {
     let mut cfg = config(1, 0);
     cfg.defer_journal_flush = true;
     cfg.compression = Compression::None;
-    let fs = ArgosFs::create_loop(&images, cfg, 32 * 1024 * 1024, "capos-root", false).unwrap();
+    let fs =
+        ArgosFs::create_loop_legacy(&images, cfg, 32 * 1024 * 1024, "capos-root", false).unwrap();
     fs.write_file("/deferred", b"journal flush at sync", 0o644)
         .unwrap();
     fs.sync().unwrap();
@@ -1081,7 +1101,8 @@ fn raw_batched_metadata_commit_persists_after_sync() {
     cfg.defer_metadata_commit = true;
     cfg.defer_data_flush = true;
     cfg.compression = Compression::None;
-    let fs = ArgosFs::create_loop(&images, cfg, 32 * 1024 * 1024, "capos-root", false).unwrap();
+    let fs =
+        ArgosFs::create_loop_legacy(&images, cfg, 32 * 1024 * 1024, "capos-root", false).unwrap();
     for index in 0..16 {
         fs.write_file(
             &format!("/batched-{index:04}"),
@@ -1115,7 +1136,8 @@ fn raw_group_commit_reuses_open_device_after_path_disappears() {
     cfg.deferred_commit_max_transactions = 1_000;
     cfg.compression = Compression::None;
     let fs =
-        ArgosFs::create_loop(&images, cfg, 32 * 1024 * 1024, "switch-root-handles", false).unwrap();
+        ArgosFs::create_loop_legacy(&images, cfg, 32 * 1024 * 1024, "switch-root-handles", false)
+            .unwrap();
     fs.write_file("/before", &vec![b'b'; 2048], 0o644).unwrap();
     fs.sync().unwrap();
 
@@ -1148,7 +1170,8 @@ fn raw_group_commit_batches_transactions_into_one_durable_record() {
     cfg.deferred_commit_interval_ms = 60_000;
     cfg.deferred_commit_max_transactions = 1_000;
     cfg.compression = Compression::None;
-    let fs = ArgosFs::create_loop(&images, cfg, 32 * 1024 * 1024, "group-commit", false).unwrap();
+    let fs =
+        ArgosFs::create_loop_legacy(&images, cfg, 32 * 1024 * 1024, "group-commit", false).unwrap();
 
     for index in 0..8 {
         fs.write_file(
@@ -1190,7 +1213,8 @@ fn raw_group_commit_forces_at_transaction_limit() {
     cfg.deferred_commit_interval_ms = 60_000;
     cfg.deferred_commit_max_transactions = 4;
     cfg.compression = Compression::None;
-    let fs = ArgosFs::create_loop(&images, cfg, 32 * 1024 * 1024, "group-limit", false).unwrap();
+    let fs =
+        ArgosFs::create_loop_legacy(&images, cfg, 32 * 1024 * 1024, "group-limit", false).unwrap();
 
     fs.write_file("/one", &vec![1u8; 2048], 0o644).unwrap();
     assert_eq!(raw_logical_journal_records(&images[0]).len(), 1);
@@ -1213,7 +1237,8 @@ fn raw_group_commit_limit_failure_is_reported_and_retryable() {
     cfg.deferred_commit_interval_ms = 60_000;
     cfg.deferred_commit_max_transactions = 2;
     cfg.compression = Compression::None;
-    let fs = ArgosFs::create_loop(&images, cfg, 32 * 1024 * 1024, "group-retry", false).unwrap();
+    let fs =
+        ArgosFs::create_loop_legacy(&images, cfg, 32 * 1024 * 1024, "group-retry", false).unwrap();
 
     let _crash = journal::thread_crash_point(
         argosfs::types::FaultPoint::AfterDataFlushBeforeJournalCommit.as_str(),
@@ -1247,7 +1272,8 @@ fn raw_deferred_reclamation_does_not_reuse_last_durable_extent() {
     cfg.deferred_commit_interval_ms = 60_000;
     cfg.deferred_commit_max_transactions = 1_000;
     cfg.compression = Compression::None;
-    let fs = ArgosFs::create_loop(&images, cfg, 32 * 1024 * 1024, "safe-reclaim", false).unwrap();
+    let fs =
+        ArgosFs::create_loop_legacy(&images, cfg, 32 * 1024 * 1024, "safe-reclaim", false).unwrap();
 
     let old = vec![b'a'; 2048];
     fs.write_file("/value", &old, 0o644).unwrap();
@@ -1301,8 +1327,8 @@ fn raw_group_commit_reclaims_old_extent_after_durability_boundary() {
     cfg.deferred_commit_interval_ms = 60_000;
     cfg.deferred_commit_max_transactions = 1_000;
     cfg.compression = Compression::None;
-    let fs =
-        ArgosFs::create_loop(&images, cfg, 32 * 1024 * 1024, "reclaim-boundary", false).unwrap();
+    let fs = ArgosFs::create_loop_legacy(&images, cfg, 32 * 1024 * 1024, "reclaim-boundary", false)
+        .unwrap();
 
     fs.write_file("/value", &vec![b'a'; 2048], 0o644).unwrap();
     fs.sync().unwrap();
@@ -1349,7 +1375,8 @@ fn raw_deferred_data_flush_requires_batched_metadata_commit() {
     let images = loop_images(&tmp, 1);
     let mut cfg = config(1, 0);
     cfg.defer_data_flush = true;
-    let err = match ArgosFs::create_loop(&images, cfg, 32 * 1024 * 1024, "capos-root", false) {
+    let err = match ArgosFs::create_loop_legacy(&images, cfg, 32 * 1024 * 1024, "capos-root", false)
+    {
         Ok(_) => panic!("defer-data-flush without batched metadata should fail"),
         Err(err) => err,
     };
@@ -1364,7 +1391,8 @@ fn raw_hot_file_transactions_use_metadata_deltas() {
     let images = loop_images(&tmp, 1);
     let mut cfg = config(1, 0);
     cfg.compression = Compression::None;
-    let fs = ArgosFs::create_loop(&images, cfg, 32 * 1024 * 1024, "capos-root", false).unwrap();
+    let fs =
+        ArgosFs::create_loop_legacy(&images, cfg, 32 * 1024 * 1024, "capos-root", false).unwrap();
     for index in 0..8 {
         fs.write_file(
             &format!("/delta-{index:04}"),
@@ -1396,7 +1424,8 @@ fn failed_multistripe_raw_write_rolls_back_allocator_state() {
     let mut cfg = config(1, 0);
     cfg.chunk_size = 8 * 1024 * 1024;
     cfg.compression = Compression::None;
-    let fs = ArgosFs::create_loop(&images, cfg, 32 * 1024 * 1024, "rollback", false).unwrap();
+    let fs =
+        ArgosFs::create_loop_legacy(&images, cfg, 32 * 1024 * 1024, "rollback", false).unwrap();
     let ino = fs.create_file_path("/victim", 0o600).unwrap();
     let before = fs.metadata_snapshot();
     let disk_id = before.disks.keys().next().unwrap().clone();
@@ -1427,7 +1456,8 @@ fn raw_allocator_inconsistency_is_reported_by_fsck() {
     let tmp = TempDir::new().unwrap();
     let images = loop_images(&tmp, 1);
     let fs =
-        ArgosFs::create_loop(&images, config(1, 0), 32 * 1024 * 1024, "capos-root", false).unwrap();
+        ArgosFs::create_loop_legacy(&images, config(1, 0), 32 * 1024 * 1024, "capos-root", false)
+            .unwrap();
     let payload = vec![b'a'; 20 * 1024];
     fs.write_file("/allocator", &payload, 0o644).unwrap();
     let mut meta = fs.metadata_snapshot();
@@ -1490,7 +1520,8 @@ fn loop_block_open_rejects_duplicate_disk_id_conflict() {
     let tmp = TempDir::new().unwrap();
     let images = loop_images(&tmp, 3);
     let fs =
-        ArgosFs::create_loop(&images, config(2, 1), 32 * 1024 * 1024, "capos-root", false).unwrap();
+        ArgosFs::create_loop_legacy(&images, config(2, 1), 32 * 1024 * 1024, "capos-root", false)
+            .unwrap();
     drop(fs);
 
     let mut bytes = vec![0u8; SUPERBLOCK_SIZE];
@@ -1528,7 +1559,8 @@ fn loop_block_add_device_initializes_new_member() {
     let tmp = TempDir::new().unwrap();
     let mut images = loop_images(&tmp, 3);
     let fs =
-        ArgosFs::create_loop(&images, config(2, 1), 32 * 1024 * 1024, "capos-root", false).unwrap();
+        ArgosFs::create_loop_legacy(&images, config(2, 1), 32 * 1024 * 1024, "capos-root", false)
+            .unwrap();
     fs.write_file("/payload", b"before-add", 0o644).unwrap();
     let new_image = tmp.path().join("disk3.img");
     let disk_id = fs
@@ -1553,7 +1585,8 @@ fn loop_block_cli_replace_device_rewrites_off_old_member() {
     let tmp = TempDir::new().unwrap();
     let images = loop_images(&tmp, 3);
     let fs =
-        ArgosFs::create_loop(&images, config(2, 1), 32 * 1024 * 1024, "capos-root", false).unwrap();
+        ArgosFs::create_loop_legacy(&images, config(2, 1), 32 * 1024 * 1024, "capos-root", false)
+            .unwrap();
     fs.write_file("/payload", b"before-replace", 0o644).unwrap();
     drop(fs);
 
@@ -1592,7 +1625,7 @@ fn offline_loop_member_can_be_reconstructed_onto_replacement() {
     let tmp = TempDir::new().unwrap();
     let images = loop_images(&tmp, 5);
     let payload = vec![b'r'; 256 * 1024];
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &images,
         config(3, 2),
         32 * 1024 * 1024,
@@ -1643,8 +1676,8 @@ fn offline_loop_member_can_be_reconstructed_onto_replacement() {
 fn repeated_loop_replacements_do_not_raise_quorum_with_removed_members() {
     let tmp = TempDir::new().unwrap();
     let mut active = loop_images(&tmp, 3);
-    let fs =
-        ArgosFs::create_loop(&active, config(2, 1), 32 * 1024 * 1024, "quorum", false).unwrap();
+    let fs = ArgosFs::create_loop_legacy(&active, config(2, 1), 32 * 1024 * 1024, "quorum", false)
+        .unwrap();
     fs.write_file("/payload", b"survives-replacements", 0o644)
         .unwrap();
     drop(fs);
@@ -1699,7 +1732,7 @@ fn raw_recovery_ignores_unquorumed_metadata_and_journal_tail() {
     let images = loop_images(&tmp, 3);
     let mut cfg = config(2, 1);
     cfg.compression = Compression::None;
-    let fs = ArgosFs::create_loop(&images, cfg, 32 * 1024 * 1024, "quorum", false).unwrap();
+    let fs = ArgosFs::create_loop_legacy(&images, cfg, 32 * 1024 * 1024, "quorum", false).unwrap();
     fs.write_file("/value", b"committed", 0o644).unwrap();
     fs.sync().unwrap();
     let committed = fs.metadata_snapshot();
@@ -1768,7 +1801,8 @@ fn raw_recovery_ignores_journal_head_without_membership_quorum() {
     let tmp = TempDir::new().unwrap();
     let images = loop_images(&tmp, 3);
     let fs =
-        ArgosFs::create_loop(&images, config(2, 1), 32 * 1024 * 1024, "capos-root", false).unwrap();
+        ArgosFs::create_loop_legacy(&images, config(2, 1), 32 * 1024 * 1024, "capos-root", false)
+            .unwrap();
     fs.write_file("/quorum-value", b"committed-majority", 0o644)
         .unwrap();
     fs.sync().unwrap();
@@ -1802,7 +1836,7 @@ fn committed_raw_replacement_persists_old_extent_reclamation() {
     let images = loop_images(&tmp, 1);
     let mut cfg = config(1, 0);
     cfg.compression = Compression::None;
-    let fs = ArgosFs::create_loop(&images, cfg, 32 * 1024 * 1024, "reclaim", false).unwrap();
+    let fs = ArgosFs::create_loop_legacy(&images, cfg, 32 * 1024 * 1024, "reclaim", false).unwrap();
     fs.write_file("/value", &vec![b'a'; 1024], 0o600).unwrap();
     fs.sync().unwrap();
     let before = fs.metadata_snapshot();
@@ -1846,7 +1880,8 @@ fn failed_raw_commit_restores_in_memory_metadata_before_returning() {
     let tmp = TempDir::new().unwrap();
     let images = loop_images(&tmp, 3);
     let fs =
-        ArgosFs::create_loop(&images, config(2, 1), 32 * 1024 * 1024, "capos-root", false).unwrap();
+        ArgosFs::create_loop_legacy(&images, config(2, 1), 32 * 1024 * 1024, "capos-root", false)
+            .unwrap();
     fs.write_file("/atomic-value", b"old", 0o644).unwrap();
     fs.sync().unwrap();
 
@@ -1887,16 +1922,19 @@ fn raw_mkfs_rejects_luks_and_unknown_nonzero_data_without_force() {
         .unwrap();
 
     for path in [&luks, &unknown] {
-        let err =
-            match ArgosFs::create_raw(std::slice::from_ref(path), config(1, 0), "safe-mkfs", false)
-            {
-                Ok(_) => panic!("raw mkfs unexpectedly overwrote {}", path.display()),
-                Err(err) => err,
-            };
+        let err = match ArgosFs::create_raw_legacy(
+            std::slice::from_ref(path),
+            config(1, 0),
+            "safe-mkfs",
+            false,
+        ) {
+            Ok(_) => panic!("raw mkfs unexpectedly overwrote {}", path.display()),
+            Err(err) => err,
+        };
         assert!(matches!(err, ArgosError::UnsafeMount(_)));
     }
 
-    let forced = ArgosFs::create_raw(
+    let forced = ArgosFs::create_raw_legacy(
         std::slice::from_ref(&luks),
         config(1, 0),
         "forced-mkfs",
@@ -1928,7 +1966,7 @@ fn raw_reshape_replay_uses_only_durable_delta_bases() {
     let _guard = env_lock();
     let tmp = TempDir::new().unwrap();
     let mut images = vec![tmp.path().join("disk0.img")];
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &images,
         config(1, 0),
         32 * 1024 * 1024,

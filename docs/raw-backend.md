@@ -117,10 +117,12 @@ group window, while recovery continues to use checksum-valid, quorum-supported
 metadata and journal records. Strict mode remains available as an explicit
 compatibility and diagnostic mode.
 
-## Optional incremental integrity upgrade
+## Optional incremental integrity upgrade for legacy pools
 
-New raw/loop pools and existing pools use the established canonical metadata
-SHA-256 unless explicitly upgraded. Large pools can enable authenticated,
+New raw/loop pools use the [paged metadata engine](persistent-metadata-tree.md)
+by default. Existing pools retain their format; use `mkfs --legacy-metadata`
+to create a pool using the original canonical metadata SHA-256. Legacy pools
+can enable authenticated,
 changed-record delta hashes on the normal deferred group-commit path using the
 one-way `argosfs upgrade-integrity --pool-config FILE --offline-confirmed`
 command. The upgrade requires **all active members** and an unmounted pool,

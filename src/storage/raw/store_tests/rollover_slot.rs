@@ -623,7 +623,7 @@ fn partial_checkpoint_write_keeps_the_previous_quorum_on_an_even_member_pool() {
     let images = (0..2)
         .map(|index| dir.path().join(format!("checkpoint-partial-{index}.img")))
         .collect::<Vec<_>>();
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 1,
@@ -686,7 +686,7 @@ fn stable_membership_discards_a_newer_unquorate_checkpoint_tail() {
     let images = (0..6)
         .map(|index| dir.path().join(format!("stable-{index}.img")))
         .collect::<Vec<_>>();
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 4,
