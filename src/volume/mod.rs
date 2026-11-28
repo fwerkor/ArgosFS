@@ -220,16 +220,16 @@ impl DeferredCommitState {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct QuotaRuntime {
+pub(crate) struct QuotaRuntime {
     active: imbl::OrdSet<InodeId>,
-    usage_bytes: imbl::OrdMap<InodeId, u128>,
+    pub(crate) usage_bytes: imbl::OrdMap<InodeId, u128>,
     // Number of reachable directory entries for each (inode, quota).
     // A file with multiple hard links is charged only on the first edge.
-    memberships: imbl::OrdMap<InodeId, imbl::OrdMap<InodeId, u64>>,
+    pub(crate) memberships: imbl::OrdMap<InodeId, imbl::OrdMap<InodeId, u64>>,
 }
 
 impl QuotaRuntime {
-    fn from_metadata(meta: &Metadata) -> Result<Self> {
+    pub(crate) fn from_metadata(meta: &Metadata) -> Result<Self> {
         let mut runtime = Self::default();
         for (ino, inode) in &meta.inodes {
             if inode.quota_bytes.is_some() {

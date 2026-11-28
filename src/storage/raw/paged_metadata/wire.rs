@@ -24,6 +24,9 @@ pub trait TreeKey: sealed::Sealed + Clone + Ord + std::fmt::Debug + Send + Sync 
     const MIN_ENCODED_LEN: usize;
     const PERSISTENT_ALLOCATOR: bool;
     fn encoded_len(&self) -> usize;
+    fn domain_id(&self) -> Option<u16> {
+        None
+    }
     fn encode_key(&self, out: &mut Vec<u8>);
     fn decode_key(input: &mut &[u8]) -> Result<Self>;
 }
@@ -107,6 +110,9 @@ impl TreeKey for TypedKey {
     const CERT_MAGIC: &'static [u8; 8] = b"ARGCT003";
     const MIN_ENCODED_LEN: usize = 4;
     const PERSISTENT_ALLOCATOR: bool = true;
+    fn domain_id(&self) -> Option<u16> {
+        Some(self.domain())
+    }
     fn encoded_len(&self) -> usize {
         2 + self.0.len()
     }
@@ -141,6 +147,7 @@ pub(super) enum Value {
 #[derive(Clone, Debug)]
 pub(super) enum Node<K: TreeKey> {
     Leaf(Vec<(K, Value)>),
+    Catalog(Vec<(u16, Ptr)>),
     Branch { level: u8, children: Vec<(K, Ptr)> },
     Blob { next: Option<Ptr>, data: Vec<u8> },
 }
@@ -209,14 +216,14 @@ impl<K: TreeKey> Node<K> {
         match self {
             Self::Leaf(_) => Some(0),
             Self::Branch { level, .. } => Some(*level),
-            Self::Blob { .. } => None,
+            Self::Blob { .. } | Self::Catalog(_) => None,
         }
     }
     pub(super) fn max_key(&self) -> Option<K> {
         match self {
             Self::Leaf(entries) => entries.last().map(|(key, _)| key.clone()),
             Self::Branch { children, .. } => children.last().map(|(key, _)| key.clone()),
-            Self::Blob { .. } => None,
+            Self::Blob { .. } | Self::Catalog(_) => None,
         }
     }
     pub(super) fn children(&self) -> Vec<Ptr> {
@@ -229,6 +236,7 @@ impl<K: TreeKey> Node<K> {
                 })
                 .collect(),
             Self::Branch { children, .. } => children.iter().map(|(_, ptr)| *ptr).collect(),
+            Self::Catalog(roots) => roots.iter().map(|(_, ptr)| *ptr).collect(),
             Self::Blob { next, .. } => next.iter().copied().collect(),
         }
     }
@@ -241,6 +249,7 @@ impl<K: TreeKey> Node<K> {
             Self::Branch { children, .. } => {
                 children.iter().map(|(k, _)| k.encoded_len() + 40).sum()
             }
+            Self::Catalog(roots) => roots.len() * 42,
             Self::Blob { data, .. } => 40 + data.len(),
         }
     }
@@ -368,6 +377,19 @@ impl<K: TreeKey> Node<K> {
                 }
                 (2, *level, children.len())
             }
+            Self::Catalog(roots) => {
+                if !K::PERSISTENT_ALLOCATOR
+                    || roots.is_empty()
+                    || !roots.windows(2).all(|pair| pair[0].0 < pair[1].0)
+                {
+                    return Err(corrupt("invalid metadata root catalog"));
+                }
+                for (domain, ptr) in roots {
+                    payload.extend_from_slice(&domain.to_be_bytes());
+                    write_ptr(&mut payload, Some(*ptr), logical);
+                }
+                (4, 0, roots.len())
+            }
             Self::Blob { next, data } => {
                 if data.is_empty() || data.len() > BLOB_MAX {
                     return Err(corrupt("invalid metadata blob page"));
@@ -441,6 +463,14 @@ impl<K: TreeKey> Node<K> {
                 let data = input.take(input.0.len())?.to_vec();
                 Self::Blob { next, data }
             }
+            4 if K::PERSISTENT_ALLOCATOR && level == 0 && count > 0 && count * 42 == len => {
+                let mut roots = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let domain = u16::from_be_bytes(input.take(2)?.try_into().unwrap());
+                    roots.push((domain, input.required_ptr()?));
+                }
+                Self::Catalog(roots)
+            }
             _ => return Err(corrupt("unknown or malformed metadata page type")),
         };
         if !input.0.is_empty() || hash(&node.encode_body(true)?[..TRAILER]) != expected {
@@ -473,7 +503,7 @@ impl Default for V3Features {
 }
 
 impl V3Features {
-    const REQUIRED: u64 = (1 << 0) | (1 << 1);
+    const REQUIRED: u64 = (1 << 0) | (1 << 1) | (1 << 2);
 
     pub fn validate(self, writable: bool) -> Result<()> {
         if self.incompat != Self::REQUIRED {

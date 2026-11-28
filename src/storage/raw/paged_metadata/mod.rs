@@ -9,6 +9,7 @@
 //! state commits update reference counts only on changed paths.
 mod image;
 mod member;
+pub mod migration;
 pub mod physical;
 mod reader;
 pub mod typed;
@@ -100,6 +101,8 @@ pub struct CommitReport {
 pub struct MetadataTree<K: TreeKey> {
     backend: Arc<dyn StorageBackend>,
     namespace: Hash,
+    pool: [u8; 16],
+    configured_members: usize,
     quorum: usize,
     members: Vec<Member<K>>,
     current: (u64, Hash),
@@ -359,10 +362,13 @@ impl<K: TreeKey> MetadataTree<K> {
         pool: [u8; 16],
         arenas: Vec<Arena>,
     ) -> Result<Self> {
+        let configured_members = arenas.len();
         let (namespace, quorum, members, current) = select_members::<K>(&*backend, pool, arenas)?;
         Ok(Self {
             backend,
             namespace,
+            pool,
+            configured_members,
             quorum,
             members,
             current,

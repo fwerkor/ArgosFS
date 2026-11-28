@@ -14,9 +14,10 @@ layout until the volume integration and the qualification gates below pass.
   compound keys (two-byte domain, big-endian numeric components, binary name
   suffixes), and versioned record envelopes with bounded LZ4 expansion.
   Direct point, predecessor and bounded range queries do not require a
-  logical-key/record-ID table. The current engine physically multiplexes
-  logical domains in one tree; an independent multi-root catalog is a
-  remaining format design gate, not a claimed feature.
+  logical-key/record-ID table. The V3 root is now an authenticated catalog of independent domain
+  trees. Only changed domain roots are replaced and the catalog is published
+  atomically. The current one-page catalog accommodates 96 nonempty domains;
+  extensible catalog storage remains a release gate if more are needed.
 - An authenticated member-local reference-count radix map tracks metadata
   pages. Each leaf holds 512 u32 counts; branches hold 64 authenticated
   child references and free counts. Entirely free subtrees are implicit.
@@ -53,9 +54,18 @@ layout until the volume integration and the qualification gates below pass.
   immutable generation; range scans bypass the hot point cache.
 - An offline image-to-record converter covers the existing inode cores,
   dirents, blocks, xattrs, disks, data-allocator cores/free extents, and
-  parent/file indexes. This is **not** an in-place migration or a complete
-  semantic converter (quota usage, member references, events and snapshot
-  accounting need further work).
+  parent/file indexes. It also imports quota usage and hard-link membership
+  counts, member-to-block references, global statistics and supplied audit
+  events. The quota accounting reuses the supported format's semantics.
+- Generation-bound dirty-overlay point reads and file-core accounting
+  update logical usage and all existing nested quotas atomically. Block
+  edits include member-reference changes. Namespace quota membership changes,
+  data allocator mutations and full live-volume integration are still required.
+- Resumable migration staging into a separate V3 arena commits each bounded
+  batch together with its source digest and cursor. Reopen resolves ambiguous
+  acknowledgements; verification compares every record and audits all
+  configured member allocators. The legacy source is still materialized in
+  memory and no production superblock publication is implemented.
 
 ## Safety invariants
 
@@ -83,15 +93,15 @@ body/root/certificate phases, returned-member repair, damage refusal,
 variable-length keys, non-UTF8 name conversion and bounded scans.
 
 The synthetic 50,000-record, three-member fixture uses 24 read requests on
-normal writable open and writes eight pages per member for a single
+normal writable open and writes ten pages per member for a single
 record edit. This measures the **standalone metadata engine**, not FUSE
 mount, whole-volume startup, physical disk latency or Borg performance.
 
 Before exposing any final-format mkfs/migration:
 
-1. Finish the typed schema, persistent aggregate and reverse indexes, and
-   explicit multi-root/extension catalog. Define canonical versioning and
-   forward-compatible record semantics. Preserve unknown compatible data.
+1. Finish runtime namespace/quota/index mutation paths and data-extent
+   accounting. Extend the root catalog if required and finalize record schema
+   evolution rules. Preserve unknown compatible data.
 2. Integrate disk-resident transactions into the live volume model and
    remove whole-image dependencies from namespace, data allocation,
    quotas, verification, FUSE, CLI, health and Autopilot. Bound dirty
@@ -102,8 +112,9 @@ Before exposing any final-format mkfs/migration:
    catalog; add a safe allocator rebuild protocol when its own pages are
    damaged.
 4. Integrate topology epochs and joint-quorum transitions; design and
-   implement resumable staging/verification/atomic publication from both
-   legacy formats. No production conversion without explicit approval.
+   connect authenticated source recovery to the implemented resumable
+   staging/verification, then implement crash-safe superblock publication
+   from both legacy formats. No production conversion without explicit approval.
 5. Run mixed workload and power-cut/fault-injection qualification, compare
    old/new namespaces and physical extents, verify compatibility with old
    software, and measure real cold mounts at 294k, million and larger

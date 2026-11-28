@@ -8,8 +8,8 @@ use super::{
 use crate::error::{ArgosError, Result};
 use crate::metadata::store::InodeCorePage;
 use crate::types::{FileBlock, Metadata, RawAllocatorState};
-use serde::{de::DeserializeOwned, Serialize};
-use std::collections::BTreeMap;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 
 /// Stable logical domains; unknown domains are not interpreted by this layer.
@@ -30,6 +30,8 @@ pub enum Domain {
     MemberReference = 12,
     Event = 13,
     Snapshot = 14,
+    QuotaMembership = 15,
+    Statistics = 16,
 }
 
 impl Domain {
@@ -55,6 +57,14 @@ impl Domain {
         bytes.extend_from_slice(name);
         TypedKey::new(Self::Parent as u16, &bytes)
     }
+    pub fn member_block(id: &str, ino: u64, offset: u64) -> Result<TypedKey> {
+        let prefix = Self::MemberReference.disk(id, None)?;
+        let mut bytes = prefix.as_bytes().to_vec();
+        bytes.extend_from_slice(&ino.to_be_bytes());
+        bytes.extend_from_slice(&offset.to_be_bytes());
+        TypedKey::from_bytes(bytes)
+    }
+
     /// Length-prefix device IDs so variable-length IDs cannot collide with
     /// their offset suffix. Ordering within an individual device is numeric.
     pub fn disk(self, id: &str, offset: Option<u64>) -> Result<TypedKey> {
@@ -67,6 +77,27 @@ impl Domain {
         }
         TypedKey::new(self as u16, &bytes)
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct QuotaRecord {
+    pub limit: u64,
+    pub used: u128,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct VolumeStatistics {
+    pub inodes: u64,
+    pub files: u64,
+    pub logical_bytes: u128,
+}
+
+fn member_block_keys(ino: u64, block: &FileBlock) -> Result<BTreeSet<TypedKey>> {
+    block
+        .shards
+        .iter()
+        .map(|shard| Domain::member_block(&shard.disk_id, ino, block.raw_offset))
+        .collect()
 }
 
 const MAGIC: &[u8; 4] = b"ARV3";
@@ -143,7 +174,17 @@ fn put(changes: &mut TypedChanges, key: TypedKey, value: &impl Serialize) -> Res
 /// record set. This is for offline conversion tests, not an in-place upgrade.
 /// Decode legacy escaped names to lossless binary compound keys.
 pub fn import_image(meta: &Metadata) -> Result<TypedChanges> {
+    import_image_with_events(meta, &[])
+}
+
+/// Convert an authenticated offline image and its available audit events.
+/// The source must remain immutable for the entire import.
+pub fn import_image_with_events(
+    meta: &Metadata,
+    events: &[crate::types::PagedAuditEvent],
+) -> Result<TypedChanges> {
     let mut changes = TypedChanges::new();
+    let mut stats = VolumeStatistics::default();
     let mut header = meta.clone();
     header.inodes = Default::default();
     header.disks.clear();
@@ -172,12 +213,15 @@ pub fn import_image(meta: &Metadata) -> Result<TypedChanges> {
                 "invalid source inode identity".into(),
             ));
         }
+        stats.inodes += 1;
         put(
             &mut changes,
             Domain::Inode.inode_prefix(ino),
             &InodeCorePage::from(inode),
         )?;
         if inode.kind == crate::types::NodeKind::File {
+            stats.files += 1;
+            stats.logical_bytes += u128::from(inode.size);
             put(&mut changes, Domain::FileIndex.inode_prefix(ino), &())?;
         }
         for (name, &child) in &inode.entries {
@@ -198,7 +242,53 @@ pub fn import_image(meta: &Metadata) -> Result<TypedChanges> {
                 Domain::Block.inode_offset(ino, block.raw_offset),
                 block,
             )?;
+            for key in member_block_keys(ino, block)? {
+                put(&mut changes, key, &block.stripe_id)?;
+            }
         }
+    }
+    put(&mut changes, Domain::Statistics.prefix(), &stats)?;
+    // Reuse the supported format's quota accounting, including hard-link
+    // deduplication and nested quota memberships, rather than inventing a
+    // second interpretation during conversion.
+    let quotas = crate::volume::QuotaRuntime::from_metadata(meta)?;
+    for (&ino, &used) in &quotas.usage_bytes {
+        let limit = meta
+            .inodes
+            .get(&ino)
+            .and_then(|inode| inode.quota_bytes)
+            .ok_or_else(|| ArgosError::CorruptedMetadata("quota index missing limit".into()))?;
+        put(
+            &mut changes,
+            Domain::Quota.inode_prefix(ino),
+            &QuotaRecord { limit, used },
+        )?;
+    }
+    for (&ino, scopes) in &quotas.memberships {
+        for (&quota, &count) in scopes {
+            if count == 0 {
+                return Err(ArgosError::CorruptedMetadata(
+                    "zero quota membership".into(),
+                ));
+            }
+            put(
+                &mut changes,
+                Domain::QuotaMembership.inode_offset(ino, quota),
+                &count,
+            )?;
+        }
+    }
+    for event in events {
+        if event.txid > meta.txid {
+            return Err(ArgosError::CorruptedMetadata(
+                "future audit event in V3 import".into(),
+            ));
+        }
+        put(
+            &mut changes,
+            Domain::Event.inode_prefix(event.sequence),
+            event,
+        )?;
     }
     Ok(changes)
 }
@@ -210,6 +300,7 @@ pub struct RecordTransaction {
     namespace: [u8; 32],
     changes: TypedChanges,
     dirent_preconditions: BTreeMap<TypedKey, Option<u64>>,
+    block_preconditions: BTreeMap<TypedKey, Option<FileBlock>>,
 }
 
 impl RecordTransaction {
@@ -219,6 +310,7 @@ impl RecordTransaction {
             namespace: tree.namespace,
             changes: TypedChanges::new(),
             dirent_preconditions: BTreeMap::new(),
+            block_preconditions: BTreeMap::new(),
         }
     }
     pub fn put(&mut self, key: TypedKey, value: &impl Serialize) -> Result<()> {
@@ -228,11 +320,203 @@ impl RecordTransaction {
     pub fn delete(&mut self, key: TypedKey) {
         self.changes.insert(key, None);
     }
-    pub fn put_inode(&mut self, inode: &InodeCorePage) -> Result<()> {
-        self.put(Domain::Inode.inode_prefix(inode.id), inode)
+    fn check_generation(&self, tree: &TypedMetadata) -> Result<()> {
+        if (tree.txid(), tree.root_hash()) != self.expected || tree.namespace != self.namespace {
+            return Err(ArgosError::Conflict("stale V3 metadata transaction".into()));
+        }
+        Ok(())
     }
-    pub fn put_block(&mut self, ino: u64, block: &FileBlock) -> Result<()> {
-        self.put(Domain::Block.inode_offset(ino, block.raw_offset), block)
+
+    /// Point lookup in the dirty overlay, then the pinned generation.
+    pub fn get_record(&self, tree: &TypedMetadata, key: TypedKey) -> Result<Option<Vec<u8>>> {
+        self.check_generation(tree)?;
+        match self.changes.get(&key) {
+            Some(value) => Ok(value.clone()),
+            None => tree.get(key),
+        }
+    }
+
+    /// Stage an existing regular file's core and its logical usage counters.
+    /// Data-plane callers must stage any corresponding block and physical
+    /// extent updates in this same transaction. This is not a truncate API.
+    ///
+    /// Changing inode identity, kind, link count or quota membership requires
+    /// the namespace transaction path, not this accounting helper.
+    pub fn update_file_core(&mut self, tree: &TypedMetadata, new: &InodeCorePage) -> Result<()> {
+        self.check_generation(tree)?;
+        let key = Domain::Inode.inode_prefix(new.id);
+        let old: InodeCorePage = self
+            .get_record(tree, key.clone())?
+            .as_deref()
+            .map(decode_record)
+            .transpose()?
+            .ok_or_else(|| ArgosError::NotFound(format!("inode {}", new.id)))?;
+        if old.id != new.id
+            || old.kind != crate::types::NodeKind::File
+            || new.kind != old.kind
+            || old.nlink != new.nlink
+            || new.quota_bytes != old.quota_bytes
+        {
+            return Err(ArgosError::Invalid(
+                "V3 file core update changes namespace identity".into(),
+            ));
+        }
+        let mut staged = TypedChanges::new();
+        put(&mut staged, key, new)?;
+        if old.size != new.size {
+            let delta = |used: u128| -> Result<u128> {
+                let value = used
+                    .checked_sub(u128::from(old.size))
+                    .and_then(|used| used.checked_add(u128::from(new.size)))
+                    .ok_or_else(|| {
+                        ArgosError::CorruptedMetadata(
+                            "V3 logical usage counter overflow or underflow".into(),
+                        )
+                    })?;
+                Ok(value)
+            };
+            let stats_key = Domain::Statistics.prefix();
+            let mut stats: VolumeStatistics = self
+                .get_record(tree, stats_key.clone())?
+                .as_deref()
+                .map(decode_record)
+                .transpose()?
+                .ok_or_else(|| {
+                    ArgosError::CorruptedMetadata("missing V3 volume statistics".into())
+                })?;
+            stats.logical_bytes = delta(stats.logical_bytes)?;
+            put(&mut staged, stats_key, &stats)?;
+            let prefix = Domain::QuotaMembership.inode_prefix(new.id);
+            let end = prefix
+                .prefix_end()
+                .map_or(Bound::Unbounded, Bound::Excluded);
+            // Until the namespace writer is connected, do not mix changes
+            // to memberships with this helper: the current on-disk set
+            // must remain the authoritative list of affected quotas.
+            if self
+                .changes
+                .range((Bound::Included(prefix.clone()), end.clone()))
+                .next()
+                .is_some()
+            {
+                return Err(ArgosError::Conflict(
+                    "V3 quota membership changed in transaction".into(),
+                ));
+            }
+            let mut window = ScanWindow {
+                start: Bound::Included(prefix.clone()),
+                end,
+                max_records: 128,
+                max_bytes: 64 * 1024,
+                order: ScanOrder::Ascending,
+            };
+            loop {
+                let page = tree.scan(&window)?;
+                for (member, value) in &page.records {
+                    let suffix = member
+                        .as_bytes()
+                        .strip_prefix(prefix.as_bytes())
+                        .and_then(|suffix| <[u8; 8]>::try_from(suffix).ok())
+                        .ok_or_else(|| {
+                            ArgosError::CorruptedMetadata("invalid V3 quota membership key".into())
+                        })?;
+                    let quota = u64::from_be_bytes(suffix);
+                    if decode_record::<u64>(value)? == 0 {
+                        return Err(ArgosError::CorruptedMetadata(
+                            "zero V3 quota membership".into(),
+                        ));
+                    }
+                    let quota_key = Domain::Quota.inode_prefix(quota);
+                    let mut record: QuotaRecord = self
+                        .get_record(tree, quota_key.clone())?
+                        .as_deref()
+                        .map(decode_record)
+                        .transpose()?
+                        .ok_or_else(|| {
+                            ArgosError::CorruptedMetadata("missing V3 quota record".into())
+                        })?;
+                    record.used = delta(record.used)?;
+                    if new.size > old.size && record.used > u128::from(record.limit) {
+                        return Err(ArgosError::QuotaExceeded {
+                            inode: quota,
+                            used: record.used.min(u128::from(u64::MAX)) as u64,
+                            limit: record.limit,
+                        });
+                    }
+                    put(&mut staged, quota_key, &record)?;
+                }
+                if !page.more {
+                    break;
+                }
+                window.start = Bound::Excluded(
+                    page.records
+                        .last()
+                        .ok_or_else(|| {
+                            ArgosError::CorruptedMetadata("V3 quota scan made no progress".into())
+                        })?
+                        .0
+                        .clone(),
+                );
+            }
+        }
+        // No partial overlay updates survive a failed quota check.
+        self.changes.extend(staged);
+        Ok(())
+    }
+    /// Replace a block and its member references atomically. The old
+    /// mapping is checked against the generation, including repeated edits.
+    pub fn set_block(
+        &mut self,
+        ino: u64,
+        offset: u64,
+        old: Option<&FileBlock>,
+        new: Option<&FileBlock>,
+    ) -> Result<()> {
+        if ino == 0
+            || old.into_iter().chain(new).any(|block| {
+                block.raw_offset != offset
+                    || block.raw_size == 0
+                    || block
+                        .raw_offset
+                        .checked_add(block.raw_size as u64)
+                        .is_none()
+            })
+        {
+            return Err(ArgosError::Invalid("invalid V3 block range".into()));
+        }
+        let key = Domain::Block.inode_offset(ino, offset);
+        if let Some(current) = self.changes.get(&key) {
+            let current = current
+                .as_deref()
+                .map(decode_record::<FileBlock>)
+                .transpose()?;
+            if current.as_ref() != old {
+                return Err(ArgosError::Conflict("V3 block overlay changed".into()));
+            }
+        } else {
+            self.block_preconditions.insert(key.clone(), old.cloned());
+        }
+        let old_keys = old
+            .map(|block| member_block_keys(ino, block))
+            .transpose()?
+            .unwrap_or_default();
+        let new_keys = new
+            .map(|block| member_block_keys(ino, block))
+            .transpose()?
+            .unwrap_or_default();
+        // Compute all encoded values before modifying the overlay.
+        let encoded = new.map(encode_record).transpose()?;
+        let reference = new
+            .map(|block| encode_record(&block.stripe_id))
+            .transpose()?;
+        for key in old_keys.difference(&new_keys) {
+            self.delete(key.clone());
+        }
+        for key in new_keys {
+            self.changes.insert(key, reference.clone());
+        }
+        self.changes.insert(key, encoded);
+        Ok(())
     }
     /// Caller supplies the old directory entry from this transaction's
     /// snapshot. Reverse parent index changes share the publication.
@@ -279,9 +563,7 @@ impl RecordTransaction {
         Ok(())
     }
     pub fn commit(self, tree: &mut super::TypedMetadata) -> Result<super::CommitReport> {
-        if (tree.txid(), tree.root_hash()) != self.expected || tree.namespace != self.namespace {
-            return Err(ArgosError::Conflict("stale V3 metadata transaction".into()));
-        }
+        self.check_generation(tree)?;
         for (key, expected) in self.dirent_preconditions {
             let actual = tree
                 .get(key)?
@@ -290,6 +572,16 @@ impl RecordTransaction {
                 .transpose()?;
             if actual != expected {
                 return Err(ArgosError::Conflict("V3 directory entry changed".into()));
+            }
+        }
+        for (key, expected) in self.block_preconditions {
+            let actual = tree
+                .get(key)?
+                .as_deref()
+                .map(decode_record::<FileBlock>)
+                .transpose()?;
+            if actual != expected {
+                return Err(ArgosError::Conflict("V3 block mapping changed".into()));
             }
         }
         tree.commit(&self.changes)
@@ -338,6 +630,40 @@ impl<'a, R: RecordRead + ?Sized> RecordView<'a, R> {
             .as_deref()
             .map(decode_record)
             .transpose()
+    }
+
+    pub fn statistics(&self) -> Result<Option<VolumeStatistics>> {
+        self.read(Domain::Statistics.prefix())
+    }
+
+    pub fn quota(&self, ino: u64) -> Result<Option<QuotaRecord>> {
+        self.read(Domain::Quota.inode_prefix(ino))
+    }
+
+    pub fn quota_membership(&self, ino: u64, quota: u64) -> Result<Option<u64>> {
+        self.read(Domain::QuotaMembership.inode_offset(ino, quota))
+    }
+
+    pub fn member_reference_page(
+        &self,
+        id: &str,
+        after: Option<(u64, u64)>,
+        max_records: usize,
+        max_bytes: usize,
+    ) -> Result<ScanPage<TypedKey>> {
+        let prefix = Domain::MemberReference.disk(id, None)?;
+        self.source.scan_records(&ScanWindow {
+            start: match after {
+                Some((ino, offset)) => Bound::Excluded(Domain::member_block(id, ino, offset)?),
+                None => Bound::Included(prefix.clone()),
+            },
+            end: prefix
+                .prefix_end()
+                .map_or(Bound::Unbounded, Bound::Excluded),
+            max_records,
+            max_bytes,
+            order: ScanOrder::Ascending,
+        })
     }
 
     pub fn inode(&self, ino: u64) -> Result<Option<InodeCorePage>> {

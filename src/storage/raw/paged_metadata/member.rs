@@ -143,7 +143,12 @@ impl Arena {
         root: Root,
     ) -> Result<()> {
         if let Some(ptr) = root.tree {
-            if self.read_node::<K>(backend, ptr)?.level().is_none() {
+            let node = self.read_node::<K>(backend, ptr)?;
+            if if K::PERSISTENT_ALLOCATOR {
+                !matches!(node, Node::Catalog(_))
+            } else {
+                node.level().is_none()
+            } {
                 return Err(corrupt("metadata root points to an overflow page"));
             }
         }
@@ -161,6 +166,8 @@ impl Arena {
             level: Option<u8>,
             lower: Option<K>,
             upper: Option<K>,
+            domain: Option<u16>,
+            catalog: bool,
         }
         let below_start = |key: &K| match &window.start {
             Bound::Included(start) => key < start,
@@ -186,24 +193,61 @@ impl Arena {
                 level: None,
                 lower: None,
                 upper: None,
+                domain: None,
+                catalog: K::PERSISTENT_ALLOCATOR,
             })
             .collect::<Vec<_>>();
         while let Some(task) = pending.pop() {
             let node = self.read_node::<K>(backend, task.ptr)?;
-            if node.level().is_none()
-                || task.level.is_some_and(|level| node.level() != Some(level))
-                || task
-                    .upper
-                    .as_ref()
-                    .is_some_and(|upper| node.max_key().as_ref() != Some(upper))
+            if task.catalog != matches!(node, Node::Catalog(_))
+                || (!task.catalog
+                    && (node.level().is_none()
+                        || task.level.is_some_and(|level| node.level() != Some(level))
+                        || task
+                            .upper
+                            .as_ref()
+                            .is_some_and(|upper| node.max_key().as_ref() != Some(upper))))
             {
                 return Err(corrupt("metadata scan path height or upper key mismatch"));
             }
             match node {
+                Node::Catalog(roots) => {
+                    let domain_start = match &window.start {
+                        Bound::Included(key) | Bound::Excluded(key) => key.domain_id(),
+                        Bound::Unbounded => None,
+                    };
+                    let domain_end = match &window.end {
+                        Bound::Included(key) | Bound::Excluded(key) => key.domain_id(),
+                        Bound::Unbounded => None,
+                    };
+                    let next = roots
+                        .into_iter()
+                        .filter(|(domain, _)| {
+                            domain_start.is_none_or(|min| *domain >= min)
+                                && domain_end.is_none_or(|max| *domain <= max)
+                        })
+                        .map(|(domain, ptr)| Task {
+                            ptr,
+                            level: None,
+                            lower: None,
+                            upper: None,
+                            domain: Some(domain),
+                            catalog: false,
+                        })
+                        .collect::<Vec<_>>();
+                    if descending {
+                        pending.extend(next);
+                    } else {
+                        pending.extend(next.into_iter().rev());
+                    }
+                }
                 Node::Branch { level, children } => {
                     let mut lower = task.lower;
                     let mut next = Vec::new();
                     for (max, ptr) in children {
+                        if task.domain.is_some() && max.domain_id() != task.domain {
+                            return Err(corrupt("metadata branch outside catalog domain"));
+                        }
                         if lower.as_ref().is_some_and(|key| key >= &max) {
                             return Err(corrupt("metadata scan overlapping branch range"));
                         }
@@ -213,6 +257,8 @@ impl Arena {
                                 level: Some(level - 1),
                                 lower: lower.clone(),
                                 upper: Some(max.clone()),
+                                domain: task.domain,
+                                catalog: false,
                             });
                         }
                         lower = Some(max);
@@ -224,6 +270,13 @@ impl Arena {
                     }
                 }
                 Node::Leaf(mut entries) => {
+                    if task.domain.is_some()
+                        && entries
+                            .iter()
+                            .any(|(key, _)| key.domain_id() != task.domain)
+                    {
+                        return Err(corrupt("metadata leaf outside catalog domain"));
+                    }
                     if task
                         .lower
                         .as_ref()
@@ -283,6 +336,7 @@ impl Arena {
 // descriptors avoids a second device read and hash without treating an
 // unverified pointer as evidence or retaining full metadata images in RAM.
 enum ScanNode<K: TreeKey> {
+    Catalog(Vec<(u16, Ptr)>),
     Leaf {
         range: (K, K),
         blobs: Vec<(Ptr, usize)>,
@@ -315,6 +369,7 @@ impl<K: TreeKey> ScanNode<K> {
                 Self::Leaf { range, blobs }
             }
             Node::Branch { level, children } => Self::Branch { level, children },
+            Node::Catalog(roots) => Self::Catalog(roots),
             Node::Blob { next, data } => Self::Blob {
                 next,
                 len: data.len(),
@@ -326,6 +381,7 @@ impl<K: TreeKey> ScanNode<K> {
         match self {
             Self::Leaf { blobs, .. } => blobs.iter().map(|(ptr, _)| *ptr).collect(),
             Self::Branch { children, .. } => children.iter().map(|(_, ptr)| *ptr).collect(),
+            Self::Catalog(roots) => roots.iter().map(|(_, ptr)| *ptr).collect(),
             Self::Blob { next, .. } => next.iter().copied().collect(),
         }
     }
@@ -334,7 +390,7 @@ impl<K: TreeKey> ScanNode<K> {
         match self {
             Self::Leaf { .. } => Some(0),
             Self::Branch { level, .. } => Some(*level),
-            Self::Blob { .. } => None,
+            Self::Blob { .. } | Self::Catalog(_) => None,
         }
     }
 }
@@ -446,6 +502,25 @@ impl<K: TreeKey> Scanner<'_, K> {
         }
     }
 
+    fn root(&mut self, ptr: Ptr) -> Result<()> {
+        if !K::PERSISTENT_ALLOCATOR {
+            self.tree(ptr, None)?;
+            return Ok(());
+        }
+        let node = self.visit(ptr)?;
+        let ScanNode::Catalog(roots) = &*node else {
+            return Err(corrupt("V3 root is not a catalog"));
+        };
+        self.prefetch(roots.iter().map(|(_, ptr)| *ptr));
+        for (domain, ptr) in roots {
+            let (min, max) = self.tree(*ptr, None)?;
+            if min.domain_id() != Some(*domain) || max.domain_id() != Some(*domain) {
+                return Err(corrupt("metadata tree outside catalog domain"));
+            }
+        }
+        Ok(())
+    }
+
     // Every root still has independent cycle, key-range and overflow checks.
     fn tree(&mut self, ptr: Ptr, expected_level: Option<u8>) -> Result<(K, K)> {
         let node = self.visit(ptr)?;
@@ -474,7 +549,7 @@ impl<K: TreeKey> Scanner<'_, K> {
                 }
                 Ok((first.unwrap(), last.unwrap()))
             }
-            ScanNode::Blob { .. } => Err(corrupt("metadata tree points to an overflow page")),
+            ScanNode::Blob { .. } | ScanNode::Catalog(_) => Err(corrupt("invalid child tree node")),
         }
     }
 }
@@ -652,7 +727,7 @@ impl<K: TreeKey> Member<K> {
                 graph: Graph::new(),
             };
             if let Some(ptr) = candidate.tree {
-                match scanner.tree(ptr, None) {
+                match scanner.root(ptr) {
                     Ok(_) => {}
                     Err(ArgosError::Checksum(_) | ArgosError::CorruptedMetadata(_)) => continue,
                     Err(err) => return Err(err),
@@ -816,7 +891,9 @@ impl<K: TreeKey> Member<K> {
             txid,
             root.physical.map(|p| p.features),
             |plan| {
-                if root.tree.is_none() {
+                if K::PERSISTENT_ALLOCATOR {
+                    plan.update_catalog(root.tree, changes)
+                } else if root.tree.is_none() {
                     plan.build_empty(changes)
                 } else {
                     let mut tree = root.tree;
@@ -1292,8 +1369,8 @@ impl<K: TreeKey> Member<K> {
                         })
                         .transpose();
                 }
-                Node::Blob { .. } => {
-                    return Err(corrupt("metadata lookup encountered overflow page"))
+                Node::Blob { .. } | Node::Catalog(_) => {
+                    return Err(corrupt("metadata lookup encountered invalid page"))
                 }
             }
         }
@@ -1325,6 +1402,7 @@ impl<K: TreeKey> Member<K> {
                 Node::Branch { children, .. } => {
                     pending.extend(children.into_iter().rev().map(|(_, ptr)| ptr))
                 }
+                Node::Catalog(roots) => pending.extend(roots.into_iter().rev().map(|(_, ptr)| ptr)),
                 Node::Leaf(entries) => {
                     for (key, value) in entries {
                         if out
@@ -1545,7 +1623,9 @@ impl<K: TreeKey> Plan<'_, K> {
                 }
                 self.store_tree(Node::Branch { level, children }, Some(ptr))
             }
-            Node::Blob { .. } => Err(corrupt("metadata update encountered overflow page")),
+            Node::Blob { .. } | Node::Catalog(_) => {
+                Err(corrupt("metadata update encountered invalid page"))
+            }
         }
     }
 
@@ -1581,6 +1661,11 @@ impl<K: TreeKey> Plan<'_, K> {
                         replace(child)?;
                     }
                 }
+                Node::Catalog(roots) => {
+                    for (_, child) in roots {
+                        replace(child)?;
+                    }
+                }
                 Node::Leaf(entries) => {
                     for (_, value) in entries {
                         if let Value::Blob { first, .. } = value {
@@ -1606,9 +1691,63 @@ impl<K: TreeKey> Plan<'_, K> {
             .ok_or_else(|| corrupt("repair did not copy root"))
     }
 
+    fn update_catalog(
+        &mut self,
+        root: Option<Ptr>,
+        changes: &TreeChanges<K>,
+    ) -> Result<Option<Ptr>> {
+        let mut roots = match root {
+            Some(ptr) => match self.read(ptr)? {
+                Node::Catalog(roots) => roots.into_iter().collect::<BTreeMap<_, _>>(),
+                _ => return Err(corrupt("V3 transaction root is not a catalog")),
+            },
+            None => BTreeMap::new(),
+        };
+        let before = roots.clone();
+        let mut grouped = BTreeMap::<u16, Vec<(&K, &Option<Vec<u8>>)>>::new();
+        for (key, value) in changes {
+            let domain = key
+                .domain_id()
+                .ok_or_else(|| corrupt("V3 key missing domain"))?;
+            grouped.entry(domain).or_default().push((key, value));
+        }
+        for (domain, changes) in grouped {
+            let mut subtree = roots.get(&domain).copied();
+            if subtree.is_none() {
+                subtree = self.build_empty(changes)?;
+            } else {
+                for (key, value) in changes {
+                    subtree = self.update_root(subtree, key.clone(), value.as_deref())?;
+                }
+            }
+            if let Some(ptr) = subtree {
+                roots.insert(domain, ptr);
+            } else {
+                roots.remove(&domain);
+            }
+        }
+        if roots == before {
+            return Ok(root);
+        }
+        if roots.is_empty() {
+            return Ok(None);
+        }
+        if roots.len() > NODE_CAPACITY / 42 {
+            return Err(ArgosError::FileTooLarge("V3 root catalog capacity".into()));
+        }
+        self.store(Node::Catalog(roots.into_iter().collect()), root)
+            .map(Some)
+    }
+
     // Initial import is a bottom-up packed build, not N repeated COW path
     // rewrites. Later transactions retain the ordinary bounded path update.
-    fn build_empty(&mut self, changes: &TreeChanges<K>) -> Result<Option<Ptr>> {
+    fn build_empty<'b>(
+        &mut self,
+        changes: impl IntoIterator<Item = (&'b K, &'b Option<Vec<u8>>)>,
+    ) -> Result<Option<Ptr>>
+    where
+        K: 'b,
+    {
         let mut leaves = Vec::new();
         let mut entries = Vec::new();
         let mut used = 0;

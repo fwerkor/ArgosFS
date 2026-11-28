@@ -572,3 +572,316 @@ fn v3_294k_records_writable_mount_is_path_bounded() {
     assert!(tree.audit_allocators().values().all(Result::is_ok));
     eprintln!("V3 294k records: initial {} pages ({build:?}), writable open {reads} read requests ({elapsed:?}), edit {:?}",initial.members["disk-0000"].pages_written,edited.members["disk-0000"]);
 }
+
+#[test]
+fn v3_catalog_independent_domains_and_atomic_cross_domain_updates() {
+    use super::typed::Domain;
+    let (_dir, backend, arenas) = fixture(3, 4096);
+    let mut tree = TypedMetadata::format(backend.clone(), POOL, arenas.clone()).unwrap();
+    let keys = [
+        Domain::Inode.inode_prefix(1),
+        Domain::Dirent.inode_name(1, b"x").unwrap(),
+        Domain::Block.inode_offset(2, 0),
+        TypedKey::new(65535, b"extension").unwrap(),
+    ];
+    tree.commit(
+        &keys
+            .iter()
+            .cloned()
+            .map(|key| (key, Some(vec![1; 128])))
+            .collect(),
+    )
+    .unwrap();
+    let catalog = |tree: &TypedMetadata| {
+        let member = &tree.members[0];
+        let slot = member.root_slot(tree.current).unwrap();
+        let root = member.roots[slot].unwrap().tree.unwrap();
+        let mut bytes = [0; PAGE_SIZE];
+        backend
+            .read_at(
+                &member.arena.disk_id,
+                member.arena.offset + root.page * PAGE_SIZE as u64,
+                &mut bytes,
+            )
+            .unwrap();
+        match wire::Node::<TypedKey>::decode(&bytes, root.hash).unwrap() {
+            wire::Node::Catalog(roots) => roots.into_iter().collect::<BTreeMap<_, _>>(),
+            _ => panic!("missing catalog"),
+        }
+    };
+    let before = catalog(&tree);
+    assert_eq!(before.len(), 4);
+    tree.commit(&TypedChanges::from([
+        (keys[0].clone(), Some(b"updated".to_vec())),
+        (keys[2].clone(), None),
+    ]))
+    .unwrap();
+    let after = catalog(&tree);
+    assert_eq!(after.len(), 3);
+    assert_ne!(after[&keys[0].domain()], before[&keys[0].domain()]);
+    assert_eq!(after[&keys[1].domain()], before[&keys[1].domain()]);
+    assert_eq!(after[&keys[3].domain()], before[&keys[3].domain()]);
+    assert!(tree.audit_allocators().values().all(Result::is_ok));
+    drop(tree);
+    let tree = TypedMetadata::open(backend, POOL, arenas).unwrap();
+    assert_eq!(tree.get(keys[0].clone()).unwrap().unwrap(), b"updated");
+    assert!(tree.get(keys[2].clone()).unwrap().is_none());
+    assert!(tree.get(keys[3].clone()).unwrap().is_some());
+    assert!(tree.audit_allocators().values().all(Result::is_ok));
+}
+
+#[test]
+fn v3_import_quota_hardlinks_statistics_events_and_member_index() {
+    use super::typed::{
+        decode_record, import_image_with_events, Domain, RecordTransaction, RecordView,
+    };
+    let host = tempfile::tempdir().unwrap();
+    let fs = crate::ArgosFs::create(
+        host.path(),
+        crate::VolumeConfig {
+            k: 1,
+            m: 0,
+            chunk_size: 4096,
+            compression: crate::types::Compression::None,
+            ..Default::default()
+        },
+        1,
+        false,
+    )
+    .unwrap();
+    let dir = fs.mkdir("/quota", 0o755).unwrap();
+    fs.write_file("/quota/file", &vec![9; 16_384], 0o600)
+        .unwrap();
+    let ino = fs.resolve_path("/quota/file", true).unwrap();
+    fs.link_at(ino, dir, std::ffi::OsStr::new("alias")).unwrap();
+    fs.set_directory_quota("/quota", 32_768).unwrap();
+    let meta = fs.metadata_snapshot();
+    let event = crate::types::PagedAuditEvent {
+        sequence: 1,
+        txid: meta.txid,
+        time: 0.0,
+        action: "test".into(),
+        details: serde_json::json!({"x":1}),
+        advisory: false,
+    };
+    let (_dir, backend, arenas) = fixture(1, 4096);
+    let mut tree = TypedMetadata::format(backend.clone(), POOL, arenas.clone()).unwrap();
+    tree.commit(&import_image_with_events(&meta, std::slice::from_ref(&event)).unwrap())
+        .unwrap();
+    let view = RecordView::new(&tree);
+    let quota = view.quota(dir).unwrap().unwrap();
+    assert_eq!(quota.limit, 32_768);
+    assert_eq!(quota.used, 16_384);
+    assert_eq!(view.quota_membership(ino, dir).unwrap(), Some(2));
+    let stats = view.statistics().unwrap().unwrap();
+    assert_eq!(stats.files, 1);
+    assert_eq!(stats.logical_bytes, 16_384);
+    assert_eq!(stats.inodes, meta.inodes.len() as u64);
+    let block = view.block_at(ino, 0).unwrap().unwrap();
+    let disk = block.shards[0].disk_id.clone();
+    let refs = view
+        .member_reference_page(&disk, None, 128, 64 * 1024)
+        .unwrap();
+    assert_eq!(
+        refs.records.len(),
+        meta.inodes.get(&ino).unwrap().blocks.len()
+    );
+    assert_eq!(
+        decode_record::<crate::types::PagedAuditEvent>(
+            &tree.get(Domain::Event.inode_prefix(1)).unwrap().unwrap()
+        )
+        .unwrap()
+        .action,
+        "test"
+    );
+    let mut new = block.clone();
+    new.shards[0].disk_id = "replacement".into();
+    let mut tx = RecordTransaction::begin(&tree);
+    tx.set_block(ino, 0, Some(&block), Some(&new)).unwrap();
+    tx.commit(&mut tree).unwrap();
+    assert!(tree
+        .get(Domain::member_block(&disk, ino, 0).unwrap())
+        .unwrap()
+        .is_none());
+    assert!(tree
+        .get(Domain::member_block("replacement", ino, 0).unwrap())
+        .unwrap()
+        .is_some());
+    let mut stale = RecordTransaction::begin(&tree);
+    stale.set_block(ino, 0, Some(&block), None).unwrap();
+    assert!(matches!(
+        stale.commit(&mut tree),
+        Err(ArgosError::Conflict(_))
+    ));
+    drop(tree);
+    let tree = TypedMetadata::open(backend, POOL, arenas).unwrap();
+    assert_eq!(
+        RecordView::new(&tree).block_at(ino, 0).unwrap().unwrap(),
+        new
+    );
+    assert!(tree.audit_allocators().values().all(Result::is_ok));
+}
+
+#[test]
+fn v3_staged_migration_resumes_after_ambiguous_commit_and_verifies_all_records() {
+    use super::migration::MigrationSource;
+    use super::typed::{import_image, RecordView};
+    let host = tempfile::tempdir().unwrap();
+    let fs = crate::ArgosFs::create(
+        host.path(),
+        crate::VolumeConfig {
+            k: 1,
+            m: 0,
+            ..Default::default()
+        },
+        1,
+        false,
+    )
+    .unwrap();
+    fs.mkdir("/dir", 0o755).unwrap();
+    for i in 0..24 {
+        fs.create_file_path(&format!("/dir/file-{i:02}"), 0o600)
+            .unwrap();
+    }
+    let meta = fs.metadata_snapshot();
+    let pool = *uuid::Uuid::parse_str(&meta.uuid).unwrap().as_bytes();
+    let source = MigrationSource::from_image(&meta, &[]).unwrap();
+    let (_dir, backend, arenas) = fixture(3, 4096);
+    let faults = Arc::new(FaultBackend::new(backend));
+    let mut target = TypedMetadata::format(faults.clone(), pool, arenas.clone()).unwrap();
+    let first = source.begin(&mut target).unwrap();
+    assert_eq!(first.copied_records, 0);
+    assert!(source.verify(&mut target, 10, 64 * 1024).is_err());
+    let first = source.copy_step(&mut target, 7, 64 * 1024).unwrap();
+    assert_eq!(first.copied_records, 7);
+    *faults.failures.lock() = arenas
+        .iter()
+        .map(|arena| (arena.disk_id.clone(), Phase::Certificate))
+        .collect();
+    assert!(matches!(
+        source.copy_step(&mut target, 7, 64 * 1024),
+        Err(ArgosError::IndeterminateCommit(_))
+    ));
+    drop(target);
+    faults.failures.lock().clear();
+    let mut target = TypedMetadata::open(faults.clone(), pool, arenas.clone()).unwrap();
+    let mut progress = source.begin(&mut target).unwrap();
+    assert_eq!(progress.copied_records, 14);
+    let mut changed = meta.clone();
+    changed.txid += 1;
+    assert!(MigrationSource::from_image(&changed, &[])
+        .unwrap()
+        .begin(&mut target)
+        .is_err());
+    while progress.copied_records < progress.total_records {
+        progress = source.copy_step(&mut target, 7, 64 * 1024).unwrap();
+    }
+    let progress = source.verify(&mut target, 5, 64 * 1024).unwrap();
+    assert!(progress.verified);
+    drop(target);
+    let mut target = TypedMetadata::open(faults, pool, arenas).unwrap();
+    assert_eq!(source.begin(&mut target).unwrap(), progress);
+    assert_eq!(source.verify(&mut target, 8, 64 * 1024).unwrap(), progress);
+    let actual = target.records().unwrap();
+    for (key, value) in import_image(&meta).unwrap() {
+        assert_eq!(actual.get(&key), value.as_ref());
+    }
+    assert_eq!(actual.len(), progress.total_records as usize + 1);
+    let dir = RecordView::new(&target).lookup(1, b"dir").unwrap().unwrap();
+    assert_eq!(
+        RecordView::new(&target)
+            .directory_page(dir, None, 100, 64 * 1024)
+            .unwrap()
+            .0
+            .len(),
+        24
+    );
+    assert_eq!(fs.metadata_snapshot().txid, meta.txid);
+}
+
+#[test]
+fn v3_staged_migration_refuses_unmarked_or_wrong_pool_destination() {
+    use super::migration::MigrationSource;
+    let host = tempfile::tempdir().unwrap();
+    let fs = crate::ArgosFs::create(
+        host.path(),
+        crate::VolumeConfig {
+            k: 1,
+            m: 0,
+            ..Default::default()
+        },
+        1,
+        false,
+    )
+    .unwrap();
+    let meta = fs.metadata_snapshot();
+    let source = MigrationSource::from_image(&meta, &[]).unwrap();
+    let (_dir, backend, arenas) = fixture(1, 256);
+    let mut target = TypedMetadata::format(backend, POOL, arenas).unwrap();
+    assert!(source.begin(&mut target).is_err());
+    let pool = *uuid::Uuid::parse_str(&meta.uuid).unwrap().as_bytes();
+    let (_dir, backend, arenas) = fixture(1, 256);
+    let mut target = TypedMetadata::format(backend, pool, arenas).unwrap();
+    target
+        .commit(&TypedChanges::from([(
+            TypedKey::new(1, b"data").unwrap(),
+            Some(b"existing".to_vec()),
+        )]))
+        .unwrap();
+    assert!(source.begin(&mut target).is_err());
+}
+
+#[test]
+fn v3_file_core_accounting_updates_nested_quotas_once_and_rejects_overflow_atomically() {
+    use super::typed::{import_image, RecordTransaction, RecordView};
+    let host = tempfile::tempdir().unwrap();
+    let fs = crate::ArgosFs::create(
+        host.path(),
+        crate::VolumeConfig {
+            k: 1,
+            m: 0,
+            chunk_size: 4096,
+            compression: crate::types::Compression::None,
+            ..Default::default()
+        },
+        1,
+        false,
+    )
+    .unwrap();
+    let outer = fs.mkdir("/outer", 0o755).unwrap();
+    let inner = fs.mkdir("/outer/inner", 0o755).unwrap();
+    fs.write_file("/outer/inner/file", &vec![7; 16_384], 0o600)
+        .unwrap();
+    let ino = fs.resolve_path("/outer/inner/file", true).unwrap();
+    fs.link_at(ino, inner, std::ffi::OsStr::new("alias"))
+        .unwrap();
+    fs.set_directory_quota("/outer", 65_536).unwrap();
+    fs.set_directory_quota("/outer/inner", 32_768).unwrap();
+    let meta = fs.metadata_snapshot();
+    let (_dir, backend, arenas) = fixture(1, 256);
+    let mut tree = TypedMetadata::format(backend.clone(), POOL, arenas.clone()).unwrap();
+    tree.commit(&import_image(&meta).unwrap()).unwrap();
+    let mut inode = RecordView::new(&tree).inode(ino).unwrap().unwrap();
+    inode.size = 20_480;
+    let mut tx = RecordTransaction::begin(&tree);
+    tx.update_file_core(&tree, &inode).unwrap();
+    inode.size = 24_576;
+    tx.update_file_core(&tree, &inode).unwrap();
+    inode.size = 32_769;
+    assert!(
+        matches!(tx.update_file_core(&tree,&inode),Err(ArgosError::QuotaExceeded{inode, ..}) if inode==inner)
+    );
+    tx.commit(&mut tree).unwrap();
+    let view = RecordView::new(&tree);
+    assert_eq!(view.inode(ino).unwrap().unwrap().size, 24_576);
+    assert_eq!(view.quota(outer).unwrap().unwrap().used, 24_576);
+    assert_eq!(view.quota(inner).unwrap().unwrap().used, 24_576);
+    assert_eq!(view.quota_membership(ino, inner).unwrap(), Some(2));
+    assert_eq!(view.statistics().unwrap().unwrap().logical_bytes, 24_576);
+    drop(tree);
+    let tree = TypedMetadata::open(backend, POOL, arenas).unwrap();
+    assert_eq!(
+        RecordView::new(&tree).quota(inner).unwrap().unwrap().used,
+        24_576
+    );
+}
