@@ -16,6 +16,16 @@ The CLI rejects mixed selectors instead of silently ignoring them. In particular
 When `--backend` is omitted, `--images` selects the loop backend and `--devices`
 selects the raw backend.
 
+## Metadata format selection at creation
+
+New raw/loop pools use authenticated paged metadata by default.
+`mkfs --paged-metadata` explicitly selects the same format;
+`mkfs --legacy-metadata` creates the original checkpoint/journal format.
+These options are mutually exclusive and are not supported by the host backend.
+Existing pools are opened according to their superblock features and are never
+silently converted. See [persistent metadata](persistent-metadata-tree.md)
+for the one-way offline migration and compatibility requirements.
+
 ## Reusable pool selector
 
 A JSON pool configuration avoids repeating a long device list for every
@@ -109,7 +119,7 @@ exceed a quota fail with `EDQUOT`.
 
 ## Offline raw/loop integrity upgrade
 
-A one-way opt-in to the raw journal's changed-record integrity chain:
+For legacy raw/loop pools, a one-way opt-in to the raw journal's changed-record integrity chain:
 
 ```sh
 # Unmount the pool in every process, supply all active members, and back up data first.

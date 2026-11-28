@@ -167,7 +167,7 @@ fn removed_members_do_not_make_a_rootfs_degraded() {
     let images = (0..3)
         .map(|index| dir.path().join(format!("removed-{index}.img")))
         .collect::<Vec<_>>();
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,
@@ -288,7 +288,7 @@ fn preflight_report_covers_degraded_redundancy_and_unnecessary_modes() {
         dir.path().join("disk1.img"),
         dir.path().join("disk2.img"),
     ];
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 1,
@@ -331,7 +331,7 @@ fn preflight_report_covers_degraded_redundancy_and_unnecessary_modes() {
         fresh_dir.path().join("disk0.img"),
         fresh_dir.path().join("disk1.img"),
     ];
-    let fresh = ArgosFs::create_loop(
+    let fresh = ArgosFs::create_loop_legacy(
         &fresh_images,
         VolumeConfig {
             k: 1,
@@ -402,7 +402,7 @@ fn verified_open_report_matches_fresh_preflight_and_degraded_open_falls_back() {
     let images = (0..3)
         .map(|i| dir.path().join(format!("member-{i}.img")))
         .collect::<Vec<_>>();
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,

@@ -608,3 +608,36 @@ fn clap_parses_cache_info_clear_and_gc() {
         _ => panic!("cache gc parsed as the wrong command"),
     }
 }
+
+#[test]
+fn mkfs_metadata_format_flags_are_explicit_and_conflicting() {
+    for (flag, expected) in [
+        (None, (false, false)),
+        (Some("--paged-metadata"), (true, false)),
+        (Some("--legacy-metadata"), (false, true)),
+    ] {
+        let mut args = vec![
+            "argosfs", "mkfs", "--images", "disk.img", "--k", "1", "--m", "0",
+        ];
+        args.extend(flag);
+        match Cli::try_parse_from(args).unwrap().command {
+            Command::Mkfs {
+                paged_metadata,
+                legacy_metadata,
+                ..
+            } => {
+                assert_eq!((paged_metadata, legacy_metadata), expected);
+            }
+            _ => panic!("expected mkfs"),
+        }
+    }
+    let result = Cli::try_parse_from([
+        "argosfs",
+        "mkfs",
+        "--images",
+        "disk.img",
+        "--paged-metadata",
+        "--legacy-metadata",
+    ]);
+    assert!(matches!(result, Err(e) if e.kind() == ErrorKind::ArgumentConflict));
+}

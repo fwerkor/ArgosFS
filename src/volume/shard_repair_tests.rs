@@ -252,7 +252,7 @@ fn raw_extent_reconstruction_is_restartable_and_reclaims_old_allocations() {
     let images = (0..4)
         .map(|i| dir.path().join(format!("member-{i}.img")))
         .collect::<Vec<_>>();
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,
@@ -325,7 +325,7 @@ fn raw_fsck_reclaims_unreferenced_extents_and_preserves_live_data() {
     let images = (0..3)
         .map(|i| dir.path().join(format!("reclaim-{i}.img")))
         .collect::<Vec<_>>();
-    let mut fs = ArgosFs::create_loop(
+    let mut fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,
@@ -409,7 +409,7 @@ fn raw_fsck_failed_immediate_commit_restores_allocator_and_txid() {
     let images = (0..3)
         .map(|i| dir.path().join(format!("rollback-{i}.img")))
         .collect::<Vec<_>>();
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &images,
         VolumeConfig {
             k: 2,

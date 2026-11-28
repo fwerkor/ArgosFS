@@ -25,9 +25,8 @@ fn paged_pool_immediate_and_group_commit_roundtrip() {
     for deferred in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let paths = images(&dir);
-        let fs =
-            ArgosFs::create_loop_paged(&paths, config(deferred), 64 * 1024 * 1024, "paged", false)
-                .unwrap();
+        let fs = ArgosFs::create_loop(&paths, config(deferred), 64 * 1024 * 1024, "paged", false)
+            .unwrap();
         assert!(fs.paged_metadata.is_some());
         fs.mkdir("/dir", 0o755).unwrap();
         let bytes = vec![19; 32_768];
@@ -107,7 +106,7 @@ fn paged_pool_degraded_commit_and_returning_member_repair() {
 fn paged_pool_offline_upgrade_preserves_data_and_is_retryable() {
     let dir = tempfile::tempdir().unwrap();
     let paths = images(&dir);
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &paths,
         config(true),
         64 * 1024 * 1024,

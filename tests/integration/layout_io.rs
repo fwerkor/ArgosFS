@@ -376,7 +376,8 @@ fn single_device_host_and_loop_support_m_zero_layouts() {
 
     let images = loop_images(&tmp, 1);
     let loop_fs =
-        ArgosFs::create_loop(&images, config(1, 0), 32 * 1024 * 1024, "single", false).unwrap();
+        ArgosFs::create_loop_legacy(&images, config(1, 0), 32 * 1024 * 1024, "single", false)
+            .unwrap();
     let loop_payload = vec![b'l'; 20 * 1024];
     loop_fs
         .write_file("/loop-single", &loop_payload, 0o644)
@@ -412,7 +413,8 @@ fn single_device_loop_partial_read_uses_subblock_checksums() {
     cfg.chunk_size = 1024 * 1024;
     cfg.compression = Compression::None;
     cfg.l2_cache_bytes = 0;
-    let fs = ArgosFs::create_loop(&images, cfg, 32 * 1024 * 1024, "single-partial", false).unwrap();
+    let fs = ArgosFs::create_loop_legacy(&images, cfg, 32 * 1024 * 1024, "single-partial", false)
+        .unwrap();
     let payload = (0..1024 * 1024)
         .map(|index| (index % 251) as u8)
         .collect::<Vec<_>>();
@@ -470,7 +472,8 @@ fn single_device_loop_inlines_small_files_and_promotes_large_appends() {
     let images = loop_images(&tmp, 1);
     let mut cfg = config(1, 0);
     cfg.compression = Compression::None;
-    let fs = ArgosFs::create_loop(&images, cfg, 32 * 1024 * 1024, "inline-small", false).unwrap();
+    let fs =
+        ArgosFs::create_loop_legacy(&images, cfg, 32 * 1024 * 1024, "inline-small", false).unwrap();
     let small = b"small CapOS config\n";
     fs.write_file("/etc-config", small, 0o644).unwrap();
     let ino = fs.resolve_path("/etc-config", true).unwrap();

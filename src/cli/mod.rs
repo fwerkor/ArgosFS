@@ -95,6 +95,7 @@ pub fn run() -> Result<()> {
             deferred_commit_interval_ms,
             deferred_commit_max_transactions,
             paged_metadata,
+            legacy_metadata,
             force,
         } => {
             let storage = storage.resolve(BackendKind::Host)?;
@@ -122,6 +123,7 @@ pub fn run() -> Result<()> {
             let fs = match storage.backend {
                 BackendKind::Host => {
                     reject_option(paged_metadata, "--paged-metadata", BackendKind::Host)?;
+                    reject_option(legacy_metadata, "--legacy-metadata", BackendKind::Host)?;
                     reject_option(image_size.is_some(), "--image-size", BackendKind::Host)?;
                     reject_option(
                         pool_name.is_some() || storage.pool.is_some(),
@@ -140,8 +142,8 @@ pub fn run() -> Result<()> {
                     let pool_name = pool_name
                         .or(storage.pool)
                         .unwrap_or_else(|| "argosfs-root".to_string());
-                    let create = if paged_metadata {
-                        ArgosFs::create_loop_paged
+                    let create = if legacy_metadata {
+                        ArgosFs::create_loop_legacy
                     } else {
                         ArgosFs::create_loop
                     };
@@ -163,8 +165,8 @@ pub fn run() -> Result<()> {
                     let pool_name = pool_name
                         .or(storage.pool)
                         .unwrap_or_else(|| "argosfs-root".to_string());
-                    if paged_metadata {
-                        ArgosFs::create_raw_paged(&paths, config, &pool_name, force)?
+                    if legacy_metadata {
+                        ArgosFs::create_raw_legacy(&paths, config, &pool_name, force)?
                     } else {
                         ArgosFs::create_raw(&paths, config, &pool_name, force)?
                     }
@@ -186,6 +188,22 @@ pub fn run() -> Result<()> {
             let mut fs =
                 open_backend(None, storage.backend, storage.images, storage.devices, true)?;
             validate_requested_pool(&fs, storage.pool.as_deref())?;
+            let metadata = fs.metadata_snapshot();
+            if metadata.integrity.hash_scheme
+                == Some(crate::storage::raw::paged_metadata::PAGED_INTEGRITY_SCHEME)
+            {
+                fs.mark_clean_unmount()?;
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "upgraded": false,
+                        "already_paged": true,
+                        "required_feature": "raw-paged-metadata-v1",
+                        "pool_uuid": metadata.uuid
+                    })
+                );
+                return Ok(());
+            }
             fs.upgrade_delta_integrity()?;
             fs.mark_clean_unmount()?;
             println!(

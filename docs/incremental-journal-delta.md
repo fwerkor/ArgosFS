@@ -1,5 +1,9 @@
 # Issue #212: bounded-memory journal delta construction
 
+This document describes the legacy checkpoint/journal backend. Fresh raw/loop
+pools use [paged metadata](persistent-metadata-tree.md) by default;
+`mkfs --legacy-metadata` selects the original format.
+
 The previous group-commit path serialized the entire previous and current
 metadata into two serde_json::Value trees on every delta commit.
 

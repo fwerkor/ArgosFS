@@ -47,7 +47,7 @@ mkdir -p "$base/data" "$out"
 printf 'before crash journal replay\n' >"$base/data/crash.txt"
 devs=/dev/vdb,/dev/vdc,/dev/vdd
 all_devs=$devs,/dev/vde
-argosfs mkfs --backend raw --devices "$devs" --k 2 --m 1 --chunk-size 65536 --compression zstd --force --pool-name crash-root >/tmp/argosfs-crash-mkfs.json
+argosfs mkfs --legacy-metadata --backend raw --devices "$devs" --k 2 --m 1 --chunk-size 65536 --compression zstd --force --pool-name crash-root >/tmp/argosfs-crash-mkfs.json
 argosfs import-tree --backend raw --devices "$devs" "$base" /
 if ARGOSFS_CRASH_POINT=after-journal-commit-before-metadata-commit argosfs add-device --backend raw --devices "$devs" --device /dev/vde --force >/tmp/argosfs-crash-injected.log 2>&1; then
   echo expected injected crash failure >&2

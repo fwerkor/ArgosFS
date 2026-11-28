@@ -888,7 +888,7 @@ fn inline_only_range_updates_do_not_count_stripe_reencoding() {
     // Only 1+0 raw/file-block volumes support inline payloads; host does not.
     let dir = tempdir().unwrap();
     let image = dir.path().join("inline-meter.img");
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         std::slice::from_ref(&image),
         VolumeConfig {
             k: 1,
@@ -999,7 +999,7 @@ fn concurrent_unencrypted_overwrites_and_aligned_appends_recover() {
     let paths = (0..3)
         .map(|i| dir.path().join(format!("prepare-{i}.img")))
         .collect::<Vec<_>>();
-    let fs = ArgosFs::create_loop(
+    let fs = ArgosFs::create_loop_legacy(
         &paths,
         VolumeConfig {
             k: 2,
