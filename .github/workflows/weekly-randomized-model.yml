@@ -209,6 +209,9 @@ jobs:
           root="$RUNNER_TEMP/ztest"
           mkdir -p "$root"
           "$bin" model --work-dir "$root/model" --seed "$SEED" --operations 256 --topology "--$FORMAT-metadata"
+          flags=()
+          if [[ "$FORMAT" == legacy ]]; then flags=(--legacy-metadata); fi
+          "$bin" mixed --work-dir "$root/mixed" --seed "$SEED" --rounds 4 "${flags[@]}"
           "$bin" run --work-dir "$root/crash" --seed "$SEED" --cycles 16 --kill-after-ms-min 500 --kill-after-ms-max 2500 --min-faults 1 --reorder-pending --recovery-cuts 3 --recovery-eios 1 "--$FORMAT-metadata"
       - name: Upload trace and recovery artifacts
         if: always()
@@ -216,6 +219,43 @@ jobs:
         with:
           name: weekly-ztest-${{ matrix.format }}-${{ matrix.seed }}
           path: ${{ runner.temp }}/ztest
+          if-no-files-found: ignore
+
+  ztest-crash-sweep:
+    name: ztest exhaustive observed crash boundaries (${{ matrix.format }})
+    needs: prepare-matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        format: [legacy, paged]
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install system dependencies
+        run: scripts/ci/install-deps.sh
+      - name: Install Rust toolchain
+        run: scripts/ci/install-rust.sh stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ztest
+          key: weekly-ztest-release
+      - name: Build harness
+        run: cargo build --manifest-path ztest/Cargo.toml --locked --release
+      - name: Enumerate crash boundaries
+        env:
+          FORMAT: ${{ matrix.format }}
+        run: |
+          bin="$(cargo metadata --manifest-path ztest/Cargo.toml --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')/release/argosfs-ztest"
+          flags=()
+          if [[ "$FORMAT" == legacy ]]; then flags=(--legacy-metadata); fi
+          "$bin" sweep --work-dir "$RUNNER_TEMP/ztest-sweep" "${flags[@]}"
+      - name: Upload crash boundary logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: weekly-ztest-sweep-${{ matrix.format }}
+          path: ${{ runner.temp }}/ztest-sweep
           if-no-files-found: ignore
 
   fuse-posix-matrix:
@@ -461,12 +501,13 @@ jobs:
     uses: ./.github/workflows/capos-full-qemu.yml
 
   weekly-required:
-    name: Weekly six-matrix gate
+    name: Weekly chaos gate
     runs-on: ubuntu-24.04
     needs:
       - prepare-matrix
       - core-randomized-matrix
       - ztest-matrix
+      - ztest-crash-sweep
       - fuse-posix-matrix
       - fuse-block-fault-matrix
       - coverage-guided-fuzz
@@ -488,7 +529,7 @@ jobs:
               if result["result"] != "success"
           }
           if failed:
-              raise SystemExit(f"weekly six-matrix gates did not all pass: {failed}")
+              raise SystemExit(f"weekly chaos gates did not all pass: {failed}")
           print("weekly core, ztest, FUSE, storage-fault, coverage-fuzz, and QEMU matrices passed")
           PY
 
@@ -522,7 +563,7 @@ jobs:
           - FUSE seeds: $FUSE_SEEDS
           - FUSE block-fault seeds: $FAULT_SEEDS
 
-          The required gate covers the direct core reference model on x86_64 and arm64, strict ztest model and interrupted recovery on both metadata formats, mounted FUSE randomized/POSIX compatibility, FUSE plus real device-mapper faults, sharded coverage-guided libFuzzer campaigns, and the full CapOS QEMU matrix on x86_64 and arm64. Download the seed manifest and the failing shard artifacts for exact replay parameters and logs.
+          The required gate covers the direct core reference model on x86_64 and arm64, strict ztest model, concurrent storage maintenance, and exhaustive observed transaction crash boundaries on both metadata formats, mounted FUSE randomized/POSIX compatibility, FUSE plus real device-mapper faults, sharded coverage-guided libFuzzer campaigns, and the full CapOS QEMU matrix on x86_64 and arm64. Download the seed manifest and the failing shard artifacts for exact replay parameters and logs.
           EOF
           )"
           if [ -n "$existing" ]; then

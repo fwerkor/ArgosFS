@@ -167,3 +167,37 @@ exploratory and are not durable-data guarantees.
 
 Both metadata formats are exercised by pull-request smoke tests and the
 weekly randomized CI matrix. The model does not replace mounted FUSE tests.
+
+## Mixed storage-management stress and crash sweeps
+
+`mixed` runs foreground range writes, truncates, unlink, whole-file reads and
+temporary file churn against live member EIO, missing-member reopen, add,
+targeted reconstruction, removal, online layout conversion, rebalance and
+Autopilot. Each shared-inode round checks its reads against legal intermediate
+states and its final bytes against all six serial orders of the three
+conflicting content mutations. The anchor hard link keeps that inode alive
+while another name is unlinked. Other files have exact independent oracles.
+It also checks hard-link quota accounting, encryption conversion of the
+already reshaped pool, key rejection, L2 overwrite coherence, hot-tier
+migration on the host backend, and actual ENOSPC followed by extent reuse.
+
+`sweep` exercises rename replacement, unlink, overwrite, cross-block range
+write, truncate, hard link, quota and xattr. For each transaction, complete
+baseline runs measure mutating I/O calls through sync. Fresh pools exercise
+each observed ordinal; a short path that never reaches the selected ordinal
+does not count. Multiple end probes detect longer paths, and failure to
+reach an observed ordinal or exceeding the configured limit fails the run.
+Every recovery must match the whole old or new state, and a completed sync
+requires the new state. This enumerates observed I/O ordinals, not every
+possible internal thread schedule or physical power-loss state.
+
+```sh
+cargo run --release -- mixed --work-dir /tmp/mixed --seed 356 --rounds 4
+cargo run --release -- sweep --work-dir /tmp/sweep
+cargo run --release -- sweep --work-dir /tmp/sweep-legacy --legacy-metadata --operations rename,range
+```
+
+The PR smoke exercises both metadata formats; the weekly gate additionally
+runs every sweep operation and seeded multi-round mixed stress. Successful
+sweep trials delete their disposable images but retain configs and boundary
+logs; failures retain the affected images. Use a new work directory on replay.
