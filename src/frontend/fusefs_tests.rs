@@ -1319,24 +1319,20 @@ fn blocked_inode_flush_does_not_hold_mount_writeback_map() {
 }
 
 #[test]
-fn optional_fuse_capabilities_negotiate_without_all_or_nothing_failure() {
+fn optional_fuse_capabilities_preserve_read_only_directory_listing() {
     use InitFlags as F;
     assert_eq!(
         fuse_optional_capabilities(F::FUSE_PARALLEL_DIROPS),
         F::FUSE_PARALLEL_DIROPS
     );
     assert_eq!(
-        fuse_optional_capabilities(F::FUSE_DO_READDIRPLUS),
-        F::FUSE_DO_READDIRPLUS
-    );
-    assert_eq!(
-        fuse_optional_capabilities(F::FUSE_READDIRPLUS_AUTO),
+        fuse_optional_capabilities(F::FUSE_DO_READDIRPLUS | F::FUSE_READDIRPLUS_AUTO),
         F::empty()
     );
     let supported = F::FUSE_DO_READDIRPLUS | F::FUSE_READDIRPLUS_AUTO | F::FUSE_PARALLEL_DIROPS;
     assert_eq!(
         fuse_optional_capabilities(supported | F::FUSE_WRITEBACK_CACHE),
-        supported
+        F::FUSE_PARALLEL_DIROPS
     );
 }
 

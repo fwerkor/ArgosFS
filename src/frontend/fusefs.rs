@@ -72,12 +72,12 @@ fn fuse_io_env(name: &str, min: u32, max: u32, default: u32) -> u32 {
 }
 
 fn fuse_optional_capabilities(supported: InitFlags) -> InitFlags {
-    let mut flags = supported & InitFlags::FUSE_PARALLEL_DIROPS;
-    if supported.contains(InitFlags::FUSE_DO_READDIRPLUS) {
-        flags |= InitFlags::FUSE_DO_READDIRPLUS;
-        flags |= supported & InitFlags::FUSE_READDIRPLUS_AUTO;
-    }
-    flags
+    // READDIRPLUS must not expose child lookup results when a caller can
+    // read directory names but cannot search the directory. fuser 0.18
+    // couples entry_out.nodeid with dirent.ino, so it cannot encode a
+    // names-only plus entry with the original inode number and nodeid 0.
+    // Keep ordinary READDIR semantics until that representation is available.
+    supported & InitFlags::FUSE_PARALLEL_DIROPS
 }
 
 pub struct ArgosFuse {
@@ -524,9 +524,7 @@ impl Filesystem for ArgosFuse {
         }
         let _ = config.set_max_background(background);
         let _ = config.set_congestion_threshold(background * 3 / 4);
-        // add_capabilities rejects the entire set if even one flag is
-        // unsupported. Negotiate each supported feature independently;
-        // READDIRPLUS_AUTO also requires DO_READDIRPLUS.
+        // Request only supported capabilities with permission-safe handlers.
         let _ = config.add_capabilities(fuse_optional_capabilities(config.capabilities()));
         Ok(())
     }

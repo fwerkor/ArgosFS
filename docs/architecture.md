@@ -230,9 +230,11 @@ to repair actual damage. The operation is deliberately not a mount side effect.
 
 ### Linux FUSE request negotiation
 
-The mount requests parallel directory operations and adaptive READDIRPLUS only
-when advertised by the kernel; adaptive READDIRPLUS requires its base
-capability. The request limits retain the default 1 MiB write and readahead
+The mount requests parallel directory operations when advertised by the kernel.
+READDIRPLUS is deliberately not negotiated: ordinary directory enumeration
+requires read permission alone, and the current fuser reply API cannot
+represent a names-only plus entry with a separate zero lookup node ID.
+The request limits retain the default 1 MiB write and readahead
 targets, 64 background requests and a 75% congestion threshold. Operators may
 override the targets with `ARGOSFS_FUSE_MAX_WRITE` and
 `ARGOSFS_FUSE_MAX_READAHEAD` (4096–1048576 bytes), or
