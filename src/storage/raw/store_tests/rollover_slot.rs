@@ -809,3 +809,165 @@ fn explicit_checkpoint_does_not_erase_certified_minority_base() {
         tip.txid
     );
 }
+
+#[test]
+fn framed_checkpoint_reuses_inode_groups_and_rewrites_only_changed_pages() {
+    let (_dir, images, base, superblocks) = quorum_fixture();
+    let backend = block_backend_for(&images);
+    let upgraded = upgrade_delta_integrity_members(&backend, &superblocks, &base).unwrap();
+    let mut previous = base.clone();
+    let mut template = previous
+        .inodes
+        .values()
+        .find(|inode| inode.kind == crate::types::NodeKind::File)
+        .unwrap()
+        .clone();
+    template.blocks.clear();
+    template.inline_data = None;
+    template.inline_sha256.clear();
+    template.size = 0;
+    // Large metadata with realistic, stable inode fields and many ranges.
+    // An xattr models a populated small-file namespace.
+    template
+        .xattrs
+        .insert("user.archive".into(), "x".repeat(512));
+    for ino in 10_000..18_192 {
+        let mut inode = template.clone();
+        inode.id = ino;
+        previous.inodes.insert(ino, inode);
+        previous
+            .inodes
+            .get_mut(&1)
+            .unwrap()
+            .entries
+            .insert(format!("file-{ino}"), ino);
+    }
+    previous.next_inode = 18_192;
+    previous.txid += 1;
+    previous.updated_at += 1.0;
+    journal::prepare_metadata_integrity_with_previous(
+        &mut previous,
+        base.integrity.meta_hash.clone(),
+    )
+    .unwrap();
+
+    let payload = prepare_checkpoint_payload(&previous, &upgraded).unwrap();
+    let exact = serde_json::to_vec(&CheckpointWire {
+        metadata: &previous,
+        checkpoint_member_catalog: previous.inodes.checkpoint_catalog(),
+    })
+    .unwrap();
+    assert_eq!(
+        payload.original.as_ref().unwrap(),
+        &(exact.len() as u64, sha256_hex(&exact))
+    );
+    assert_eq!(
+        zstd::stream::decode_all(payload.bytes.as_slice()).unwrap(),
+        exact
+    );
+    assert_eq!(payload.bytes.len() % METADATA_PAGE_SIZE, 0);
+
+    let first_frames = previous.inodes.checkpoint_frames().unwrap();
+    assert!(first_frames.len() > 10);
+    let before = prepare_checkpoint_writes(&previous, &upgraded).unwrap();
+    let mut next = previous.clone();
+    next.inodes.get_mut(&12_345).unwrap().uid = 123;
+    next.txid += 1;
+    next.updated_at += 1.0;
+    journal::prepare_metadata_integrity_with_previous(
+        &mut next,
+        previous.integrity.meta_hash.clone(),
+    )
+    .unwrap();
+    let second_frames = next.inodes.checkpoint_frames().unwrap();
+    assert_eq!(first_frames.len(), second_frames.len());
+    let changed = first_frames
+        .iter()
+        .zip(&second_frames)
+        .filter(|(old, new)| !Arc::ptr_eq(old, new))
+        .count();
+    assert_eq!(
+        changed, 1,
+        "only the modified inode range may be encoded again"
+    );
+    assert!(previous
+        .inodes
+        .checkpoint_frames()
+        .unwrap()
+        .iter()
+        .zip(&first_frames)
+        .all(|(old, cached)| Arc::ptr_eq(old, cached)));
+    let after = prepare_checkpoint_writes(&next, &upgraded).unwrap();
+    // Exercise the ordinary two-slot quorum writer, not just the codec.
+    write_metadata_copies_quorum(&backend, &upgraded, &previous).unwrap();
+    write_metadata_copies_quorum(&backend, &upgraded, &next).unwrap();
+    for member in &upgraded {
+        let mut txids = checkpoint_slot_txids(&backend, member);
+        txids.sort_unstable();
+        assert_eq!(txids, [previous.txid, next.txid]);
+    }
+    let recovered = recover_metadata(&backend, &upgraded).unwrap();
+    assert_eq!(recovered.txid, next.txid);
+    assert_eq!(recovered.inodes.get(&12_345).unwrap().uid, 123);
+    assert_eq!(before.data_start, after.data_start);
+    assert_eq!(before.payload.len(), after.payload.len());
+    let sb = &upgraded[0];
+    let slot = sb.metadata.offset;
+    write_metadata_slot(&backend, sb, slot, &before, None).unwrap();
+    let metrics = CommitMetrics::default();
+    write_metadata_slot_differential(&backend, sb, slot, &after, Some(&metrics)).unwrap();
+    let written = metrics
+        .raw_write_byte_snapshots()
+        .find(|(kind, _)| *kind == "checkpoint")
+        .unwrap()
+        .1;
+    let full = after.header.len() as u64
+        + after
+            .body_writes()
+            .map(|(_, data)| data.len() as u64)
+            .sum::<u64>();
+    eprintln!("framed checkpoint: {written} differential bytes vs {full} full bytes");
+    assert!(
+        written < full / 8,
+        "framed write amplification: {written} / {full}"
+    );
+    let decoded = decode_metadata_payload(&after.header, &after.payload).unwrap();
+    assert_eq!(decoded.inodes.get(&12_345).unwrap().uid, 123);
+    assert_eq!(decoded.inodes.len(), next.inodes.len());
+    assert_eq!(
+        journal::canonical_metadata_hash(&decoded).unwrap(),
+        next.integrity.meta_hash
+    );
+
+    // Removal and insertion must invalidate the affected frames as well,
+    // including a newly created group. The original snapshot is unchanged.
+    let mut edits = next.clone();
+    let mut inserted = edits.inodes.get(&12_345).unwrap().clone();
+    inserted.id = 100_000;
+    edits.inodes.remove(&12_345);
+    edits.inodes.insert(inserted.id, inserted);
+    let edited_payload = prepare_checkpoint_payload(&edits, &upgraded).unwrap();
+    let edited_exact = serde_json::to_vec(&CheckpointWire {
+        metadata: &edits,
+        checkpoint_member_catalog: edits.inodes.checkpoint_catalog(),
+    })
+    .unwrap();
+    assert_eq!(
+        zstd::stream::decode_all(edited_payload.bytes.as_slice()).unwrap(),
+        edited_exact
+    );
+    assert!(next.inodes.contains_key(&12_345));
+    assert!(!next.inodes.contains_key(&100_000));
+
+    // The compact fallback remains available on a tighter legacy slot.
+    let mut tight = upgraded.clone();
+    for member in &mut tight {
+        member.metadata.length = 128 * 1024;
+    }
+    let dense = prepare_checkpoint_payload(&previous, &tight).unwrap();
+    assert!(dense.original.is_some());
+    assert_eq!(
+        zstd::stream::decode_all(dense.bytes.as_slice()).unwrap(),
+        exact
+    );
+}

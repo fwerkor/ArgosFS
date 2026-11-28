@@ -124,11 +124,30 @@ SHA-256 unless explicitly upgraded. Large pools can enable authenticated,
 changed-record delta hashes on the normal deferred group-commit path using the
 one-way `argosfs upgrade-integrity --pool-config FILE --offline-confirmed`
 command. The upgrade requires **all active members** and an unmounted pool,
-changes a mandatory feature bit in both superblocks, and prevents older
-ArgosFS binaries from mounting. The v2 change does not alter region offsets,
-the journal envelope, or existing payload checksums. See
+changes mandatory feature bits in both superblocks, and prevents older
+ArgosFS binaries from mounting. The v2 change does not alter region offsets
+or existing payload checksums. The upgraded journal can also compress individual
+records, identified by a flag in the existing envelope. See
 [`incremental-journal-delta.md`](incremental-journal-delta.md) for upgrade,
 crash-recovery and downgrade precautions.
+
+## Incremental framed checkpoints
+
+After the explicit integrity upgrade, complete pools with at least 4,096
+inodes can use the existing compressed-checkpoint wire format with independent
+Zstd frames for stable 512-inode ID ranges. A copy-on-write cache retains frames
+across metadata snapshots, and inode insertion, deletion or mutation invalidates
+only the corresponding range. Header and optional member catalog are encoded
+separately. Legal Zstd skippable padding aligns frames to metadata pages; modest
+tail padding keeps the checkpoint index boundary stable for small changes.
+Recovery still checks the existing full compressed and expanded hashes, plus
+per-page digests, before interpreting the same JSON.
+
+Sparse or capacity-constrained pools automatically retain the dense encoding.
+A frame growing across a page boundary can shift following frames, so this is
+not a constant-I/O checkpoint protocol: the compressed stream is assembled and
+the expanded digest recomputed, and target pages are physically compared before
+reuse. No existing checkpoint format or recovery anchor rule changes.
 
 ## Device I/O deadline
 

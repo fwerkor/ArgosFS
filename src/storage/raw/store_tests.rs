@@ -2155,6 +2155,121 @@ fn journal_replays_acked_delta_from_surviving_certified_checkpoint() {
 }
 
 #[test]
+fn compressed_journal_avoids_rollover_and_replays_across_mixed_records() {
+    let (_dir, images, previous, superblocks) = quorum_fixture();
+    let backend = block_backend_for(&images);
+    let upgraded = upgrade_delta_integrity_members(&backend, &superblocks, &previous).unwrap();
+    assert!(upgraded
+        .iter()
+        .all(|sb| sb.required_feature_flags & REQUIRED_FEATURE_JOURNAL_COMPRESSION != 0));
+
+    // A partial upgrade must not emit the new encoding on any member.
+    let mut mixed = upgraded.clone();
+    mixed[0].required_feature_flags &= !REQUIRED_FEATURE_JOURNAL_COMPRESSION;
+    let mut next = previous.clone();
+    next.txid += 1;
+    next.updated_at += 1.0;
+    next.raw_pool.pool_name = "mixed-compression-features".into();
+    journal::prepare_delta_integrity(&mut next, &previous).unwrap();
+    let offset = raw_journal_end(&backend, &mixed[0]);
+    append_transaction_with_trusted_integrity_quorum(
+        &backend,
+        &mixed,
+        &next,
+        Some(&previous),
+        "mixed-journal",
+        serde_json::json!({"payload": "a".repeat(16 * 1024)}),
+    )
+    .unwrap();
+    let mut header = [0; 36];
+    backend
+        .read_at(
+            &mixed[0].disk_id,
+            mixed[0].journal.offset + offset,
+            &mut header,
+        )
+        .unwrap();
+    assert!(!journal_entry_length(&mixed[0], &header).unwrap().1);
+
+    // A large, repetitive delta fits into a few KiB after compression; the
+    // corresponding legacy journal record would force a full checkpoint.
+    let mut third = next.clone();
+    third.txid += 1;
+    third.updated_at += 1.0;
+    third.raw_pool.pool_name = "compressed-journal".into();
+    journal::prepare_delta_integrity(&mut third, &next).unwrap();
+    let mut short = upgraded.clone();
+    let offset = raw_journal_end(&backend, &short[0]);
+    for sb in &mut short {
+        sb.journal.length = raw_journal_end(&backend, sb) + 4096;
+    }
+    let metrics = CommitMetrics::default();
+    append_journal_quorum(
+        &backend,
+        &short,
+        &third,
+        Some(&next),
+        "compressed-journal",
+        serde_json::json!({"payload": "b".repeat(128 * 1024)}),
+        JournalQuorumOptions {
+            mode: JournalQuorumMode::TrustedTransaction,
+            metrics: Some(&metrics),
+            prepared_delta: None,
+        },
+    )
+    .unwrap();
+    backend
+        .read_at(
+            &short[0].disk_id,
+            short[0].journal.offset + offset,
+            &mut header,
+        )
+        .unwrap();
+    let (len, compressed) = journal_entry_length(&short[0], &header).unwrap();
+    assert!(compressed);
+    assert!(len < 2048);
+    assert!(journal_entry_length(&mixed[0], &header).is_err());
+    assert_eq!(
+        journal_tip_identity(&backend, &short[0]).unwrap(),
+        Some((third.txid, third.integrity.meta_hash.clone()))
+    );
+    let (recovered, report) = load_or_recover(&backend, &short, false).unwrap();
+    assert_eq!(report.invalid_entries, 0, "{:?}", report.errors);
+    assert_eq!(recovered.integrity, third.integrity);
+    assert_eq!(recovered.raw_pool.pool_name, third.raw_pool.pool_name);
+
+    // Keep the verified checksum and bounded expansion requirements separate:
+    // a malformed compressed prefix must not trigger an unbounded allocation.
+    assert!(decode_journal_payload(&u32::MAX.to_le_bytes(), true).is_err());
+    assert!(decode_journal_payload(&[1, 0, 0, 0], true).is_err());
+    // Damage one member; the two intact members still recover the same tip.
+    let mut byte = [0; 1];
+    backend
+        .read_at(
+            &short[0].disk_id,
+            short[0].journal.offset + offset + 36,
+            &mut byte,
+        )
+        .unwrap();
+    byte[0] ^= 1;
+    backend
+        .write_at(
+            &short[0].disk_id,
+            short[0].journal.offset + offset + 36,
+            &byte,
+        )
+        .unwrap();
+    assert!(matches!(
+        journal_tip_identity(&backend, &short[0]),
+        Err(ArgosError::Checksum(_))
+    ));
+    assert_eq!(
+        recover_metadata(&backend, &short).unwrap().integrity,
+        third.integrity
+    );
+}
+
+#[test]
 fn prepared_v2_group_delta_survives_quorum_journal_replay() {
     let (_dir, images, previous, superblocks) = quorum_fixture();
     let backend = block_backend_for(&images);
@@ -2299,6 +2414,10 @@ fn interrupted_integrity_feature_upgrade_is_retryable_without_v2_records() {
             0
         );
         assert_ne!(sb.required_feature_flags & REQUIRED_FEATURE_ARRAY_SPLICE, 0);
+        assert_ne!(
+            sb.required_feature_flags & REQUIRED_FEATURE_JOURNAL_COMPRESSION,
+            0
+        );
     }
     assert!(array_splice_feature_enabled(&upgraded));
     assert_eq!(

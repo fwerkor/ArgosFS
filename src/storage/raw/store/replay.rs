@@ -158,7 +158,17 @@ pub(super) fn scan_journal_metadata(
                 report.invalid_entries += 1;
                 break;
             }
-            let len = u32::from_le_bytes(entry_header[..4].try_into().unwrap()) as usize;
+            let (len, compressed) = match journal_entry_length(sb, &entry_header) {
+                Ok(value) => value,
+                Err(err) => {
+                    report.invalid_entries += 1;
+                    report.errors.push(format!(
+                        "raw journal record at {}:{}: {err}",
+                        sb.disk_id, cursor
+                    ));
+                    break;
+                }
+            };
             if len == 0 || cursor + 36 + len as u64 > end {
                 report.invalid_entries += 1;
                 break;
@@ -175,11 +185,11 @@ pub(super) fn scan_journal_metadata(
                 ));
                 break;
             }
-            if hex::encode(&entry_header[4..36]) != sha256_hex(&bytes) {
+            if Sha256::digest(&bytes).as_slice() != &entry_header[4..36] {
                 report.invalid_entries += 1;
                 break;
             }
-            match serde_json::from_slice::<RawJournalRecord>(&bytes) {
+            match decode_journal_payload(&bytes, compressed) {
                 Ok(record) => {
                     if raw_record_hash(&record)? != record.record_hash {
                         report.invalid_entries += 1;
