@@ -2,7 +2,6 @@
 //!
 //! The in-memory representation is independent of the serialized Metadata
 //! format: JSON always writes keys in increasing inode order.
-use super::checkpoint_chunks::{CheckpointChunks, CheckpointFrame};
 use super::types::{Inode, InodeId};
 use imbl::{HashMap, OrdMap, OrdSet};
 use serde::de::Deserializer;
@@ -13,6 +12,8 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Index;
 use std::sync::{Arc, OnceLock};
+
+use super::checkpoint_chunks::{CheckpointChunks, CheckpointFrame};
 
 /// A checkpoint-only derived extension. The normal Metadata serializer
 /// deliberately omits it, so legacy integrity identities remain unchanged.
