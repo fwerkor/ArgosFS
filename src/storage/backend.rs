@@ -338,7 +338,7 @@ impl StorageBackend for FileBlockBackend {
     ) -> Result<()> {
         let device = self.device(device_id)?;
         #[cfg(target_os = "linux")]
-        if mode == IoMode::IoUring {
+        if matches!(mode, IoMode::Buffered | IoMode::IoUring) {
             // Asynchronous submission is limited to disjoint, bounded
             // ranges. Contiguous ranges already benefit from pwritev.
             if super::raw_uring::eligible(&writes, device.capacity)

@@ -2282,7 +2282,7 @@ impl ArgosFs {
                 .collect()
         };
         let submit = |backend: &dyn StorageBackend| {
-            if meta.config.io_mode == IoMode::IoUring {
+            if matches!(meta.config.io_mode, IoMode::Buffered | IoMode::IoUring) {
                 backend.write_owned_batch(&disk_id.to_string(), owned(), meta.config.io_mode)
             } else {
                 backend.write_batch(&disk_id.to_string(), writes)

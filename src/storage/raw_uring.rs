@@ -2,7 +2,7 @@
 //! A per-device deadline worker reuses its ring. No request is acknowledged
 //! before every completion is consumed; the caller retains its flush barrier.
 use crate::error::{ArgosError, Result};
-use io_uring::{opcode, types, IoUring};
+use io_uring::{opcode, types, IoUring, Probe};
 use std::cell::RefCell;
 use std::fs::File;
 use std::io;
@@ -11,6 +11,21 @@ use std::os::unix::fs::FileExt;
 
 const DEPTH: usize = 64;
 const MAX_BYTES: usize = 4 * 1024 * 1024;
+
+fn disabled_by_operator() -> bool {
+    static DISABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *DISABLED.get_or_init(|| std::env::var_os("ARGOSFS_DISABLE_IO_URING").is_some_and(|v| v == "1"))
+}
+
+fn create_ring() -> io::Result<IoUring> {
+    let ring = IoUring::new(DEPTH as u32)?;
+    let mut probe = Probe::new();
+    ring.submitter().register_probe(&mut probe)?;
+    if !probe.is_supported(opcode::Write::CODE) {
+        return Err(io::Error::from_raw_os_error(libc::EOPNOTSUPP));
+    }
+    Ok(ring)
+}
 
 #[derive(Default)]
 struct WorkerRing {
@@ -70,12 +85,12 @@ impl Drop for PayloadGuard<'_> {
 pub(super) fn write(file: &File, writes: &mut Vec<(u64, Vec<u8>)>) -> Result<bool> {
     WORKER.with(|worker| {
         let mut worker = worker.borrow_mut();
-        if worker.disabled {
+        if disabled_by_operator() || worker.disabled {
             return Ok(false);
         }
         let mut ring = match worker.ring.take() {
             Some(ring) => ring,
-            None => match IoUring::new(DEPTH as u32) {
+            None => match create_ring() {
                 Ok(ring) => ring,
                 Err(_) => {
                     worker.disabled = true;
