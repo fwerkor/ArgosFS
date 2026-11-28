@@ -28,6 +28,7 @@ pub struct WorkerConfig {
 
 struct LocalModel {
     files: BTreeMap<String, Vec<u8>>,
+    verified: BTreeMap<String, u64>,
     sequence: u64,
 }
 
@@ -35,8 +36,26 @@ impl LocalModel {
     fn new() -> Self {
         Self {
             files: BTreeMap::new(),
+            verified: BTreeMap::new(),
             sequence: 0,
         }
+    }
+
+    fn remove(&mut self, path: &str) {
+        self.files.remove(path);
+        self.verified.remove(path);
+    }
+
+    fn record(&mut self, path: String, data: Vec<u8>, generation: Option<u64>) {
+        self.verified.remove(&path);
+        if let Some(generation) = generation {
+            self.verified.insert(path.clone(), generation);
+        }
+        self.files.insert(path, data);
+    }
+
+    fn trusted(&self, path: &str, generation: u64) -> bool {
+        self.verified.get(path) == Some(&generation)
     }
 
     fn name(&mut self, prefix: &str) -> String {
@@ -130,9 +149,10 @@ pub fn run_worker(config: WorkerConfig) -> Result<()> {
     for thread_index in 0..config.threads.max(1) {
         let fs = fs.clone();
         let config = config.clone();
+        let stats = stats.clone();
         std::thread::Builder::new()
             .name(format!("ztest-chaos-{thread_index}"))
-            .spawn(move || chaos_loop(fs, config, thread_index))?;
+            .spawn(move || chaos_loop(fs, config, thread_index, stats))?;
     }
 
     std::fs::File::create(&config.ready)?;
@@ -220,7 +240,7 @@ fn write_epoch(
     Ok(records)
 }
 
-fn chaos_loop(fs: ArgosFs, config: WorkerConfig, thread_index: usize) -> ! {
+fn chaos_loop(fs: ArgosFs, config: WorkerConfig, thread_index: usize, stats: Arc<FaultStats>) -> ! {
     let mut rng = LocalRng::new(
         config
             .seed
@@ -229,6 +249,7 @@ fn chaos_loop(fs: ArgosFs, config: WorkerConfig, thread_index: usize) -> ! {
     let root = format!("/scratch/s{:016x}-t{thread_index:02}", config.seed);
     let _ = fs.mkdir(&root, 0o755);
     let mut model = LocalModel::new();
+    let generation = || stats.snapshot().injected();
 
     loop {
         match rng.below(12) {
@@ -236,41 +257,55 @@ fn chaos_loop(fs: ArgosFs, config: WorkerConfig, thread_index: usize) -> ! {
                 let name = model.name("file");
                 let path = format!("{root}/{name}");
                 let data = rng.bytes(config.max_file_bytes);
+                let before = generation();
                 if fs.write_file(&path, &data, 0o644).is_ok() {
-                    model.files.insert(path, data);
+                    let after = generation();
+                    model.record(path, data, (before == after).then_some(after));
                 }
             }
             2 | 3 => {
                 if let Some(path) = pick(&model.files, &mut rng) {
                     let data = rng.bytes(config.max_file_bytes);
+                    let before = generation();
                     if fs.write_file(&path, &data, 0o644).is_ok() {
-                        model.files.insert(path, data);
+                        let after = generation();
+                        model.record(path, data, (before == after).then_some(after));
+                    } else {
+                        // A failed write can have an indeterminate outcome.
+                        model.remove(&path);
                     }
                 }
             }
             4 | 5 => {
                 if let Some(path) = pick(&model.files, &mut rng) {
-                    match fs.read_file(&path, true) {
-                        Ok(data) => {
-                            let mismatch = model
-                                .files
-                                .get(&path)
-                                .is_some_and(|expected| &data != expected);
-                            if mismatch {
-                                // A torn, lost, or EIO-after-write fault can
-                                // legitimately leave old or partial data. The
-                                // host oracle is the durable correctness gate;
-                                // a scratch path is only useful while its local
-                                // model still matches.
-                                eprintln!(
-                                    "ztest: scratch mismatch reading {path}; dropping local model entry"
-                                );
-                                model.files.remove(&path);
+                    let before = generation();
+                    let result = fs.read_file(&path, true);
+                    let after = generation();
+                    // No new fault since a verified state means no legitimate
+                    // excuse for wrong bytes or an unexpected read error.
+                    let strict = before == after && model.trusted(&path, before);
+                    match result {
+                        Ok(data) if model.files.get(&path) == Some(&data) => {
+                            if before == after {
+                                model.verified.insert(path, after);
                             }
                         }
-                        Err(_) => {
-                            // Injected EIO and damage are expected to surface
-                            // as errors; silent wrong data never is.
+                        Ok(_) if strict => {
+                            panic!("scratch content mismatch without intervening fault: {path}")
+                        }
+                        Err(err) if strict => {
+                            panic!("scratch read failed without intervening fault: {path}: {err}")
+                        }
+                        result => {
+                            eprintln!(
+                                "ztest: ambiguous scratch result for {path}: {}",
+                                if result.is_ok() {
+                                    "content mismatch"
+                                } else {
+                                    "read failure"
+                                }
+                            );
+                            model.remove(&path);
                         }
                     }
                 }
@@ -278,23 +313,46 @@ fn chaos_loop(fs: ArgosFs, config: WorkerConfig, thread_index: usize) -> ! {
             6 => {
                 if let Some(path) = pick(&model.files, &mut rng) {
                     let append = rng.bytes(4096);
-                    if let Ok(ino) = fs.resolve_path(&path, true) {
-                        let offset = model.files.get(&path).map_or(0, |data| data.len() as u64);
-                        if fs.write_inode_range(ino, offset, &append).is_ok() {
-                            if let Some(data) = model.files.get_mut(&path) {
-                                data.extend_from_slice(&append);
+                    let before = generation();
+                    let trusted = model.trusted(&path, before);
+                    let offset = model.files[&path].len() as u64;
+                    let result = fs
+                        .resolve_path(&path, true)
+                        .and_then(|ino| fs.write_inode_range(ino, offset, &append));
+                    let after = generation();
+                    match result {
+                        Ok(n) if n == append.len() => {
+                            model
+                                .files
+                                .get_mut(&path)
+                                .unwrap()
+                                .extend_from_slice(&append);
+                            model.verified.remove(&path);
+                            if trusted && before == after {
+                                model.verified.insert(path, after);
                             }
                         }
+                        Ok(n) if trusted && before == after => {
+                            panic!("short scratch write without intervening fault: {path}: {n}")
+                        }
+                        _ => model.remove(&path),
                     }
                 }
             }
             7 => {
                 if let Some(path) = pick(&model.files, &mut rng) {
                     let size = rng.below(config.max_file_bytes.saturating_add(1)) as u64;
+                    let before = generation();
+                    let trusted = model.trusted(&path, before);
                     if fs.truncate_path(&path, size).is_ok() {
-                        if let Some(data) = model.files.get_mut(&path) {
-                            data.resize(size as usize, 0);
+                        let after = generation();
+                        model.files.get_mut(&path).unwrap().resize(size as usize, 0);
+                        model.verified.remove(&path);
+                        if trusted && before == after {
+                            model.verified.insert(path, after);
                         }
+                    } else {
+                        model.remove(&path);
                     }
                 }
             }
@@ -302,18 +360,26 @@ fn chaos_loop(fs: ArgosFs, config: WorkerConfig, thread_index: usize) -> ! {
                 if let Some(old_path) = pick(&model.files, &mut rng) {
                     let name = model.name("moved");
                     let new_path = format!("{root}/{name}");
+                    let before = generation();
+                    let trusted = model.trusted(&old_path, before);
                     if fs.rename_path(&old_path, &new_path).is_ok() {
-                        if let Some(data) = model.files.remove(&old_path) {
-                            model.files.insert(new_path, data);
-                        }
+                        let after = generation();
+                        let data = model.files.remove(&old_path).unwrap();
+                        model.verified.remove(&old_path);
+                        model.record(
+                            new_path,
+                            data,
+                            (trusted && before == after).then_some(after),
+                        );
+                    } else {
+                        model.remove(&old_path);
                     }
                 }
             }
             9 => {
                 if let Some(path) = pick(&model.files, &mut rng) {
-                    if fs.unlink_path(&path).is_ok() {
-                        model.files.remove(&path);
-                    }
+                    let _ = fs.unlink_path(&path);
+                    model.remove(&path);
                 }
             }
             10 => {
