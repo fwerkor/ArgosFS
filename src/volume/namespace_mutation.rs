@@ -249,6 +249,8 @@ impl ArgosFs {
         } else if child_inode.kind == NodeKind::Directory {
             return Err(ArgosError::IsDirectory(name.to_string()));
         }
+        let quota_candidate =
+            self.plan_quota_edges_locked(meta, &[(parent, child)], &[], dir.then_some(child))?;
         self.dir_inode_mut_locked(meta, parent)?
             .entries
             .remove(name);
@@ -276,7 +278,7 @@ impl ArgosFs {
         if child_inode.kind == NodeKind::Directory {
             self.forget_parent_link(child);
         }
-        self.refresh_quota_runtime_if_active_locked(meta)?;
+        self.publish_quota_edges(quota_candidate);
         self.finish_block_reclamation_locked(meta, &blocks_to_delete);
         Ok(())
     }
@@ -377,16 +379,12 @@ impl ArgosFs {
                     "cannot exchange a directory into itself".to_string(),
                 ));
             }
-            if self.has_directory_quotas() {
-                let mut quota_candidate = meta.clone();
-                self.dir_inode_mut_locked(&mut quota_candidate, old_parent)?
-                    .entries
-                    .insert(old_name.to_string(), existing);
-                self.dir_inode_mut_locked(&mut quota_candidate, new_parent)?
-                    .entries
-                    .insert(new_name.to_string(), child);
-                self.validate_all_directory_quotas_locked(&quota_candidate)?;
-            }
+            let quota_candidate = self.plan_quota_edges_locked(
+                meta,
+                &[(old_parent, child), (new_parent, existing)],
+                &[(new_parent, child), (old_parent, existing)],
+                None,
+            )?;
             self.dir_inode_mut_locked(meta, old_parent)?
                 .entries
                 .insert(old_name.to_string(), existing);
@@ -426,7 +424,7 @@ impl ArgosFs {
             if existing_inode.kind == NodeKind::Directory {
                 self.remember_parent_link(old_parent, old_name, existing);
             }
-            self.refresh_quota_runtime_if_active_locked(meta)?;
+            self.publish_quota_edges(quota_candidate);
             return Ok(());
         }
         let existing_inode = if let Some(existing) = existing {
@@ -453,21 +451,13 @@ impl ArgosFs {
         } else {
             None
         };
-        if self.has_directory_quotas() {
-            let mut quota_candidate = meta.clone();
-            if existing.is_some() {
-                self.dir_inode_mut_locked(&mut quota_candidate, new_parent)?
-                    .entries
-                    .remove(new_name);
-            }
-            self.dir_inode_mut_locked(&mut quota_candidate, old_parent)?
-                .entries
-                .remove(old_name);
-            self.dir_inode_mut_locked(&mut quota_candidate, new_parent)?
-                .entries
-                .insert(new_name.to_string(), child);
-            self.validate_all_directory_quotas_locked(&quota_candidate)?;
-        }
+        let removed = [(old_parent, child), (new_parent, existing.unwrap_or(child))];
+        let removed = &removed[..1 + usize::from(existing.is_some())];
+        let deleted_directory = existing_inode
+            .as_ref()
+            .and_then(|(ino, inode)| (inode.kind == NodeKind::Directory).then_some(*ino));
+        let quota_candidate =
+            self.plan_quota_edges_locked(meta, removed, &[(new_parent, child)], deleted_directory)?;
         let mut blocks_to_delete = Vec::new();
         if let Some((existing, existing_inode)) = existing_inode {
             self.dir_inode_mut_locked(meta, new_parent)?
@@ -516,7 +506,7 @@ impl ArgosFs {
             }
             self.remember_parent_link(new_parent, new_name, child);
         }
-        self.refresh_quota_runtime_if_active_locked(meta)?;
+        self.publish_quota_edges(quota_candidate);
         self.finish_block_reclamation_locked(meta, &blocks_to_delete);
         Ok(())
     }
