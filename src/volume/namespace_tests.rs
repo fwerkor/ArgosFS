@@ -569,6 +569,72 @@ fn quota_rejects_rename_and_hard_link_without_partial_namespace_changes() {
 }
 
 #[test]
+fn incremental_quota_edges_match_authoritative_rebuild() {
+    let (_dir, fs) = volume();
+    let a = fs.mkdir("/a", 0o755).unwrap();
+    let b = fs.mkdir("/b", 0o755).unwrap();
+    let nested = fs.mkdir("/a/nested", 0o755).unwrap();
+    fs.set_directory_quota("/a", 100).unwrap();
+    fs.set_directory_quota("/b", 100).unwrap();
+    fs.set_directory_quota("/a/nested", 50).unwrap();
+    let check = || {
+        let meta = fs.meta.read();
+        assert_eq!(
+            *fs.quota_runtime.read(),
+            QuotaRuntime::from_metadata(&meta).unwrap()
+        );
+        for (ino, used) in &fs.quota_runtime.read().usage_bytes {
+            assert_eq!(
+                *used,
+                u128::from(ArgosFs::subtree_logical_usage_locked(&meta, *ino).unwrap())
+            );
+        }
+    };
+    check();
+    fs.write_file("/a/nested/file", b"12345678", 0o600).unwrap();
+    let file = fs.resolve_path("/a/nested/file", true).unwrap();
+    check();
+    fs.link_at(file, a, OsStr::new("another")).unwrap();
+    fs.link_at(file, nested, OsStr::new("alias")).unwrap();
+    fs.link_at(file, b, OsStr::new("outside")).unwrap();
+    check();
+    fs.unlink_path("/a/nested/alias").unwrap();
+    check();
+    fs.rename_path("/a/nested", "/b/nested").unwrap();
+    check();
+    fs.truncate_inode(file, 9).unwrap();
+    check();
+    fs.unlink_path("/a/another").unwrap();
+    check();
+    fs.symlink_path("missing", "/b/nested/sym").unwrap();
+    check();
+    fs.unlink_path("/b/nested/sym").unwrap();
+    fs.mkdir("/a/empty", 0o755).unwrap();
+    fs.set_directory_quota("/a/empty", 0).unwrap();
+    check();
+    fs.rename_at_with_policy(
+        a,
+        OsStr::new("empty"),
+        b,
+        OsStr::new("nested"),
+        RenamePolicy {
+            exchange: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    check();
+    fs.unlink_path("/a/empty/file").unwrap();
+    fs.rmdir_at(a, OsStr::new("empty")).unwrap();
+    check();
+    fs.mkdir("/a/replacement", 0o755).unwrap();
+    fs.rename_path("/a/replacement", "/b/nested").unwrap();
+    check();
+    fs.unlink_path("/b/outside").unwrap();
+    check();
+}
+
+#[test]
 fn setting_quota_below_existing_usage_is_rejected() {
     let (_dir, fs) = volume();
     fs.mkdir("/q", 0o755).unwrap();

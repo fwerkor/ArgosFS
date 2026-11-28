@@ -1108,6 +1108,15 @@ fn streamed_canonical_hash_preserves_legacy_float_roundtrip_bytes() {
     let mut parsed: Metadata = serde_json::from_slice(&legacy_pretty).unwrap();
     parsed.integrity = MetadataIntegrity::default();
     let legacy = sha256_hex(&serde_json::to_vec_pretty(&parsed).unwrap());
+    // Compare against the exact prior compact-round-trip implementation too.
+    let compact = serde_json::to_vec(&old_image).unwrap();
+    let compact_parsed: Metadata = serde_json::from_slice(&compact).unwrap();
+    assert_eq!(
+        canonical_metadata_hash(&metadata).unwrap(),
+        sha256_hex(&serde_json::to_vec_pretty(&compact_parsed).unwrap())
+    );
+    assert_eq!(canonical_metadata_hash_decoded(&parsed).unwrap(), legacy);
+    assert_eq!(serde_json::to_vec(&old_image).unwrap(), compact);
     assert_eq!(canonical_metadata_hash(&metadata).unwrap(), legacy);
 }
 
