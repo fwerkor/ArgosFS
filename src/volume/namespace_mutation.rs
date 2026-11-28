@@ -90,7 +90,7 @@ impl ArgosFs {
             "mkdir",
             json!({"parent": parent, "name": name, "inode": ino}),
         )?;
-        self.remember_parent_link(parent, ino);
+        self.remember_parent_link(parent, name, ino);
         self.inherit_quota_memberships(parent, ino);
         Ok(ino)
     }
@@ -213,7 +213,6 @@ impl ArgosFs {
             }
             return Err(err);
         }
-        self.remember_parent_link(parent, ino);
         self.inherit_quota_memberships(parent, ino);
         Ok(ino)
     }
@@ -274,7 +273,9 @@ impl ArgosFs {
             if dir { "rmdir" } else { "unlink" },
             json!({"parent": parent, "name": name, "inode": child}),
         )?;
-        self.forget_parent_link(child);
+        if child_inode.kind == NodeKind::Directory {
+            self.forget_parent_link(child);
+        }
         self.refresh_quota_runtime_if_active_locked(meta)?;
         self.finish_block_reclamation_locked(meta, &blocks_to_delete);
         Ok(())
@@ -308,7 +309,6 @@ impl ArgosFs {
         meta.inodes.remove(&ino);
         self.stage_block_reclamation_locked(&mut meta, &blocks);
         self.commit_locked(&mut meta, "orphan-reap", json!({"inode": ino}))?;
-        self.forget_parent_link(ino);
         self.finish_block_reclamation_locked(&mut meta, &blocks);
         Ok(())
     }
@@ -420,8 +420,12 @@ impl ArgosFs {
                 "rename-exchange",
                 json!({"old_parent": old_parent, "old_name": old_name, "new_parent": new_parent, "new_name": new_name, "inode": child, "exchanged_inode": existing}),
             )?;
-            self.remember_parent_link(new_parent, child);
-            self.remember_parent_link(old_parent, existing);
+            if child_is_dir {
+                self.remember_parent_link(new_parent, new_name, child);
+            }
+            if existing_inode.kind == NodeKind::Directory {
+                self.remember_parent_link(old_parent, old_name, existing);
+            }
             self.refresh_quota_runtime_if_active_locked(meta)?;
             return Ok(());
         }
@@ -506,10 +510,12 @@ impl ArgosFs {
             "rename",
             json!({"old_parent": old_parent, "old_name": old_name, "new_parent": new_parent, "new_name": new_name, "inode": child}),
         )?;
-        if let Some(existing) = existing {
-            self.forget_parent_link(existing);
+        if child_is_dir {
+            if let Some(existing) = existing {
+                self.forget_parent_link(existing);
+            }
+            self.remember_parent_link(new_parent, new_name, child);
         }
-        self.remember_parent_link(new_parent, child);
         self.refresh_quota_runtime_if_active_locked(meta)?;
         self.finish_block_reclamation_locked(meta, &blocks_to_delete);
         Ok(())
@@ -610,65 +616,78 @@ impl ArgosFs {
         Ok(inode)
     }
 
-    /// Resolve an inode's parent for the ".." entry. `Meta.inodes` has no
-    /// reverse edges, so a full scan here made every readdir O(namespace) and
-    /// a tree walk O(directories * namespace). Build the inverse map once and
-    /// then maintain it from the namespace mutations.
+    /// Resolve an inode's parent for the ".." entry. Only directories have
+    /// a unique parent; keep the legacy lookup for non-directory callers
+    /// without indexing every file or depending on hard-link update order.
     pub(super) fn parent_inode_locked(&self, meta: &Metadata, ino: InodeId) -> Result<InodeId> {
         if ino == ROOT_INO {
             return Ok(ROOT_INO);
+        }
+        let missing = || ArgosError::NotFound(format!("parent of inode {ino}"));
+        let inode = meta.inodes.get(&ino).ok_or_else(missing)?;
+        if inode.kind != NodeKind::Directory {
+            return meta
+                .inodes
+                .iter()
+                .find_map(|(parent, inode)| {
+                    (inode.kind == NodeKind::Directory
+                        && inode.entries.values().any(|child| *child == ino))
+                    .then_some(*parent)
+                })
+                .ok_or_else(missing);
         }
         if let Some(parent) = self.cached_parent_inode(meta, ino) {
             return Ok(parent);
         }
         let mut index = self.runtime.parent_index.write();
         // Another reader may have built the map between the two locks.
-        if let Some(parent) = index
-            .as_ref()
-            .and_then(|index| index.get(&ino))
-            .copied()
-            .filter(|parent| Self::parent_link_valid(meta, *parent, ino))
-        {
-            return Ok(parent);
+        if let Some((parent, name)) = index.as_ref().and_then(|index| index.get(&ino)) {
+            if Self::parent_link_valid(meta, *parent, name, ino) {
+                return Ok(*parent);
+            }
         }
         *index = Some(Self::build_parent_index(meta));
         index
             .as_ref()
             .and_then(|index| index.get(&ino))
-            .copied()
-            .ok_or_else(|| ArgosError::NotFound(format!("parent of inode {ino}")))
+            .map(|(parent, _)| *parent)
+            .ok_or_else(missing)
     }
 
     fn cached_parent_inode(&self, meta: &Metadata, ino: InodeId) -> Option<InodeId> {
         let index = self.runtime.parent_index.read();
-        let parent = *index.as_ref()?.get(&ino)?;
-        // A stale hint is never trusted. The parent's directory entry is the
-        // authority, and checking one directory is bounded by its own size.
-        Self::parent_link_valid(meta, parent, ino).then_some(parent)
+        let (parent, name) = index.as_ref()?.get(&ino)?;
+        Self::parent_link_valid(meta, *parent, name, ino).then_some(*parent)
     }
 
-    fn parent_link_valid(meta: &Metadata, parent: InodeId, ino: InodeId) -> bool {
+    fn parent_link_valid(meta: &Metadata, parent: InodeId, name: &str, ino: InodeId) -> bool {
         meta.inodes.get(&parent).is_some_and(|inode| {
-            inode.kind == NodeKind::Directory && inode.entries.values().any(|child| *child == ino)
+            inode.kind == NodeKind::Directory && inode.entries.get(name) == Some(&ino)
         })
     }
 
-    fn build_parent_index(meta: &Metadata) -> BTreeMap<InodeId, InodeId> {
+    fn build_parent_index(meta: &Metadata) -> DirectoryParentIndex {
         let mut index = BTreeMap::new();
         for inode in meta.inodes.values() {
             if inode.kind != NodeKind::Directory {
                 continue;
             }
-            for child in inode.entries.values() {
-                index.insert(*child, inode.id);
+            for (name, child) in &inode.entries {
+                if meta
+                    .inodes
+                    .get(child)
+                    .is_some_and(|entry| entry.kind == NodeKind::Directory)
+                {
+                    index.insert(*child, (inode.id, name.clone()));
+                }
             }
         }
         index
     }
 
-    pub(super) fn remember_parent_link(&self, parent: InodeId, child: InodeId) {
+    fn remember_parent_link(&self, parent: InodeId, name: &str, child: InodeId) {
         if let Some(index) = self.runtime.parent_index.write().as_mut() {
-            index.insert(child, parent);
+            index.insert(child, (parent, name.to_owned()));
         }
     }
 
