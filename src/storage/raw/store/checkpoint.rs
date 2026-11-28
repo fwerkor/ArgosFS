@@ -5,6 +5,7 @@ pub fn write_metadata_copies(
     superblocks: &[RawSuperblock],
     metadata: &Metadata,
 ) -> Result<()> {
+    super::paged::reject_paged(superblocks)?;
     // Store compact JSON: the metadata checkpoint has half the fixed metadata
     // region, and pretty-printing wastes about a third of that space.
     let checkpoint = prepare_checkpoint_writes(metadata, superblocks)?;
@@ -94,6 +95,7 @@ fn write_metadata_copies_quorum_impl(
     metrics: Option<&CommitMetrics>,
     replay_selected: bool,
 ) -> Result<QuorumWriteReport> {
+    super::paged::reject_paged(superblocks)?;
     let need = metadata_quorum_requirement(metadata);
     if superblocks.len() < need {
         return Err(quorum_unavailable(

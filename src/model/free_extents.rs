@@ -59,9 +59,37 @@ pub struct FreeExtents {
     length_upper_bound: OnceLock<u64>,
     #[serde(skip)]
     fit_index: OnceLock<FitIndex>,
+    #[serde(skip)]
+    offset_index: OnceLock<Option<OrdMap<u64, RawFreeExtent>>>,
 }
 
 impl FreeExtents {
+    /// Exact persistent offset map for paged metadata. The first observation
+    /// of a legacy list validates order; allocator-owned edits maintain it.
+    pub(crate) fn offset_index(&self) -> Option<&OrdMap<u64, RawFreeExtent>> {
+        self.offset_index
+            .get_or_init(|| {
+                if !self
+                    .extents
+                    .iter()
+                    .zip(self.extents.iter().skip(1))
+                    .all(|(a, b)| a.offset < b.offset)
+                {
+                    return None;
+                }
+                Some(self.extents.iter().map(|e| (e.offset, e.clone())).collect())
+            })
+            .as_ref()
+    }
+
+    pub(crate) fn take_offset_index(&mut self) -> Option<OrdMap<u64, RawFreeExtent>> {
+        self.offset_index.take().flatten()
+    }
+
+    pub(crate) fn restore_offset_index(&mut self, index: OrdMap<u64, RawFreeExtent>) {
+        self.offset_index = OnceLock::from(Some(index));
+    }
+
     /// Some(None) means an indexed search proved that no extent fits;
     /// None means use the original linear search (small/legacy lists).
     pub(crate) fn indexed_fit(
@@ -170,6 +198,7 @@ impl DerefMut for FreeExtents {
         self.normalized.take();
         self.length_upper_bound.take();
         self.fit_index.take();
+        self.offset_index.take();
         &mut self.extents
     }
 }
@@ -194,6 +223,7 @@ impl FromIterator<RawFreeExtent> for FreeExtents {
             normalized: OnceLock::new(),
             length_upper_bound: OnceLock::new(),
             fit_index: OnceLock::new(),
+            offset_index: OnceLock::new(),
         }
     }
 }

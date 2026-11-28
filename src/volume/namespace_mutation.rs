@@ -57,11 +57,11 @@ impl ArgosFs {
             atime: now,
             mtime: now,
             ctime: now,
-            entries: BTreeMap::new(),
+            entries: Default::default(),
             target: None,
             inline_data: None,
             inline_sha256: String::new(),
-            blocks: Vec::new(),
+            blocks: Default::default(),
             xattrs: BTreeMap::new(),
             quota_bytes: None,
             posix_acl_access: inherited_access_acl,
@@ -173,11 +173,11 @@ impl ArgosFs {
             atime: now,
             mtime: now,
             ctime: now,
-            entries: BTreeMap::new(),
+            entries: Default::default(),
             target: None,
             inline_data: None,
             inline_sha256: String::new(),
-            blocks: Vec::new(),
+            blocks: Default::default(),
             xattrs: BTreeMap::new(),
             quota_bytes: None,
             posix_acl_access: inherited_acl,
@@ -255,7 +255,7 @@ impl ArgosFs {
             .entries
             .remove(name);
         self.touch_inode_locked(meta, parent, true, true);
-        let mut blocks_to_delete = Vec::new();
+        let mut blocks_to_delete = crate::model::file_blocks::FileBlocks::default();
         if child_inode.kind == NodeKind::Directory {
             if let Some(parent_inode) = meta.inodes.get_mut(&parent) {
                 parent_inode.nlink = parent_inode.nlink.saturating_sub(1).max(2);
@@ -458,7 +458,7 @@ impl ArgosFs {
             .and_then(|(ino, inode)| (inode.kind == NodeKind::Directory).then_some(*ino));
         let quota_candidate =
             self.plan_quota_edges_locked(meta, removed, &[(new_parent, child)], deleted_directory)?;
-        let mut blocks_to_delete = Vec::new();
+        let mut blocks_to_delete = crate::model::file_blocks::FileBlocks::default();
         if let Some((existing, existing_inode)) = existing_inode {
             self.dir_inode_mut_locked(meta, new_parent)?
                 .entries

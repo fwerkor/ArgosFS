@@ -51,6 +51,7 @@ pub struct ParityDrillReport {
 pub struct RunConfig {
     pub work_dir: Option<PathBuf>,
     pub keep_work_dir: bool,
+    pub paged_metadata: bool,
     pub cycles: usize,
     pub seed: u64,
     pub devices: usize,
@@ -135,7 +136,12 @@ pub fn run(config: RunConfig) -> Result<RunOutcome> {
         ..VolumeConfig::default()
     };
     {
-        let fs = ArgosFs::create_loop(
+        let create = if config.paged_metadata {
+            ArgosFs::create_loop_paged
+        } else {
+            ArgosFs::create_loop
+        };
+        let fs = create(
             &images,
             volume_config,
             config.image_size,

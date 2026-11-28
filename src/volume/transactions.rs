@@ -107,14 +107,52 @@ impl ArgosFs {
             let changed = meta
                 .inodes
                 .changed_candidates(&cache.as_ref().expect("validated cache exists").inodes);
-            Self::validate_data_durability_blocks(
-                meta,
-                unavailable,
-                changed
-                    .iter()
-                    .filter_map(|ino| meta.inodes.get(ino))
-                    .flat_map(|inode| inode.blocks.iter()),
-            )?
+            if meta.integrity.hash_scheme
+                == Some(crate::storage::raw::paged_metadata::PAGED_INTEGRITY_SCHEME)
+            {
+                use imbl::ordmap::DiffItem;
+                let previous = &cache.as_ref().expect("validated cache exists").inodes;
+                let empty = imbl::OrdMap::new();
+                let mut checked = 0;
+                for ino in changed {
+                    let Some(inode) = meta.inodes.get(&ino) else {
+                        continue;
+                    };
+                    let old = match previous.get(&ino) {
+                        Some(inode) => inode.blocks.offset_index(),
+                        None => Some(&empty),
+                    };
+                    if let (Some(old), Some(new)) = (old, inode.blocks.offset_index()) {
+                        checked += Self::validate_data_durability_blocks(
+                            meta,
+                            unavailable,
+                            old.diff(new).filter_map(|change| match change {
+                                DiffItem::Add(_, block)
+                                | DiffItem::Update {
+                                    new: (_, block), ..
+                                } => Some(block),
+                                DiffItem::Remove(..) => None,
+                            }),
+                        )?;
+                    } else {
+                        checked += Self::validate_data_durability_blocks(
+                            meta,
+                            unavailable,
+                            inode.blocks.iter(),
+                        )?;
+                    }
+                }
+                checked
+            } else {
+                Self::validate_data_durability_blocks(
+                    meta,
+                    unavailable,
+                    changed
+                        .iter()
+                        .filter_map(|ino| meta.inodes.get(ino))
+                        .flat_map(|inode| inode.blocks.iter()),
+                )?
+            }
         } else {
             Self::validate_data_durability_blocks(
                 meta,
@@ -271,7 +309,9 @@ impl ArgosFs {
             let mut prepared_delta = None;
             {
                 let _integrity_timer = self.runtime.commit_metrics.timer(CommitPhase::Integrity);
-                if incremental_integrity_enabled && !checkpoint {
+                if self.paged_metadata.is_some() {
+                    // The page root authenticates the image; no legacy full hash.
+                } else if incremental_integrity_enabled && !checkpoint {
                     prepared_delta = Some(journal::prepare_delta_integrity_with_delta(
                         meta, &previous,
                     )?);
@@ -295,6 +335,11 @@ impl ArgosFs {
                     &mut state.durability_cache,
                 )?;
             }
+            let commit_backend = if self.open_backend_covers_superblocks(&superblocks) {
+                self.backend.clone()
+            } else {
+                self.metadata_block_backend_locked(meta, &superblocks, true)?
+            };
             let mut commit =
                 |backend: &dyn StorageBackend| -> Result<raw_store::QuorumWriteReport> {
                     if dirty_transactions > 0
@@ -311,6 +356,15 @@ impl ArgosFs {
                         journal::inject_crash(
                             FaultPoint::AfterDataFlushBeforeJournalCommit.as_str(),
                         )?;
+                    }
+                    if let Some(store) = &self.paged_metadata {
+                        return raw_store::commit_paged_metadata(
+                            &mut store.lock(),
+                            meta,
+                            &superblocks,
+                            &self.runtime.commit_metrics,
+                            ("group-commit", json!({"transactions": dirty_transactions})),
+                        );
                     }
                     if checkpoint {
                         let reason = if state.raw_checkpoint_required {
@@ -351,12 +405,7 @@ impl ArgosFs {
                         )
                     }
                 };
-            if self.open_backend_covers_superblocks(&superblocks) {
-                commit(&*self.backend)
-            } else {
-                let backend = self.metadata_block_backend_locked(meta, &superblocks, true)?;
-                commit(&*backend)
-            }
+            commit(&*commit_backend)
         })();
 
         let durability = match result {
@@ -390,7 +439,9 @@ impl ArgosFs {
 
         // Both a successful quorum and an already-committed error advance the
         // durable baseline. Never roll back or reclaim their acknowledged data.
-        meta.inodes.mark_committed();
+        if self.paged_metadata.is_none() {
+            meta.inodes.mark_committed();
+        }
         if let Some(cache) = &mut state.durability_cache {
             cache.inodes = meta.inodes.clone();
         }
@@ -490,7 +541,9 @@ impl ArgosFs {
             );
             let mut prepared_delta = {
                 let _integrity_timer = self.runtime.commit_metrics.timer(CommitPhase::Integrity);
-                if let Some(base) = v2_base.as_deref() {
+                if self.paged_metadata.is_some() {
+                    None
+                } else if let Some(base) = v2_base.as_deref() {
                     Some(journal::prepare_delta_integrity_with_delta(meta, base)?)
                 } else {
                     journal::prepare_metadata_integrity_with_previous(
@@ -534,8 +587,22 @@ impl ArgosFs {
                     .filter(|previous| previous.integrity.meta_hash == previous_meta_hash)
             };
             let details = json!({"txid": meta.txid, "previous_meta_hash": previous_meta_hash, "details": details});
+            let commit_backend = if self.open_backend_covers_superblocks(&superblocks) {
+                self.backend.clone()
+            } else {
+                self.metadata_block_backend_locked(meta, &superblocks, true)?
+            };
             let mut commit = |backend: &dyn StorageBackend| {
                 let _timer = self.runtime.commit_metrics.timer(CommitPhase::Journal);
+                if let Some(store) = &self.paged_metadata {
+                    return raw_store::commit_paged_metadata(
+                        &mut store.lock(),
+                        meta,
+                        &superblocks,
+                        &self.runtime.commit_metrics,
+                        (action, details.clone()),
+                    );
+                }
                 if let Some(base) = v2_base.as_deref() {
                     return raw_store::append_transaction_with_trusted_integrity_quorum_measured(
                         backend,
@@ -569,12 +636,7 @@ impl ArgosFs {
                     ),
                 }
             };
-            let result = if self.open_backend_covers_superblocks(&superblocks) {
-                commit(&*self.backend)
-            } else {
-                let backend = self.metadata_block_backend_locked(meta, &superblocks, true)?;
-                commit(&*backend)
-            };
+            let result = commit(&*commit_backend);
             match result {
                 Ok(report) => {
                     if let Err(err) = self.apply_quorum_write_report(meta, report) {
@@ -582,7 +644,9 @@ impl ArgosFs {
                         // Keep the live metadata at that durable state, but fail the
                         // mutation and fence further writes because referenced data is
                         // no longer reconstructable from runtime-available members.
-                        meta.inodes.mark_committed();
+                        if self.paged_metadata.is_none() {
+                            meta.inodes.mark_committed();
+                        }
                         let mut state = self.deferred_commit.lock();
                         state.durable_metadata = Some(Arc::new(meta.clone()));
                         state.raw_uncommitted_metadata_dirty = false;
@@ -597,7 +661,9 @@ impl ArgosFs {
                 Err(commit_err) => {
                     self.fence_on_quorum_loss(&commit_err);
                     if Self::transaction_error_is_committed(&commit_err) {
-                        meta.inodes.mark_committed();
+                        if self.paged_metadata.is_none() {
+                            meta.inodes.mark_committed();
+                        }
                         let mut state = self.deferred_commit.lock();
                         state.durable_metadata = Some(Arc::new(meta.clone()));
                         state.raw_uncommitted_metadata_dirty = false;
@@ -622,7 +688,9 @@ impl ArgosFs {
                     return Err(commit_err);
                 }
             }
-            meta.inodes.mark_committed();
+            if self.paged_metadata.is_none() {
+                meta.inodes.mark_committed();
+            }
             let mut state = self.deferred_commit.lock();
             state.durable_metadata = Some(Arc::new(meta.clone()));
             if let Some(cache) = &mut state.durability_cache {
@@ -653,7 +721,9 @@ impl ArgosFs {
                 recompute_disk_usage_from_metadata(meta);
                 self.rebuild_quota_runtime_locked(meta)?;
             } else {
-                meta.inodes.mark_committed();
+                if self.paged_metadata.is_none() {
+                    meta.inodes.mark_committed();
+                }
                 self.rebuild_quota_runtime_locked(meta)?;
             }
         }
@@ -669,7 +739,9 @@ impl ArgosFs {
         meta: &mut Metadata,
         superblocks: &[RawSuperblock],
     ) -> Result<()> {
-        let recovered = if self.open_backend_covers_superblocks(superblocks) {
+        let recovered = if let Some(store) = &self.paged_metadata {
+            store.lock().snapshot()
+        } else if self.open_backend_covers_superblocks(superblocks) {
             raw_store::recover_metadata(&*self.backend, superblocks)?
         } else {
             let backend = self.metadata_block_backend_locked(meta, superblocks, false)?;
@@ -693,11 +765,34 @@ impl ArgosFs {
 
     pub(super) fn journal_locked(
         &self,
-        meta: &Metadata,
+        meta: &mut Metadata,
         action: &str,
         details: serde_json::Value,
     ) -> Result<()> {
         self.ensure_block_backend_writable_locked(meta)?;
+        if let Some(handle) = &self.paged_metadata {
+            let superblocks = self.metadata_superblocks_locked(meta)?;
+            let mut store = handle.lock();
+            let report = match raw_store::commit_paged_event(
+                &mut store,
+                &superblocks,
+                &self.runtime.commit_metrics,
+                action,
+                details,
+            ) {
+                Ok(report) => report,
+                Err(err) => {
+                    self.fence_on_quorum_loss(&err);
+                    return Err(err);
+                }
+            };
+            let base = store.snapshot();
+            meta.integrity.meta_hash = base.integrity.meta_hash.clone();
+            drop(store);
+            self.deferred_commit.lock().durable_metadata = Some(Arc::new(base));
+            return self.apply_quorum_write_report(meta, report);
+        }
+
         if meta.backend != BackendKind::Host {
             // Read-side telemetry is allowed to mutate live metadata without a
             // transaction, so its integrity fields can still describe the last
@@ -838,13 +933,23 @@ impl ArgosFs {
                 .checked_add(1)
                 .ok_or_else(|| ArgosError::Invalid("metadata txid overflow".to_string()))?;
             meta.updated_at = now_f64();
-            journal::prepare_metadata_integrity_with_previous(&mut meta, previous_meta_hash)?;
+            if self.paged_metadata.is_none() {
+                journal::prepare_metadata_integrity_with_previous(&mut meta, previous_meta_hash)?;
+            }
             let superblocks = self.metadata_superblocks_locked(&meta)?;
             self.runtime
                 .commit_metrics
                 .record_checkpoint_reason(CheckpointReason::RecoveryOrFormat);
             let _checkpoint_timer = self.runtime.commit_metrics.timer(CommitPhase::Checkpoint);
-            let result = if self.open_backend_covers_superblocks(&superblocks) {
+            let result = if let Some(store) = &self.paged_metadata {
+                raw_store::commit_paged_metadata(
+                    &mut store.lock(),
+                    &mut meta,
+                    &superblocks,
+                    &self.runtime.commit_metrics,
+                    ("recovery-checkpoint", json!({})),
+                )
+            } else if self.open_backend_covers_superblocks(&superblocks) {
                 raw_store::write_metadata_copies_quorum_measured(
                     &*self.backend,
                     &superblocks,
@@ -869,7 +974,9 @@ impl ArgosFs {
             };
             // A successful metadata checkpoint is durable even when a
             // subsequent device-loss fence reports CommittedDurabilityLoss.
-            meta.inodes.mark_committed();
+            if self.paged_metadata.is_none() {
+                meta.inodes.mark_committed();
+            }
             let mut state = self.deferred_commit.lock();
             state.durable_metadata = Some(Arc::new(meta.clone()));
             state.raw_uncommitted_metadata_dirty = false;

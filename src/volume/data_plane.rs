@@ -384,7 +384,7 @@ impl ArgosFs {
         let new_blocks_for_cleanup = new_blocks.clone();
         let now = now_f64();
         let inode = meta.inodes.get_mut(&ino).unwrap();
-        inode.blocks = new_blocks;
+        inode.blocks = new_blocks.into();
         set_inline_payload(inode, inline_payload);
         inode.size = data.len() as u64;
         inode.write_count = inode.write_count.saturating_add(1);
@@ -708,21 +708,9 @@ impl ArgosFs {
 
         self.ensure_resize_within_quotas_locked(meta, ino, new_size as u64)?;
 
-        let mut merged = Vec::new();
-        let mut replaced = Vec::new();
-        for block in old_blocks {
-            let block_start = block.raw_offset as usize;
-            let block_end = block_start.saturating_add(block.raw_size);
-            if block_end <= affected_start || block_start >= affected_end {
-                if block_start < new_size {
-                    merged.push(block);
-                } else {
-                    replaced.push(block);
-                }
-            } else {
-                replaced.push(block);
-            }
-        }
+        let mut merged = old_blocks;
+        let replaced =
+            merged.remove_window(affected_start as u64, affected_end as u64, new_size as u64);
 
         let inline_payload = if affected_start == 0 && window.len() == new_size {
             inline_payload_for(meta, window)
@@ -743,8 +731,7 @@ impl ArgosFs {
         } else {
             Vec::new()
         };
-        merged.extend(written_blocks.clone());
-        merged.sort_by_key(|block| block.raw_offset);
+        merged.insert_sorted(written_blocks.iter().cloned());
 
         let now = write_time.map_or_else(now_f64, |time| time.at);
         let inode = meta.inodes.get_mut(&ino).unwrap();
@@ -2031,14 +2018,18 @@ impl ArgosFs {
         }
     }
 
-    pub(super) fn stage_block_reclamation_locked(&self, meta: &mut Metadata, blocks: &[FileBlock]) {
+    pub(super) fn stage_block_reclamation_locked<'a>(
+        &self,
+        meta: &mut Metadata,
+        blocks: impl IntoIterator<Item = &'a FileBlock> + Copy,
+    ) {
         if meta.backend != BackendKind::Host
             && (bulk_import_enabled() || meta.config.defer_metadata_commit)
         {
             self.deferred_commit
                 .lock()
                 .pending_reclaims
-                .extend(blocks.iter().cloned());
+                .extend(blocks.into_iter().cloned());
             return;
         }
         self.account_blocks_locked(meta, blocks, false);
@@ -2047,17 +2038,21 @@ impl ArgosFs {
         }
     }
 
-    pub(super) fn finish_block_reclamation_locked(
+    pub(super) fn finish_block_reclamation_locked<'a>(
         &self,
         meta: &mut Metadata,
-        blocks: &[FileBlock],
+        blocks: impl IntoIterator<Item = &'a FileBlock>,
     ) {
         if meta.backend == BackendKind::Host {
             self.delete_blocks_locked(meta, blocks);
         }
     }
 
-    pub(super) fn delete_blocks_locked(&self, meta: &mut Metadata, blocks: &[FileBlock]) {
+    pub(super) fn delete_blocks_locked<'a>(
+        &self,
+        meta: &mut Metadata,
+        blocks: impl IntoIterator<Item = &'a FileBlock>,
+    ) {
         for block in blocks {
             self.cache.remove(&format!(
                 "{}:{}:{}",
@@ -2304,13 +2299,13 @@ impl ArgosFs {
         Ok(Arc::new(GuardedBackend::new(inner)))
     }
 
-    pub(super) fn account_blocks_locked(
+    pub(super) fn account_blocks_locked<'a>(
         &self,
         meta: &mut Metadata,
-        blocks: &[FileBlock],
+        blocks: impl IntoIterator<Item = &'a FileBlock>,
         add: bool,
     ) {
-        for shard in blocks.iter().flat_map(|block| block.shards.iter()) {
+        for shard in blocks.into_iter().flat_map(|block| block.shards.iter()) {
             if let Some(disk) = meta.disks.get_mut(&shard.disk_id) {
                 let accounted = shard_accounted_size(shard);
                 if add {

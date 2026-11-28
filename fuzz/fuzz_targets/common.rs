@@ -91,7 +91,7 @@ pub fn metadata_from(data: &[u8], salt: usize) -> Metadata {
 
 pub fn add_small_inode_tree(meta: &mut Metadata, data: &[u8], salt: usize) {
     let mut root_entries = BTreeMap::new();
-    root_entries.insert(text_at(data, salt, 20, "file"), 2);
+    root_entries.insert(text_at(data, salt, 20, "file"), 2u64);
 
     let mut root_xattrs = BTreeMap::new();
     root_xattrs.insert(
@@ -111,11 +111,11 @@ pub fn add_small_inode_tree(meta: &mut Metadata, data: &[u8], salt: usize) {
         atime: meta.created_at,
         mtime: meta.updated_at,
         ctime: meta.updated_at,
-        entries: root_entries,
+        entries: root_entries.into_iter().collect(),
         target: None,
         inline_data: None,
         inline_sha256: String::new(),
-        blocks: vec![],
+        blocks: Default::default(),
         quota_bytes: None,
         xattrs: root_xattrs,
         posix_acl_access: None,
@@ -153,11 +153,11 @@ pub fn add_small_inode_tree(meta: &mut Metadata, data: &[u8], salt: usize) {
         atime: meta.created_at,
         mtime: meta.updated_at,
         ctime: meta.updated_at,
-        entries: BTreeMap::new(),
+        entries: Default::default(),
         target: None,
         inline_data: Some(payload),
         inline_sha256: String::new(),
-        blocks: vec![],
+        blocks: Default::default(),
         quota_bytes: None,
         xattrs: file_xattrs,
         posix_acl_access: None,

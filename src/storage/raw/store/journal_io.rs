@@ -19,6 +19,7 @@ pub fn reset_journals_after_checkpoint(
     superblocks: &[RawSuperblock],
     checkpoint: &Metadata,
 ) -> Result<u64> {
+    super::paged::reject_paged(superblocks)?;
     // Metadata contains floating-point telemetry that can change its JSON
     // representation on deserialization. Match the persisted transaction identity
     // and integrity hash rather than requiring byte-for-byte reserialization.
@@ -550,6 +551,7 @@ fn append_journal_with_previous_validation(
     details: serde_json::Value,
     trust_integrity: bool,
 ) -> Result<()> {
+    super::paged::reject_paged(superblocks)?;
     let (entry, _) = build_journal_entry(
         metadata,
         previous_metadata,
@@ -637,6 +639,7 @@ pub(super) fn append_journal_quorum(
     details: serde_json::Value,
     options: JournalQuorumOptions<'_>,
 ) -> Result<QuorumWriteReport> {
+    super::paged::reject_paged(superblocks)?;
     let JournalQuorumOptions {
         mode,
         metrics,

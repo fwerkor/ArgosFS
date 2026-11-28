@@ -393,8 +393,8 @@ impl ArgosFs {
         });
         self.save_autopilot_state(&state)?;
         append_json_line(&self.root.join(".argosfs/autopilot.jsonl"), &result)?;
-        let meta = self.meta.read();
-        self.journal_locked(&meta, "autopilot", json!({"actions": actions}))?;
+        let mut meta = self.meta.write();
+        self.journal_locked(&mut meta, "autopilot", json!({"actions": actions}))?;
         Ok(result)
     }
 

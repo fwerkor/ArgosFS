@@ -42,6 +42,12 @@ pub const REQUIRED_FEATURE_ARRAY_SPLICE: u64 = 1 << 1;
 /// Journal records can carry LZ4-compressed JSON behind a flagged length.
 /// Older readers must reject upgraded members before attempting replay.
 pub const REQUIRED_FEATURE_JOURNAL_COMPRESSION: u64 = 1 << 2;
+/// Independent authenticated metadata page arena and immutable membership manifest.
+pub const REQUIRED_FEATURE_PAGED_METADATA: u64 = 1 << 3;
+/// Offline upgrade fence; old binaries cannot open a member while its new arena is staged.
+pub const REQUIRED_FEATURE_PAGED_MIGRATION: u64 = 1 << 4;
+/// Configuration epochs and joint quorum certificates.
+pub const REQUIRED_FEATURE_PAGED_TOPOLOGY: u64 = 1 << 5;
 /// Bits 8..15 of optional feature flags identify the erasure-code wire format.
 /// Zero is the implicit legacy ID used by superblocks formatted before #259.
 /// Both IDs currently use byte-identical GF(2^8) systematic Vandermonde parity.
@@ -53,7 +59,10 @@ const CODEC_ID_SHIFT: u32 = 8;
 const CODEC_ID_MASK: u64 = 0xff << CODEC_ID_SHIFT;
 const SUPPORTED_REQUIRED_FEATURE_FLAGS: u64 = REQUIRED_FEATURE_DELTA_INTEGRITY
     | REQUIRED_FEATURE_ARRAY_SPLICE
-    | REQUIRED_FEATURE_JOURNAL_COMPRESSION;
+    | REQUIRED_FEATURE_JOURNAL_COMPRESSION
+    | REQUIRED_FEATURE_PAGED_METADATA
+    | REQUIRED_FEATURE_PAGED_MIGRATION
+    | REQUIRED_FEATURE_PAGED_TOPOLOGY;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RawRegion {

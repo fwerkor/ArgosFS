@@ -239,7 +239,7 @@ impl From<&Inode> for InodeCorePage {
 }
 
 impl InodeCorePage {
-    fn into_inode(
+    pub(crate) fn into_inode(
         self,
         entries: BTreeMap<String, InodeId>,
         xattrs: BTreeMap<String, String>,
@@ -257,11 +257,11 @@ impl InodeCorePage {
             atime: self.atime,
             mtime: self.mtime,
             ctime: self.ctime,
-            entries,
+            entries: entries.into_iter().collect(),
             target: self.target,
             inline_data: self.inline_data,
             inline_sha256: self.inline_sha256,
-            blocks,
+            blocks: blocks.into(),
             xattrs,
             quota_bytes: self.quota_bytes,
             posix_acl_access: self.posix_acl_access,
@@ -426,11 +426,8 @@ impl PagedMetadata {
                     }),
                 )?)?;
             }
-            for (page, chunk) in inode
-                .blocks
-                .chunks(options.file_blocks_per_page)
-                .enumerate()
-            {
+            let blocks = inode.blocks.iter().cloned().collect::<Vec<_>>();
+            for (page, chunk) in blocks.chunks(options.file_blocks_per_page).enumerate() {
                 store.put_page(MetadataPage::new(
                     MetadataPageKey::shard_index(inode.id, page as u64),
                     meta.txid,

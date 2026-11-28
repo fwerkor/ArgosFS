@@ -322,7 +322,7 @@ impl ArgosFs {
                     survivors.push(new_shard);
                 }
                 survivors.sort_by_key(|shard| shard.slot);
-                new_blocks[index].shards = survivors;
+                new_blocks.edit_at(index, |block| block.shards = survivors);
                 if !old_shards.is_empty() {
                     let mut garbage = block.clone();
                     garbage.shards = old_shards;

@@ -139,7 +139,7 @@ fn sample_metadata() -> Metadata {
         storage_class: StorageTier::Warm,
     };
 
-    let mut root_entries = BTreeMap::new();
+    let mut root_entries = BTreeMap::<String, InodeId>::new();
     root_entries.insert("alpha".to_string(), 2);
     root_entries.insert("beta".to_string(), 3);
     let root = Inode {
@@ -154,11 +154,11 @@ fn sample_metadata() -> Metadata {
         atime: created_at,
         mtime: created_at,
         ctime: created_at,
-        entries: root_entries,
+        entries: root_entries.into_iter().collect(),
         target: None,
         inline_data: None,
         inline_sha256: String::new(),
-        blocks: Vec::new(),
+        blocks: Default::default(),
         xattrs: BTreeMap::new(),
         quota_bytes: Some(4096),
         posix_acl_access: None,
@@ -190,7 +190,7 @@ fn sample_metadata() -> Metadata {
         atime: created_at,
         mtime: created_at + 1.0,
         ctime: created_at + 1.0,
-        entries: BTreeMap::new(),
+        entries: Default::default(),
         target: None,
         inline_data: Some(b"hello".to_vec()),
         inline_sha256: "inline-hash".to_string(),
@@ -201,7 +201,8 @@ fn sample_metadata() -> Metadata {
                 raw_offset: 5,
                 ..block
             },
-        ],
+        ]
+        .into(),
         xattrs,
         quota_bytes: None,
         posix_acl_access: Some(PosixAcl::default()),
@@ -229,11 +230,11 @@ fn sample_metadata() -> Metadata {
         atime: created_at,
         mtime: created_at,
         ctime: created_at,
-        entries: BTreeMap::new(),
+        entries: Default::default(),
         target: Some("alpha".to_string()),
         inline_data: None,
         inline_sha256: String::new(),
-        blocks: Vec::new(),
+        blocks: Default::default(),
         xattrs: BTreeMap::new(),
         quota_bytes: None,
         posix_acl_access: None,

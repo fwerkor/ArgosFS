@@ -418,7 +418,7 @@ fn sparse_extent_seek_helpers_cover_inline_holes_merging_and_bounds() {
     assert!(seek_hole(&inode, 101).is_err());
 
     inode.inline_data = None;
-    inode.blocks = vec![block(10, 20), block(25, 20), block(70, 40), block(100, 0)];
+    inode.blocks = vec![block(10, 20), block(25, 20), block(70, 40), block(100, 0)].into();
     assert_eq!(inode_data_extents(&inode), vec![(10, 45), (70, 100)]);
     assert_eq!(seek_data(&inode, 0).unwrap(), 10);
     assert_eq!(seek_data(&inode, 20).unwrap(), 20);

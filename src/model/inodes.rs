@@ -65,8 +65,73 @@ impl MemberCatalog {
         }
     }
 
+    fn advance_inode_blocks(&mut self, ino: InodeId, current: Option<&Inode>) -> bool {
+        use imbl::ordmap::DiffItem;
+        let empty = OrdMap::new();
+        let previous = match self.base.get(&ino) {
+            Some(inode) => inode.blocks.unique_stripe_index(),
+            None => Some(&empty),
+        };
+        let next = match current {
+            Some(inode) => inode.blocks.unique_stripe_index(),
+            None => Some(&empty),
+        };
+        let (Some(previous), Some(next)) = (previous, next) else {
+            return false;
+        };
+        let mut removals = Vec::new();
+        let mut additions = Vec::new();
+        for change in previous.diff(next) {
+            match change {
+                DiffItem::Add(_, block) => additions.push(block),
+                DiffItem::Remove(_, block) => removals.push(block),
+                DiffItem::Update {
+                    old: (_, old),
+                    new: (_, new),
+                } => {
+                    removals.push(old);
+                    additions.push(new);
+                }
+            }
+        }
+        for block in removals {
+            for shard in &block.shards {
+                let disk = &shard.disk_id;
+                if let Some(inodes) = self.members.get_mut(disk) {
+                    if let Some(stripes) = inodes.get_mut(&ino) {
+                        stripes.remove(&block.stripe_id);
+                        if stripes.is_empty() {
+                            inodes.remove(&ino);
+                        }
+                    }
+                    if inodes.is_empty() {
+                        self.members.remove(disk);
+                    }
+                }
+            }
+        }
+        for block in additions {
+            for shard in &block.shards {
+                self.members
+                    .entry(shard.disk_id.clone())
+                    .or_default()
+                    .entry(ino)
+                    .or_default()
+                    .insert(block.stripe_id.clone());
+            }
+        }
+        true
+    }
+
     fn advance(&mut self, map: &HashMap<InodeId, Inode>, dirty: &BTreeSet<InodeId>) {
         for ino in dirty {
+            // If stripe identities are unique within both versions, the
+            // authenticated offset-map diff gives exact reference edits.
+            // Remove before inserting, including a stripe moved to a new
+            // logical offset. Legacy duplicate IDs use the exhaustive path.
+            if self.advance_inode_blocks(*ino, map.get(ino)) {
+                continue;
+            }
             let previous = inode_references(self.base.get(ino));
             let current = inode_references(map.get(ino));
             for disk_id in previous.keys().filter(|disk| !current.contains_key(*disk)) {

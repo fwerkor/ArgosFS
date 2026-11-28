@@ -463,7 +463,7 @@ pub struct Disk {
     pub created_at: f64,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Shard {
     pub slot: usize,
     pub disk_id: String,
@@ -495,7 +495,7 @@ pub struct PhysicalExtent {
     pub flags: u32,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct FileBlock {
     #[serde(default)]
     pub layout_id: String,
@@ -536,7 +536,8 @@ pub struct Inode {
     pub atime: f64,
     pub mtime: f64,
     pub ctime: f64,
-    pub entries: BTreeMap<String, InodeId>,
+    /// Persistent ordered directory map: snapshots share untouched branches.
+    pub entries: imbl::OrdMap<String, InodeId>,
     pub target: Option<String>,
     #[serde(
         default,
@@ -546,7 +547,7 @@ pub struct Inode {
     pub inline_data: Option<Vec<u8>>,
     #[serde(default)]
     pub inline_sha256: String,
-    pub blocks: Vec<FileBlock>,
+    pub blocks: super::file_blocks::FileBlocks,
     pub xattrs: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota_bytes: Option<u64>,
@@ -700,6 +701,17 @@ pub struct RawJournalMemberReport {
     pub error: Option<String>,
 }
 
+/// An authenticated, bounded event record in a paged metadata pool.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PagedAuditEvent {
+    pub sequence: u64,
+    pub txid: u64,
+    pub time: f64,
+    pub action: String,
+    pub details: serde_json::Value,
+    pub advisory: bool,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct TransactionReport {
     pub valid_entries: u64,
@@ -718,6 +730,8 @@ pub struct TransactionReport {
     pub raw_journal_members: Vec<RawJournalMemberReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_journal_quorum: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paged_events: Vec<PagedAuditEvent>,
     pub errors: Vec<String>,
 }
 

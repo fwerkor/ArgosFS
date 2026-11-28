@@ -630,7 +630,7 @@ impl ArgosFs {
                 Err(err) => {
                     if self.ensure_block_backend_writable_locked(&meta).is_ok() {
                         self.journal_locked(
-                            &meta,
+                            &mut meta,
                             "self-heal-deferred",
                             json!({"inode": ino, "error": err.to_string()}),
                         )?;
@@ -1006,11 +1006,10 @@ impl ArgosFs {
         let now = write_time.map_or_else(now_f64, |time| time.at);
         let inode = meta.inodes.get_mut(&ino).unwrap();
         if full_inline_data.is_some() {
-            inode.blocks = written_blocks.clone();
+            inode.blocks = written_blocks.clone().into();
         } else {
-            inode.blocks.extend(written_blocks.clone());
+            inode.blocks.insert_sorted(written_blocks.iter().cloned());
         }
-        inode.blocks.sort_by_key(|block| block.raw_offset);
         set_inline_payload(inode, inline_payload);
         inode.size = new_size as u64;
         inode.write_count = inode.write_count.saturating_add(1);
@@ -1320,11 +1319,11 @@ impl ArgosFs {
             atime: now,
             mtime: now,
             ctime: now,
-            entries: BTreeMap::new(),
+            entries: Default::default(),
             target: Some(target_string.clone()),
             inline_data: None,
             inline_sha256: String::new(),
-            blocks: Vec::new(),
+            blocks: Default::default(),
             xattrs: BTreeMap::new(),
             quota_bytes: None,
             posix_acl_access: inherited_acl,

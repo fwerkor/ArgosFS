@@ -54,6 +54,17 @@ pub fn allocate(
         let offset = free.offset;
         let preserve_proof = state.free_extents.known_normalized();
         let old_bound = state.free_extents.known_length_upper_bound();
+        let mut offset_index = state.free_extents.take_offset_index();
+        if let Some(index) = &mut offset_index {
+            index.remove(&free.offset);
+            if free.length > length {
+                let next = RawFreeExtent {
+                    offset: free.offset + length,
+                    length: free.length - length,
+                };
+                index.insert(next.offset, next);
+            }
+        }
         let mut fit_index = state.free_extents.take_fit_index();
         if let Some(index) = &mut fit_index {
             index.remove(&free);
@@ -79,6 +90,9 @@ pub fn allocate(
         }
         if let Some(index) = fit_index {
             state.free_extents.restore_fit_index(index);
+        }
+        if let Some(index) = offset_index {
+            state.free_extents.restore_offset_index(index);
         }
         return Ok(PhysicalExtent {
             disk_id: disk_id.to_string(),
@@ -169,6 +183,13 @@ pub fn free(state: &mut RawAllocatorState, extent: &PhysicalExtent) -> Result<()
         length: end.saturating_sub(start),
     };
     let merged_length = replacement.length;
+    let mut offset_index = free.take_offset_index();
+    if let Some(index) = &mut offset_index {
+        for i in first..last {
+            index.remove(&free[i].offset);
+        }
+        index.insert(replacement.offset, replacement.clone());
+    }
     let mut fit_index = free.take_fit_index();
     if let Some(index) = &mut fit_index {
         for i in first..last {
@@ -192,6 +213,9 @@ pub fn free(state: &mut RawAllocatorState, extent: &PhysicalExtent) -> Result<()
     }
     if let Some(index) = fit_index {
         free.restore_fit_index(index);
+    }
+    if let Some(index) = offset_index {
+        free.restore_offset_index(index);
     }
     Ok(())
 }

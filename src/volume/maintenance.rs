@@ -65,6 +65,12 @@ impl ArgosFs {
         capacity_bytes: Option<u64>,
         rebalance: bool,
     ) -> Result<String> {
+        if self.paged_metadata.is_some() {
+            return Err(ArgosError::Unsupported(
+                "paged pool membership changes are not implemented".into(),
+            ));
+        }
+
         let mut meta = self.meta.write();
         self.ensure_block_backend_writable_locked(&meta)?;
         let next = meta
@@ -153,12 +159,26 @@ impl ArgosFs {
     }
 
     pub fn add_block_device(&self, path: PathBuf, image_size: u64, force: bool) -> Result<String> {
+        if self.paged_metadata.is_some() {
+            self.sync()?;
+        }
+
         let kind = self.metadata_snapshot().backend;
         if kind == BackendKind::Host {
             return Err(ArgosError::Unsupported(
                 "add-device is only for loop/raw block pools; use add-disk for host volumes"
                     .to_string(),
             ));
+        }
+        if self.paged_metadata.is_some() {
+            let canonical = canonical_or_self(&path);
+            if self.meta.read().disks.values().any(|disk| {
+                disk.status != DiskStatus::Removed && canonical_or_self(&disk.path) == canonical
+            }) {
+                return Err(ArgosError::AlreadyExists(
+                    "cannot format an active paged pool member".into(),
+                ));
+            }
         }
         if kind == BackendKind::LoopBlock {
             prepare_loop_images(std::slice::from_ref(&path), image_size, force)?;
@@ -177,6 +197,10 @@ impl ArgosFs {
             .ok_or_else(|| ArgosError::MissingDevice(path.display().to_string()))?;
         let mut meta = self.meta.write();
         self.ensure_block_backend_writable_locked(&meta)?;
+        if self.paged_metadata.is_some() {
+            self.commit_deferred_locked(&mut meta, false)?;
+        }
+        let before = self.paged_metadata.is_some().then(|| meta.clone());
         let next = meta
             .disks
             .keys()
@@ -243,6 +267,24 @@ impl ArgosFs {
                 created_at,
             },
         );
+        if let Some(before) = before {
+            let result = (|| {
+                // Clear any previous configuration records before publishing
+                // this new device identity, including forced replacement.
+                raw_store::clear_paged_manifest(&new_backend_with_id, &sb)?;
+                raw_store::initialize_member_headers(
+                    &new_backend_with_id,
+                    std::slice::from_ref(&sb),
+                )?;
+                self.reconfigure_paged_locked(&mut meta, &before)
+            })();
+            if let Err(err) = result {
+                *meta = before;
+                self.fence_on_quorum_loss(&err);
+                return Err(err);
+            }
+            return Ok(id);
+        }
         let mut bootstrap_metadata = meta.clone();
         let previous_meta_hash = bootstrap_metadata.integrity.meta_hash.clone();
         journal::prepare_metadata_integrity_with_previous(
@@ -264,12 +306,21 @@ impl ArgosFs {
     }
 
     pub fn mark_disk(&self, disk_id: &str, status: DiskStatus) -> Result<()> {
+        if self.paged_metadata.is_some() && status == DiskStatus::Removed {
+            return self.remove_disk(disk_id).map(|_| ());
+        }
+
         let mut meta = self.meta.write();
         self.ensure_block_backend_writable_locked(&meta)?;
         let disk = meta
             .disks
             .get_mut(disk_id)
             .ok_or_else(|| ArgosError::NotFound(disk_id.to_string()))?;
+        if self.paged_metadata.is_some() && disk.status == DiskStatus::Removed {
+            return Err(ArgosError::Unsupported(
+                "retired paged members must be added as a new device identity".into(),
+            ));
+        }
         disk.status = status;
         disk.manually_offline = status == DiskStatus::Offline;
         disk.offline_since = if status == DiskStatus::Offline {
@@ -563,20 +614,94 @@ impl ArgosFs {
 
     pub fn remove_disk(&self, disk_id: &str) -> Result<u64> {
         let rewritten = self.drain_disk(disk_id)?;
+        if self.paged_metadata.is_some() {
+            self.sync()?;
+        }
         let mut meta = self.meta.write();
         self.ensure_block_backend_writable_locked(&meta)?;
+        if self.paged_metadata.is_some() {
+            self.commit_deferred_locked(&mut meta, false)?;
+        }
+        let before = self.paged_metadata.is_some().then(|| meta.clone());
         let disk = meta
             .disks
             .get_mut(disk_id)
             .ok_or_else(|| ArgosError::NotFound(disk_id.to_string()))?;
         disk.status = DiskStatus::Removed;
         disk.offline_since = None;
+        if let Some(before) = before {
+            if let Err(err) = self.reconfigure_paged_locked(&mut meta, &before) {
+                *meta = before;
+                self.fence_on_quorum_loss(&err);
+                return Err(err);
+            }
+            return Ok(rewritten);
+        }
         self.commit_locked(
             &mut meta,
             "remove-disk",
             json!({"disk_id": disk_id, "rewritten_files": rewritten}),
         )?;
         Ok(rewritten)
+    }
+
+    /// The metadata write lock serializes topology against normal data and
+    /// metadata commits. The old page-store handle stays alive until the
+    /// joint configuration certificate is durable.
+    fn reconfigure_paged_locked(&self, meta: &mut Metadata, before: &Metadata) -> Result<()> {
+        let handle = self
+            .paged_metadata
+            .as_ref()
+            .ok_or_else(|| ArgosError::Unsupported("not a paged pool".into()))?;
+        let mut store = handle.lock();
+        let base = store.snapshot();
+        let expected_pool = Uuid::parse_str(&meta.uuid)
+            .map_err(|err| ArgosError::Invalid(format!("invalid pool UUID: {err}")))?;
+        let mut superblocks = Vec::new();
+        let mut seen = BTreeSet::new();
+        // Removed members must participate in the old configuration barrier
+        // when reachable. Do not use the post-removal active set alone.
+        for (id, disk) in &meta.disks {
+            if disk.status == DiskStatus::Removed
+                && before
+                    .disks
+                    .get(id)
+                    .is_none_or(|old| old.status == DiskStatus::Removed)
+            {
+                continue;
+            }
+            if self.is_device_quarantined(id) {
+                continue;
+            }
+            if let Ok((sb, _)) = raw_store::inspect_device(meta.backend, disk.path.clone()) {
+                if sb.pool_uuid != expected_pool
+                    || sb.disk_id != *id
+                    || !seen.insert(sb.device_uuid)
+                {
+                    return Err(ArgosError::Conflict(
+                        "paged topology device identity mismatch".into(),
+                    ));
+                }
+                superblocks.push(sb);
+            }
+        }
+        let backend = self.metadata_block_backend_locked(meta, &superblocks, true)?;
+        let unavailable = self.quarantined_devices.lock().clone();
+        self.validate_data_durability_locked(meta, &unavailable)?;
+        let new_store = raw_store::reconfigure_paged_metadata(
+            backend,
+            &superblocks,
+            &base,
+            meta,
+            &store.events(),
+        )?;
+        *store = new_store;
+        drop(store);
+        let mut state = self.deferred_commit.lock();
+        *state = DeferredCommitState::new(meta);
+        drop(state);
+        self.publish_capacity_snapshot_locked(meta);
+        Ok(())
     }
 
     pub fn rebalance(&self) -> Result<u64> {
