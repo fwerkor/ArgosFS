@@ -201,8 +201,9 @@ impl Scanner<'_> {
             {
                 continue;
             }
-            for (&ptr, bytes) in batch.iter().zip(data.chunks_exact(PAGE_SIZE)) {
-                let bytes: &Bytes = bytes.try_into().expect("exact page");
+            let (pages, remainder) = data.as_chunks::<PAGE_SIZE>();
+            debug_assert!(remainder.is_empty());
+            for (&ptr, bytes) in batch.iter().zip(pages) {
                 if let Ok(node) = Node::decode(bytes, ptr.hash) {
                     self.verified
                         .insert(ptr.page, (ptr, Arc::new(ScanNode::from_node(node))));
