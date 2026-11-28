@@ -2,7 +2,8 @@ use super::wire::*;
 use super::{Arena, Changes, CommitIo};
 use crate::backend::StorageBackend;
 use crate::error::{ArgosError, Result};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 #[derive(Debug)]
 struct GraphPage {
@@ -63,18 +64,92 @@ impl Arena {
     }
 }
 
+// Cache only authenticated structural information, not record payloads.
+// Consecutive COW roots share most physical pages. Reusing their verified
+// descriptors avoids a second device read and hash without treating an
+// unverified pointer as evidence or retaining full metadata images in RAM.
+enum ScanNode {
+    Leaf {
+        range: (u64, u64),
+        blobs: Vec<(Ptr, usize)>,
+    },
+    Branch {
+        level: u8,
+        children: Vec<(u64, Ptr)>,
+    },
+    Blob {
+        next: Option<Ptr>,
+        len: usize,
+    },
+}
+
+impl ScanNode {
+    fn from_node(node: Node) -> Self {
+        match node {
+            Node::Leaf(entries) => {
+                let range = (entries.first().unwrap().0, entries.last().unwrap().0);
+                let blobs = entries
+                    .into_iter()
+                    .filter_map(|(_, value)| match value {
+                        Value::Blob { first, len } => Some((first, len)),
+                        Value::Inline(_) => None,
+                    })
+                    .collect();
+                Self::Leaf { range, blobs }
+            }
+            Node::Branch { level, children } => Self::Branch { level, children },
+            Node::Blob { next, data } => Self::Blob {
+                next,
+                len: data.len(),
+            },
+        }
+    }
+
+    fn children(&self) -> Vec<Ptr> {
+        match self {
+            Self::Leaf { blobs, .. } => blobs.iter().map(|(ptr, _)| *ptr).collect(),
+            Self::Branch { children, .. } => children.iter().map(|(_, ptr)| *ptr).collect(),
+            Self::Blob { next, .. } => next.iter().copied().collect(),
+        }
+    }
+
+    fn level(&self) -> Option<u8> {
+        match self {
+            Self::Leaf { .. } => Some(0),
+            Self::Branch { level, .. } => Some(*level),
+            Self::Blob { .. } => None,
+        }
+    }
+}
+
+type VerifiedPages = BTreeMap<u64, (Ptr, Arc<ScanNode>)>;
+
 struct Scanner<'a> {
     arena: &'a Arena,
     backend: &'a dyn StorageBackend,
+    verified: &'a mut VerifiedPages,
     graph: Graph,
 }
 
 impl Scanner<'_> {
-    fn visit(&mut self, ptr: Ptr) -> Result<Node> {
+    fn visit(&mut self, ptr: Ptr) -> Result<Arc<ScanNode>> {
         if self.graph.contains_key(&ptr.page) {
             return Err(corrupt("metadata root contains a cycle or duplicate page"));
         }
-        let node = self.arena.read_node(self.backend, ptr)?;
+        let node = if let Some((authenticated, node)) = self.verified.get(&ptr.page) {
+            if *authenticated != ptr {
+                return Err(corrupt(
+                    "metadata page reference disagrees with authenticated identity",
+                ));
+            }
+            Arc::clone(node)
+        } else {
+            let node = Arc::new(ScanNode::from_node(
+                self.arena.read_node(self.backend, ptr)?,
+            ));
+            self.verified.insert(ptr.page, (ptr, Arc::clone(&node)));
+            node
+        };
         self.graph.insert(
             ptr.page,
             GraphPage {
@@ -86,15 +161,66 @@ impl Scanner<'_> {
         Ok(node)
     }
 
+    /// The page tree's physical order need not match key order. Group
+    /// adjacent authenticated child pointers into bounded device reads.
+    /// No speculative free pages are read. If a bulk read fails, let normal
+    /// per-page traversal report the error for the actual referenced page.
+    fn prefetch(&mut self, pointers: impl Iterator<Item = Ptr>) {
+        const MAX_PAGES: usize = 64;
+        let mut pending = pointers
+            .filter(|ptr| {
+                ptr.page >= RESERVED_PAGES
+                    && ptr.page < self.arena.pages()
+                    && !self.verified.contains_key(&ptr.page)
+            })
+            .collect::<Vec<_>>();
+        pending.sort_unstable_by_key(|ptr| ptr.page);
+        pending.dedup_by_key(|ptr| ptr.page);
+        let mut start = 0;
+        while start < pending.len() {
+            let mut end = start + 1;
+            while end < pending.len()
+                && end - start < MAX_PAGES
+                && pending[end].page == pending[end - 1].page + 1
+            {
+                end += 1;
+            }
+            let batch = &pending[start..end];
+            start = end;
+            if batch.len() < 2 {
+                continue;
+            }
+            let Ok(offset) = self.arena.offset_of(batch[0].page) else {
+                continue;
+            };
+            let mut data = vec![0; batch.len() * PAGE_SIZE];
+            if self
+                .backend
+                .read_at(&self.arena.disk_id, offset, &mut data)
+                .is_err()
+            {
+                continue;
+            }
+            for (&ptr, bytes) in batch.iter().zip(data.chunks_exact(PAGE_SIZE)) {
+                let bytes: &Bytes = bytes.try_into().expect("exact page");
+                if let Ok(node) = Node::decode(bytes, ptr.hash) {
+                    self.verified
+                        .insert(ptr.page, (ptr, Arc::new(ScanNode::from_node(node))));
+                }
+            }
+        }
+    }
+
     fn blob(&mut self, mut ptr: Ptr, mut remaining: usize) -> Result<()> {
         loop {
-            let Node::Blob { next, data } = self.visit(ptr)? else {
+            let node = self.visit(ptr)?;
+            let ScanNode::Blob { next, len } = &*node else {
                 return Err(corrupt("metadata overflow points to a tree page"));
             };
             remaining = remaining
-                .checked_sub(data.len())
+                .checked_sub(*len)
                 .ok_or_else(|| corrupt("metadata overflow exceeds declared length"))?;
-            match (next, remaining) {
+            match (*next, remaining) {
                 (None, 0) => return Ok(()),
                 (Some(p), n) if n > 0 => ptr = p,
                 _ => return Err(corrupt("metadata overflow length mismatch")),
@@ -102,27 +228,25 @@ impl Scanner<'_> {
         }
     }
 
-    // The level decreases on every branch descent, bounding stack depth
-    // independently of any corrupted pointer or arena size.
+    // Every root still has independent cycle, key-range and overflow checks.
     fn tree(&mut self, ptr: Ptr, expected_level: Option<u8>) -> Result<(u64, u64)> {
         let node = self.visit(ptr)?;
         if expected_level.is_some() && node.level() != expected_level {
             return Err(corrupt("metadata tree height mismatch"));
         }
-        match node {
-            Node::Leaf(entries) => {
-                let range = (entries.first().unwrap().0, entries.last().unwrap().0);
-                for (_, value) in entries {
-                    if let Value::Blob { first, len } = value {
-                        self.blob(first, len)?;
-                    }
+        match &*node {
+            ScanNode::Leaf { range, blobs } => {
+                self.prefetch(blobs.iter().map(|(ptr, _)| *ptr));
+                for &(first, len) in blobs {
+                    self.blob(first, len)?;
                 }
-                Ok(range)
+                Ok(*range)
             }
-            Node::Branch { level, children } => {
+            ScanNode::Branch { level, children } => {
+                self.prefetch(children.iter().map(|(_, ptr)| *ptr));
                 let mut first = None;
                 let mut last = None;
-                for (key, child) in children {
+                for &(key, child) in children {
                     let (min, max) = self.tree(child, Some(level - 1))?;
                     if max != key || last.is_some_and(|previous| previous >= min) {
                         return Err(corrupt("metadata branch key range mismatch"));
@@ -132,8 +256,75 @@ impl Scanner<'_> {
                 }
                 Ok((first.unwrap(), last.unwrap()))
             }
-            Node::Blob { .. } => Err(corrupt("metadata tree points to an overflow page")),
+            ScanNode::Blob { .. } => Err(corrupt("metadata tree points to an overflow page")),
         }
+    }
+}
+
+/// Sorted, disjoint free page ranges, with exclusive end offsets. A large
+/// mostly empty arena must not allocate one B-tree entry per unused page.
+#[derive(Default)]
+struct FreePages(BTreeMap<u64, u64>);
+
+impl FreePages {
+    fn from_graph(pages: u64, graph: &Graph) -> Self {
+        let mut free = Self::default();
+        let mut start = RESERVED_PAGES;
+        for &page in graph.keys() {
+            if start < page {
+                free.0.insert(start, page);
+            }
+            start = page + 1;
+        }
+        if start < pages {
+            free.0.insert(start, pages);
+        }
+        free
+    }
+
+    fn contains(&self, page: &u64) -> bool {
+        self.0
+            .range(..=page)
+            .next_back()
+            .is_some_and(|(_, end)| page < end)
+    }
+
+    fn remove(&mut self, page: &u64) {
+        let Some((&start, &end)) = self.0.range(..=page).next_back() else {
+            return;
+        };
+        if *page >= end {
+            return;
+        }
+        self.0.remove(&start);
+        if start < *page {
+            self.0.insert(start, *page);
+        }
+        if page + 1 < end {
+            self.0.insert(page + 1, end);
+        }
+    }
+
+    fn insert(&mut self, page: u64) {
+        if self.contains(&page) {
+            return;
+        }
+        let mut start = page;
+        let mut end = page + 1;
+        if let Some((&left, &left_end)) = self.0.range(..page).next_back() {
+            if left_end == page {
+                start = left;
+                self.0.remove(&left);
+            }
+        }
+        if let Some(right_end) = self.0.remove(&end) {
+            end = right_end;
+        }
+        self.0.insert(start, end);
+    }
+
+    fn iter(&self) -> impl Iterator<Item = u64> + '_ {
+        self.0.iter().flat_map(|(&start, &end)| start..end)
     }
 }
 
@@ -142,7 +333,7 @@ pub(super) struct Member {
     pub(super) roots: [Option<Root>; 2],
     pub(super) certificates: [Option<Root>; 2],
     graph: Graph,
-    free: BTreeSet<u64>,
+    free: FreePages,
 }
 
 impl Member {
@@ -155,6 +346,7 @@ impl Member {
         let mut roots = [None; 2];
         let mut certificates = [None; 2];
         let mut graph = Graph::new();
+        let mut verified = VerifiedPages::new();
         for (slot, root) in roots.iter_mut().enumerate() {
             // A read error is not proof that a root is invalid. Exclude the
             // whole member rather than recycling potentially live pages.
@@ -168,6 +360,7 @@ impl Member {
             let mut scanner = Scanner {
                 arena: &arena,
                 backend,
+                verified: &mut verified,
                 graph: Graph::new(),
             };
             if let Some(ptr) = candidate.tree {
@@ -204,9 +397,7 @@ impl Member {
             }
             page.refs += 1;
         }
-        let free = (RESERVED_PAGES..arena.pages())
-            .filter(|page| !graph.contains_key(page))
-            .collect();
+        let free = FreePages::from_graph(arena.pages(), &graph);
         Ok(Self {
             arena,
             roots,
@@ -242,7 +433,7 @@ impl Member {
         let mut plan = Plan {
             member: self,
             backend,
-            free: self.free.iter(),
+            free: Box::new(self.free.iter()),
             recycled: Vec::new(),
             pages: BTreeMap::new(),
             reads: 0,
@@ -279,7 +470,7 @@ impl Member {
         let mut plan = Plan {
             member: self,
             backend,
-            free: self.free.iter(),
+            free: Box::new(self.free.iter()),
             recycled: Vec::new(),
             pages: BTreeMap::new(),
             reads: 0,
@@ -604,7 +795,7 @@ pub(super) struct Prepared {
 struct Plan<'a> {
     member: &'a Member,
     backend: &'a dyn StorageBackend,
-    free: std::collections::btree_set::Iter<'a, u64>,
+    free: Box<dyn Iterator<Item = u64> + 'a>,
     recycled: Vec<u64>,
     pages: BTreeMap<u64, Staged>,
     reads: usize,
@@ -622,7 +813,7 @@ impl Plan<'_> {
     fn alloc(&mut self) -> Result<u64> {
         self.recycled
             .pop()
-            .or_else(|| self.free.next().copied())
+            .or_else(|| self.free.next())
             .ok_or_else(|| ArgosError::DiskFull {
                 disk_id: self.member.arena.disk_id.clone(),
                 required: PAGE_SIZE as u64,
@@ -898,5 +1089,40 @@ impl Plan<'_> {
                 None,
             )?)),
         }
+    }
+}
+
+#[cfg(test)]
+mod free_page_tests {
+    use super::*;
+
+    #[test]
+    fn huge_sparse_arena_uses_ranges_and_reclaims_holes() {
+        let mut graph = Graph::new();
+        for page in [4, 6, 999_999_999] {
+            graph.insert(
+                page,
+                GraphPage {
+                    ptr: Ptr {
+                        page,
+                        hash: [0; 32],
+                    },
+                    children: Vec::new(),
+                    refs: 1,
+                },
+            );
+        }
+        let mut free = FreePages::from_graph(1_000_000_000, &graph);
+        assert_eq!(free.0.len(), 2);
+        assert_eq!(free.iter().take(4).collect::<Vec<_>>(), vec![5, 7, 8, 9]);
+        assert!(!free.contains(&6));
+        free.remove(&8);
+        assert_eq!(free.0.len(), 3);
+        assert!(!free.contains(&8));
+        free.insert(6);
+        free.insert(8);
+        free.insert(4);
+        free.insert(999_999_999);
+        assert_eq!(free.0, BTreeMap::from([(4, 1_000_000_000)]));
     }
 }

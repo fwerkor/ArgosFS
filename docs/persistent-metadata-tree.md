@@ -77,7 +77,14 @@ free list can incorrectly mark a live page free after a torn write.
 
 ## Recovery and repair
 
-Read and verify root/certificate headers and every reachable page. Verify
+Read and verify root/certificate headers and every reachable page. Consecutive
+COW roots share physical pages; within one member recovery, a page with the
+same authenticated pointer is read and hashed only once. Each root still
+undergoes independent graph, key-range, overflow and duplicate checks.
+Adjacent referenced child pages are read in batches of at most 256 KiB
+(with individual-read fallback); no unused pages are speculatively read.
+Free space is reconstructed from sorted gaps between live pages, using
+coalesced ranges rather than one allocation entry per unused arena page. Verify
 tree height, key ranges, overflow lengths, checksums, and absence of cycles
 or duplicate pages in each graph. Count votes once per configured member.
 

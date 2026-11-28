@@ -693,3 +693,66 @@ fn verified_degraded_v2_mount_defers_reanchor_until_mutation() {
     assert_eq!(fs.read_file("/new", false).unwrap(), b"");
     assert_eq!(fs.transaction_report().unwrap().invalid_entries, 0);
 }
+
+#[test]
+fn paged_degraded_mount_and_first_mutation_do_not_rewrite_namespace() {
+    let dir = tempfile::tempdir().unwrap();
+    let images = (0..9)
+        .map(|i| dir.path().join(format!("paged-member-{i}.img")))
+        .collect::<Vec<_>>();
+    let fs = ArgosFs::create_loop_paged(
+        &images,
+        VolumeConfig {
+            k: 4,
+            m: 4,
+            chunk_size: 4096,
+            defer_metadata_commit: true,
+            deferred_commit_max_transactions: 10_000,
+            deferred_commit_interval_ms: 60_000,
+            ..Default::default()
+        },
+        64 * 1024 * 1024,
+        "paged-degraded-write-audit",
+        false,
+    )
+    .unwrap();
+    for i in 0..1024 {
+        fs.create_file_path(&format!("/file-{i:04}"), 0o600)
+            .unwrap();
+    }
+    fs.sync().unwrap();
+    fs.mark_clean_unmount().unwrap();
+    let superblocks = fs.raw_superblocks.clone();
+    drop(fs);
+    let audit_slot = std::sync::Mutex::new(None);
+    let fs = ArgosFs::open_loop_with_backend(&images[..8], true, |inner| {
+        let audit = Arc::new(WriteAuditBackend::new(inner, &superblocks));
+        *audit_slot.lock().unwrap() = Some(audit.clone());
+        audit
+    })
+    .unwrap();
+    let audit = audit_slot.into_inner().unwrap().unwrap();
+    let mount = audit.totals();
+    assert_eq!(mount[0], 0, "mount wrote paged metadata");
+    assert_eq!(mount[1], 0, "mount wrote legacy journal");
+    assert_eq!(
+        fs.metadata_snapshot().disks["disk-0008"].status,
+        DiskStatus::Offline
+    );
+    fs.sync().unwrap();
+    assert_eq!(audit.totals(), mount);
+    fs.create_file_path("/new", 0o600).unwrap();
+    fs.sync().unwrap();
+    let changed = audit.totals();
+    eprintln!("degraded paged mount: {mount:?}; first mutation: {changed:?}");
+    assert_eq!(changed[1], 0);
+    assert!(
+        changed[0] > 0 && changed[0] <= 8 * 256 * 1024,
+        "first mutation rewrote excessive metadata: {changed:?}"
+    );
+    fs.mark_clean_unmount().unwrap();
+    drop(fs);
+    let fs = ArgosFs::open_loop(&images[..8], false).unwrap();
+    assert_eq!(fs.metadata_snapshot().inodes.len(), 1026);
+    assert_eq!(fs.read_file("/new", false).unwrap(), b"");
+}
