@@ -771,11 +771,7 @@ impl ArgosFs {
         if max_files == 0 {
             return Ok((0, cursor));
         }
-        let targets = self
-            .file_window(cursor, max_files)
-            .into_iter()
-            .map(|(ino, _)| ino)
-            .collect::<Vec<_>>();
+        let targets = self.file_window(cursor, max_files);
         {
             let meta = self.meta.read();
             self.ensure_block_backend_writable_locked(&meta)?;
@@ -834,7 +830,7 @@ impl ArgosFs {
             .read_recovered
             .load(std::sync::atomic::Ordering::Relaxed);
         let mut next_cursor = cursor;
-        for (ino, _) in self.file_window(cursor, max_files) {
+        for ino in self.file_window(cursor, max_files) {
             let inode_lock = self.inode_lock(ino);
             let _inode_guard = inode_lock.lock();
             report.files_checked += 1;
